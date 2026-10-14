@@ -278,7 +278,7 @@ The protocol join + `GROUP BY` that started this, 11.5 ms against Postgres's 6.9
 
 ### Correlated subqueries, joins on expressions and long `IN` lists (2026-10-02)
 
-A CRM demo (six agents on one Chronos) showed minutes-long statements over a 150,600-row `leads` table. Alone, the plain `GROUP BY` ones were fast; the slow ones were correlated `EXISTS` / `NOT EXISTS`, a join on `lower(a.email) = lower(b.email)` and `x IN (select ...)` over a long list (the rest of what the agents saw was queueing: `chronos mcp` serves one request at a time per process). [PR #72](https://github.com/Abhishekxdg/chronosdb-engine/pull/72) fixed them (see [SQL](docs/sql.md#speed)).
+A CRM demo (six agents on one Chronos) showed minutes-long statements over a 150,600-row `leads` table. Alone, the plain `GROUP BY` ones were fast; the slow ones were correlated `EXISTS` / `NOT EXISTS`, a join on `lower(a.email) = lower(b.email)` and `x IN (select ...)` over a long list. The agents weren't waiting on each other: each has a session of its own in the server ([Several sessions on one database](#several-sessions-on-one-database-2026-10-14), below). [PR #72](https://github.com/Abhishekxdg/chronosdb-engine/pull/72) fixed them (see [SQL](docs/sql.md#speed)).
 
 `python bench/sql-subqueries/bench.py` runs each statement alone on 150,600 rows (25,000 accounts of 6 leads in 10 regions; region R3 has 15,000 leads of 2,500 companies; a `PRIMARY KEY` on `id` and one index on `region`) and prints the wall time and a digest of the sorted rows. Run on an idle GCP e2-standard-4 (4 vCPUs, 16 GB, Ubuntu 24.04, cross-built Linux binaries), one run each, statements stopped at 450 s. Before is `main` at `b8624047`, after is `c7f90dda`. Raw output is in [`bench/results/2026-10-02-sql-subqueries/`](bench/results/2026-10-02-sql-subqueries).
 
@@ -299,6 +299,39 @@ A CRM demo (six agents on one Chronos) showed minutes-long statements over a 150
 | `EXISTS` with 243 distinct outer values against one 50,000-row bucket | 5.8 s | 2.9 s |
 
 Every statement the old build finished returns the same rows on both builds (same digests). The three plain `GROUP BY` / CTE statements were never slow and are unchanged. The last row gains least: the old per-row path already kept its answer for each distinct outer value, so it ran 243 times, and the new one does the same work 243 times over a hash bucket. A correlated subquery whose equality is on an indexed column keeps running per outer row until that has taken half a second, then hashes (the `EXISTS` on `region` row).
+
+### Several sessions on one database (2026-10-14)
+
+An earlier edition of this page said the demo's agents queued because `chronos mcp` serves one request at a time. That was never measured, and it's wrong: each agent's `chronos mcp` joins the `chronos serve` that has the folder open and gets a session and a thread of its own there (`src/local.rs`).
+
+`CHRONOS=target/release/chronos python3 bench/mcp-sessions/bench.py` starts one server and a `chronos mcp` process per session, as the demo's agents ran, and times fast calls in some sessions while session A runs something slow. **Not the 32-core machine:** an 8-core, 8 GB M2 laptop, a v0.1.3 release build of 2026-10-02, one run. Raw output is in [`bench/results/2026-10-14-mcp-sessions/`](bench/results/2026-10-14-mcp-sessions). Median / worst, in ms:
+
+| while session A | another's read of main | another's write in its own world | another's write to main |
+|---|---|---|---|
+| nothing | 0.1 / 0.6 | 0.1 / 0.9 | 3.0 / 3.8 |
+| sleeps 4 s | 0.6 / 2.3 | 0.6 / 2.3 | 4.0 / 5.6 |
+| reads main for 3.4 s (a nested loop) | 0.2 / 1.1 | 0.2 / 1.6 | 3.0 / 4.9 |
+| writes its own world for 1.7 s (a slow `UPDATE`) | 0.2 / 1.2 | 0.2 / 1.2 | 3.0 / 4.8 |
+| the same, with a checkpoint meanwhile (it took 0.03 s) | 0.1 / 2.0 | 0.1 / 1.7 | 3.0 / 9.3 |
+| writes main for 1.7 s (the same `UPDATE`) | 0.2 / 0.8 | 0.2 / 0.9 | 3.9 / **1,671** |
+
+Queries big enough to be split across cores share the cores, and no more:
+
+| while | `GROUP BY` over one region (15,000 rows) | `GROUP BY` over the table (150,000 rows) |
+|---|---|---|
+| nothing | 35 / 49 | 7.7 / 35 |
+| 5 sessions loop a 138 ms `GROUP BY` over 1.5M rows | 131 / 259 | 85 / 265 |
+| 1 session runs a 21 s join | 129 / 481 | 109 / 372 |
+| 3 sessions run a join each (30 to 58 s) | 60 / 633 | 20 / 674 |
+
+**Verdict:** sessions don't wait for each other's statements. Beside statements that take every core, a 35 ms query took 60 to 131 ms and never more than 0.7 s.
+
+**What does wait:**
+- **Writes to `main` behind a statement writing `main`:** the other session's 3 ms write took 1.67 s, all of that statement's time. Reads of `main` and writes in other worlds didn't wait. Merges into `main` weren't measured here; section 1's losses are about them.
+- **Calls in one session:** two calls sent together are answered in order (`pg_sleep(2)` and `select 1` both at 2.00 s). An agent that sends tool calls in parallel gets them one after another.
+- **The five looping sessions themselves:** 12 runs of the 138 ms `GROUP BY` took 4.8 to 10.0 s per session, against 1.7 s alone, on 8 cores shared by seven busy sessions.
+
+**Not explained:** the demo's 5 to 8 minute calls of a plain `GROUP BY ... HAVING` over one region. Alone it takes 0.07 s (the table above this section), and here beside long statements under 0.7 s; it wasn't reproduced.
 
 ## 5. Crash safety
 
@@ -875,6 +908,7 @@ N=200000 cargo run --release --example report                       # PG=off run
 ROWS=500000 AGENT=100000 OTHERS=50000 cargo run --release --example undo_agent
 CHRONOS_CACHE_MB=32 MB=500 cargo run --release --example big            # builds ~800 MB in a temp folder
 python bench/sql-subqueries/bench.py [--timeout 300]                # the CRM demo's slow SQL on 150,600 rows; needs psql
+python bench/mcp-sessions/bench.py                                  # MCP sessions beside one running something slow; needs psql
 python bench/vector_dbs.py [system ...]                             # one system per run; see its header
 DATA=... python bench/rivals/pgvector_ef.py                         # pgvector's ef_search sweep on a loaded table
 SWEEP=1 ROWS=100000 cargo run --release --example worlds            # 10 .. 100,000 worlds

@@ -2,6 +2,93 @@
 
 ## Unreleased
 
+**What the migration probe still refused**
+- `EXCLUDE` constraints: `exclude using gist (room with =, during with &&)`, with `WHERE`, in `CREATE TABLE` and `ALTER TABLE ... ADD`. A conflicting row is 23P01 naming the two keys, among one statement's rows too, when a merge brings two worlds' rows together, and for the rows already there when one is added. No index answers `&&`: a statement that writes such a table reads it whole.
+- An enum as a primary key, alone or among several columns. (A label of an enum some table is keyed by can't be renamed.)
+- `sum`, `min` and `max` of `money`. `count(t.*)` counts the rows where `t` has one, as after a `LEFT JOIN`.
+- `UNIQUE (...) DEFERRABLE [INITIALLY IMMEDIATE]` is taken: a unique constraint here is checked once a statement's rows are written, which is what that asks for. `INITIALLY DEFERRED` is refused.
+- `COMMIT` in a PL/pgSQL procedure. A `CALL` is one statement here and stores its work together when it ends, so a procedure that fails after its `COMMIT` keeps nothing, where Postgres keeps what it committed. In a transaction block it is 2D000, as in Postgres. `ROLLBACK` in one is still refused.
+- `(f()).field` of a function with several `OUT` parameters; `textcat`, by its name, as a user aggregate's step.
+- `schema.table.column`, as Prisma writes every column it names (it was a syntax error, so Prisma's first query failed).
+- The migration probe: 3 of 181 statements refused, from 15, all three an extension (`tablefunc`, `intarray`, `pg_stat_statements`). The Postgres regression suite: 77.37% of expected lines, from 77.20%, ten files better and none worse (`tests/regress_floor.tsv` raised).
+
+**Lint**
+- `cargo fmt` over the whole tree, and clippy clean (with and without `s3`) with warnings as errors, which ci's `lint` job asks for and `main` didn't pass. Seven always-false conditions left in place were taken out (`&& false` in `geom.rs`, `money.rs`, `rules.rs`, `userdefs.rs`; a self-assignment in `tsearch.rs`): what they did is unchanged.
+
+**GROUP BY and DISTINCT in a nondeterministic collation, and of citext**
+- `GROUP BY`, `DISTINCT` and `DISTINCT ON` of such text were refused. They go by the key the strings are equal by: `'Ada'` and `'ADA'` are one group, which shows one of them (either, as in Postgres). `UNION`, `INTERSECT`, `EXCEPT`, `count(DISTINCT)` and `PARTITION BY` are still refused.
+
+**Drivers and ORMs**
+- `tests/drivers` and the `drivers` workflow: psycopg 3, SQLAlchemy 2, Django, node-postgres, pgx, JDBC and Prisma each make a table, write and read typed values, use a transaction and read a constraint error's code against `chronos serve`. Nightly, on request, and on pull requests that change them. All seven pass.
+
+**After a review of the changes below**
+- `COPY ... FROM ... WHERE` counted a row as left out when its WHERE failed (`WHERE 10 / v > 0` with a zero): the COPY fails now, and stores nothing.
+- `COPY (INSERT ... RETURNING ...) TO` with `FORCE_QUOTE` of a column it doesn't return ran the INSERT, then failed, and the rows stayed. The columns are checked before the statement runs.
+- A COPY whose rows first take a sequence's value past its first 16,384 rows (a trigger that calls `nextval` for some rows) was refused (54000). Its parts are kept from the start, up to `CHRONOS_WORK_MEM`, to be stored again.
+- A key-value `put` to a table whose primary key is a date, a time, a timestamp, a number or a boolean wrote a second row with the same key, and `get` and `delete` didn't find the row SQL stored: the key is taken as people read it (`days/2026-01-01`) and put in its stored form.
+- `NaN`, `Infinity` and `-Infinity` are numeric primary keys, in numeric's order.
+- A default worked out for each row is typed when it is made: `i int DEFAULT now()` is refused (42804) by `CREATE TABLE`, where every INSERT failed. `ADD GENERATED ... AS IDENTITY` is refused on a column that has one, and two parents' different ones are a conflict for a table that inherits both.
+- A row written as JSON without a column whose default only SQL can work out (it takes a sequence's value, or calls a function made here) says so.
+- `CASE x WHEN ...` and `NULLIF(x, y)` in a nondeterministic collation worked `x` out once for each comparison: `nextval` in it advanced more than once. Once now.
+- In PL/pgSQL, `NEW IS NULL` is true when every field is null and `NEW IS NOT NULL` when none is, as a row is in Postgres (they went by whether the record held a row).
+- `hstore`, `ltree` and `lquery` parameters and results in binary, as a driver with an adapter for them sends and asks for (they were read as text). An array of them keeps its lower bound and its dimensions. `TG_RELID` is an `oid`.
+- Not changed: a default's (like a check's and a generated column's) functions are found by the search_path of whoever writes the row; `citext` as a function's parameter or result type is text.
+
+**Release gates, fuzzing, and a floor under the regression suite**
+- `tests/fuzz.rs`: statements nobody would write (tokens thrown together, and statements that run with tokens dropped, doubled, swapped or replaced) and wire frames no driver would send (wrong lengths, unknown types, messages cut short). Nothing may panic, and the server must answer the next real client. Seeded: `CHRONOS_FUZZ_SEED`, `CHRONOS_FUZZ_ROUNDS`.
+- A release is built only after a `gate` job passes on the tagged commit: the crash suite, `kill -9` under concurrent merges, the simulated interleavings, and the fuzz tests at 100,000 rounds.
+- `tests/regress_ratchet.sh` and `tests/regress_floor.tsv`: no Postgres regression file may match fewer of its expected lines than it has reached. The `regress` workflow runs it every night.
+- [operations.md](docs/operations.md#high-availability) says what Chronos has for availability (one writer, a restart, a takeover from cloud storage) and what it doesn't (replicas, failover).
+
+**hstore and ltree**
+- `hstore` and `ltree` were types that don't exist, and `CREATE EXTENSION hstore` and `ltree` errors, so a table with an attributes or a tree-path column wasn't made, nor anything after it that reads the table. Both are built in now, checked against the extensions in Postgres 16 (`tests/pgdiff.rs`, `hstore_type` and `ltree_type`).
+- hstore: its text read and written as Postgres does; `->`, `||`, `?`, `?|`, `?&`, `@>`, `<@`, `-`, `h['key']`; `hstore(...)`, `akeys`, `avals`, `skeys`, `svals`, `each`, `exist`, `defined`, `delete`, `slice`, `hstore_to_json` and its kin, and a cast to `jsonb`. A `gin` or `gist` index on one is made and holds no entries, as on a `jsonb`.
+- ltree and lquery: `@>`, `<@`, `~`, `?`, `||`, the comparisons, and `nlevel`, `subpath`, `subltree`, `index`, `lca`, `text2ltree`, `ltree2text`. Paths order label by label, as Postgres orders them. A `gist` index on one is a btree here.
+- They work where an expression runs: a default, a check, a generated column, an index's expression, `RETURNING`, a trigger's `WHEN`, a policy, SQL and PL/pgSQL functions, and prepared statements with `hstore` or `ltree` parameters.
+- What pg_dump writes for an extension's objects is read: the type and the functions with their schema (`public.hstore`, `public.nlevel(...)`), `OPERATOR(public.->)` for every operator (it was read for the comparisons only), and an operator class with its schema and its parameters, `public.gist_ltree_ops (siglen='8')`.
+- `ORDER BY column LIMIT n` read an index in its order for a `money`, a `time with time zone` or a range column, whose index is in their text's order: the first rows could be the wrong ones. Those sort now.
+- `GROUP BY` an operator's result on a `money`, `bit`, `time with time zone` or range value (`GROUP BY m * 2`) said the column must appear in the GROUP BY clause. It groups.
+- PL/pgSQL trigger functions have `TG_RELID`.
+- Not yet: `ltxtquery`, `hstore(record)` and `populate_record`, `(each(h)).key` in a select list.
+- The migration probe: 15 of 181 statements refused, from 77. What the rest wait for: `EXCLUDE` constraints, an enum primary key, `COMMIT` in a procedure, a deferrable `UNIQUE`, `sum(money)`, `count(t.*)`, a field of a function's composite result, and the `tablefunc`, `intarray` and `pg_stat_statements` extensions.
+
+**citext**
+- `citext` was a type that doesn't exist, and `CREATE EXTENSION citext` an error, so every schema with a case-insensitive email or username column stopped there. It is built in now: text in the collation `citext`, equal and sorted by its lower case. A `citext` column, cast and domain; `=`, `<>`, `<`, `IN`, `CASE`, joins, `ORDER BY`, `min` and `max`; unique constraints and `ON CONFLICT`; and `LIKE`, which doesn't look at case, as the extension's doesn't. Each matches Postgres with the extension (`tests/pgdiff.rs`, `citext_compares_by_lower_case`).
+- A citext compared with text of a type is compared as text, as Postgres does. `format_type` and `information_schema.columns` say `citext`.
+- It is a nondeterministic collation's text, so what those refuse it refuses: `GROUP BY`, `DISTINCT`, set operations, and a primary or a foreign key on a citext column. Not yet as the extension has them: the regular-expression operators and `replace`, `strpos`, `split_part` and `translate` without regard to case, and `pg_typeof` ([citext](docs/sql.md#citext)).
+- A column made from a domain takes the domain's collation.
+- The migration probe (`tests/fixtures/pg-gap-probe-migrate.sql`): 77 of 181 statements refused, from 86. `hstore` and `ltree` are the types the rest wait for.
+
+**Nondeterministic collations**
+- `CREATE COLLATION ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false)` was refused: every collation here was deterministic, text equal only when its bytes are. It is taken now, and the strings ICU ties are equal in it: `=`, `<>`, `<` and the other comparisons, `BETWEEN`, `IN (a, b)`, `CASE x WHEN`, `NULLIF`, `IS DISTINCT FROM`, a join's `ON`, `ORDER BY`, `min` and `max`, and unique constraints, unique indexes and `ON CONFLICT` on a column of one. Each matches Postgres 16 (`tests/pgdiff.rs`, `nondeterministic_collations`).
+- What would still tell such strings apart by their bytes is refused (0A000) rather than done wrong: `GROUP BY`, `DISTINCT`, `UNION`, `INTERSECT`, `EXCEPT`, `count(DISTINCT)`, `PARTITION BY`, a subquery's rows (`IN (SELECT ...)`), arrays and rows of such text, and a primary, foreign or partition key of one. `LIKE` is refused as Postgres 16 refuses it. See [Nondeterministic collations](docs/sql.md#nondeterministic-collations).
+- `pg_collation.collisdeterministic` says which a collation is, so a dump keeps it.
+
+**Audit triggers, and the indexes a dump has**
+- A record used whole in PL/pgSQL was refused when the function was made: `to_jsonb(NEW)`, `row_to_json(OLD)`, `OLD IS NULL`, `NEW IS DISTINCT FROM OLD`, a loop's record. It reads as the record's fields in a JSON object now (null while it holds no row), so the usual audit trigger, which keeps `to_jsonb(OLD)` and `to_jsonb(NEW)`, works and keeps what Postgres keeps.
+- `CREATE INDEX ... USING gin` on a `jsonb` or an array column was refused, and with it every dump that has one. It is made, listed (`pg_indexes`, `\d`) and dumped; it holds no entries, so `@>`, `?` and `&&` read the rows as they did. `jsonb_ops`, `jsonb_path_ops` and `array_ops` are accepted.
+- `CREATE EXTENSION btree_gin` and `btree_gist` succeed: their operator classes are for indexes that are btrees here whatever their method.
+
+**Primary keys of dates, times and numbers**
+- A one-column primary key had to be an integer, text, bytea, uuid or an address: `day date PRIMARY KEY`, `at timestamptz PRIMARY KEY`, `id numeric(20,0) PRIMARY KEY` and a boolean, time, timestamp or double precision key were refused (0A000), and the table with them. They work now, and numeric, double precision and time can be columns of a key of several. Rows are stored in the key's order, found by it, upserted with `ON CONFLICT` and referenced by foreign keys as in Postgres (`tests/pgdiff.rs`, `primary_keys_of_dates_times_and_numbers`). A numeric key of NaN or an infinity is 22003. Still refused: an enum, interval, array or JSON key.
+- `tests/fixtures/pg-gap-probe-migrate.sql`: 181 statements a dump or a migration of an ordinary application sends (extensions, types, tables, indexes, functions, triggers, views, row security, grants, queries), for `tests/pg_gap_probe.sh`. Postgres 16 takes them all; what Chronos refuses is the list to work down.
+
+**A COPY that took sequence values stored nothing**
+- `COPY ... FROM` into a table whose rows take a sequence's value as they are stored (a trigger calling `nextval`, a function it calls) said `COPY n` and stored no row. A statement whose reserved sequence values run out is run again from its start, and the COPY's rows, which the client sends once, were gone by then. They are kept now and handed out again: the first part always, and every part once the COPY has been run again, up to `CHRONOS_WORK_MEM`; a COPY past that which runs out again fails (54000) with nothing stored, rather than storing some of its rows. Upgrade if you COPY into tables with such triggers.
+- A statement run again for more sequence values gives back the ones its first run took, so a sequence skips none for it: three rows whose default is `nextval('s') * 10` get 10, 20 and 30, as in Postgres, where they got 30, 40 and 50.
+
+**Column defaults worked out for each row**
+- A `DEFAULT` that Postgres works out afresh for each row was refused (0A000): `now() + interval '7 days'`, `timezone('utc', now())`, `random()`, `nextval('s') + 1`, `gen_random_bytes(16)`, a function of your own. It is kept as its SQL now and run for each row that takes it: in `CREATE TABLE`, `ALTER COLUMN ... SET DEFAULT`, `LIKE ... INCLUDING DEFAULTS`, inherited columns, `INSERT`, `COPY`, and `UPDATE ... SET col = DEFAULT`. So a dump with such defaults restores, and `chronos import postgres://` brings them over instead of leaving them out.
+- `DEFAULT upper(current_user)` and other defaults that name the role were worked out once, as the role making the table; they are the role writing the row now.
+- A column a default names is `cannot use column reference in DEFAULT expression`, as in Postgres.
+- Still different: `ADD COLUMN` with a default that gives each row its own value (`random()`, a sequence, a function) is refused on a table with rows, and the catalog shows such a default as written ([Known gaps](docs/postgres-compatibility.md#known-gaps)).
+
+**COPY of a statement that changes rows**
+- `COPY (INSERT | UPDATE | DELETE ... RETURNING ...) TO STDOUT` sends the rows the statement returns, in any of COPY's formats. It was refused ("COPY (query) TO takes a SELECT").
+- Without a `RETURNING` it is 0A000 (`COPY query must have a RETURNING clause`), and what the table's rules would make of it is refused in Postgres's words: `DO INSTEAD NOTHING`, `DO ALSO`, conditional and multi-statement `DO INSTEAD` rules, a rule that runs a utility command, and a `RETURNING` under an `INSTEAD` rule that has none.
+- What a COPY's statement raised was dropped: its triggers' `RAISE NOTICE`s now reach the client, the BEFORE triggers' before the rows and the AFTER triggers' after them.
+- `tests/regress_triage.py` ranks what breaks a run of Postgres's regression files by statements lost, charging the ones that fail after a refused `CREATE` (or in a transaction it aborted) to that statement.
+
 **ALTER DEFAULT PRIVILEGES, type privileges, and the predefined roles' privileges**
 - `ALTER DEFAULT PRIVILEGES [FOR ROLE | USER r, ...] [IN SCHEMA s, ...] GRANT | REVOKE [GRANT OPTION FOR] ... ON TABLES | SEQUENCES | FUNCTIONS | ROUTINES | TYPES | SCHEMAS TO | FROM ... [WITH GRANT OPTION] [CASCADE | RESTRICT]` was a syntax error (42601); it works as in Postgres 16, for the roles whose privileges the running role has (42501 `permission denied to change default privileges` otherwise), with Postgres's refusals (`IN SCHEMA` with `ON SCHEMAS`, a privilege the kind hasn't, columns, a grant option for PUBLIC: 0LP01). A role's own entry replaces the built-in defaults and a schema's adds to it; one back at its start is gone. `pg_default_acl` shows them, psql's `\ddp` lists them, and `pg_dump` writes them, which restore.
 - What a role makes starts with them: tables, views, materialized views, `CREATE TABLE AS` and `SELECT INTO`, partitions, sequences, serial and identity columns' sequences (one `ALTER TABLE` adds: its table owner's), functions, procedures, types, domains and schemas (`CREATE SCHEMA ... AUTHORIZATION`'s owner's), so `relacl`, `proacl`, `typacl`, `nspacl` and the `has_*_privilege` functions show them. They are rows of the world: they fork, merge and come back with `RESTORE`. `DROP ROLE` of a role that has them or is named in them is 2BP01 with Postgres's detail, `DROP OWNED` drops a role's and takes it out of others', `REASSIGN OWNED` leaves them and `DROP SCHEMA` drops the schema's.

@@ -57,6 +57,16 @@ chronos --remote s3://bucket/prefix mydb        # or: chronos serve … with the
   - If that process is gone, open with `--takeover` (or `Db::open_remote_takeover`). The old writer is fenced off: it re-checks the lease before every upload.
 - **Local testing:** a local MinIO container works well for this (see `tests/remote.rs`).
 
+## High availability
+
+Chronos is one process that writes one database. There is no replica that follows it and nothing fails over on its own; what keeps a database available is how fast another process can open it.
+
+- **One machine:** the database is its folder. `main` writes and merges are on disk before they return, so a crash or a `kill -9` loses none that were acknowledged; the process opens the folder again in the time it takes to read the log since the last checkpoint. Run it under a supervisor that restarts it.
+- **Losing the machine:** with [cloud storage](#cloud-storage---features-s3) the bucket holds the database as of its last checkpoint. Another machine opens it from an empty folder with `--takeover`, and the lease fences the old writer off. What that loses is the writes since the last checkpoint, which live only in the old machine's log: checkpoint as often as the writes you can afford to lose.
+- **Without cloud storage:** a [backup](#backups) is the copy on another machine, and it is as old as it is.
+- **One writer, always:** two processes never write the same database, on a folder (the second gets an error) or a bucket (the lease).
+- **Not here:** synchronous replication, a hot standby that follows the log, automatic failover, several writers.
+
 ## TLS
 
 `chronos serve mydb --tls-cert cert.pem --tls-key key.pem` (or `CHRONOS_TLS_CERT` and `CHRONOS_TLS_KEY`) turns on TLS for both ports:
