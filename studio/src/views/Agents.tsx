@@ -6,7 +6,7 @@ import { useApp } from '../context';
 import { copyText, Empty, ErrorBox, toast, type Dialogs, useDialogs } from '../ui';
 import { fmtTime, n } from '../util';
 
-const CAPS = ['read', 'fork', 'write_own', 'write', 'write_main', 'merge_own', 'merge', 'restore', 'admin'];
+const CAPS = ['read', 'fork', 'write_own', 'write', 'write_main', 'merge_own', 'merge', 'restore', 'outbox', 'admin'];
 const QUOTAS: [string, string][] = [
   ['max_worlds', 'Max worlds'],
   ['writes_per_minute', 'Writes per minute'],

@@ -153,6 +153,7 @@ curl -s -H "Authorization: Bearer $CHRONOS_TOKEN" localhost:7070/v1/drop_agent -
 | `merge_own` | merging worlds it forked into their parent, if it may change that parent (`main` needs `write_main` too) |
 | `merge` | merging any world |
 | `restore` | `RESTORE WORLD` (with the right to change that world); simulating from a past moment. With `merge` too: `UNDO MERGE` and `UNDO AGENT` |
+| `outbox` | working `main`'s outbox: `CLAIM OUTBOX`, `ACK OUTBOX` and `RETRY OUTBOX` (give it to the workers that send effects; an agent that may merge doesn't get it from `write_main`, or it could take back what its merges queued) |
 | `admin` | everything: managing agents, `ALTER SYSTEM`, `BACKUP`, `VERIFY`, pinning worlds or changing their TTL, forking the past, and the HTTP ops for these |
 
 - **A world an agent forks is its own** (`owner` in `SHOW WORLDS` and HTTP `world`). The owner and expiry are metadata only the database sets: no one can change them with `set_meta` or `ALTER WORLD`.
@@ -190,7 +191,7 @@ merge world agent_7;             -- as the database's own user
 drop world agent_7;              -- or not
 ```
 
-- **There's no approval queue:** approving means merging, as the database's own user or an agent allowed to. `merge_own` with `write_main` lets an agent publish its own work to `main` with no one looking.
+- **Approving means merging,** as the database's own user or an agent allowed to; merges a policy refuses wait in `SHOW REVIEWS`. Approve the version you read (`MERGE WORLD w AT VERSION n`, HTTP `merge` with `version`, Studio does it for you): an agent that keeps writing to its world while you review doesn't get its later writes merged with it. `merge_own` with `write_main` lets an agent publish its own work to `main` with no one looking.
 - **MCP:** without flags, agents can't merge; `--allow-merge` gives the MCP session everything, not just merging. Prefer `--agent NAME` with `merge_own` (plus `write_main` to publish to `main`) when an agent should publish.
 - **Crashes can't make a merge publish less than was written:** merges check the world's version, and worlds open during a crash are flagged until someone confirms them (see [concepts](concepts.md#versions-and-crashes)).
 

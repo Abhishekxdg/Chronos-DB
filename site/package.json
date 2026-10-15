@@ -12,5 +12,11 @@
     "@easyops-cn/docusaurus-search-local": "^0.55.3",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
+  },
+  "overrides": {
+    "tinypool": "^2.1.2",
+    "serialize-javascript": "^7.0.5",
+    "uuid": "^11.1.1",
+    "postcss-selector-parser": "^7.1.6"
   }
 }
