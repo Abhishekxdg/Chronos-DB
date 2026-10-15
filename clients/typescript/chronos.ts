@@ -264,13 +264,13 @@ export class Chronos {
    *  those rows, and `into` merges into another branch instead; either way this branch stays. */
   async merge(
     resolve: "fail" | "ours" | "theirs" = "fail",
-    opts: MergeOptions & { confirm?: boolean; version?: number } = {},
+    opts: MergeOptions & { confirm?: boolean; version?: number; target?: number } = {},
   ): Promise<number> {
     // `version`: merge only if the branch is still at it, as when approving what you reviewed (the
     // `version` of preview(), diffCount() or diffPage()); else this client's last write's
     const version = opts.version ?? (opts.confirm ? undefined : (this.version ?? undefined));
     const r = await this.call<{ merged: number; version?: number }>("merge", {
-      branch: this.branchName, resolve, version, confirm: opts.confirm, ...mergeArgs(opts),
+      branch: this.branchName, resolve, version, target: opts.target, confirm: opts.confirm, ...mergeArgs(opts),
     });
     if (r.version !== undefined) this.version = r.version; // it stays open: a partial merge moved its version
     return r.merged;
@@ -285,6 +285,7 @@ export class Chronos {
     conflicts: number;
     blocked: string | null;
     version: number;
+    target: number;
   }> {
     return this.call("merge", { branch: this.branchName, resolve, ...mergeArgs(opts), dry_run: true });
   }

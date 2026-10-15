@@ -252,6 +252,7 @@ Applies a branch's changes to its parent and deletes the branch. If rows both si
 | `resolve` | string | no | `fail`; `ours` (this branch's values) or `theirs` (the parent's) |
 | `confirm` | boolean | no | `false`; after a crash, merge the flagged branch as it is now (check its `diff` first) |
 | `version` | integer | no | none; merge only if the branch is still at this version (what `merge_preview` or `reviews` showed), refused otherwise |
+| `target` | integer | no | none; with rows settled (`resolve`, `by_columns`, `rows`), the target `merge_preview` named: refused if the parent changed since |
 
 Returns `merged 1 change from task-1 into main`. `confirm` applies to a plain merge only: it's ignored when `into`, `only_tables`, `only_keys`, `by_columns`, `rows` or `version` is given.
 

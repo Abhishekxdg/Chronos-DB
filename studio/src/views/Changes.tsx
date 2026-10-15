@@ -25,6 +25,8 @@ interface Plan {
   outcomes: Record<string, number>;
   /** the world's version this plan is for: merging at it merges what it shows, or nothing */
   version: number;
+  /** the world merged into as this plan saw it: the picks settle against it */
+  target: number;
 }
 type Pick = 'ours' | 'theirs';
 
@@ -130,7 +132,12 @@ export function ChangesView() {
     try {
       // the version reviewed: if the world changed since (an agent still writing to it), nothing
       // merges and the merge says so
-      const r = await api<{ merged: number }>('merge', { branch: app.world, version: reviewed, picks });
+      const r = await api<{ merged: number }>('merge', {
+        branch: app.world,
+        version: reviewed,
+        target: plan?.target, // the picks were chosen against the parent as the preview saw it
+        picks,
+      });
       await app.drawBack(app.world);
       const rows = counts?.total ?? r.merged; // what the user reviewed (the merge also counts index entries)
       app.setLastMerge({ world: app.world, into: parent, rows });
@@ -144,7 +151,7 @@ export function ChangesView() {
       if (e.status === 409 && e.detail?.conflicts) {
         toast(`${plural(e.detail.conflicts_total ?? e.detail.conflicts.length, 'row')} changed on both sides: choose a side for each`);
         preview();
-      } else if (e.message.includes('it changed since')) again(); // nothing merged
+      } else if (e.message.includes('it changed since') || e.message.includes('changed since the preview')) again();
       else toast(e.message);
     }
   };

@@ -282,6 +282,7 @@ MERGE BRANCH [name] [clause ...]
 | `BY COLUMNS` | a row both sides changed merges column by column; only a column both changed conflicts. A table set `ALTER TABLE t SET (merge_by_columns = true)` merges this way in every merge into a world that has the setting |
 | `RESOLVE ('t/1' = OURS \| THEIRS \| DELETE \| '<row as JSON>', ...)` | settle rows one by one |
 | `CONFIRM` | after a crash: merge the world as it is now (check `DIFF` first) |
+| `TARGET n` | with rows settled by `USING`, `BY COLUMNS` or `RESOLVE`: merge only if the world merged into is as the `DRY RUN` that named `n` saw it (its NOTICE does), so the settling can't overwrite a change made there since (55000 otherwise). Not with `REBASE` |
 | `AT VERSION n` | merge only if the world is still at version `n`: the version a person reviewed (`SHOW REVIEWS`, a `DRY RUN`'s notice, HTTP `diff`). Written to or partly merged since, the merge is refused (55000) and nothing merges. Not with `CONFIRM` |
 | `DRY RUN` | change nothing; see [below](#merge-dry-run) |
 

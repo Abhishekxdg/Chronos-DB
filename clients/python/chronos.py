@@ -183,7 +183,7 @@ class Chronos:
     def merge(self, resolve: str = "fail", confirm: bool = False, columns: bool = False,
               picks: Optional[dict] = None, into: Optional[str] = None,
               only_tables: Optional[list] = None, only_keys: Optional[list] = None,
-              version: Optional[int] = None) -> int:
+              version: Optional[int] = None, target: Optional[int] = None) -> int:
         """Applies this branch to its parent and deletes it. Raises ChronosError (409) with .conflicts
         (each with "explain") if both changed the same rows: retry with resolve="ours" or "theirs",
         columns=True (combine rows where the sides changed different columns), or picks
@@ -192,10 +192,12 @@ class Chronos:
         only_tables / only_keys ("table/id") merge just those rows, and into merges into another
         branch instead of the parent; either way this branch stays.
         version: merge only if the branch is still at it, as when approving what you reviewed: the
-        "version" of preview(), diff_count() or diff_page() (default: this client's last write's)."""
+        "version" of preview(), diff_count() or diff_page() (default: this client's last write's).
+        target: with rows settled (resolve, columns, picks), the "target" of the preview they were
+        chosen from: refused if the world merged into changed since."""
         if version is None:
             version = None if confirm else self.version
-        r = self._call("merge", resolve=resolve, version=version, confirm=confirm or None,
+        r = self._call("merge", resolve=resolve, version=version, target=target, confirm=confirm or None,
                        columns=columns or None, picks=picks, into=into,
                        only_tables=only_tables, only_keys=only_keys)
         if "version" in r:  # it stays open: a partial merge moved its version
@@ -207,7 +209,8 @@ class Chronos:
                 only_keys: Optional[list] = None) -> dict:
         """What merge() would do, row by row, changing nothing: {"rows": [{"key", "outcome",
         "detail", "base", "ours", "theirs", "result"}], "conflicts": n, "blocked": reason or None,
-        "version": the branch's}. merge(version=...) with it merges only what this showed."""
+        "version": the branch's, "target": the world merged into's}. merge(version=..., target=...)
+        with them merges only what this showed."""
         return self._call("merge", resolve=resolve, columns=columns or None, picks=picks, into=into,
                           only_tables=only_tables, only_keys=only_keys, dry_run=True)
 
