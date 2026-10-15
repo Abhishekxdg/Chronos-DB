@@ -23,8 +23,6 @@ interface Plan {
   conflicts: number;
   blocked: string | null;
   outcomes: Record<string, number>;
-  /** the world's version this plan is for: merging at it merges what it shows, or nothing */
-  version: number;
 }
 type Pick = 'ours' | 'theirs';
 
@@ -32,13 +30,7 @@ export function ChangesView() {
   const app = useApp();
   const dlg = useDialogs();
   const w = worldOf(app, app.world);
-  const [counts, setCounts] = useState<{
-    total: number;
-    tables: Record<string, number>;
-    readers?: Reader[];
-    coverage?: string[];
-    version?: number;
-  } | null>(null);
+  const [counts, setCounts] = useState<{ total: number; tables: Record<string, number>; readers?: Reader[]; coverage?: string[] } | null>(null);
   const [changes, setChanges] = useState<Change[]>([]);
   const [next, setNext] = useState<string | null>(null);
   const [error, setError] = useState<unknown>(null);
@@ -46,40 +38,21 @@ export function ChangesView() {
   const [plan, setPlan] = useState<Plan | null>(null);
   const [picks, setPicks] = useState<Record<string, Pick>>({});
   const [busy, setBusy] = useState(false);
-  // the version the review is of: the first page's. Later pages are read at it (refused if the world
-  // changed since), and the merge merges it, so nothing merges that the pages didn't show
-  const [reviewed, setReviewed] = useState<number | null>(null);
   const page = async (after: string | null) => {
     setLoading(true);
     try {
-      const r = await api<{ changes: Change[]; next: string | null; version: number }>('diff', {
-        branch: app.world,
-        limit: PAGE,
-        after,
-        version: after ? reviewed : undefined,
-      });
+      const r = await api<{ changes: Change[]; next: string | null }>('diff', { branch: app.world, limit: PAGE, after });
       setChanges((c) => [...(after ? c : []), ...r.changes]);
       setNext(r.next);
-      if (!after) setReviewed(r.version);
     } catch (e) {
-      if ((e as ApiError).status === 409 && after) return again();
       setError(e);
     }
     setLoading(false);
   };
-  const load = () => {
-    setPlan(null);
-    api('diff', { branch: app.world, count: true, readers: true }).then(setCounts, setError);
-    page(null);
-  };
-  // written to (or partly merged) since the review started: start it again, as the world is now
-  const again = () => {
-    toast(`${app.world} changed since you started reviewing it: showing it as it is now`);
-    load();
-  };
   useEffect(() => {
     if (!w?.parent) return;
-    load();
+    api('diff', { branch: app.world, count: true, readers: true }).then(setCounts, setError);
+    page(null);
   }, []);
 
   const m = app.lastMerge;
@@ -117,8 +90,6 @@ export function ChangesView() {
   const merge = async () => {
     const unsettled = plan ? plan.rows.filter((r) => r.outcome === 'conflict' && !picks[r.key]).length : 0;
     if (unsettled) return toast(`Choose a side for ${plural(unsettled, 'conflict')} first`);
-    if (reviewed === null) return toast('Still reading the changes');
-    if (plan && plan.version !== reviewed) return again(); // the preview is of a later version than the pages
     const live = parent === 'main' ? ' (the live data)' : '';
     const ok = await dlg.confirm(
       `Merge into ${parent}?`,
@@ -128,9 +99,7 @@ export function ChangesView() {
     if (!ok) return;
     setBusy(true);
     try {
-      // the version reviewed: if the world changed since (an agent still writing to it), nothing
-      // merges and the merge says so
-      const r = await api<{ merged: number }>('merge', { branch: app.world, version: reviewed, picks });
+      const r = await api<{ merged: number }>('merge', { branch: app.world, confirm: true, picks });
       await app.drawBack(app.world);
       const rows = counts?.total ?? r.merged; // what the user reviewed (the merge also counts index entries)
       app.setLastMerge({ world: app.world, into: parent, rows });
@@ -144,8 +113,7 @@ export function ChangesView() {
       if (e.status === 409 && e.detail?.conflicts) {
         toast(`${plural(e.detail.conflicts_total ?? e.detail.conflicts.length, 'row')} changed on both sides: choose a side for each`);
         preview();
-      } else if (e.message.includes('it changed since')) again(); // nothing merged
-      else toast(e.message);
+      } else toast(e.message);
     }
   };
   const tables = Object.entries(counts?.tables || {});

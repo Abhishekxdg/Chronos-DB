@@ -439,30 +439,15 @@ notify on merge billing, '{"refund": 42}';
 -- a person merges fix: listeners on main hear  billing  '{"refund": 42}'  now,
 -- and it waits in main's outbox until a worker says it's done
 show outbox;
---            id                  | channel |    payload     | world |          queued           | by  | state  | attempts | worker | lease_until
--- -------------------------------+---------+----------------+-------+---------------------------+-----+--------+----------+--------+-------------
---  1790590000000-9f2c41d07e6a13b5 | billing | {"refund": 42} | fix   | 2026-09-28 10:00:00.00+00 | bot | queued |        0 |        |
-
--- a worker: take it, do it, say so
-claim outbox for billing lease '30 seconds';   -- the same columns, state claimed, attempts 1
-ack outbox '1790590000000-9f2c41d07e6a13b5';   -- ACK 1: done
-```
-
-Each entry in `main` is queued, claimed or ambiguous, so a worker that dies between calling a receiver and saying so never makes an effect vanish, or go out twice without anyone seeing:
-
-```
-queued ──CLAIM OUTBOX──> claimed (a worker, a lease, attempt n) ──ACK OUTBOX──> gone: done
-                         claimed ──RETRY OUTBOX 'id' ATTEMPT n──> queued (the worker knows it wasn't sent)
-                         lease runs out, claimed IDEMPOTENT ──> queued (the receiver drops a repeat)
-                         lease runs out, otherwise ──> ambiguous: it may have reached the receiver
-                         ambiguous ──ACK or RETRY──> once someone checked the receiver
+--            id                  | channel |    payload     | world |          queued           | by
+-- -------------------------------+---------+----------------+-------+---------------------------+-----
+--  1790590000000-9f2c41d07e6a13b5 | billing | {"refund": 42} | fix   | 2026-09-28 10:00:00.00+00 | bot
+ack outbox '1790590000000-9f2c41d07e6a13b5';   -- ACK 1
 ```
 
 - **An entry, not a message:** it's a row of the world, so a `ROLLBACK` drops it, a transaction's `COMMIT` keeps it, and a merge into another world carries it along. Only reaching `main` sends it: a merge, a transaction's `COMMIT` on `main`, or `NOTIFY ON MERGE` run on `main` itself (heard as the statement or its transaction ends). A merge sends it with backend id 0.
-- **Kept until acknowledged:** after the NOTIFY, the entry waits in `main`'s outbox, so work a worker missed (it wasn't listening, or crashed) is still there. A worker listens (the NOTIFY is its wake-up), claims, does the work, then runs `ACK OUTBOX 'id', ...`, which removes them (`ACK n`; ids not there are skipped, so acknowledging twice is fine). The database never sends anything out itself: no webhooks, no mail, no secrets.
-- **CLAIM OUTBOX [FOR channel, ...] [LIMIT n] [LEASE 'interval'] [IDEMPOTENT]:** takes up to `n` (default 1) queued effects, oldest first, on those channels (default any), for the lease (default 5 minutes), and returns them as `SHOW OUTBOX` shows them. Two claims never get the same effect. The id is the same from queueing to acknowledgement: pass it to the receiver as an idempotency key where it takes one, and claim with `IDEMPOTENT` then.
-- **A lease that runs out** puts an `IDEMPOTENT` claim back in the queue. Any other becomes `ambiguous`: the worker may have called the receiver and died before `ACK`. No `CLAIM` returns it, and it stays in `SHOW OUTBOX` until someone checks the receiver and runs `ACK OUTBOX` (it went out) or `RETRY OUTBOX 'id' ATTEMPT n, ...` (it didn't: queued again, `RETRY n`). `n` is the `attempts` its claim showed: only that attempt is retried, so a retry that arrives late, or twice, after the effect was claimed again never takes the new claim from its worker (`RETRY 0`). A worker that knows a call failed retries it at once the same way.
-- **Who:** `NOTIFY ON MERGE` is a write to the session's world (an agent needs to be allowed to write it; one keeping to a merge policy can't queue on `main` directly). Merge policies count effects apart from rows (`max_effects`, `effects_per_hour`, `review_channels`: see [merge policies](reference/worlds.md#merge-policies)). `SHOW OUTBOX` lists the entries in the session's world (in a world, its own and `main`'s as they were at the fork). `CLAIM`, `ACK` and `RETRY OUTBOX` need the database's own user, or an agent with `outbox` or `admin`, not `write_main`: an agent that may merge can't take back the effects its merges queued. A merge policy doesn't stop them.
+- **Kept until acknowledged:** after the NOTIFY, the entry waits in `main`'s outbox, so work a worker missed (it wasn't listening, or crashed) is still there. A worker listens, or polls `SHOW OUTBOX`, does the work, then runs `ACK OUTBOX 'id', ...`, which removes them (`ACK n`; ids not there are skipped, so acknowledging twice is fine). The database never sends anything out itself: no webhooks, no mail, no secrets.
+- **Who:** `NOTIFY ON MERGE` is a write to the session's world (an agent needs to be allowed to write it; one keeping to a merge policy can't queue on `main` directly). An effect isn't a row or schema change of the parent, so merge policies don't count it. `SHOW OUTBOX` lists the entries in the session's world (in a world, its own and `main`'s as they were at the fork). `ACK OUTBOX` needs the database's own user, or an agent with `write_main` or `admin`; a merge policy doesn't stop it.
 - **Partial merges:** `ONLY TABLES` and `ONLY KEYS` leave a world's effects in it until it merges whole. `DIFF` doesn't list effects; `MERGE ... DRY RUN` shows them as rows of `_sonos_outbox`.
 - **Limits:** channels and payloads as for `NOTIFY` (a channel under 64 bytes, a payload under 8000). An effect is delivered once per landing: `UNDO MERGE` doesn't take back a notification already heard.
 

@@ -91,7 +91,6 @@ Every tool that reads or writes rows takes `branch` (string, default `main`). A 
 | [`restore`](#restore) | put a branch back to a moment | not listed |
 | [`merge`](#merge) | apply a branch to its parent | not listed |
 | [`merge_preview`](#merge_preview) | what a merge would do | yes |
-| [`rebase`](#rebase) | take in what changed in the parent, keep the branch's own changes | on its own worlds |
 | [`undo_merge`](#undo_merge) | undo a branch's latest merge | not listed |
 | [`checkpoint`](#checkpoint) | name a moment of a branch | on its own worlds |
 | [`rollback`](#rollback) | go back to a checkpoint | on its own worlds |
@@ -251,27 +250,12 @@ Applies a branch's changes to its parent and deletes the branch. If rows both si
 | `rows` | object | no | none; `{"table/id": "ours" \| "theirs" \| "delete" \| {row to keep}}` |
 | `resolve` | string | no | `fail`; `ours` (this branch's values) or `theirs` (the parent's) |
 | `confirm` | boolean | no | `false`; after a crash, merge the flagged branch as it is now (check its `diff` first) |
-| `version` | integer | no | none; merge only if the branch is still at this version (what `merge_preview` or `reviews` showed), refused otherwise |
 
-Returns `merged 1 change from task-1 into main`. `confirm` applies to a plain merge only: it's ignored when `into`, `only_tables`, `only_keys`, `by_columns`, `rows` or `version` is given.
-
-### rebase
-
-Moves a branch's fork point up to its parent as it is now, keeping the branch's own changes on top, without changing the parent: a long-running branch picks up what changed under it and settles conflicts as they come. Refused, with nothing changed, on a conflict nothing settles, or when a row the branch read (with check_reads) changed since. Runs [`REBASE WORLD`](worlds.md#rebase-world).
-
-| Parameter | Type | Required | Default |
-|---|---|---|---|
-| `branch` | string | yes | |
-| `by_columns` | boolean | no | `false`; `true`: only a column both sides changed conflicts |
-| `rows` | object | no | none; `{"table/id": "ours" \| "theirs" \| "delete" \| {row to keep}}` |
-| `resolve` | string | no | `fail`; `ours` or `theirs` |
-| `version` | integer | no | none; rebase only if the branch is still at this version |
-
-Returns `REBASE n`, n the parent's rows it took in.
+Returns `merged 1 change from task-1 into main`. `confirm` applies to a plain merge only: it's ignored when `into`, `only_tables`, `only_keys`, `by_columns` or `rows` is given.
 
 ### merge_preview
 
-What `merge` would do with the same parameters, without doing it: per row, whether it applies or conflicts and why, with the fork point's, the branch's and the parent's versions. Runs [`MERGE ... DRY RUN`](worlds.md#merge-dry-run); its columns are `table`, `id`, `outcome`, `detail`, `base`, `ours`, `theirs`, `result`. Then `What reads the changed columns:` and the table from [`DIFF ... READERS`](worlds.md#diff--readers) for the branch, and the branch's version: pass it as `version` with later pages (`offset`), which are refused if the branch changed since, and with `merge`, which then merges exactly what the pages showed.
+What `merge` would do with the same parameters, without doing it: per row, whether it applies or conflicts and why, with the fork point's, the branch's and the parent's versions. Runs [`MERGE ... DRY RUN`](worlds.md#merge-dry-run); its columns are `table`, `id`, `outcome`, `detail`, `base`, `ours`, `theirs`, `result`. Then `What reads the changed columns:` and the table from [`DIFF ... READERS`](worlds.md#diff--readers) for the branch.
 
 | Parameter | Type | Required | Default |
 |---|---|---|---|
@@ -279,7 +263,6 @@ What `merge` would do with the same parameters, without doing it: per row, wheth
 | `into`, `only_tables`, `only_keys`, `by_columns`, `resolve`, `rows` | | no | as for [`merge`](#merge) |
 | `limit` | integer | no | 20 |
 | `offset` | integer | no | 0 |
-| `version` | integer | no | none; with a later page, the version the first page named (refused if the branch changed since) |
 
 ### undo_merge
 

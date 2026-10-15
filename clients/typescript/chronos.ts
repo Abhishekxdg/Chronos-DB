@@ -240,19 +240,14 @@ export class Chronos {
   }
 
   /** How many rows changed on this branch, per table, without reading them. */
-  async diffCount(): Promise<{ total: number; tables: Record<string, number>; version: number }> {
+  async diffCount(): Promise<{ total: number; tables: Record<string, number> }> {
     return this.call("diff", { branch: this.branchName, count: true });
   }
 
   /** Up to `limit` changes after cursor `after`; pass `next` back as `after` for the next page
    *  (null on the last one). Reads only this page, so it suits big diffs. */
-  async diffPage<R = Row>(
-    limit: number,
-    after?: string,
-    version?: number,
-  ): Promise<{ changes: Change<R>[]; next: string | null; version: number }> {
-    // `version`: the first page's, with later pages; a branch changed since is refused (409)
-    return this.call("diff", { branch: this.branchName, limit, after: after ?? null, version: version ?? null });
+  async diffPage<R = Row>(limit: number, after?: string): Promise<{ changes: Change<R>[]; next: string | null }> {
+    return this.call("diff", { branch: this.branchName, limit, after: after ?? null });
   }
 
   /** Applies this branch to its parent and deletes it. Throws ChronosError (409) with `conflicts`
@@ -264,28 +259,21 @@ export class Chronos {
    *  those rows, and `into` merges into another branch instead; either way this branch stays. */
   async merge(
     resolve: "fail" | "ours" | "theirs" = "fail",
-    opts: MergeOptions & { confirm?: boolean; version?: number } = {},
+    opts: MergeOptions & { confirm?: boolean } = {},
   ): Promise<number> {
-    // `version`: merge only if the branch is still at it, as when approving what you reviewed (the
-    // `version` of preview(), diffCount() or diffPage()); else this client's last write's
-    const version = opts.version ?? (opts.confirm ? undefined : (this.version ?? undefined));
-    const r = await this.call<{ merged: number; version?: number }>("merge", {
-      branch: this.branchName, resolve, version, confirm: opts.confirm, ...mergeArgs(opts),
-    });
-    if (r.version !== undefined) this.version = r.version; // it stays open: a partial merge moved its version
-    return r.merged;
+    const version = opts.confirm ? undefined : (this.version ?? undefined);
+    return (
+      await this.call<{ merged: number }>("merge", {
+        branch: this.branchName, resolve, version, confirm: opts.confirm, ...mergeArgs(opts),
+      })
+    ).merged;
   }
 
   /** What merge() would do, row by row, changing nothing. */
   async preview(
     resolve: "fail" | "ours" | "theirs" = "fail",
     opts: MergeOptions = {},
-  ): Promise<{
-    rows: { key: string; outcome: string; detail: string; result: unknown }[];
-    conflicts: number;
-    blocked: string | null;
-    version: number;
-  }> {
+  ): Promise<{ rows: { key: string; outcome: string; detail: string; result: unknown }[]; conflicts: number; blocked: string | null }> {
     return this.call("merge", { branch: this.branchName, resolve, ...mergeArgs(opts), dry_run: true });
   }
 

@@ -23,7 +23,7 @@ agent: MERGE WORLD w
                                 └─ no ──> refused (42501, the rules broken),
                                           the world stays, queued in SHOW REVIEWS
                                              │
-                                  a person: DIFF, then MERGE WORLD w AT VERSION n  (approve)
+                                  a person: DIFF, then MERGE WORLD w  (approve)
                                                    or DROP WORLD w    (reject)
 ```
 
@@ -32,7 +32,6 @@ Three things make this safe while data keeps changing:
 - **What's checked is what merges.** The rules run inside the merge, while it holds its locks, on the rows it's about to apply. Nothing written a moment before or after can slip past the check, and there's no gap between "checked" and "merged" for a race to use.
 - **Stale work doesn't win.** If `main` changed a row after the agent forked, a merge that would overwrite it (`USING OURS`, or rows picked by hand) needs a person, unless the policy allows `overwrite`. Without `USING OURS`, those rows are conflicts and the merge fails anyway.
 - **The queue says when it's out of date.** `SHOW REVIEWS` records the world's version when the agent asked. `changed_since` is true if the agent kept writing afterwards, or part of the world was merged since, so you know the diff you're about to approve isn't the one that was refused.
-- **An approval names what it approves.** `MERGE WORLD w AT VERSION n` merges only if the world is still at the version you read; if its agent wrote more meanwhile, nothing merges (55000). Studio, HTTP `merge` with `version`, MCP `merge` with `version`, and the CLI's `merge w at n` do the same.
 
 A policy only ever takes rights away: an agent needs `merge_own` or `merge` to merge at all, and a policy decides which of those merges need a person. An agent keeping to a policy changes `main` **only by merging**: its `write_main` right lets its merges reach `main`, but a direct `INSERT`, `UPDATE`, `DELETE`, `put` or restore on `main` is refused, since it would skip the rules. So are `UNDO MERGE` and `UNDO AGENT`, which write their rows straight into a world. People, and agents without a policy, act as their rights alone decide.
 
@@ -83,9 +82,9 @@ show merge policies;
 ```
 
 ```
-  name   | max_rows | max_deletes | tables | review_tables | review_columns | schema | overwrite | critical | check_reads | require_scope | rows_per_hour | deletes_per_hour | max_age |          created          | max_effects | effects_per_hour | review_channels
----------+----------+-------------+--------+---------------+----------------+--------+-----------+----------+-------------+---------------+---------------+------------------+---------+---------------------------+-------------+------------------+-----------------
- careful |        3 |           0 |        | payments      |                | f      | f         | f        | f           | f             |               |                  |         | 2026-09-27 16:19:35.06+00 |             |                  |
+  name   | max_rows | max_deletes | tables | review_tables | review_columns | schema | overwrite | critical | check_reads | require_scope | rows_per_hour | deletes_per_hour | max_age |          created
+---------+----------+-------------+--------+---------------+----------------+--------+-----------+----------+-------------+---------------+---------------+------------------+---------+---------------------------
+ careful |        3 |           0 |        | payments      |                | f      | f         | f        | f           | f             |               |                  |         | 2026-09-27 16:19:35.06+00
 ```
 
 Every rule is optional. A rule left out doesn't limit anything, except `schema` and `overwrite`, which are `false` (the safe side) until you allow them:
@@ -97,9 +96,6 @@ Every rule is optional. A rule left out doesn't limit anything, except `schema` 
 | `rows_per_hour` | together with the agent's other merges into `main` in the last hour, it changes more rows than this | no limit |
 | `deletes_per_hour` | together with the agent's other merges into `main` in the last hour, it deletes more rows than this | no limit |
 | `max_age` | its world was forked longer ago than this (`'1h'`): the longer a world stays open, the more its merge rests on what it read long ago | no limit |
-| `max_effects` | it queues more effects than this: the emails, webhooks and payments `NOTIFY ON MERGE` sends once the merge lands (a merge that changes one row can queue a thousand) | no limit |
-| `effects_per_hour` | together with the agent's other merges into `main` in the last hour, it queues more effects than this | no limit |
-| `review_channels` | it queues an effect on any channel in this list (`'payments,refunds'`), even one | none |
 | `tables` | it changes a table not in this list (`'orders,items'`) | any table |
 | `review_tables` | it changes any table in this list | none |
 | `review_columns` | it changes any column in this list (`'users.email,accounts.owner'`), even in one row: identity, owner and billing fields, where a quiet wrong value does more harm than a loud delete | none |
@@ -213,7 +209,7 @@ drop world bot_bulk;         -- reject
 show reviews;                -- (0 rows)
 ```
 
-- **Approve what you read:** `merge world bot_refund at version 1` (the `version` column) merges only if the world is still as you read it; if the agent wrote to it since, or part of it was merged, nothing merges (55000) and you read the diff again. If `changed_since` is already `t`, read the diff before approving. Over HTTP, `merge` takes the same `version` (`409` otherwise), and `diff` and a `dry_run` return it.
+- **Approve what you read:** if `changed_since` is `t`, the agent wrote to the world after it asked, so read the diff again. Over HTTP, `merge` takes the `version` you read and merges only if the world is still at it (`409` otherwise).
 - **Approve part of it:** `MERGE WORLD bot_bulk ONLY TABLES (orders)` or `ONLY KEYS ('orders/1', ...)` merges some rows and leaves the world open with the rest.
 - **The agent can't skip the queue:** its queue entry is in the world's metadata under a key only the database sets. The agent can't remove it, and can't merge the world until a person does, or until it fits the rules.
 - **Who did what:** `SHOW AUDIT FOR AGENT bot` lists the agent's forks, writes and merges. A refused merge shows as `metadata`: that's the world being queued.

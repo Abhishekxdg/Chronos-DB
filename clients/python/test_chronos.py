@@ -79,33 +79,6 @@ assert [c["key"] for c in part.diff()] == ["notes/p2"]
 assert part.merge() == 1 and db.get("notes", "p2") == {"v": 2}
 other.discard()
 
-# a reviewer approves the version it previewed: written to after that, nothing merges
-rv = db.fork("reviewed")
-rv.put("notes", "r1", {"v": 1})
-seen = Chronos(os.environ["CHRONOS_URL"], token=os.environ.get("CHRONOS_TOKEN")).branch("reviewed").preview()["version"]
-rv.put("notes", "r2", {"v": 2})
-try:
-    rv.merge(version=seen)
-    raise AssertionError("merged a write the reviewer never saw")
-except ChronosError as e:
-    assert "changed since" in str(e), e
-assert db.get("notes", "r1") is None
-assert rv.merge(version=rv.diff_count()["version"]) == 2 and db.get("notes", "r2") == {"v": 2}
-
-# a paged review is of one version: a row added before the cursor since the first page refuses the next
-pg = db.fork("paged")
-pg.put("notes", "k1", {"v": 1})
-pg.put("notes", "k3", {"v": 3})
-first = pg.diff_page(1)
-assert pg.diff_page(1, after=first["next"], version=first["version"])["changes"][0]["key"] == "notes/k3"
-pg.put("notes", "k0", {"v": 0})
-try:
-    pg.diff_page(1, after=first["next"], version=first["version"])
-    raise AssertionError("a page of a changed branch")
-except ChronosError as e:
-    assert "changed since version" in str(e), e
-pg.discard()
-
 # simulate: many worlds, the best kept; replay one from history
 db.sql("create table stock (id integer primary key, qty integer)")
 db.sql("insert into stock values (1, 10), (2, 20)")
