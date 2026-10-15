@@ -173,31 +173,41 @@ class Chronos:
         """How many rows changed on this branch, without reading them: {"total", "tables": {name: n}}."""
         return self._call("diff", count=True)
 
-    def diff_page(self, limit: int, after: Optional[str] = None) -> dict:
-        """Up to `limit` changes after cursor `after`: {"changes", "next"}. Pass "next" back as `after`
-        for the next page; it is None on the last one. Reads only this page, so it suits big diffs."""
-        return self._call("diff", limit=limit, after=after)
+    def diff_page(self, limit: int, after: Optional[str] = None, version: Optional[int] = None) -> dict:
+        """Up to `limit` changes after cursor `after`: {"changes", "next", "version"}. Pass "next" back as
+        `after` for the next page; it is None on the last one. Reads only this page, so it suits big
+        diffs. Pass the first page's "version" with the later ones: if the branch changed since, the
+        page is refused (409), so a review is of one version, the one to merge at."""
+        return self._call("diff", limit=limit, after=after, version=version)
 
     def merge(self, resolve: str = "fail", confirm: bool = False, columns: bool = False,
               picks: Optional[dict] = None, into: Optional[str] = None,
-              only_tables: Optional[list] = None, only_keys: Optional[list] = None) -> int:
+              only_tables: Optional[list] = None, only_keys: Optional[list] = None,
+              version: Optional[int] = None) -> int:
         """Applies this branch to its parent and deletes it. Raises ChronosError (409) with .conflicts
         (each with "explain") if both changed the same rows: retry with resolve="ours" or "theirs",
         columns=True (combine rows where the sides changed different columns), or picks
         ({"table/id": "ours" | "theirs" | row dict | None}). Also raises if the branch lost writes
         in a server crash (redo them; confirm=True merges it as it is after a crash).
         only_tables / only_keys ("table/id") merge just those rows, and into merges into another
-        branch instead of the parent; either way this branch stays."""
-        version = None if confirm else self.version
-        return self._call("merge", resolve=resolve, version=version, confirm=confirm or None,
-                          columns=columns or None, picks=picks, into=into,
-                          only_tables=only_tables, only_keys=only_keys)["merged"]
+        branch instead of the parent; either way this branch stays.
+        version: merge only if the branch is still at it, as when approving what you reviewed: the
+        "version" of preview(), diff_count() or diff_page() (default: this client's last write's)."""
+        if version is None:
+            version = None if confirm else self.version
+        r = self._call("merge", resolve=resolve, version=version, confirm=confirm or None,
+                       columns=columns or None, picks=picks, into=into,
+                       only_tables=only_tables, only_keys=only_keys)
+        if "version" in r:  # it stays open: a partial merge moved its version
+            self.version = r["version"]
+        return r["merged"]
 
     def preview(self, resolve: str = "fail", columns: bool = False, picks: Optional[dict] = None,
                 into: Optional[str] = None, only_tables: Optional[list] = None,
                 only_keys: Optional[list] = None) -> dict:
         """What merge() would do, row by row, changing nothing: {"rows": [{"key", "outcome",
-        "detail", "base", "ours", "theirs", "result"}], "conflicts": n, "blocked": reason or None}."""
+        "detail", "base", "ours", "theirs", "result"}], "conflicts": n, "blocked": reason or None,
+        "version": the branch's}. merge(version=...) with it merges only what this showed."""
         return self._call("merge", resolve=resolve, columns=columns or None, picks=picks, into=into,
                           only_tables=only_tables, only_keys=only_keys, dry_run=True)
 

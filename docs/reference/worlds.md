@@ -44,6 +44,7 @@ History reaches back `history_retention` (30 days by default). Earlier than that
 | [`DIFF`](#diff) | rows | `read` |
 | [`MERGE WORLD` / `MERGE BRANCH`](#merge) | tag `MERGE n` | `merge`, or `merge_own` |
 | [`MERGE ... DRY RUN`](#merge-dry-run) | rows | `read` |
+| [`REBASE WORLD`](#rebase-world) | tag `REBASE n` | the right to change the world |
 | [`UNDO MERGE`](#undo-merge) | tag `UNDO MERGE n` | `restore` and `merge`, or `admin` |
 | [`AS OF`](#as-of) | a table as it was | `read` |
 | [`RESTORE WORLD`](#restore-world) | tag `RESTORE n` | `restore` |
@@ -57,7 +58,7 @@ History reaches back `history_retention` (30 days by default). Earlier than that
 | [`SHOW METRICS`](#show-metrics) | rows | `read` |
 | [`ALTER SYSTEM SET history_retention`](#history-retention) | tag `ALTER SYSTEM` | `admin` |
 
-- **Not inside a transaction:** `CREATE`/`FORK`/`DROP`/`SWITCH`/`USE`/`MERGE`/`ALTER WORLD`, `RESTORE`, `UNDO MERGE`, `UNDO AGENT`, `SIMULATE`, `REPLAY` and `ALTER SYSTEM` fail with 25001 between `BEGIN` and `COMMIT`.
+- **Not inside a transaction:** `CREATE`/`FORK`/`DROP`/`SWITCH`/`USE`/`MERGE`/`REBASE`/`ALTER WORLD`, `RESTORE`, `UNDO MERGE`, `UNDO AGENT`, `SIMULATE`, `REPLAY` and `ALTER SYSTEM` fail with 25001 between `BEGIN` and `COMMIT`.
 - **Agents:** rights are listed in [concepts](../concepts.md#agents). A refused statement fails with 42501. "Own world" means one the agent forked.
 - **MCP safe mode** refuses every statement above except the `SHOW`s, `DIFF`, `MERGE ... DRY RUN` and `AS OF` reads (see [MCP](mcp.md#safe-mode)).
 
@@ -281,6 +282,7 @@ MERGE BRANCH [name] [clause ...]
 | `BY COLUMNS` | a row both sides changed merges column by column; only a column both changed conflicts. A table set `ALTER TABLE t SET (merge_by_columns = true)` merges this way in every merge into a world that has the setting |
 | `RESOLVE ('t/1' = OURS \| THEIRS \| DELETE \| '<row as JSON>', ...)` | settle rows one by one |
 | `CONFIRM` | after a crash: merge the world as it is now (check `DIFF` first) |
+| `AT VERSION n` | merge only if the world is still at version `n`: the version a person reviewed (`SHOW REVIEWS`, a `DRY RUN`'s notice, HTTP `diff`). Written to or partly merged since, the merge is refused (55000) and nothing merges. Not with `CONFIRM` |
 | `DRY RUN` | change nothing; see [below](#merge-dry-run) |
 
 - **Default:** a row both sides changed fails the merge with 40001, naming up to 10 rows; nothing is merged.
@@ -296,7 +298,7 @@ Returns tag `MERGE n`, n the rows applied.
 | 23505 | both sides added rows with the same unique values |
 | 23503 / 23514 | the merged result breaks a foreign key or `CHECK` |
 | 22023 | `INTO` itself; `ONLY KEYS` given something that isn't `'table/id'`; a row tied (unique value or reference) to one left out; a row of a table the world changed itself (use `ONLY TABLES`) |
-| 55000 | the world was open when the database crashed: `CONFIRM` after checking `DIFF`, or drop it |
+| 55000 | the world was open when the database crashed: `CONFIRM` after checking `DIFF`, or drop it; or `AT VERSION n` and the world isn't at `n` |
 | 0A000 | main has no parent |
 | 3D000 | no such world |
 
@@ -307,6 +309,8 @@ merge world agent_7b into agent_7;
 ```
 
 See [concepts](../concepts.md#merging) for three-way merging and [partial merges](../concepts.md#merging-part-of-a-world-or-into-another-world).
+
+- **Approve what you read:** a world's version moves on with each write to it and each partial merge of it. A person who reviewed it at version 12 merges with `AT VERSION 12`: if its agent wrote more meanwhile, nothing merges and the error says so.
 
 ### MERGE DRY RUN
 
@@ -341,11 +345,13 @@ merge world payout;
 alter world payout set (check_reads = false);    -- a person's way past it
 ```
 
-- **What counts as read:** every row read through the world (a key looked up, and a scan's range, up to where it stopped when it stopped early), the entries of indexes and constraints it looked in (so a row the parent added that a lookup would have found counts too), and whole tables for full-text and vector searches. Past 10,000 keys or 1,000 ranges of one table, reads of it count as the whole table. Reads in a transaction count for its world. Rows the world wrote itself aren't checked here: they conflict or settle as always.
+- **What counts as read:** every row read through the world (a key looked up, and a scan's range, up to where it stopped when it stopped early), the entries of indexes and constraints it looked in (so a row the parent added that a lookup would have found counts too), and whole tables for full-text and vector searches. A SQL scan of a whole table with conditions like `column op constant` (`=`, `<`, `>=`, `IN`, `IS NULL`, `LIKE 'prefix%'`, joined by `AND`) counts as reading the rows those conditions can match, not the table: a changed row holds the merge only if it matched them before the change or after it, so `select ... from leads where owner = 'ana'` isn't held by changes to other owners' leads. A scan with no such condition (`where lower(name) = 'x'`, an `OR` of columns) reads the whole table. Past 10,000 keys, 1,000 ranges or 1,000 filtered scans of one table, reads of it count as the whole table. Reads in a transaction count for its world. Rows the world wrote itself aren't checked here: they conflict or settle as always.
 - **Refused or queued:** SQLSTATE `40001` (HTTP 409); for an agent keeping to a merge policy, a reason like any broken rule, and the world waits in `SHOW REVIEWS`. `MERGE ... DRY RUN` shows it in its `blocked` row.
 - **For every world of an agent:** a merge policy with `check_reads = true` turns it on for every world its agents fork, and they can't turn it off (42501); a person can.
 - **Restarts:** what a world read is kept in memory. After the database restarts, a world that checks its reads can't show its earlier reads were current, so its merge is held (`relies on reads made before the database restarted`): redo the work in a new world, or turn the check off.
 - **Anyone reading it counts:** a person inspecting the world with `SELECT` adds to what it read.
+- **Partial merges:** `ONLY TABLES` and `ONLY KEYS` check every read of the world, not only those of the rows they merge: which reads led to which writes isn't known.
+- **Replaying the log:** a merge that went through is replayed after a restart without checking its reads again.
 
 ### Declared scope (may_change, tenant)
 
@@ -372,6 +378,24 @@ merge world close_stale;
 - **Changing it:** `ALTER WORLD w SET (may_change = 'leads')` widens it, `= null` drops a part. Only the database's own users and admins may; the agent that forked the world can't (42501).
 - **Shown:** `SHOW WORLDS` and `SHOW REVIEWS` have a `scope` column (JSON: `may_change` as `[{"table": ..., "column": ...}]`, `tenant` as `{"column": ..., "value": ...}`, `intent`, `run`); the world's owner is the agent that forked it. Over HTTP and MCP a world has a `scope` field.
 - **Required:** a merge policy with `require_scope = true` refuses its agents' forks that declare neither `may_change` nor `tenant`.
+
+## REBASE WORLD
+
+```
+REBASE WORLD [name] [USING OURS | THEIRS] [BY COLUMNS] [RESOLVE ('t/1' = OURS, ...)] [AT VERSION n]
+```
+
+Moves a world's fork point up to its parent as it is now, its own changes kept on top: what a merge would leave in the parent, kept in the world instead. The parent doesn't change. A world that runs for hours picks up what changed under it, and settles conflicts as they come rather than all at its merge; its diff, and its merge, are then against the parent as it was at the rebase. `name` defaults to the session's world. Rows both sides changed settle as in [`MERGE`](#merge) (`RESOLVE`, then `BY COLUMNS`, then `USING`); `AT VERSION` as there. Returns tag `REBASE n`, n the rows of the parent's it took in.
+
+```sql
+rebase world agent_7;                         -- conflicts refuse it (40001), naming them
+rebase world agent_7 by columns using theirs;
+```
+
+- **Refused, nothing changed:** a conflict nothing settles (40001); rows both sides added under one unique value (23505); for a world that [checks its reads](#stale-reads-check_reads), a row it read that changed since the fork (40001: the decision made on it needs making again in a new world). What it read stays recorded, checked from the new fork point at its merge.
+- **No policy judges it:** the merge that follows is judged, against the new fork point. One exception: an agent whose policy has `overwrite = false` can't keep its rows over its parent's changes (`USING OURS`, rows picked as its own), which its merge would then not see (42501).
+- **Going back:** `RESTORE WORLD` to a time before a rebase is refused (55000): put back on the new fork point, the old rows would undo at its merge what the parent changed in between.
+- **Not:** `INTO`, `ONLY`, `CONFIRM` or `DRY RUN` (42601); inside a transaction (25001); `main` (0A000).
 
 ## UNDO MERGE
 
@@ -417,7 +441,7 @@ RESTORE WORLD name TO CHECKPOINT 'label'
 
 Writes the world's rows back as they were, as an ordinary write: history keeps what it replaced, and a restore of a fork merges like any change. Returns tag `RESTORE n`, n the rows written.
 
-Errors: 22023 outside history, or no such checkpoint; 22P02 not a time.
+Errors: 22023 outside history, or no such checkpoint; 22P02 not a time; 55000 a time before the world's last [rebase](#rebase-world).
 
 ```sql
 restore world main to '-10 minutes';
@@ -624,7 +648,8 @@ DROP MERGE POLICY name [CASCADE]                    -- refused (22023) while an 
                                                     -- CASCADE: then its agents keep to none (a NOTICE each)
 SHOW MERGE POLICIES                                 -- name, max_rows, max_deletes, tables, review_tables, review_columns,
                                                     -- schema, overwrite, critical, check_reads, require_scope,
-                                                    -- rows_per_hour, deletes_per_hour, max_age, created
+                                                    -- rows_per_hour, deletes_per_hour, max_age, created,
+                                                    -- max_effects, effects_per_hour, review_channels
 SHOW REVIEWS                                        -- world, owner, policy, reasons, asked, version,
                                                     -- changed_since (written to, or partly merged, since the agent asked),
                                                     -- scope (what the world was forked to change)
@@ -638,6 +663,9 @@ ALTER AGENT name SET (policy = 'name')              -- or policy = null
 | `rows_per_hour` | it's a merge into `main`, and with the agent's other merges into `main` in the last hour it changes more rows than this | `null` (no limit) |
 | `deletes_per_hour` | likewise for deleted rows (`50`: at most 50 deletes an hour, however the job is split) | `null` (no limit) |
 | `max_age` | the world was forked longer ago than this (`'1h'`, `'30 minutes'`, or ms): its merge rests on what it read then | `null` (no limit) |
+| `max_effects` | it queues more effects than this (`NOTIFY ON MERGE`: the emails, webhooks and payments that happen once it lands; see the [outbox](../sql.md#effects-on-merge-notify-on-merge-and-the-outbox)) | `null` (no limit) |
+| `effects_per_hour` | it's a merge into `main`, and with the agent's other merges into `main` in the last hour it queues more effects than this | `null` (no limit) |
+| `review_channels` | it queues an effect on any channel in this list (`'payments,refunds'`), even one | none |
 | `tables` | it changes a table not in this list (`'orders,items'`) | any table |
 | `review_tables` | it changes any table in this list | none |
 | `review_columns` | it changes any column in this list (`'users.email,accounts.owner'`), even in one row: an update changing it, an insert giving it a value, a delete of a row with one | none |
@@ -650,7 +678,8 @@ ALTER AGENT name SET (policy = 'name')              -- or policy = null
 An agent keeping to a policy changes `main` only by merging: a direct write there, `RESTORE`,
 `UNDO MERGE` or `UNDO AGENT` is refused (42501), since it would skip the rules. Rules count the
 rows a merge applies (a row settled `USING THEIRS` changes nothing), and read table names as SQL
-does: unquoted names fold to lowercase, `'orders,"Orders"'` names two tables. Merges into other worlds are checked too.
+does: unquoted names fold to lowercase, `'orders,"Orders"'` names two tables. Effects are counted apart from rows: a merge
+that changes one row and queues a thousand emails changes 1 row and queues 1,000 effects. A merge that would take back or change an effect its parent already queued always waits for a person. Merges into other worlds are checked too.
 An agent's `MERGE ... DRY RUN` shows a `blocked` row when its merge would need a person. To try
 rules on a world before an agent keeps to them, use MCP's `check_merge_policy`. Only
 `admin` may manage policies; any agent may `SHOW MERGE POLICIES` and `SHOW REVIEWS`. A person, or an
