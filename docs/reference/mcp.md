@@ -4,7 +4,7 @@ title: MCP
 
 `chronos mcp <folder> [--allow-merge | --agent NAME] [-b branch]`
 
-Serves a database folder to an AI agent as MCP tools, over stdio. Why worlds work the way they do: [concepts](../concepts.md#worlds). Who may do what: [security](../security.md).
+Serves a database folder to an AI agent as MCP tools, over stdio; `chronos serve` serves the same tools over HTTP, to an agent with its token ([below](#over-http-chronos-serve)). Why worlds work the way they do: [concepts](../concepts.md#worlds). Who may do what: [security](../security.md).
 
 ```bash
 claude mcp add chronos -- chronos mcp /path/to/mydb
@@ -44,9 +44,22 @@ Any client that starts stdio servers from a JSON config (`mcpServers`):
 
 Use an absolute folder path: the client picks the working directory.
 
+## Over HTTP (`chronos serve`)
+
+`chronos serve` answers MCP at `POST /mcp`, as the agent whose token the client sends (`Authorization: Bearer <token>`), so the client needs only that token: not the folder, not the `chronos` binary. This is how an agent in a container or on another machine connects (see [agents in containers](../security.md#agents-in-containers)).
+
+```bash
+claude mcp add --transport http chronos https://db.internal:7070/mcp --header "Authorization: Bearer $BOT_TOKEN"
+```
+
+- **Who it acts as:** always an agent, the same as `chronos mcp --agent` with that agent's name: its rights decide which tools are listed and what they may change, its quotas apply (`max_concurrent` counts each tool call, and each statement of a `sql` call; the SQL any tool runs has its `max_query_ms` and `max_memory_mb`), and what it does is in the audit trail. `describe` shows no rows of a table a row-level security policy limits it on. Under `--safe`, a request with no agent's token is the agent `guest`: one with no token on a server without `--token`, or with the server's token. Every such client is the same guest, sharing its worlds (any of them can change or discard what another guest forked) and its rights, and the guest has no quotas: give each agent a token of its own. The server's token, the admin token, and no token on a server without `--safe` get `403`: the database's own user uses `chronos mcp <folder>` on the database's machine. A wrong, disabled or dropped agent's token gets `401`, and wrong tokens back off per address as on the rest of the API.
+- **Transport:** MCP's Streamable HTTP, without its event stream. Each request's body is one JSON-RPC message, and a request's reply is the response's JSON body (`200`). A notification, or a client's response, gets `202` with no body. A batch (a JSON array) gets `400` (`-32600`), and a body that isn't JSON gets `400` (`-32700`). `GET /mcp` (an event stream) gets `405`. There are no session IDs: nothing carries over between requests, as nothing does between stdio's calls.
+- **Sizes:** a message may be at most 8 MB (`413` from its `Content-Length`, before the body is read). Over HTTP and stdio alike, `find` and `history` give at most 1000 rows a call, `find` pages to `offset` 100000 with a beam (`ef`) up to 4096, and past those the call says to read with the `sql` tool.
+- **The rest of the API's rules apply:** loopback only unless the server has a token and TLS; a request from a web page (with an `Origin` header) gets `403`; the body must be sent with `Content-Type: application/json`.
+
 ## Protocol
 
-- **Transport:** stdio, JSON-RPC 2.0, one message per line. stdout carries only protocol messages; blank lines are skipped.
+- **Transport:** stdio, JSON-RPC 2.0, one message per line. stdout carries only protocol messages; blank lines are skipped. Over HTTP, see [above](#over-http-chronos-serve).
 - **Protocol version:** the server answers `initialize` with the client's `protocolVersion`, or `2025-06-18` if it sends none.
 - **Capabilities:** `tools` only. No resources, no prompts.
 - **Methods:** `initialize`, `ping` (replies `{}`), `tools/list`, `tools/call`. A message without an `id` (a notification such as `notifications/initialized`) gets no reply.

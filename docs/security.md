@@ -96,13 +96,14 @@ In safe mode, the guest can read `/metrics`, as its `read` right already gives i
 
 ### MCP (`chronos mcp <folder>`)
 
-MCP runs over stdio as the OS user that starts it, with the folder open (or shared from the process that has it open, over the socket below). There's no token: whoever starts the process decides who it is.
+`chronos mcp` runs over stdio as the OS user that starts it, with the folder open (or shared from the process that has it open, over the socket below). There's no token: whoever starts the process decides who it is. `chronos serve` also serves the MCP tools over HTTP (`POST /mcp`), and there a token decides: it acts only as the agent whose token is sent (the guest under `--safe`), never as the database's own user (see [MCP over HTTP](reference/mcp.md#over-http-chronos-serve)).
 
 | Started as | Acts as | May |
 |---|---|---|
 | `chronos mcp mydb` | safe mode (the default) | read every world, fork, and change only worlds forked in this session. `merge`, `restore` and `undo_merge` aren't listed. SQL that forks, merges, restores, drops or switches worlds, or changes settings, agents or backups, is refused |
 | `chronos mcp mydb --agent bot` | agent `bot` | what `bot` may do: tools it can't use aren't listed, its forks stay its own across sessions, its quotas apply, and what it does is in the audit trail |
 | `chronos mcp mydb --allow-merge` | the database's own user | everything |
+| `POST /mcp` on `chronos serve`, with an agent's token | that agent | as `--agent` with its name; the server's and admin tokens get `403` |
 
 - **`--agent` takes a name, not a token:** anyone who can run `chronos mcp` on the folder can act as any agent. It names who does what; the OS decides who may start it. A disabled or unknown agent is refused at start.
 - **Safe mode without `--agent`** leaves no audit trail: its writes aren't attributed to anyone, like the database's own user's. Use `--agent` to get the audit trail and quotas.
@@ -330,7 +331,7 @@ Not recorded: who, when it's the database's own user (the shell, the server or a
    edits go through a world.
 5. Give every agent its own agent and token, with only the rights it needs (the default is right for most), and set `max_worlds`, `max_changes`, `writes_per_minute`, `world_ttl`, `max_query_ms`, `max_concurrent` and `max_memory_mb`.
 6. Set `max_worlds` and `world_idle_ttl` for the whole database.
-7. For MCP, use `chronos mcp <folder> --agent NAME`; never `--allow-merge` for an agent you don't fully trust.
+7. For MCP, give each agent its token and `chronos serve`'s `/mcp`, or run `chronos mcp <folder> --agent NAME` where only you start it; never `--allow-merge` for an agent you don't fully trust.
 8. Run the server as its own OS user, with the folder `0700`, and agents as other OS users, or in containers that hold only their token (see [agents in containers](#agents-in-containers)).
 9. Encrypt with `CHRONOS_KEY_FILE`, point `CHRONOS_SPILL_DIR` at a private directory on an encrypted disk, and keep the key somewhere other than the backups.
 10. Put the server behind a proxy that limits connections and request rates if clients you don't control can reach it.
@@ -340,7 +341,7 @@ Not recorded: who, when it's the database's own user (the shell, the server or a
 An agent's rights hold for what it asks the database, not for what it runs. An agent that can run shell commands as the OS user that owns the folder can run `chronos <folder> merge <world>` itself, or read the folder's files. A container keeps its shell away from the folder; its token then decides what it may do in the database. The two need each other: a container does nothing for your data if the credential inside it can write `main`, and a token does nothing if the agent can reach the folder.
 
 - **Give the container the agent's token and nothing else.** Not the folder, not the folder's socket directory (`$TMPDIR/chronos-<uid>/`), not the server token or the admin token. Pass the token in the environment, and make one agent per container, with only the rights it needs (the default `read,fork,write_own` can't write `main` or merge) and its quotas (`max_worlds`, `world_ttl`, `writes_per_minute`, `max_query_ms`).
-- **Connect over Postgres or HTTP, not MCP, for now.** `postgres://bot:$BOT_TOKEN@<host>:5433/agent_7`, or `Authorization: Bearer $BOT_TOKEN` on the HTTP API. `chronos mcp` opens the folder (or its socket) and takes an agent's name, not its token, so it belongs outside the container; MCP over the network with an agent's token is planned.
+- **Connect with the token, not the folder.** Over MCP, point the client at `chronos serve`'s `/mcp` with `Authorization: Bearer $BOT_TOKEN` ([MCP over HTTP](reference/mcp.md#over-http-chronos-serve)); over Postgres, `postgres://bot:$BOT_TOKEN@<host>:5433/agent_7`; over HTTP, the same bearer token. `chronos mcp <folder>` opens the folder (or its socket) and takes an agent's name, not its token, so it doesn't belong in the container.
 - **Let the container reach the server, and nothing else private.** A container on Docker's default bridge can still reach the host and its network. If you reject private and link-local addresses from containers (in the `DOCKER-USER` chain and on the agents' bridge, IPv6 too: `fc00::/7`, `fe80::/10`; link-local covers the cloud metadata address `169.254.169.254`), allow the Chronos server's address and port before those rules, and DNS if the container's resolver is on the host. Rules like these are wiped when the VM or host restarts, so put them where every start applies them again. Chronos doesn't install them.
 - **Serve on an address the container can reach,** with the token and TLS (`serve` refuses an address that isn't loopback without them, unless `--insecure-no-tls` says a private network carries it): the bridge's address on the host, or a network shared with the agent's container. Run it with `--safe --admin-token`, so a client without an agent's token is the guest.
 - **Reads aren't scoped yet.** The agent reads every world, `main`, its history and other agents' worlds included. Keep out of the database what the agent mustn't see, and let the network rules decide where it can send what it reads.

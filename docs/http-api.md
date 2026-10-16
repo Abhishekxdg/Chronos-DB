@@ -3,6 +3,7 @@
 `chronos serve <folder> [--listen 127.0.0.1:7070] [--token T] [--safe [--admin-token A]]`
 
 - **Requests:** every operation is `POST /v1/<op>` with a JSON body, and replies are JSON. `GET /v1/health` answers without auth. An agent's token (see `create_agent`) acts as that agent: reads anywhere, changes only what it's allowed to (403 otherwise; 429 when writing too fast, running `max_concurrent` requests, or past the database's `max_worlds`; 413 when a query passes its `max_memory_mb`); its worlds are its own, and a person merges them unless it may.
+- **MCP:** `POST /mcp` serves the MCP tools as the agent whose token is sent (the guest under `--safe`); see [MCP over HTTP](reference/mcp.md#over-http-chronos-serve).
 - **Branch:** every operation takes `"branch"` (default `"main"`).
 - **Rows** go in and come out as JSON objects.
 

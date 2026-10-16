@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **MCP over HTTP:** `chronos serve` answers MCP at `POST /mcp`, as the agent whose token is sent (the guest under `--safe`), so an agent in a container or on another machine connects with its token alone, never the folder. See [MCP over HTTP](docs/reference/mcp.md#over-http-chronos-serve) and [agents in containers](docs/security.md#agents-in-containers).
+
 ## 0.2.0 (beta), 2026-10-16
 
 **The first public beta, for developers moving Postgres applications and their data in.** Chronos is not Postgres and not yet used in production; this release is for trying it on your own schema and workload. As measured for it:
