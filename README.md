@@ -514,4 +514,4 @@ The Chronos DB engine is closed source; this repository holds everything around 
 ## License
 
 - **The Studio, the clients, the docs site and the examples** (everything in this repository): the [MIT License](LICENSE).
-- **The `chronos` binaries:** free to use, including in production, except to offer Chronos DB as a hosted or managed database service. See [TERMS.md](TERMS.md).
+- **The `chronos` binaries:** free to use, including in production and inside commercial products, except to offer Chronos DB itself to others as a hosted or managed database service. Running it as your own application's database is fine. See [TERMS.md](TERMS.md).
