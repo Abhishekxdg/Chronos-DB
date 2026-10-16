@@ -49,7 +49,7 @@ Flags may go anywhere on the line. A flag that takes a value and has none prints
 | `--tls-cert <file>` | `CHRONOS_TLS_CERT` | `serve` | PEM certificate; with `--tls-key`, HTTPS only and TLS on the Postgres port. One without the other fails: `TLS needs both --tls-cert and --tls-key`. Needed for any address that isn't loopback, unless `--insecure-no-tls` |
 | `--tls-key <file>` | `CHRONOS_TLS_KEY` | `serve` | PEM private key |
 | `--insecure-no-tls` | off | `serve` | listen on an address that isn't loopback without TLS (with a warning): only where something else encrypts the connection |
-| `--allow-plaintext-password` | off | `import ... postgres://` | send the password to a source that asks for it in the clear or as MD5 over a connection that isn't TLS (refused otherwise) |
+| `--allow-plaintext-password` | off | `import ... postgres://` | send the password to a source that asks for it in the clear or as MD5 over a connection that isn't TLS with the server's certificate checked for its name (`sslmode=verify-full`; refused otherwise) |
 | `--allow-merge` | off | `mcp` | lets the MCP client merge; without it agents change only worlds they fork, and a person merges |
 | `--agent <name>` | none | `mcp` | the MCP client acts as that agent (it must exist), with its permissions and limits |
 | `--schema <schema.csv>` | none | `import` | the table's columns; required |
