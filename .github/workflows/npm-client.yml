@@ -1,0 +1,38 @@
+# Publishes the TypeScript client (clients/typescript) to npm as @chronosdb/client whenever main has a version of
+# it npm doesn't: bump "version" in its package.json (in the engine repository, which mirrors clients/ here) and
+# the next push publishes it, with provenance (which npm signs only from a public repository, so from here).
+# No token: npm trusts this workflow (trusted publishing, GitHub's OIDC identity), set on npmjs.com under
+# @chronosdb/client > Settings > Trusted Publisher: GitHub Actions, Abhishekxdg / chronosdb, npm-client.yml.
+# npm lets a package trust a workflow only once it exists, so its first version was published by hand.
+name: npm client
+on:
+  push:
+    branches: [main]
+    paths: ["clients/typescript/**", ".github/workflows/npm-client.yml"]
+  workflow_dispatch:
+
+permissions: { contents: read, id-token: write }
+
+concurrency: { group: npm-client, cancel-in-progress: false }
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: clients/typescript } }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with: { node-version: 22, registry-url: "https://registry.npmjs.org" }
+      # trusted publishing needs npm 11.5.1 or later (Node 22 comes with 10)
+      - run: npm install -g npm@^11.5.1
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build
+      - name: Publish, unless npm has this version
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "$name@$version is on npm already"
+            exit 0
+          fi
+          npm publish --provenance --access public

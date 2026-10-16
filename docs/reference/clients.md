@@ -14,15 +14,21 @@ await agent.merge();                                // or agent.discard()
 
 ## Getting them
 
-Copy the file into your project. They aren't published to npm or PyPI.
+TypeScript/JavaScript, from npm ([`@chronosdb/client`](https://www.npmjs.com/package/@chronosdb/client), ESM, with its types):
 
-| Language | File | Needs |
+```bash
+npm install @chronosdb/client
+```
+
+Python isn't on PyPI yet: copy the file into your project.
+
+| Language | Get it | Needs |
 |---|---|---|
-| TypeScript / JavaScript | [clients/typescript/chronos.ts](https://github.com/Abhishekxdg/chronosdb/blob/main/clients/typescript/chronos.ts) | global `fetch`: Node 18+, browsers, edge runtimes |
+| TypeScript / JavaScript | `npm install @chronosdb/client`, or copy [clients/typescript/chronos.ts](https://github.com/Abhishekxdg/chronosdb/blob/main/clients/typescript/chronos.ts) | global `fetch`: Node 18+, browsers, edge runtimes |
 | Python | [clients/python/chronos.py](https://github.com/Abhishekxdg/chronosdb/blob/main/clients/python/chronos.py) | Python 3.9+, standard library only |
 
 ```ts
-import { Chronos, ChronosError } from "./chronos";
+import { Chronos, ChronosError } from "@chronosdb/client";
 ```
 ```python
 from chronos import Chronos, ChronosError
