@@ -217,6 +217,7 @@ show reviews;                -- (0 rows)
 - **Approve part of it:** `MERGE WORLD bot_bulk ONLY TABLES (orders)` or `ONLY KEYS ('orders/1', ...)` merges some rows and leaves the world open with the rest.
 - **The agent can't skip the queue:** its queue entry is in the world's metadata under a key only the database sets. The agent can't remove it, and can't merge the world until a person does, or until it fits the rules.
 - **Who did what:** `SHOW AUDIT FOR AGENT bot` lists the agent's forks, writes and merges. A refused merge shows as `metadata`: that's the world being queued.
+- **Whether the rules work:** `SHOW MERGE OUTCOMES` counts how each agent's worlds ended within the history window (merged on the rules alone, approved, rejected, dropped, open) and how often its merges were held, conflicted or were refused. `rules_rate` is the share of decided worlds that merged on the rules alone: if it's low, the rules hold too much; if people undo what passed, they hold too little (undone merges still count as merged; see [SQL](../sql.md#agents)). `BY POLICY` gives a row per policy.
 
 ## 6. Tune the rules
 

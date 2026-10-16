@@ -60,6 +60,7 @@ A merge conflict returns the rows involved:
 | `drop_agent` | `name` | `{ok}` |
 | `agents` |  | `{agents: [...]}` |
 | `audit` | `agent`, `limit` (100) | `{events: [{at, agent, world, action, rows}]}` |
+| `merge_outcomes` | `by` (`"policy"`; default by agent) | `{since, outcomes: [{agent, policy, worlds, on_rules, no_policy, approved, rejected, discarded, open, partly_merged, before_window, conflicts, stale_reads, check_refusals, holds, rules_rate}]}` (by policy: no `agent`); the server's token only, 403 for an agent's; `since` null with no log. Columns as [`SHOW MERGE OUTCOMES`](sql.md#agents) |
 | `backup` | `to` (a new folder on the server) | `{files, bytes}` |
 | `verify` | | `{pages, bytes, log_records}` |
 | `checkpoint` | `branch`, `name` | `{ok, at}`; `restore` takes `checkpoint` instead of `at` |

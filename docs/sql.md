@@ -729,12 +729,43 @@ alter agent bot set (writes_per_minute = 600, disabled = false);
 alter agent bot set (max_query_ms = 30000, max_concurrent = 4, max_memory_mb = 512);
 show agents;                              -- name, id, can, quotas, world_ttl, created, disabled, limits
 show audit for agent bot limit 20;        -- at, agent, world, action, rows
+show merge outcomes;                      -- how each agent's worlds ended, and how often its merges were held or refused
+show merge outcomes by policy;            -- the same, a row per merge policy
 checkpoint world bot_task as 'before';    -- name a moment of a world...
 restore world bot_task to checkpoint 'before';  -- ...and go back to it
 drop agent bot;                           -- its token stops working; its worlds stay
 ```
 
 See [concepts](concepts.md#agents) for what agents may do. The names `guest` and `system` are the database's own.
+
+`SHOW MERGE OUTCOMES` reads the history window (`show history_retention`; `since` is where it starts) and counts each
+world once, by how it ended:
+
+| column | a world that ... |
+|---|---|
+| `on_rules` | its owner merged, keeping to a merge policy, with no hold |
+| `no_policy` | its owner merged, keeping to no merge policy (the database's own users, or an agent without one) |
+| `approved` | someone other than its owner merged: a person, after a hold or without one |
+| `rejected` | was dropped after a hold |
+| `discarded` | was dropped with no hold |
+| `open` | is still open, nothing merged |
+| `partly_merged` | is still open, some of it merged (`ONLY TABLES`, `ONLY KEYS`, or `INTO` another world) |
+| `before_window` | was forked before the window: counted, not classed |
+
+and counts attempts: `conflicts` (rows both sides changed), `stale_reads` (rows it relied on changed since it read
+them), `check_refusals` (a merge check or a CHECK constraint the result breaks) and `holds` (a merge policy sent it to a
+person). A merge retried in a loop adds attempts, never worlds. `rules_rate` is `on_rules / (on_rules + approved +
+rejected)`: the share of decided worlds that merged on their rules alone (NULL when none were). `agent` is NULL for the
+database's own users; `policy` is each agent's policy now. A transaction's COMMIT that conflicts isn't counted (it's no
+agent's merge).
+
+Its limits: it replays the whole retained log, so it costs what `SHOW AUDIT` costs: 0.47 s over 1,022,531 log records
+(340,000 worlds) on the 16-core test VM, 2026-10-16. A refused merge logs its world's metadata once (about 65 bytes
+for a world with only the counts), and refusals don't count toward an agent's `writes_per_minute`, so an agent
+retrying a refused merge in a loop grows the log by that much each time. A merge undone later with `UNDO
+MERGE` still counts as merged (the undo is logged as an ordinary write). After a crash, refusals since the last sync to
+disk may be missing; merges never are. An in-memory database keeps no log: no rows, and a notice says so. Only the
+database's own users may run it: an agent's session gets 42501.
 
 ## Roles and privileges
 

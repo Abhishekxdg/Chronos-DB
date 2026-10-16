@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **How merges end: `SHOW MERGE OUTCOMES [BY POLICY]`**, and the HTTP op `merge_outcomes`. Each agent's worlds within the history window, counted once by how they ended (merged on the rules alone, merged with no policy, approved, rejected, dropped, open, partly merged), with how often their merges were held, conflicted, read rows that changed, or broke a merge check, and `rules_rate`: the share of decided worlds that merged on the rules alone. A refused merge now leaves a count in its world's metadata (`_sonos_refusals`, set only by the database), so the counts come from history and survive a restart; a merge that goes through does no new work. For the database's own users only. Merges later undone still count as merged. See [SQL](docs/sql.md#agents).
+
+## Unreleased
+
 - **MCP over HTTP:** `chronos serve` answers MCP at `POST /mcp`, as the agent whose token is sent (the guest under `--safe`), so an agent in a container or on another machine connects with its token alone, never the folder. See [MCP over HTTP](docs/reference/mcp.md#over-http-chronos-serve) and [agents in containers](docs/security.md#agents-in-containers).
 - **No false deadlocks between row waits:** a statement waiting for a row could fail with 40P01 when the transaction it waited for committed, began another and waited for a row the first one held: the deadlock check followed it as if it still held the row. Seen as a rare failure of a TPC-B loop from eight clients.
 - **The TypeScript client is on npm:** `npm install @chronosdb/client` ([clients](docs/reference/clients.md)).
