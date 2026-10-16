@@ -212,7 +212,7 @@ merge world agent_7;             -- as the database's own user
 drop world agent_7;              -- or not
 ```
 
-- **Approving means merging,** as the database's own user or an agent allowed to; merges a policy refuses wait in `SHOW REVIEWS`. Approve the version you read (`MERGE WORLD w AT VERSION n`, HTTP `merge` with `version`, Studio does it for you): an agent that keeps writing to its world while you review doesn't get its later writes merged with it. `merge_own` with `write_main` lets an agent publish its own work to `main` with no one looking. The database's own user and admins can write `main` directly unless `protect_main` is on.
+- **Approving means merging,** as the database's own user or an agent allowed to; merges a policy refuses wait in `SHOW REVIEWS`. Approve the version you read (`MERGE WORLD w AT VERSION n`, HTTP `merge` with `version`, Studio does it for you): an agent that keeps writing to its world while you review doesn't get its later writes merged with it. `merge_own` with `write_main` lets an agent publish its own work to `main` with no one looking. The database's own user and admins can write `main` directly unless `protect_main` is on; `chronos serve` warns as it starts when other machines can reach it with such a token (no `--safe`, `protect_main` off).
 - **MCP:** without flags, agents can't merge; `--allow-merge` gives the MCP session everything, not just merging. Prefer `--agent NAME` with `merge_own` (plus `write_main` to publish to `main`) when an agent should publish.
 - **Crashes can't make a merge publish less than was written:** merges check the world's version, and worlds open during a crash are flagged until someone confirms them (see [concepts](concepts.md#versions-and-crashes)).
 
@@ -320,12 +320,20 @@ Not recorded: who, when it's the database's own user (the shell, the server or a
 
 1. Keep both ports on loopback unless something else must reach them; then give a numeric address, `CHRONOS_TOKEN` (`openssl rand -hex 24`, in the environment, not on the command line) and TLS. In a container, publish the ports on the host's loopback (`-p 127.0.0.1:5432:5432`) unless TLS is on.
 2. Run with `--safe --admin-token`, so clients without an agent's token are the guest; keep the admin token for people.
-3. Give every agent its own agent and token, with only the rights it needs (the default is right for most), and set `max_worlds`, `max_changes`, `writes_per_minute`, `world_ttl`, `max_query_ms`, `max_concurrent` and `max_memory_mb`.
-4. Set `max_worlds` and `world_idle_ttl` for the whole database.
-5. For MCP, use `chronos mcp <folder> --agent NAME`; never `--allow-merge` for an agent you don't fully trust.
-6. Run the server as its own OS user, with the folder `0700`, and agents as other OS users, or in containers that hold only their token (see [agents in containers](#agents-in-containers)).
-7. Encrypt with `CHRONOS_KEY_FILE`, point `CHRONOS_SPILL_DIR` at a private directory on an encrypted disk, and keep the key somewhere other than the backups.
-8. Put the server behind a proxy that limits connections and request rates if clients you don't control can reach it.
+   Without `--safe`, the server token is the database's own user: whoever holds it changes `main` directly, with no
+   world and no review. `chronos serve` says so as it starts on an address other machines can reach.
+3. **Keep the server and admin tokens out of agents' reach:** not in an agent's environment, its container, a `.env`
+   file its tools can read, or a repository it works in. An agent connects with its own token only.
+4. `ALTER SYSTEM SET protect_main = on`, so `main`'s rows change only by merging a world, for everyone, the admin
+   included: a leaked admin token can then still merge, but not quietly rewrite `main` (see [protecting
+   `main`](#protecting-main)). Turn it on after `chronos import`, which writes `main`'s rows; from then on, row
+   edits go through a world.
+5. Give every agent its own agent and token, with only the rights it needs (the default is right for most), and set `max_worlds`, `max_changes`, `writes_per_minute`, `world_ttl`, `max_query_ms`, `max_concurrent` and `max_memory_mb`.
+6. Set `max_worlds` and `world_idle_ttl` for the whole database.
+7. For MCP, use `chronos mcp <folder> --agent NAME`; never `--allow-merge` for an agent you don't fully trust.
+8. Run the server as its own OS user, with the folder `0700`, and agents as other OS users, or in containers that hold only their token (see [agents in containers](#agents-in-containers)).
+9. Encrypt with `CHRONOS_KEY_FILE`, point `CHRONOS_SPILL_DIR` at a private directory on an encrypted disk, and keep the key somewhere other than the backups.
+10. Put the server behind a proxy that limits connections and request rates if clients you don't control can reach it.
 
 ## Agents in containers
 

@@ -16,6 +16,8 @@ What changed most:
 - **Reliability fixes from the trials:** sequences never repeat a value after a crash, `max_connections` is enforced honestly, oversize wire messages fail the statement instead of the connection, idle timeouts are enforced.
 - **Release:** a draft release with static Linux builds (x86_64 and aarch64, musl), macOS builds, SHA-256 sums and cosign signatures; a Dockerfile (non-root, data in a volume); new docs: [Quickstart](docs/quickstart.md), [Migrating from Postgres](docs/migrating-from-postgres.md), and [where the beta stands](docs/postgres-compatibility.md#where-it-stands-beta).
 
+- **Shared servers say when the token is too strong:** `chronos serve` on an address other machines can reach, without `--safe` and with `protect_main` off, warns that its token changes `main` directly, with no world and no review; the [hardened deployment](docs/security.md#a-hardened-deployment) checklist now says to keep server and admin tokens out of agents' environments and to turn `protect_main` on.
+
 Upgrading from 0.1.x:
 
 - **0.1.x may not open a database 0.2.0 has written:** the write-ahead log has new record kinds (`RebaseTx` for READ COMMITTED statements, `Rebase` for REBASE WORLD), and a database whose log holds one can't be opened by an earlier version. Take a backup before opening an existing database with 0.2.0 if you may want to go back.
