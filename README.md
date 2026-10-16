@@ -2,10 +2,11 @@
 
 # Chronos DB
 
-### The database for AI agents: fork the world, try everything, merge what works.
+### Let AI agents write to real data. Each run gets its own branch; your rules decide what merges.
 
-Every agent gets its own copy-on-write **world** (a branch of the whole database) in about **2 microseconds**.<br>
-It speaks **Postgres**, searches **filters, text and vectors** in one query, and **merges** changes back with conflicts returned as data.
+The branch is the easy part; the merge is what has to be trusted.<br>
+Every agent run works in its own copy-on-write **world** (a branch of the whole database). Chronos **diffs** it row by row and checks the merge against **rules you approve once**: no deletes without a person, at most 500 rows, every lead list keeps a lead.<br>
+What keeps to the rules merges on its own; the rest waits for review, with the reasons. It speaks **Postgres** and searches filters, text and vectors inside every world.
 
 <br>
 
@@ -34,18 +35,23 @@ It speaks **Postgres**, searches **filters, text and vectors** in one query, and
 ---
 
 ```sql
--- psql postgres://127.0.0.1:5433/main
-create world agent_7 with (owner = 'claude', task = 42);   -- instant private copy, any size
-switch world agent_7;
-update prices set amount = amount * 0.9 where sku like 'SUMMER-%';
+-- once, as you: the rules an agent's merges must keep
+create merge policy agents with (max_deletes = 0, max_rows = 500, review_tables = 'payments');
+create agent bot with (can = 'read,fork,write_own,write_main,merge_own', policy = 'agents');
 
-select id, title from products                              -- hybrid search sees the world's own edits
-where category = 'shoes'
-order by embedding <=> $1::vector limit 10;
+-- as the agent (psql postgres://bot:<token>@127.0.0.1:5433/main)
+create world run_42 with (task = 'clean up stale leads');   -- private copy of everything, any size
+switch world run_42;
+update leads set status = 'stale' where last_contact < now() - interval '1 year';
+delete from leads where email is null;
 
-diff world agent_7;                  -- table, id, change, before, after
-merge world agent_7 dry run;         -- what would happen, row by row, and why rows conflict
-merge world agent_7;                 -- or: drop world agent_7
+diff world run_42;                   -- table, id, change, before, after
+merge world run_42 dry run;          -- row by row, plus why it would be held
+merge world run_42;                  -- the delete breaks a rule: held, queued in SHOW REVIEWS
+
+-- as you: look, then approve or throw it away
+show reviews;
+merge world run_42;                  -- or: drop world run_42 (main never saw it)
 ```
 
 
@@ -71,11 +77,12 @@ Postgres and SQLite were built for **a few long-lived databases with one shared 
 
 | Agents need to... | Traditional databases | Chronos DB |
 |---|---|---|
+| Write to real data without a person reading every change | Read-only agents, or hand-built staging tables and approval steps | Merge policies and merge checks: within the rules it merges, outside them it waits in `SHOW REVIEWS` |
+| Review what an agent changed | Audit tables you build yourself | `diff` any two worlds or moments, as rows or as SQL |
+| Keep the good work, drop the rest | Hand-written migrations | Three-way `merge` (whole, by table, by key, by column), conflicts as rows, or `drop` |
+| Undo a bad agent | Restore a backup and lose everyone's work | `UNDO AGENT bot SINCE '-2 hours'`, row by row |
 | Try something without breaking production | Copy the database (seconds to minutes) or mock it | `fork` in ~2 µs, any size, on disk |
 | Run many attempts in parallel | One connection pool, one truth, lock contention | Thousands of isolated worlds, 100,000 tested |
-| Review what an agent changed | Audit tables you build yourself | `diff` any two worlds or moments, as rows or as SQL |
-| Keep the good work, drop the rest | Hand-written migrations | `merge` (whole, by table, by key, by column) or `drop` |
-| Undo a bad agent | Restore a backup and lose everyone's work | `UNDO AGENT bot SINCE '-2 hours'`, row by row |
 | Search while working | A separate vector DB that can't see uncommitted edits | Filters + full text + vectors inside every world |
 | Stay safe with untrusted agents | Roles and hope | Per-agent capabilities, quotas, time and memory limits; humans approve merges |
 
