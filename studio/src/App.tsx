@@ -4,26 +4,36 @@
 // tabs over the canvas, the status bar, and the state they share. A world's hue marks it
 // everywhere it appears; main's is amber, the live data.
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
-import { api, onConnection, onGate, token, type Table, type World } from './api';
-import { AppCtx, lineage, TABS, worldOf, type App as AppState, type Merged, type Prefs, type Tab } from './context';
+import { api, errText, onConnection, onGate, onSignedOut, signIn, signOut, token, whoami, type ApiError, type HistoryWindow, type Table, type User, type Who, type World } from './api';
+import { ADMIN_ONLY, AppCtx, lineage, TABS, worldOf, type App as AppState, type Merged, type Prefs, type Tab } from './context';
 import { Icon, typeMark, type IconName } from './icons';
 import { Palette, type Command } from './Palette';
 import { Worldline } from './Worldline';
 import { DialogHost, Popover, Toast, toast, useDialogs } from './ui';
-import { ago, fmtTime, hueOf, mod, n, plural, reducedMotion, setTimeZone, store, suggestName } from './util';
+import { ago, fmtTime, hueOf, mod, momentOf, n, outsideHistory, plural, reducedMotion, setTimeZone, store, suggestName } from './util';
 import { AgentsView, AuditView } from './views/Agents';
 import { ChangesView, discard } from './views/Changes';
 import { castType, DataView, tableInfo, type TableInfo } from './views/Data';
 import { DiagramView } from './views/Diagram';
 import { HistoryView, saveCheckpoint } from './views/History';
+import { PgImportView } from './views/PgImport';
 import { SearchView } from './views/Search';
+import { SessionsView } from './views/Sessions';
 import { SettingsView, SHORTCUTS } from './views/Settings';
 import { SimulateView } from './views/Simulate';
 import { SqlView } from './views/Sql';
 import { StatusView } from './views/Status';
 import { worldDetails } from './views/World';
 
-const PAGES: Partial<Record<Tab, string>> = { simulate: 'Simulations', agents: 'Agents', audit: 'Audit log', status: 'Status', settings: 'Settings' };
+const PAGES: Partial<Record<Tab, string>> = {
+  simulate: 'Simulations',
+  agents: 'Agents',
+  audit: 'Audit log',
+  status: 'Status',
+  settings: 'Settings',
+  sessions: 'Sessions',
+  pgimport: 'Import from Postgres',
+};
 const VIEWS = {
   data: DataView,
   diagram: DiagramView,
@@ -36,6 +46,8 @@ const VIEWS = {
   status: StatusView,
   settings: SettingsView,
   simulate: SimulateView,
+  sessions: SessionsView,
+  pgimport: PgImportView,
 };
 const ICONS: Record<Tab, IconName> = {
   data: 'table',
@@ -49,6 +61,8 @@ const ICONS: Record<Tab, IconName> = {
   status: 'pulse',
   settings: 'sliders',
   simulate: 'play',
+  sessions: 'eye',
+  pgimport: 'download',
 };
 const typing = (e: KeyboardEvent) => {
   const t = e.target as HTMLElement;
@@ -65,7 +79,7 @@ export function App() {
 }
 
 type Theme = Prefs['theme'];
-type Menu = 'file' | 'view' | 'world' | 'help' | 'worldpill' | 'settings' | 'more' | null;
+type Menu = 'file' | 'view' | 'world' | 'help' | 'worldpill' | 'settings' | 'more' | 'user' | null;
 
 function Studio() {
   const dlg = useDialogs();
@@ -103,6 +117,19 @@ function Studio() {
   const [conn, setConn] = useState(true);
   useEffect(() => onGate(() => setGate(true)), []);
   useEffect(() => onConnection(setConn), []);
+  // the key in the link, or (chronos studio --login) a role signed in; asked once, before anything else
+  // without a key (with one the page starts at once, as it always has)
+  const [who, setWho] = useState<Who | null>(null);
+  useEffect(() => {
+    whoami().then(setWho, () => setWho({ mode: 'key', user: null }));
+    return onSignedOut(() => setWho((w) => w && { ...w, user: null }));
+  }, []);
+  const login = who?.mode === 'login';
+  const user = (login && who?.user) || null;
+  const admin = !login || !!user?.superuser;
+  // nothing to show yet: the key's gate (shown once the mode is known), or the sign-in
+  const locked = login ? !user : gate;
+  const tabs = admin ? TABS : TABS.filter(([t]) => !ADMIN_ONLY.has(t));
 
   const [world, setWorldName] = useState('main');
   const [worlds, setWorlds] = useState<World[]>([]);
@@ -132,9 +159,12 @@ function Studio() {
   const [sideW, setSideW] = useState(() => Number(store.get('chronos-studio-side')) || 264);
   const [statusSlot, setStatusSlot] = useState<HTMLElement | null>(null);
   const [about, setAbout] = useState<{ version: string; folder: string } | null>(null);
+  const [history, setHistory] = useState<HistoryWindow | null>(null);
   const worldRef = useRef(world);
 
   const reloadWorlds = useCallback(async () => {
+    // the history window moves on with checkpoints: read it again with the worlds
+    api<{ history?: HistoryWindow }>('status').then((s) => setHistory(s.history ?? null), () => {});
     const r = await api<{ branches: World[] }>('worlds');
     setWorlds(r.branches);
     if (!r.branches.some((w) => w.name === worldRef.current)) {
@@ -192,7 +222,7 @@ function Studio() {
   );
 
   useEffect(() => {
-    if (gate) return;
+    if (locked) return;
     reloadWorlds().then(reloadTables, () => {});
     api<{ version: string; folder?: string }>('status').then(
       (s) => {
@@ -201,7 +231,7 @@ function Studio() {
       },
       () => {},
     );
-  }, [gate, reloadWorlds, reloadTables]);
+  }, [locked, reloadWorlds, reloadTables]);
 
   const app: AppState = {
     world,
@@ -221,6 +251,7 @@ function Studio() {
     reloadTables,
     forkFrom,
     show: (t) => {
+      if (!admin && ADMIN_ONLY.has(t)) return toast(`${PAGES[t] || TABS.find(([x]) => x === t)?.[1] || t} needs a superuser role`);
       setTab(t);
       setSide(false);
       setBump((b) => b + 1);
@@ -232,6 +263,8 @@ function Studio() {
     setSearch,
     timeTravel: (at) => {
       if (!table) return toast('Pick a table first: the moment applies to it');
+      const why = outsideHistory(history, momentOf(at));
+      if (why) return toast(why);
       setAsOf(at);
       setTab('data');
       setSide(false);
@@ -250,6 +283,9 @@ function Studio() {
     setPref,
     statusSlot,
     folder: about?.folder || '',
+    history,
+    user,
+    admin,
   };
 
   const w = worldOf(app, world);
@@ -257,19 +293,34 @@ function Studio() {
   const onMain = world === 'main';
   const changes = w?.changes ?? 0;
   const reloadAll = () => (reloadWorlds(), reloadTables(), app.refresh());
+  // signing out ends the session on the server; the sign-in comes back
+  const out = async () => {
+    await signOut();
+    setWho((x) => x && { ...x, user: null });
+  };
 
   // ---------- commands and keys ----------
   const commands = useMemo<Command[]>(() => {
-    const c: Command[] = [
-      ...TABS.map(([t, label], i) => ({ group: 'Go to', label, hint: `${mod}${i + 1}`, run: () => app.show(t) })),
+    const owner: Command[] = [
       { group: 'Go to', label: 'Simulations', run: () => app.show('simulate') },
       { group: 'Go to', label: 'Agents', run: () => app.show('agents') },
       { group: 'Go to', label: 'Audit log', run: () => app.show('audit') },
+    ];
+    const c: Command[] = [
+      ...tabs.map(([t, label], i) => ({ group: 'Go to', label, hint: `${mod}${i + 1}`, run: () => app.show(t) })),
+      ...(admin ? owner : []),
       { group: 'Go to', label: 'Status', run: () => app.show('status') },
-      { group: 'World', label: `Fork a world from ${world}`, run: () => forkFrom(world, suggestName()) },
+      ...(admin
+        ? [
+            { group: 'Go to', label: 'Sessions and locks', run: () => app.show('sessions') },
+            { group: 'Go to', label: 'Import from Postgres…', run: () => app.show('pgimport') },
+            { group: 'World', label: `Fork a world from ${world}`, run: () => forkFrom(world, suggestName()) },
+          ]
+        : []),
       { group: 'World', label: `Details of ${world}`, run: () => w && worldDetails(app, dlg, w) },
     ];
-    if (!onMain && w?.parent) {
+    if (user) c.push({ group: 'Session', label: `Sign out ${user.name}`, run: () => out() });
+    if (admin && !onMain && w?.parent) {
       c.push({ group: 'World', label: `Review changes in ${world}`, run: () => app.show('changes') });
       c.push({ group: 'World', label: `Merge ${world} into ${w.parent}`, run: () => app.show('changes') });
       c.push({ group: 'World', label: `Discard ${world}`, run: () => discard(app, dlg, world) });
@@ -282,7 +333,7 @@ function Studio() {
     for (const x of worlds) c.push({ group: 'Switch world', label: x.name, run: () => setWorld(x.name) });
     for (const t of tables || []) c.push({ group: 'Open table', label: t.name, run: () => app.pickTable(t.name) });
     return c;
-  }, [world, worlds, tables, dark, tab, explorer, line]); // eslint-disable-line
+  }, [world, worlds, tables, dark, tab, explorer, line, user, admin]); // eslint-disable-line
 
   useEffect(() => {
     const key = (e: KeyboardEvent) => {
@@ -298,7 +349,7 @@ function Studio() {
         setExplorer(!explorer);
       } else if (m && /^[1-6]$/.test(e.key)) {
         e.preventDefault();
-        app.show(TABS[Number(e.key) - 1][0]);
+        if (tabs[Number(e.key) - 1]) app.show(tabs[Number(e.key) - 1][0]);
       } else if (!m && !typing(e) && !document.querySelector('.overlay')) {
         if (e.key === '/') {
           e.preventDefault();
@@ -341,7 +392,8 @@ function Studio() {
       {hint && <span className="kbd">{hint}</span>}
     </button>
   );
-  const worldMenu = (
+  // (a role that isn't a superuser may look at a world, not fork, checkpoint, review or discard it)
+  const worldMenu = admin ? (
     <>
       {item(`Fork from ${world}…`, () => forkFrom(world, suggestName()))}
       {item('Details and metadata', () => w && worldDetails(app, dlg, w))}
@@ -354,7 +406,14 @@ function Studio() {
         </>
       )}
     </>
+  ) : (
+    item('Details', () => w && worldDetails(app, dlg, w))
   );
+
+  // without a key, the mode not known yet: nothing for the moment whoami takes (not the key's gate, nor the window)
+  if (!who && !token) return <div className="signin" />;
+  // chronos studio --login without a session: the sign-in, in place of the window
+  if (login && !user) return <SignIn onIn={(u) => (setTab('data'), setWho({ mode: 'login', user: u }))} />;
 
   const View = VIEWS[tab];
   const chain = lineage(worlds, world);
@@ -378,24 +437,37 @@ function Studio() {
           <nav className="menus" aria-label="Menus">
             <span onMouseEnter={hoverMenu('file')}>
               <Popover label="File" cls="menu-top" {...menuProps('file')}>
-                {item(`Fork a world from ${world}…`, () => forkFrom(world, suggestName()))}
+                {admin && item(`Fork a world from ${world}…`, () => forkFrom(world, suggestName()))}
                 {item('New SQL query', () => app.show('sql'), `${mod}3`)}
+                {admin && item('Import from Postgres…', () => app.show('pgimport'))}
                 {item('Reload', reloadAll)}
                 {item('Settings', () => app.show('settings'), `${mod},`)}
                 <div className="menu-sep" />
-                {item('Simulations', () => app.show('simulate'))}
-                {item('Simulations', () => app.show('simulate'))}
-                {item('Agents', () => app.show('agents'))}
-                {item('Audit log', () => app.show('audit'))}
+                {admin && item('Simulations', () => app.show('simulate'))}
+                {admin && item('Simulations', () => app.show('simulate'))}
+                {admin && item('Agents', () => app.show('agents'))}
+                {admin && item('Audit log', () => app.show('audit'))}
                 {item('Status', () => app.show('status'))}
+                {user && (
+                  <>
+                    <div className="menu-sep" />
+                    {item(`Sign out ${user.name}`, out)}
+                  </>
+                )}
               </Popover>
             </span>
             <span onMouseEnter={hoverMenu('view')}>
               <Popover label="View" cls="menu-top" {...menuProps('view')}>
-                {TABS.map(([t, label], i) => (
+                {tabs.map(([t, label], i) => (
                   <span key={t}>{item(label, () => app.show(t), `${mod}${i + 1}`, t === tab ? 'active' : '')}</span>
                 ))}
                 <div className="menu-sep" />
+                {admin && (
+                  <>
+                    {item('Sessions', () => app.show('sessions'), undefined, tab === 'sessions' ? 'active' : '')}
+                    <div className="menu-sep" />
+                  </>
+                )}
                 {item(explorer ? 'Hide the explorer' : 'Show the explorer', () => setExplorer(!explorer), `${mod}B`)}
                 {item(line ? 'Hide the worldline' : 'Show the worldline', () => setLine(!line))}
                 {item(dark ? 'Light theme' : 'Dark theme', () => setTheme(dark ? 'light' : 'dark'))}
@@ -473,7 +545,7 @@ function Studio() {
               {chain.length > 1 && <div className="menu-head faint mono">{chain.map((x) => x.name).join(' › ')}</div>}
               {worldMenu}
             </Popover>
-            {!onMain && changes > 0 ? (
+            {!admin ? null : !onMain && changes > 0 ? (
               <button className="btn accent" type="button" onClick={() => app.show('changes')} title="Review and merge this world's changes">
                 <Icon name="diff" />
                 <span className="txt">Review</span>
@@ -490,6 +562,27 @@ function Studio() {
                 <span className="txt">Fork</span>
               </button>
             )}
+            {user && (
+              <Popover
+                label={
+                  <>
+                    <Icon name="user" size={14} />
+                    <span className="uname">{user.name}</span>
+                    {user.superuser && <span className="tag">superuser</span>}
+                  </>
+                }
+                cls="btn ghost user-chip"
+                title={`Signed in as ${user.name}`}
+                right
+                {...menuProps('user')}
+              >
+                <div className="menu-head faint">
+                  Signed in as <span className="mono">{user.name}</span>
+                  {user.superuser ? ', a superuser' : ': reads, and SQL with its privileges'}
+                </div>
+                {item('Sign out', out)}
+              </Popover>
+            )}
           </div>
         </header>
 
@@ -505,11 +598,11 @@ function Studio() {
             <Icon name="panel" size={18} />
           </button>
           <span className="rail-sep" />
-          {TABS.map(([t, label], i) => (
+          {tabs.map(([t, label], i) => (
             <RailButton key={t} icon={ICONS[t]} label={`${label} (${mod}${i + 1})`} on={tab === t} onClick={() => app.show(t)} />
           ))}
           <span className="rail-sep" />
-          {(['simulate', 'agents', 'audit', 'status'] as Tab[]).map((t) => (
+          {((admin ? ['simulate', 'agents', 'audit', 'status'] : ['status']) as Tab[]).map((t) => (
             <RailButton key={t} icon={ICONS[t]} label={PAGES[t]!} on={tab === t} onClick={() => app.show(t)} />
           ))}
           <span className="spacer" />
@@ -526,7 +619,7 @@ function Studio() {
         <main className="main">
           <div className="tabs">
             <div className="tray" role="tablist" aria-label="Views">
-              {TABS.map(([t, label], i) => (
+              {tabs.map(([t, label], i) => (
                 <button
                   key={t}
                   role="tab"
@@ -554,16 +647,16 @@ function Studio() {
             <span className="spacer" />
             <Popover label={<Icon name="more" />} cls="btn ghost icon" title="More" right {...menuProps('more')}>
               {item('Refresh the view', reloadAll)}
-              {item('Agents', () => app.show('agents'))}
-              {item('Audit log', () => app.show('audit'))}
+              {admin && item('Agents', () => app.show('agents'))}
+              {admin && item('Audit log', () => app.show('audit'))}
               {item('Status', () => app.show('status'))}
               {item('Settings', () => app.show('settings'), `${mod},`)}
               <div className="menu-sep" />
               {item('Keyboard shortcuts', () => shortcuts(dlg), '?')}
             </Popover>
           </div>
-          {line && !gate && !PAGES[tab] && <Worldline />}
-          <div className={'canvas c-' + tab}>{gate ? <Gate /> : <View key={`${tab}/${world}/${table}/${bump}`} />}</div>
+          {line && !locked && admin && !PAGES[tab] && <Worldline />}
+          <div className={'canvas c-' + tab}>{locked ? <Gate /> : <View key={`${tab}/${world}/${table}/${bump}`} />}</div>
         </main>
 
         <footer className="statusbar">
@@ -649,15 +742,17 @@ function Explorer({
           {app.folder || 'database'}
         </span>
         <span className="spacer" />
-        <button
-          className="btn ghost icon small"
-          type="button"
-          title={`Fork a world from ${world}`}
-          aria-label={`Fork a world from ${world}`}
-          onClick={() => app.forkFrom(world, suggestName())}
-        >
-          <Icon name="fork" size={15} />
-        </button>
+        {app.admin && (
+          <button
+            className="btn ghost icon small"
+            type="button"
+            title={`Fork a world from ${world}`}
+            aria-label={`Fork a world from ${world}`}
+            onClick={() => app.forkFrom(world, suggestName())}
+          >
+            <Icon name="fork" size={15} />
+          </button>
+        )}
         <button className="btn ghost icon small" type="button" title="Reload" aria-label="Reload" onClick={onReload}>
           <Icon name="refresh" size={15} />
         </button>
@@ -703,8 +798,13 @@ function Explorer({
                       >
                         <Icon name={isOpen ? 'down' : 'right'} size={13} />
                       </button>
-                      <button type="button" className="pick" title={t.name} onClick={() => app.pickTable(t.name)}>
-                        <Icon name="table" size={14} />
+                      <button
+                        type="button"
+                        className="pick"
+                        title={t.kind ? `${t.name} · ${t.kind}, read only` : t.name}
+                        onClick={() => app.pickTable(t.name)}
+                      >
+                        <Icon name={t.kind ? 'eye' : 'table'} size={14} />
                         <span className="name">{t.name}</span>
                         <span className="count">{t.rows == null ? '' : n(t.rows)}</span>
                       </button>
@@ -728,11 +828,13 @@ function Explorer({
         </Section>
       </div>
 
-      <div className="ex-card">
-        <Section title="Timeline" shut={!!shut.timeline} onToggle={() => toggle('timeline')}>
-          <Timeline world={world} onOpen={() => app.show('history')} />
-        </Section>
-      </div>
+      {app.admin && (
+        <div className="ex-card">
+          <Section title="Timeline" shut={!!shut.timeline} onToggle={() => toggle('timeline')}>
+            <Timeline world={world} onOpen={() => app.show('history')} />
+          </Section>
+        </div>
+      )}
       <div className="ex-card">
         <Section title={table ? `Outline · ${table}` : 'Outline'} shut={!!shut.outline} onToggle={() => toggle('outline')}>
           <ul className="list cols-list flat">
@@ -852,6 +954,59 @@ function shortcuts(dlg: ReturnType<typeof useDialogs>) {
       </tbody>
     </table>,
     [{ label: 'Close', cls: 'primary', value: () => true }],
+  );
+}
+
+/** chronos studio --login's sign-in: a database role and its password, as psql asks for them. The server's
+ *  refusal is shown as it says it (one message for any wrong name or password). */
+function SignIn({ onIn }: { onIn: (u: User) => void }) {
+  const [name, setName] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!name || !password) return setError('Give the role’s name and its password');
+    setBusy(true);
+    setError('');
+    try {
+      onIn(await signIn(name, password));
+    } catch (err) {
+      setError(errText((err as ApiError).detail ?? (err as Error).message));
+      setPassword('');
+      setBusy(false);
+    }
+  };
+  return (
+    <main className="signin">
+      <form className="signin-card" onSubmit={submit} aria-label="Sign in">
+        <span className="logo" aria-hidden="true">
+          <svg width="28" height="28" viewBox="0 0 24 24">
+            <rect x="3" y="3" width="15" height="4.5" rx="2.25" />
+            <rect x="7" y="9.75" width="14" height="4.5" rx="2.25" />
+            <rect x="3" y="16.5" width="10" height="4.5" rx="2.25" />
+          </svg>
+        </span>
+        <h1>Sign in to Chronos Studio</h1>
+        <p className="note">With a database role that may log in and has a password. The Studio acts with that role’s privileges.</p>
+        <label className="field">
+          <span>Role</span>
+          <input type="text" autoComplete="username" autoCapitalize="none" spellCheck={false} autoFocus value={name} onChange={(e) => setName(e.target.value)} />
+        </label>
+        <label className="field">
+          <span>Password</span>
+          <input type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} />
+        </label>
+        {error && (
+          <p className="err" role="alert">
+            {error}
+          </p>
+        )}
+        <button className="btn primary" type="submit" disabled={busy}>
+          {busy ? 'Signing in…' : 'Sign in'}
+        </button>
+      </form>
+    </main>
   );
 }
 

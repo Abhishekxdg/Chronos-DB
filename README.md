@@ -9,7 +9,7 @@ It speaks **Postgres**, searches **filters, text and vectors** in one query, and
 
 <br>
 
-![status](https://img.shields.io/badge/status-v0.1.3%20preview-f59e0b?style=flat-square)
+![status](https://img.shields.io/badge/status-v0.2.0%20beta-f59e0b?style=flat-square)
 ![rust](https://img.shields.io/badge/rust-1.90%2B-b7410e?style=flat-square&logo=rust&logoColor=white)
 ![postgres wire](https://img.shields.io/badge/postgres-wire%20protocol-336791?style=flat-square&logo=postgresql&logoColor=white)
 ![mcp](https://img.shields.io/badge/MCP-ready-7c3aed?style=flat-square)
@@ -27,6 +27,9 @@ It speaks **Postgres**, searches **filters, text and vectors** in one query, and
 [**Changelog**](CHANGELOG.md)
 
 </div>
+
+> [!IMPORTANT]
+> **Public beta (0.2).** Chronos speaks the Postgres 16 protocol and much of its SQL, but it is not Postgres and not yet used in production. As measured for this release: 83.69% of the lines Postgres 16's regression suite expects (46 of its 219 files exactly), and 7 real databases moved in with identical row checksums; point reads at about half Postgres's rate, writes at a fraction of it. Read [where it stands](docs/postgres-compatibility.md#where-it-stands-beta) and [Migrating from Postgres](docs/migrating-from-postgres.md) before moving data in.
 
 ---
 
@@ -219,6 +222,7 @@ flowchart LR
 - **Server-wide:** `statement_timeout`, `max_worlds`, `world_idle_ttl`; `serve --safe --admin-token`
 - One folder shared by many processes: the first opener serves the rest
 - Examples for Claude Code, LLM tool definitions and parallel agents in [`examples/agents`](examples/agents)
+- A five-minute trial on a small CRM, where four mistakes an agent makes are caught before they reach `main`: [`examples/trial`](examples/trial)
 
 </td>
 </tr>
@@ -267,11 +271,12 @@ chronos --version
 ### Postgres: psql, drivers, ORMs
 
 ```bash
-chronos serve mydb                              # HTTP on :7070, Postgres on :5433
+chronos serve mydb                              # HTTP on :7070, Postgres on :5433, loopback only
 psql postgres://127.0.0.1:5433/main
+export DATABASE_URL="postgres://app@127.0.0.1:5433/main"    # for your application
 ```
 
-Every world is also a database name: `psql postgres://127.0.0.1:5433/agent_7`.
+Every world is also a database name: `psql postgres://127.0.0.1:5433/agent_7`. Moving a Postgres database in, and checking it came over: [Migrating from Postgres](docs/migrating-from-postgres.md).
 
 ### The shell
 
@@ -461,7 +466,7 @@ The Jepsen-style test found two real bugs before this release (money created by 
 
 ## Status and roadmap
 
-Chronos DB is a **working engine**, released as [v0.1.3](https://github.com/Abhishekxdg/chronosdb/releases/tag/v0.1.3) on 2026-09-29, and not yet used in production.
+Chronos DB is a **public beta** (0.2.0), and not yet used in production. The previous release was [v0.1.3](https://github.com/Abhishekxdg/chronosdb/releases/tag/v0.1.3), on 2026-09-29.
 
 - [x] Worlds: fork, diff, three-way merge, partial merges, time travel, undo
 - [x] Postgres wire protocol and a broad SQL surface, checked against Postgres 17

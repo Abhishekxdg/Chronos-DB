@@ -129,7 +129,8 @@ class Chronos:
 
     def sql(self, sql: str, params: Optional[list] = None) -> dict:
         """Runs SQL on this branch; params fill $1, $2, ... Returns the last statement's
-        {"command": "INSERT 0 1", "rows": [{column: value}]}."""
+        {"command": "INSERT 0 1", "rows": [{column: value}]}; a numeric value is a string
+        with its scale ("15.00"): Decimal(v) reads it exactly."""
         r = self._call("sql", sql=sql, params=params)
         if r.get("version") is not None:
             self.version = r["version"]

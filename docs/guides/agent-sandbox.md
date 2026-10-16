@@ -196,3 +196,4 @@ The loop is the same as above: `describe`, `fork` (with `meta`), `put` or `sql` 
 - [Agent evaluation](agent-evaluation.md): grade an agent's world against the state it should have left.
 - [Scenario planning](scenario-planning.md): let `SIMULATE` fork and score a thousand worlds for you.
 - [Merge policies](merge-policies.md): let agents merge on their own within rules, and review only what breaks them.
+- [Security: agents in containers](../security.md#agents-in-containers): run each agent with only its token, away from the folder and your network.

@@ -190,7 +190,8 @@ export class Chronos {
   }
 
   /** Runs SQL on this branch; `params` fill $1, $2, ... Returns the last statement's command
-   *  (e.g. "INSERT 0 1") and rows as objects. Throws ChronosError with `code`, the SQLSTATE. */
+   *  (e.g. "INSERT 0 1") and rows as objects (a numeric as a string with its scale, "15.00").
+   *  Throws ChronosError with `code`, the SQLSTATE. */
   async sql<R = Row>(sql: string, params: unknown[] = []): Promise<{ command: string; rows: R[] }> {
     const r = await this.call<{ results: { command: string; rows: R[] }[]; version: number | null }>("sql", {
       sql,

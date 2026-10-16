@@ -1,10 +1,11 @@
 // Settings: how the Studio looks and reads (kept in this browser), the session's security,
 // and the database itself (its facts and an integrity check).
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { api, token } from '../api';
+import { api, signOut, token } from '../api';
 import { useApp, type Prefs } from '../context';
 import { toast, useDialogs } from '../ui';
 import { bytes, mod, n, store } from '../util';
+import { RetentionSection } from './Retention';
 
 export const SHORTCUTS: [string, string][] = [
   [`${mod}K`, 'Command palette: worlds, tables, actions'],
@@ -21,7 +22,7 @@ export const SHORTCUTS: [string, string][] = [
   ['Esc', 'Close the inspector, a menu or a dialog'],
 ];
 
-const SECTIONS = ['Appearance', 'Layout', 'Data and time', 'Stored in this browser', 'Keyboard', 'Session', 'Database'] as const;
+const SECTIONS = ['Appearance', 'Layout', 'Data and time', 'Stored in this browser', 'Keyboard', 'Session', 'History', 'Database'] as const;
 
 function Choice<T extends string>({ value, options, onChange, label }: { value: T; options: [T, string][]; onChange: (v: T) => void; label: string }) {
   return (
@@ -151,7 +152,7 @@ export function SettingsView() {
         <header className="st-head">
           <h1>Settings</h1>
           <p className="muted">
-            How the Studio looks and reads is kept in this browser. Nothing here changes the database, except the integrity check, which only reads it.
+            How the Studio looks and reads is kept in this browser. Nothing here changes the database except History, which sets how long it keeps its past (the integrity check only reads it).
           </p>
         </header>
 
@@ -275,17 +276,44 @@ export function SettingsView() {
 
         <section data-sec="Session">
           <h2 className="label">Session</h2>
-          <Setting
-            title="Access"
-            note="The Studio listens on 127.0.0.1 only, and this page talks to nothing else. Every call carries this run's key, which lives in this tab and dies when chronos studio stops."
-          >
-            <span className="mono muted">key …{token ? token.slice(-6) : 'none'}</span>
-          </Setting>
-          <Setting title="Forget the key" note="Locks this tab: open the printed link again to come back.">
-            <button className="btn" type="button" onClick={forget}>
-              Forget key
-            </button>
-          </Setting>
+          {app.user ? (
+            <>
+              <Setting
+                title="Signed in"
+                note={
+                  app.user.superuser
+                    ? 'A superuser role: the Studio may do everything the database’s owner may.'
+                    : 'Not a superuser: the Studio reads, and SQL runs with this role’s privileges. Worlds, agents, history and imports need a superuser role.'
+                }
+              >
+                <span className="mono muted">{app.user.name}</span>
+              </Setting>
+              <Setting title="Sign out" note="Ends this session on the server. A session also ends after 30 minutes unused, or 12 hours.">
+                <button className="btn" type="button" onClick={() => signOut().then(() => location.reload())}>
+                  Sign out
+                </button>
+              </Setting>
+            </>
+          ) : (
+            <>
+              <Setting
+                title="Access"
+                note="The Studio listens on 127.0.0.1 only, and this page talks to nothing else. Every call carries this run's key, which lives in this tab and dies when chronos studio stops."
+              >
+                <span className="mono muted">key …{token ? token.slice(-6) : 'none'}</span>
+              </Setting>
+              <Setting title="Forget the key" note="Locks this tab: open the printed link again to come back.">
+                <button className="btn" type="button" onClick={forget}>
+                  Forget key
+                </button>
+              </Setting>
+            </>
+          )}
+        </section>
+
+        <section data-sec="History">
+          <h2 className="label">History</h2>
+          <RetentionSection />
         </section>
 
         <section data-sec="Database">
@@ -307,11 +335,13 @@ export function SettingsView() {
               </div>
             ))}
           </div>
-          <Setting title="Integrity check" note="Reads every page and log record to check they're intact. Safe while agents work: it only reads.">
-            <button className="btn" type="button" disabled={check.state === 'running'} onClick={verify}>
-              {check.state === 'running' ? 'Checking…' : 'Check integrity'}
-            </button>
-          </Setting>
+          {app.admin && (
+            <Setting title="Integrity check" note="Reads every page and log record to check they're intact. Safe while agents work: it only reads.">
+              <button className="btn" type="button" disabled={check.state === 'running'} onClick={verify}>
+                {check.state === 'running' ? 'Checking…' : 'Check integrity'}
+              </button>
+            </Setting>
+          )}
           {check.state !== 'idle' && (
             <p className={'check-out ' + check.state} role="status">
               {check.text}

@@ -28,7 +28,7 @@ merge world agent_7;        -- into main; the session moves back to main
 
 In `AS OF`, `RESTORE ... TO` and `UNDO AGENT ... SINCE`, `when` is an expression: a string as above, a `timestamp`, `timestamptz` or `date` value, or a parameter (`$1`). Anything else fails with 22P02 `AS OF needs a time`.
 
-History reaches back `history_retention` (30 days by default). Earlier than that, later than now, or on an in-memory database: 22023.
+History reaches back `history_retention` (1 hour by default for a new database; 30 days for one made by a release before 0.2.0). Earlier than that, later than now, or on an in-memory database: 22023.
 
 ## Statements
 
@@ -349,7 +349,7 @@ alter world payout set (check_reads = false);    -- a person's way past it
 - **What counts as read:** every row read through the world (a key looked up, and a scan's range, up to where it stopped when it stopped early), the entries of indexes and constraints it looked in (so a row the parent added that a lookup would have found counts too), and whole tables for full-text and vector searches. A SQL scan of a whole table with conditions like `column op constant` (`=`, `<`, `>=`, `IN`, `IS NULL`, `LIKE 'prefix%'`, joined by `AND`) counts as reading the rows those conditions can match, not the table: a changed row holds the merge only if it matched them before the change or after it, so `select ... from leads where owner = 'ana'` isn't held by changes to other owners' leads. A scan with no such condition (`where lower(name) = 'x'`, an `OR` of columns) reads the whole table. Past 10,000 keys, 1,000 ranges or 1,000 filtered scans of one table, reads of it count as the whole table. Reads in a transaction count for its world. Rows the world wrote itself aren't checked here: they conflict or settle as always.
 - **Refused or queued:** SQLSTATE `40001` (HTTP 409); for an agent keeping to a merge policy, a reason like any broken rule, and the world waits in `SHOW REVIEWS`. `MERGE ... DRY RUN` shows it in its `blocked` row.
 - **For every world of an agent:** a merge policy with `check_reads = true` turns it on for every world its agents fork, and they can't turn it off (42501); a person can.
-- **Restarts:** what a world read is kept in memory. After the database restarts, a world that checks its reads can't show its earlier reads were current, so its merge is held (`relies on reads made before the database restarted`): redo the work in a new world, or turn the check off.
+- **Restarts:** what a world read is kept in memory, and in the folder (`readsets`) as the database closes cleanly: after a clean restart it's checked as before. After a crash, a world that checks its reads can't show its earlier reads were current, so its merge is held (`relies on reads made before the database restarted`): redo the work in a new world, or turn the check off. Reads of a value kept only in memory, or a text range in a collation, come back as reads of the whole table.
 - **Anyone reading it counts:** a person inspecting the world with `SELECT` adds to what it read.
 - **Partial merges:** `ONLY TABLES` and `ONLY KEYS` check every read of the world, not only those of the rows they merge: which reads led to which writes isn't known.
 - **Replaying the log:** a merge that went through is replayed after a restart without checking its reads again.
@@ -603,7 +603,7 @@ ALTER SYSTEM SET history_retention TO '0'
 SHOW history_retention
 ```
 
-How far back time travel, `RESTORE`, `UNDO MERGE`, `UNDO AGENT`, `SHOW HISTORY` and `REPLAY` reach. Default `30 days`; `'0'` keeps none. Shorter settings free space at the next checkpoint. `SHOW history_retention` returns one `interval`. On an in-memory database: 22023.
+How far back time travel, `RESTORE`, `UNDO MERGE`, `UNDO AGENT`, `SHOW HISTORY` and `REPLAY` reach. Default `1 day` for a new database (`30 days` for one made by a release before 0.2.0, which keeps what it had); `'0'` keeps none. Shorter settings free space at the next checkpoint. `SHOW history_retention` returns one `interval`. On an in-memory database: 22023.
 
 ## Agents
 

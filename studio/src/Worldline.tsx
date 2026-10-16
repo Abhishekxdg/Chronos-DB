@@ -3,11 +3,12 @@
 // drag across the strip to scrub back in time, and let go to read the tables as they were.
 // Time runs piecewise: each fork gets an even share of the width, so a busy hour and a quiet
 // month read equally well. Merges into main (from its history) rejoin it: a world that's gone
-// since is drawn as a faint lane from its fork to its merge.
+// since is drawn as a faint lane from its fork to its merge. Moments before the history kept
+// (history_retention) are greyed: time travel can't read them.
 import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
 import { api, type World } from './api';
 import { useApp } from './context';
-import { fmtTime, hueOf, n, plural } from './util';
+import { fmtTime, hueOf, n, plural, span as lasting } from './util';
 
 const PAD_L = 20;
 const PAD_R = 188; // room for the active world's label at the end of its lane
@@ -90,6 +91,11 @@ export function Worldline() {
   const ids = new Map(worlds.map((x) => [x.id, x.name]));
   const parentOf = (f: World) => (f.parent == null ? 'main' : names.has(f.parent) ? f.parent : (ids.get(f.parent) ?? 'main'));
   const xNow = x(now);
+  // the moments time travel can read: from the oldest history kept (none kept yet: none before now)
+  const h = app.history;
+  const kept = h ? (h.from ?? now) : null;
+  const xKept = kept === null ? PAD_L : Math.max(PAD_L, Math.min(xNow, x(kept)));
+  const keptNote = h ? `history kept ${lasting(h.retention)}` : '';
 
   const path = (f: World) => {
     const x0 = x(f.created);
@@ -145,6 +151,16 @@ export function Worldline() {
     <div className="worldline" ref={box} aria-label="Worlds over time">
       <svg width={w} height={H} onPointerDown={startScrub} role="img">
         <title>Worlds over time: click a lane to switch, drag to read the past</title>
+        {/* before the history kept: greyed, unreadable */}
+        {xKept > PAD_L && (
+          <rect className="wl-gone" x={PAD_L} y={2} width={xKept - PAD_L} height={H - 4}>
+            <title>
+              {kept === now
+                ? `No history kept yet (history_retention is ${lasting(h!.retention)})`
+                : `Before ${fmtTime(kept)}: history_retention is ${lasting(h!.retention)}, so time travel can't read this far back`}
+            </title>
+          </rect>
+        )}
         {/* main: the live data, from its start to now */}
         <g className={'lane main' + (app.world === 'main' ? ' on' : '')} style={{ '--hue': hueOf(main) } as CSSProperties} onClick={() => pick('main')}>
           <line className="hit" x1={PAD_L} x2={xNow} y1={TOP} y2={TOP} />
@@ -209,20 +225,20 @@ export function Worldline() {
           </g>
         )}
         {shownLabel && label(shownLabel)}
-        {main.created > 0 && (
+        {(main.created > 0 || keptNote) && (
           <text className="wl-axis" x={PAD_L} y={H - 5}>
-            since {fmtTime(main.created).slice(0, 10)}
+            {[main.created > 0 ? `since ${fmtTime(main.created).slice(0, 10)}` : '', keptNote].filter(Boolean).join(' · ')}
           </text>
         )}
         <text className="wl-axis" x={xNow + 10} y={H - 5}>
           now · drag left to read the past
         </text>
         {scrub && (
-          <g className="scrub">
+          <g className={'scrub' + (kept !== null && scrub.t < kept ? ' gone' : '')}>
             <line x1={scrub.x} x2={scrub.x} y1={2} y2={H - 2} />
             <rect x={scrub.x + (scrub.x + 160 > w ? -156 : 6)} y={H / 2 - 10} width={150} height={20} rx={6} />
             <text x={scrub.x + (scrub.x + 160 > w ? -148 : 14)} y={H / 2} dy="0.35em">
-              as of {fmtTime(scrub.t).slice(5)}
+              {kept !== null && scrub.t < kept ? 'before the history kept' : `as of ${fmtTime(scrub.t).slice(5)}`}
             </text>
           </g>
         )}

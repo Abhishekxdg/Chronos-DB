@@ -78,6 +78,16 @@ For big diffs, `diff` can count or page without reading every change into memory
 Pages concatenated equal the unpaged `changes`. SQL has the same as `DIFF WORLD w [TO v] LIMIT n` (the first `n` changes); the MCP `diff` tool takes `count` and `after`.
 | `merge` | `branch`, `resolve` (`fail`/`ours`/`theirs`), `version` or `confirm: true`, `columns: true`, `picks` (`{"table/id": "ours" \| "theirs" \| row \| null}`), `only_tables` / `only_keys` (arrays: merge just those; the branch stays), `into` (another world to merge into; the branch stays), `target` (a dry run's: rows settled are settled against the world merged into as it saw it, `409` if it changed), `dry_run: true` | `{merged}`, and `version` when the branch stays (a partial merge moves it: send it with the next merge); 409 with `conflicts` (each with `explain`), or when the result breaks a [merge check](guides/merge-checks.md) (23514, the rows it found in the message); a dry run returns `{rows: [{key, outcome, detail, base, ours, theirs, result}], conflicts, blocked, readers, coverage, version, target}` (`version`: pass it to `merge` to merge only what the dry run showed; `target`: pass it too when the merge settles rows) (`blocked` names the checks that would fail; `readers`, what in the world merged into reads the columns it would change) |
 | `discard` | `branch`, `cascade: true` (and every world forked from it) | `{ok}`; with cascade `{ok, discarded}` |
+| `sql` | `sql` (one or more statements), `params` (values for `$1`, `$2`, ...) | `{results: [{command, columns, types, rows}], version}`: one result per statement; `types` are the columns' Postgres type names; `version` is the branch's after a write |
+
+### Values in `sql` results
+
+Each row is an object of column: value. Numbers, text, booleans and `json`/`jsonb` come as their JSON kinds, with two exceptions so nothing is lost on the way to a client whose JSON numbers are doubles:
+
+- **`numeric` values come as strings** with their scale, as Postgres shows them: `"15.00"`, `"16.50"`, `"NaN"` (a JSON number would read as `15` and lose digits past 15 or so). Read them with a decimal type (`Decimal(v)`, `new Big(v)`), or `Number(v)` where a double is enough.
+- **`real` (float4) values** come with float4's shortest digits, as Postgres shows them: `0.1`, not the double's `0.10000000149011612`. Rows from `get`, `find` and `diff` do the same.
+
+Times, dates and intervals are ISO 8601 strings; `bytea` is `\x...` hex.
 
 ## Versions
 

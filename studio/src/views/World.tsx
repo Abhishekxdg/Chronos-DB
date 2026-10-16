@@ -34,10 +34,11 @@ export async function worldDetails(app: App, dlg: Dialogs, w: World) {
       </table>
       <label className="field">
         <span>Metadata (a JSON object)</span>
-        <textarea rows={6} defaultValue={meta.current} spellCheck={false} onChange={(e) => (meta.current = e.target.value)} />
+        <textarea rows={6} defaultValue={meta.current} spellCheck={false} readOnly={!app.admin} onChange={(e) => (meta.current = e.target.value)} />
       </label>
     </>,
-    [
+    // (a role that isn't a superuser reads it: set_meta needs one)
+    !app.admin ? [{ label: 'Close', value: () => null }] : [
       { label: 'Close', value: () => null },
       {
         label: 'Save metadata',

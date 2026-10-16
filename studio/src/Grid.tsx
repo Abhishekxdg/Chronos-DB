@@ -221,7 +221,7 @@ export function Grid(p: Props) {
             <div
               key={c.name}
               role="gridcell"
-              className={'cell ' + valClass(v) + (sel?.i === i && sel.c === ci ? ' on' : '')}
+              className={'cell ' + valClass(v, c.type) + (sel?.i === i && sel.c === ci ? ' on' : '')}
               title={
                 isVector(v)
                   ? `${v.length} numbers: ${v

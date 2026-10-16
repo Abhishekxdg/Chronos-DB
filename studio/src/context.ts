@@ -1,9 +1,22 @@
 // What every view shares: the active world and table, and the actions that change them.
 import { createContext, useContext } from 'react';
-import type { Table, World } from './api';
+import type { HistoryWindow, Table, User, World } from './api';
 
 /** The canvas tabs, then the Database pages (from the sidebar's Database menu). */
-export type Tab = 'data' | 'diagram' | 'sql' | 'search' | 'changes' | 'history' | 'simulate' | 'agents' | 'audit' | 'status' | 'settings';
+export type Tab =
+  | 'data'
+  | 'diagram'
+  | 'sql'
+  | 'search'
+  | 'changes'
+  | 'history'
+  | 'simulate'
+  | 'agents'
+  | 'audit'
+  | 'status'
+  | 'settings'
+  | 'sessions'
+  | 'pgimport';
 export const TABS: [Tab, string][] = [
   ['data', 'Data'],
   ['diagram', 'Diagram'],
@@ -12,6 +25,8 @@ export const TABS: [Tab, string][] = [
   ['history', 'History'],
   ['search', 'Search'],
 ];
+/** What only the owner or a superuser role may open: they list history, diffs, agents and other roles' work. */
+export const ADMIN_ONLY: ReadonlySet<Tab> = new Set<Tab>(['changes', 'history', 'search', 'simulate', 'agents', 'audit', 'sessions', 'pgimport']);
 
 export interface Prefs {
   theme: 'light' | 'dark' | 'system';
@@ -66,6 +81,13 @@ export interface App {
   statusSlot: HTMLElement | null;
   /** The database folder's name. */
   folder: string;
+  /** How far back time travel reads; null until the status op answers. */
+  history: HistoryWindow | null;
+  /** The role signed in (chronos studio --login); null with the key in the link. */
+  user: User | null;
+  /** May do what the database's owner may: the key in the link, or a superuser role. Other roles only read,
+   *  and write through SQL as their privileges allow. */
+  admin: boolean;
 }
 
 export const AppCtx = createContext<App | null>(null);

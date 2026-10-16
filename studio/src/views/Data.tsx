@@ -9,7 +9,7 @@ import { Inspector, rowId, type Inspect } from '../Inspector';
 import { Empty, ErrorBox, Popover, StatusSlot, toast, type Dialogs, useDialogs } from '../ui';
 import { Icon } from '../icons';
 import { importRows } from './Import';
-import { downloadCsv, likeEsc, lit, n, qid, qtable, splitName, suggestName, when } from '../util';
+import { downloadCsv, historyStart, likeEsc, lit, momentOf, n, outsideHistory, qid, qtable, span, splitName, suggestName, when } from '../util';
 
 export interface ColumnInfo {
   column_name: string;
@@ -98,6 +98,8 @@ export function DataView() {
   const dlg = useDialogs();
   const { world, table } = app;
   const json = app.tables.some((t) => t.name === table && !t.schema);
+  // a view or materialized view: its rows are read, never written here
+  const view = app.tables.find((t) => t.name === table)?.kind;
   const [info, setInfo] = useState<TableInfo | null>(null);
   const [filters, setFilters] = useState<Filter[]>([]);
   // undefined: the default, a SQL table in key order (without ORDER BY rows come in the key's text order)
@@ -141,7 +143,7 @@ export function DataView() {
     };
   }, [q, info, world]);
   // an edit in the grid: one UPDATE ... RETURNING (a JSON table: put), and the grid shows the stored row
-  const canEdit = (col: string) => !asOf && !!info && info.pk.length > 0 && !info.pk.includes(col);
+  const canEdit = (col: string) => !asOf && !view && app.admin && !!info && info.pk.length > 0 && !info.pk.includes(col);
   const onCellEdit = async (row: Row, col: string, s: string): Promise<Row | null> => {
     if (!info || !table) return null;
     const id = rowId(info.pk, row);
@@ -209,11 +211,11 @@ export function DataView() {
       const t = e.target as HTMLElement;
       if (e.key !== 'e' || e.metaKey || e.ctrlKey || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName) || document.querySelector('.overlay')) return;
       const row = inspect?.mode === 'row' ? inspect.row : selRow;
-      if (row && !asOf) setInspect({ mode: 'row', row, edit: true });
+      if (row && !asOf && !view && app.admin) setInspect({ mode: 'row', row, edit: true });
     };
     addEventListener('keydown', key);
     return () => removeEventListener('keydown', key);
-  }, [inspect, selRow, asOf]);
+  }, [inspect, selRow, asOf, view, app.admin]);
 
   if (!table && !app.tablesReady)
     return (
@@ -237,6 +239,7 @@ export function DataView() {
           table={table}
           total={res?.total ?? null}
           json={!!info?.json}
+          view={view}
           columns={res?.columns.map((c) => c.name) || []}
           filters={filters}
           setFilters={setFilters}
@@ -272,7 +275,13 @@ export function DataView() {
             <Skeleton />
           ) : !res.total ? (
             <Empty>
-              {filters.length ? 'No rows match these filters.' : asOf ? `The table had no rows at ${asOf}.` : 'No rows yet. Add one with + Row, or run SQL.'}
+              {filters.length
+                ? 'No rows match these filters.'
+                : asOf
+                  ? `The table had no rows at ${asOf}.`
+                  : view
+                    ? `The ${view} has no rows.`
+                    : 'No rows yet. Add one with + Row, or run SQL.'}
             </Empty>
           ) : (
             <Grid
@@ -302,6 +311,8 @@ export function DataView() {
               <span>{Math.round(res.ms)} ms</span>
               <span>{res.total ? `rows ${n(range[0])}–${n(range[1])} of ${n(res.total)}` : '0 rows'}</span>
               {asOf && <span>as of {when(asOf)} · read only</span>}
+              {view && !asOf && <span>{view} · read only</span>}
+              {!app.admin && !view && !asOf && <span>read only here · change rows with SQL</span>}
               <span className="spacer" />
               <span className="hint faint">Double-click a cell to edit · Enter opens the row · / filters</span>
             </>
@@ -318,6 +329,7 @@ export function DataView() {
           info={info}
           columns={res?.columns || []}
           asOf={asOf}
+          readOnly={view ? `A ${view}: read only. Change the tables it reads, or its definition with SQL.` : !app.admin ? ROLE_READ_ONLY : undefined}
           live={world === 'main'}
           onEdit={(row) => setInspect({ mode: 'row', row, edit: true })}
           onClose={() => setInspect(null)}
@@ -327,6 +339,9 @@ export function DataView() {
     </>
   );
 }
+
+/** Why rows are read only here for a role that isn't a superuser (chronos studio --login). */
+const ROLE_READ_ONLY = 'Signed in as a role that isn’t a superuser: rows are read only here. Change them with SQL, as its privileges allow.';
 
 const SKEL = { '--cols': '44px repeat(5, 160px)' } as React.CSSProperties;
 function Skeleton() {
@@ -352,6 +367,7 @@ function Toolbar(p: {
   table: string;
   total: number | null;
   json: boolean;
+  view?: string;
   columns: string[];
   filters: Filter[];
   setFilters: (f: Filter[]) => void;
@@ -366,6 +382,7 @@ function Toolbar(p: {
   exporting: boolean;
   live: boolean;
 }) {
+  const app = useApp();
   const [open, setOpen] = useState<'filter' | 'sort' | 'asof' | null>(null);
   const [col, setCol] = useState('');
   const [op, setOp] = useState<Filter['op']>('contains');
@@ -389,6 +406,10 @@ function Toolbar(p: {
     setOpen(null);
   };
   const toggle = (k: typeof open) => (o: boolean) => setOpen(o ? k : null);
+  // how far back history goes, and why a moment typed can't be read (a moment it can't parse: the server says)
+  const h = app.history;
+  const outside = at.trim() ? outsideHistory(h, momentOf(at)) : null;
+  const readAsOf = () => !outside && (p.setAsOf(at.trim()), setOpen(null));
   return (
     <div className="toolbar">
       <span className="ident">{p.table}</span>
@@ -396,6 +417,11 @@ function Toolbar(p: {
       {p.json && (
         <span className="tag" title="Made by writing JSON rows: every field any row has is a column">
           JSON
+        </span>
+      )}
+      {p.view && (
+        <span className="tag" title={`A ${p.view}: its rows are read only here`}>
+          {p.view.toUpperCase()}
         </span>
       )}
       <Popover
@@ -499,12 +525,19 @@ function Toolbar(p: {
             placeholder="-1 hour, or 2026-09-20 10:00"
             value={at}
             onChange={(e) => setAt(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && (p.setAsOf(at.trim()), setOpen(null))}
+            onKeyDown={(e) => e.key === 'Enter' && readAsOf()}
           />
         </label>
-        <p className="note">Times without a zone are UTC. Past tables are read only.</p>
+        <p className="note">
+          Times without a zone are UTC. Past tables are read only.
+          {h &&
+            (h.from === null
+              ? ` No history kept yet (history_retention: ${span(h.retention)}).`
+              : ` History goes back to ${historyStart(h.from)} (history_retention: ${span(h.retention)}).`)}
+        </p>
+        {outside && <p className="err small">{outside}</p>}
         <div className="row2">
-          <button className="btn primary" type="button" onClick={() => (p.setAsOf(at.trim()), setOpen(null))}>
+          <button className="btn primary" type="button" disabled={!!outside} title={outside || undefined} onClick={readAsOf}>
             Read as of
           </button>
           {p.asOf && (
@@ -534,8 +567,8 @@ function Toolbar(p: {
       <button
         className="btn ghost"
         type="button"
-        disabled={!!p.asOf}
-        title={p.asOf ? 'Past tables are read only' : 'Add rows from a CSV, JSON or NDJSON file'}
+        disabled={!!p.asOf || !!p.view || !app.admin}
+        title={!app.admin ? ROLE_READ_ONLY : p.view ? `A ${p.view} is read only` : p.asOf ? 'Past tables are read only' : 'Add rows from a CSV, JSON or NDJSON file'}
         onClick={p.onImport}
       >
         <Icon name="upload" size={14} /> Import
@@ -552,8 +585,8 @@ function Toolbar(p: {
       <button
         className={'btn' + (p.live ? ' live-edit' : '')}
         type="button"
-        disabled={!!p.asOf}
-        title={p.asOf ? 'Past tables are read only' : p.live ? 'Add a row to main (live data)' : 'Add a row'}
+        disabled={!!p.asOf || !!p.view || !app.admin}
+        title={!app.admin ? ROLE_READ_ONLY : p.view ? `A ${p.view} is read only` : p.asOf ? 'Past tables are read only' : p.live ? 'Add a row to main (live data)' : 'Add a row'}
         onClick={p.onInsert}
       >
         + Row

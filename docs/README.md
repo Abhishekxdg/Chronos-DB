@@ -3,6 +3,8 @@ title: Chronos DB documentation
 slug: /
 ---
 
+> **Beta.** Chronos 0.2 is a public beta for developers; see [where it stands](postgres-compatibility.md#where-it-stands-beta).
+
 Chronos DB gives every AI agent its own **world**: a copy-on-write branch of the whole database, made in about 2 microseconds. Agents change their world freely; you look at what changed and keep what works.
 
 **Fork, experiment, diff, merge.**
@@ -21,7 +23,8 @@ It speaks the Postgres protocol, so `psql`, drivers and ORMs connect as they do 
 
 ## Start here
 
-- [Quickstart](quickstart.md): install, the shell, TypeScript, Python, Claude Code, Rust.
+- [Quickstart](quickstart.md): install, start a server, connect with psql and from an application, then the shell, TypeScript, Python, Claude Code, Rust.
+- [Migrating from Postgres](migrating-from-postgres.md): `chronos import` or a `pg_dump` replay, checking row counts and checksums, pointing an ORM at it, the differences to plan for.
 - [Concepts](concepts.md): worlds, merging and conflicts, time travel, durability.
 
 ## Guides
@@ -41,7 +44,7 @@ It speaks the Postgres protocol, so `psql`, drivers and ORMs connect as they do 
 
 ## Running it
 
-- [Postgres compatibility](postgres-compatibility.md): tested drivers and ORMs, protocol features, known gaps.
+- [Postgres compatibility](postgres-compatibility.md): where the beta stands, as measured; tested drivers and ORMs, protocol features, known gaps.
 - [Security and auth](security.md): tokens, agents, safe mode, limits, and what not to expose yet.
 - [Operations](operations.md): the folder, checkpoints, crashes, cloud storage, backups, memory.
 - [Benchmarks](https://github.com/Abhishekxdg/chronosdb/blob/main/BENCHMARKS.md): every result with its method, losses included.

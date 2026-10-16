@@ -123,7 +123,7 @@ restore world run_2 to checkpoint 'start';
 diff world run_2;   -- no changes since the fork: ready for another attempt
 ```
 
-`RESTORE WORLD run_2 TO '-5 minutes'` works too (any moment in the history window, 30 days by default). Or drop the world and fork a new one: forking costs the same whatever the database's size.
+`RESTORE WORLD run_2 TO '-5 minutes'` works too (any moment in the history window: 1 hour by default for a new database, `alter system set history_retention` keeps more). Or drop the world and fork a new one: forking costs the same whatever the database's size.
 
 ## 6. A real agent, and undoing it
 

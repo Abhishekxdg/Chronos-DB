@@ -1,6 +1,7 @@
 #!/bin/sh
 # Installs the `chronos` binary: picks the build for this OS and CPU, checks its SHA-256 against
-# the release's SHA256SUMS, and puts it in ~/.local/bin (or $CHRONOS_INSTALL_DIR).
+# the release's SHA256SUMS, and puts it in ~/.local/bin (or $CHRONOS_INSTALL_DIR). It never runs anything
+# as root: for /usr/local/bin, run it as `sudo env CHRONOS_INSTALL_DIR=/usr/local/bin sh install.sh` yourself.
 #
 #   curl -fsSL https://github.com/__REPO__/releases/latest/download/install.sh | sh
 #   curl -fsSL https://github.com/__REPO__/releases/latest/download/install.sh | CHRONOS_VERSION=v0.1.0 sh
@@ -68,13 +69,18 @@ fi
 
 tar -xzf "$tmp/$file" -C "$tmp"
 [ -f "$tmp/chronos" ] || fail "$file has no chronos binary in it"
-mkdir -p "$DIR"
+chmod +x "$tmp/chronos"
+# it runs here (x86-64 builds need an x86-64-v2 CPU: POPCNT, SSE4.2) before anything is put in place
+version=$("$tmp/chronos" --version 2>/dev/null) || fail "the $target build doesn't run on this machine; nothing was installed"
+# nothing here runs as root: a folder you can't write is yours to choose (sudo, or another folder)
+mkdir -p "$DIR" 2>/dev/null && [ -w "$DIR" ] ||
+    fail "can't write to $DIR; set CHRONOS_INSTALL_DIR to a folder you can write (to use $DIR, run this script with sudo yourself)"
 # copy next to the target, then rename: a same-directory mv is atomic, so an interrupted
 # install never leaves a half-written chronos (mv from $tmp may cross filesystems and copy)
 cp "$tmp/chronos" "$DIR/.chronos.tmp.$$"
 chmod +x "$DIR/.chronos.tmp.$$"
 mv -f "$DIR/.chronos.tmp.$$" "$DIR/chronos"
-echo "installed chronos ($target) to $DIR/chronos"
+echo "installed $version ($target) to $DIR/chronos"
 case ":$PATH:" in
 *":$DIR:"*) ;;
 *) echo "add it to your PATH: export PATH=\"$DIR:\$PATH\"" ;;

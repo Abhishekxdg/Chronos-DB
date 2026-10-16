@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { api } from '../api';
 import { useApp, worldOf, type App } from '../context';
 import { Empty, ErrorBox, toast, type Dialogs, useDialogs } from '../ui';
-import { fmtTime, n, plural } from '../util';
+import { fmtTime, historyStart, momentOf, n, outsideHistory, plural, span } from '../util';
 
 interface Event {
   at: number;
@@ -22,6 +22,9 @@ export function HistoryView() {
   useEffect(() => {
     api<{ events: Event[] }>('history', { branch: app.world, limit: 200 }).then((r) => setEvents(r.events), setError);
   }, [app.world]);
+  // moments before the history kept can't be read or restored to: greyed, with the reason
+  const outside = (ms: number) => outsideHistory(app.history, ms);
+  const typed = at.trim() ? outsideHistory(app.history, momentOf(at)) : null;
   const viewAsOf = (iso: string) => {
     if (!app.table) return toast('Pick a table first: the moment applies to it');
     app.setAsOf(iso);
@@ -32,7 +35,13 @@ export function HistoryView() {
       <div className="pad stack">
         <div className="head-row">
           <h2 className="ident">{app.world}</h2>
-          <span className="muted">history, newest first</span>
+          <span className="muted">
+            history, newest first
+            {app.history &&
+              (app.history.from === null
+                ? ` · none kept yet (history_retention: ${span(app.history.retention)})`
+                : ` · kept back to ${historyStart(app.history.from)} (history_retention: ${span(app.history.retention)})`)}
+          </span>
           <span className="spacer" />
           <input
             type="text"
@@ -42,14 +51,15 @@ export function HistoryView() {
             value={at}
             onChange={(e) => setAt(e.target.value)}
           />
-          <button className="btn" type="button" disabled={!at.trim()} onClick={() => restore(app, dlg, at.trim())}>
+          <button className="btn" type="button" disabled={!at.trim() || !!typed} title={typed || undefined} onClick={() => restore(app, dlg, at.trim())}>
             Restore to…
           </button>
           <button className="btn primary" type="button" onClick={() => saveCheckpoint(app, dlg)}>
             Save checkpoint
           </button>
         </div>
-        <Checkpoints app={app} dlg={dlg} onView={viewAsOf} />
+        {typed && <p className="err small">{typed}</p>}
+        <Checkpoints app={app} dlg={dlg} onView={viewAsOf} outside={outside} />
         {error ? (
           <ErrorBox error={error} />
         ) : !events ? (
@@ -71,6 +81,7 @@ export function HistoryView() {
               <tbody>
                 {events.map((e, i) => {
                   const iso = new Date(e.at).toISOString();
+                  const gone = outside(e.at);
                   return (
                     <tr key={i}>
                       <td className="mono nowrap" title={iso}>
@@ -80,13 +91,20 @@ export function HistoryView() {
                       <td>{e.event}</td>
                       <td className="num">{n(e.rows)}</td>
                       <td className="nowrap">
-                        <button className="btn small ghost" type="button" title="Browse the tables as they were right after this" onClick={() => viewAsOf(iso)}>
+                        <button
+                          className="btn small ghost"
+                          type="button"
+                          disabled={!!gone}
+                          title={gone || 'Browse the tables as they were right after this'}
+                          onClick={() => viewAsOf(iso)}
+                        >
                           View as of
                         </button>
                         <button
                           className="btn small ghost"
                           type="button"
-                          title="Put the whole world back to this moment"
+                          disabled={!!gone}
+                          title={gone || 'Put the whole world back to this moment'}
                           onClick={() => restore(app, dlg, iso)}
                         >
                           Restore
@@ -140,7 +158,7 @@ export async function saveCheckpoint(app: App, dlg: Dialogs) {
   }
 }
 
-function Checkpoints({ app, dlg, onView }: { app: App; dlg: Dialogs; onView: (iso: string) => void }) {
+function Checkpoints({ app, dlg, onView, outside }: { app: App; dlg: Dialogs; onView: (iso: string) => void; outside: (ms: number) => string | null }) {
   const w = worldOf(app, app.world);
   const cps = [...(w?.checkpoints || [])].sort((a, b) => b.at - a.at);
   const back = async (name: string) => {
@@ -178,10 +196,16 @@ function Checkpoints({ app, dlg, onView }: { app: App; dlg: Dialogs; onView: (is
                   <td className="mono">{c.name}</td>
                   <td className="mono nowrap muted">{fmtTime(c.at)}</td>
                   <td className="nowrap num">
-                    <button className="btn small ghost" type="button" onClick={() => onView(new Date(c.at).toISOString())}>
+                    <button
+                      className="btn small ghost"
+                      type="button"
+                      disabled={!!outside(c.at)}
+                      title={outside(c.at) || undefined}
+                      onClick={() => onView(new Date(c.at).toISOString())}
+                    >
                       View as of
                     </button>
-                    <button className="btn small ghost" type="button" onClick={() => back(c.name)}>
+                    <button className="btn small ghost" type="button" disabled={!!outside(c.at)} title={outside(c.at) || undefined} onClick={() => back(c.name)}>
                       Restore
                     </button>
                   </td>

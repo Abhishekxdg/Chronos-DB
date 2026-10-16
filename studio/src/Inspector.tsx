@@ -19,6 +19,8 @@ interface Props {
   info: TableInfo;
   columns: Column[];
   asOf: string;
+  /** why its rows can't be changed here (a view), if they can't */
+  readOnly?: string;
   live: boolean;
   onEdit: (row: Row) => void;
   onClose: () => void;
@@ -87,7 +89,7 @@ function RowPanel(p: Props & { row: Row; edit: boolean }) {
   const app = useApp();
   const { row, info } = p;
   const id = rowId(info.pk, row);
-  const readonly = !!p.asOf || id === null;
+  const readonly = !!p.asOf || !!p.readOnly || id === null;
   const [vals, setVals] = useState<Record<string, string>>(() => Object.fromEntries(p.columns.map((c) => [c.name, editText(row[c.name])])));
   const [nulls, setNulls] = useState<Record<string, boolean>>(() => Object.fromEntries(p.columns.map((c) => [c.name, row[c.name] === null])));
   const [json, setJson] = useState(() => {
@@ -110,7 +112,13 @@ function RowPanel(p: Props & { row: Row; edit: boolean }) {
     if (!(await dlg.confirm('Delete this row?', `Row ${id} of ${p.table} will be deleted.`, 'Delete row', { danger: true }))) return;
     p.write(`delete row ${id} of ${p.table}`, (world) => api('delete', { branch: world, table: p.table, id }));
   };
-  const note = id === null ? 'This table has no primary key: change its rows with SQL.' : p.asOf ? `As of ${p.asOf}: read only.` : null;
+  const note = p.readOnly
+    ? p.readOnly
+    : id === null
+      ? 'This table has no primary key: change its rows with SQL.'
+      : p.asOf
+        ? `As of ${p.asOf}: read only.`
+        : null;
   return (
     <>
       <div className="ib">

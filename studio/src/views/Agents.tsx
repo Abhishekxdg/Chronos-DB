@@ -5,6 +5,7 @@ import { api, type Agent } from '../api';
 import { useApp } from '../context';
 import { copyText, Empty, ErrorBox, toast, type Dialogs, useDialogs } from '../ui';
 import { fmtTime, n } from '../util';
+import './screens.css';
 
 const CAPS = ['read', 'fork', 'write_own', 'write', 'write_main', 'merge_own', 'merge', 'restore', 'outbox', 'admin'];
 const QUOTAS: [string, string][] = [
@@ -107,8 +108,16 @@ export function AgentsView() {
                         .join(' · ') || 'none'}
                     </td>
                     <td className="mono nowrap">{fmtTime(a.created)}</td>
-                    <td>
+                    <td className="nowrap">
                       <span className={'tag ' + (a.disabled ? 'bad' : 'ok')}>{a.disabled ? 'disabled' : 'active'}</span>
+                      {a.needs_http_login === true && (
+                        <span
+                          className="tag warn"
+                          title="Made before Chronos 0.2.0, when agents had no SCRAM verifier: the database keeps only a hash of its token, so it can't check a Postgres login's SCRAM proof yet. Its first request over the HTTP API, with its token, makes one; until then a server with a token refuses its Postgres logins."
+                        >
+                          needs one HTTP login before Postgres logins
+                        </span>
+                      )}
                     </td>
                     <td className="nowrap">
                       <button className="btn small ghost" type="button" onClick={() => form(a)}>

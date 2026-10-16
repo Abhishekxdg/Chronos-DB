@@ -1,13 +1,77 @@
 # Quickstart
 
+> **Beta.** Chronos 0.2 is a public beta for developers. It is not yet used in production anywhere, and it is not Postgres, though it speaks Postgres's protocol and much of its SQL: see [where it stands](postgres-compatibility.md#where-it-stands-beta) before you move real data.
+
 ## Install
 
 ```bash
+# a prebuilt binary for macOS or Linux (x86_64 or arm64), into ~/.local/bin
 curl -fsSL https://github.com/Abhishekxdg/chronosdb/releases/latest/download/install.sh | sh
 chronos --version
 ```
 
-That's a prebuilt binary for macOS or Linux (x86_64 or arm64), checked against the release's SHA-256 sums, in `~/.local/bin` (set `CHRONOS_INSTALL_DIR` for another place; `CHRONOS_VERIFY=1` also checks its signature with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/): proof Chronos DB's release workflow built it).
+The script picks the build for your OS and CPU, checks its SHA-256 against the release's `SHA256SUMS`, and installs it for your user; it never runs anything as root. `CHRONOS_INSTALL_DIR=<folder>` installs into another folder you can write (for `/usr/local/bin`, download the script and run it with `sudo` yourself), `CHRONOS_VERSION=v0.2.0` picks a release, and `CHRONOS_VERIFY=1` also checks the build's signature with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/): proof Chronos DB's release workflow built it. The Linux builds are static (musl), so they run on any distribution.
+
+<!-- TODO(owner): no container image is published yet. The engine repository's Dockerfile builds one
+(non-root, volume /data, Postgres on 5432, HTTP on 7070, CHRONOS_TOKEN required). If an image is published
+(e.g. ghcr.io/<org>/chronos), add here:
+  export CHRONOS_TOKEN=$(openssl rand -hex 24)
+  docker run -d --name chronos -e CHRONOS_TOKEN -p 127.0.0.1:5432:5432 -v chronos-data:/data <image>
+  psql "postgres://app:$CHRONOS_TOKEN@127.0.0.1:5432/main" -->
+
+## Start a server and connect with psql
+
+```bash
+chronos serve mydb               # makes the folder mydb if it's new
+```
+
+```
+chronos: serving on http://127.0.0.1:7070 (POST /v1/<op>; GET /v1/health)
+chronos: postgres protocol on 127.0.0.1:5433 (psql postgres://127.0.0.1:5433/main)
+```
+
+`chronos serve` listens on 127.0.0.1 only: the Postgres protocol on port 5433 (not 5432, so it doesn't collide with a Postgres you already run) and the HTTP API on 7070. On loopback without a token no password is asked. In another terminal:
+
+```bash
+psql postgres://127.0.0.1:5433/main
+```
+
+```sql
+create table todos (id bigserial primary key, title text not null, done boolean not null default false);
+insert into todos (title) values ('try chronos'), ('read the docs');
+update todos set done = true where id = 1;
+select * from todos order by id;
+```
+
+```
+ id |     title     | done
+----+---------------+------
+  1 | try chronos   | t
+  2 | read the docs | f
+(2 rows)
+```
+
+The database name is the **world**: `main` is the database itself, and every world you fork is another name (see [concepts](concepts.md)). Stop the server with Ctrl-C or SIGTERM; it closes the database cleanly.
+
+## Connect an application
+
+Point the application's `DATABASE_URL` (or its driver's connection settings) at the server:
+
+```bash
+export DATABASE_URL="postgres://app@127.0.0.1:5433/main"
+```
+
+Postgres drivers and ORMs connect as they do to Postgres; whether everything they send works depends on the SQL they send. Which have been tested, and how far: [Clients](postgres-compatibility.md#clients). For a server other machines reach, a token of at least 24 characters and TLS are required (`chronos serve` refuses to start on another address without them), and the token is the password, with any user name:
+
+```bash
+export CHRONOS_TOKEN=$(openssl rand -hex 24)     # serve reads it from the environment (not --token, which ps shows)
+chronos serve mydb --pg 0.0.0.0:5433 --tls-cert cert.pem --tls-key key.pem
+export DATABASE_URL="postgres://app:${CHRONOS_TOKEN}@db-host:5433/main?sslmode=require"
+```
+
+Without a token, anyone who reaches the loopback port can log in under any name, as a superuser. Before you expose a server, read [security](security.md): TLS (`--tls-cert`, `--tls-key`), agents with their own tokens, roles with passwords.
+
+Moving an existing Postgres database in: [Migrating from Postgres](migrating-from-postgres.md).
 
 ## Five minutes in the shell
 
@@ -31,15 +95,9 @@ chronos:main> find users where role = admin match ada
 
 `help` lists every command. `chronos mydb <command>` runs one command and exits, and `chronos mydb < script.txt` runs a file.
 
-## From TypeScript or Python
+## From TypeScript or Python (the HTTP API)
 
-Start the server:
-
-```bash
-chronos serve mydb            # http://127.0.0.1:7070
-```
-
-Copy the client you need. Each is one file with no dependencies.
+With `chronos serve mydb` running (HTTP on 127.0.0.1:7070), copy the client you need. Each is one file with no dependencies.
 
 ```ts
 // clients/typescript/chronos.ts
@@ -86,4 +144,4 @@ db.merge_at("agent-7", Resolve::Fail, Some(v))?;
 
 A database folder is opened by one process at a time: the shell, `chronos serve`, `chronos mcp` or your program. Close one before opening another, or run `chronos serve` and point everything at it.
 
-Next: [concepts](concepts.md).
+Next: the [five-minute trial](../examples/trial), an agent on a small CRM whose mistakes are caught before they land, then [concepts](concepts.md).

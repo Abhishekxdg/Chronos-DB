@@ -7,7 +7,7 @@ The `chronos` binary: its commands and flags, the environment variables it reads
 ```sh
 chronos mydb                                  # interactive shell (the folder is created if missing)
 chronos mydb get users 1                      # one command, then exit
-chronos serve mydb --token "$CHRONOS_TOKEN"     # HTTP on 127.0.0.1:7070, Postgres on 127.0.0.1:5433
+CHRONOS_TOKEN=$(openssl rand -hex 24) chronos serve mydb   # HTTP on 127.0.0.1:7070, Postgres on 127.0.0.1:5433
 chronos mcp mydb                              # MCP server for AI agents, over stdio
 ```
 
@@ -43,11 +43,13 @@ Flags may go anywhere on the line. A flag that takes a value and has none prints
 | `--takeover` | off | with `--remote` | replace a dead owner's lease on the prefix |
 | `--listen <addr>` | `127.0.0.1:7070` | `serve` | the HTTP API's address |
 | `--pg <addr>\|off` | `127.0.0.1:5433` | `serve` | the Postgres protocol's address; `off` turns it off |
-| `--token <T>` | `CHRONOS_TOKEN` | `serve` | the server's bearer token (HTTP) and password (Postgres). Needed for any address that isn't loopback (`127.*`, `localhost*`, `[::1]*`): without one, `serve` refuses to start |
+| `--token <T>` | `CHRONOS_TOKEN` | `serve` | the server's bearer token (HTTP) and password (Postgres), at least 24 characters (`openssl rand -hex 24`; `change-me` is refused). Needed for any address that isn't loopback: without one, `serve` refuses to start. Prefer the variable: a flag shows in `ps` |
 | `--safe` | off | `serve` | clients without an agent's token act as the agent `guest`; see [security](../security.md) |
-| `--admin-token <A>` | `CHRONOS_ADMIN_TOKEN` | `serve --safe` | the token that is the database's own user in safe mode |
-| `--tls-cert <file>` | `CHRONOS_TLS_CERT` | `serve` | PEM certificate; with `--tls-key`, HTTPS only and TLS on the Postgres port. One without the other fails: `TLS needs both --tls-cert and --tls-key` |
+| `--admin-token <A>` | `CHRONOS_ADMIN_TOKEN` | `serve --safe` | the token that is the database's own user in safe mode; at least 24 characters |
+| `--tls-cert <file>` | `CHRONOS_TLS_CERT` | `serve` | PEM certificate; with `--tls-key`, HTTPS only and TLS on the Postgres port. One without the other fails: `TLS needs both --tls-cert and --tls-key`. Needed for any address that isn't loopback, unless `--insecure-no-tls` |
 | `--tls-key <file>` | `CHRONOS_TLS_KEY` | `serve` | PEM private key |
+| `--insecure-no-tls` | off | `serve` | listen on an address that isn't loopback without TLS (with a warning): only where something else encrypts the connection |
+| `--allow-plaintext-password` | off | `import ... postgres://` | send the password to a source that asks for it in the clear or as MD5 over a connection that isn't TLS (refused otherwise) |
 | `--allow-merge` | off | `mcp` | lets the MCP client merge; without it agents change only worlds they fork, and a person merges |
 | `--agent <name>` | none | `mcp` | the MCP client acts as that agent (it must exist), with its permissions and limits |
 | `--schema <schema.csv>` | none | `import` | the table's columns; required |
@@ -118,7 +120,7 @@ Settings the database keeps in its folder, across restarts. Setting one needs an
 | `statement_timeout` | `0` (none) | `ALTER SYSTEM SET statement_timeout = 30000` or `'30s'` | the timeout every SQL session starts with; units as for `SET statement_timeout` below |
 | `max_worlds` | `0` (no limit) | `ALTER SYSTEM SET max_worlds = 1000` | live worlds at most, besides main and transactions' own; a fork past it fails with 53400 |
 | `world_idle_ttl` | `0` (never) | `ALTER SYSTEM SET world_idle_ttl = '7 days'` (or `0`) | the background worker discards worlds unused this long |
-| `history_retention` | `30 days` | `ALTER SYSTEM SET history_retention = '7 days'` (or `'0'`) | how far back time travel reaches; see [worlds](worlds.md#history-retention) |
+| `history_retention` | `1 hour` (a database made before 0.2.0: `30 days`) | `ALTER SYSTEM SET history_retention = '7 days'` (or `'0'`) | how far back time travel reaches; see [worlds](worlds.md#history-retention) |
 | `synchronous_commit` | `full` | `ALTER SYSTEM SET synchronous_commit = full \| normal \| off` (`on` means `full`) | how far a commit pushes the log before it returns: `full` through the drive's cache to stable storage (`F_FULLFSYNC` on macOS, `fdatasync` elsewhere); `normal` a plain `fsync` (on macOS the drive may still cache it; elsewhere the same as `full`); `off` handed to the OS only, which survives a process crash but not a machine crash |
 
 `=` or `TO` both work. `SHOW <setting>` reads each one (`statement_timeout` shows the session's, below).
@@ -133,7 +135,7 @@ These last for the session (the Postgres connection, or the shell).
 | `SET search_path TO a, "B", public` / `'a, public'` / `DEFAULT`, `SET SCHEMA 'a'`, `RESET search_path`, `SHOW search_path` | where unqualified names are looked up and created; default `"$user", public` |
 | `SET hnsw.ef_search = 100` / `DEFAULT` | the HNSW graph's beam for this session's vector searches, 1 to 1000 (else 22023); `DEFAULT` lets the index choose. See [search](../search.md) |
 | `SET SESSION ...`, `SET LOCAL ...` | the same as `SET ...` |
-| any other `SET` | accepted and ignored, with tag `SET`: `application_name`, `client_encoding`, `TIME ZONE`, `extra_float_digits` and the like. So is a session `SET synchronous_commit`: use `ALTER SYSTEM` |
+| any other `SET` | checked as Postgres checks it (22023 for a bad value, 42704 for a name Postgres 16 doesn't have) and kept for the session, so `SHOW` reads it back; many change nothing here (`application_name`, `extra_float_digits` and the like). A session `SET synchronous_commit` doesn't change how commits reach the disk: use `ALTER SYSTEM` |
 
-- **Also accepted and ignored:** isolation levels on `BEGIN` / `START TRANSACTION` (the isolation is always snapshot), `CREATE EXTENSION vector` and `postgis` (tag `CREATE EXTENSION`).
-- **Not recognized:** `SHOW` of anything not listed on this page or in [worlds](worlds.md) is a syntax error (42601). A Postgres client gets the fixed parameters at connect: `server_version` 16.0, `server_encoding` and `client_encoding` UTF8, `DateStyle` ISO, MDY, `TimeZone` UTC, `integer_datetimes` on, `standard_conforming_strings` on.
+- **Isolation levels:** `READ COMMITTED` (the default) and `REPEATABLE READ`, on `BEGIN`, `START TRANSACTION`, `SET TRANSACTION` or `default_transaction_isolation`; `SERIALIZABLE` is refused (0A000). See [Transactions](../sql.md#transactions).
+- **Postgres's settings:** `SHOW`, `SET` and `pg_settings` know all of Postgres 16's settings, checked as Postgres checks them ([Postgres compatibility](../postgres-compatibility.md#known-gaps)). A Postgres client gets these parameters at connect: `server_version` 16.15, `server_encoding` and `client_encoding` UTF8, `DateStyle` ISO, MDY, `TimeZone` (UTC unless the client asks for another), `integer_datetimes` on, `standard_conforming_strings` on.

@@ -89,12 +89,12 @@ code, .mono { font-family: var(--mono); font-size: 11.5px; }
 .kbd { font-family: var(--mono); font-size: 11px; color: var(--faint); border: 1px solid var(--line-strong); border-radius: 5px; padding: 0 5px; line-height: 17px; background: var(--surface); }
 .icon { width: 30px; padding: 0; justify-content: center; }
 .btn.small.icon { width: 26px; }
-input[type=text], input[type=search], input:not([type]), select, textarea { height: 30px; border: 1px solid var(--line); background: var(--raised); border-radius: var(--r); padding: 0 10px; min-width: 0; transition: border-color .12s, background .12s; }
-input[type=text]:hover, input[type=search]:hover, input:not([type]):hover, select:hover, textarea:hover { border-color: var(--line-strong); }
+input[type=text], input[type=search], input[type=password], input:not([type]), select, textarea { height: 30px; border: 1px solid var(--line); background: var(--raised); border-radius: var(--r); padding: 0 10px; min-width: 0; transition: border-color .12s, background .12s; }
+input[type=text]:hover, input[type=search]:hover, input[type=password]:hover, input:not([type]):hover, select:hover, textarea:hover { border-color: var(--line-strong); }
 textarea { height: auto; padding: 8px 10px; font-family: var(--mono); font-size: 12px; resize: vertical; line-height: 1.5; }
 input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid color-mix(in srgb, var(--focus) 40%, transparent); outline-offset: 0; border-color: var(--focus); background: var(--surface); }
 @media (pointer: coarse), (max-width: 700px) {
-  .btn, input[type=text], input[type=search], input:not([type]), select { height: 34px; }
+  .btn, input[type=text], input[type=search], input[type=password], input:not([type]), select { height: 34px; }
   .btn.small { height: 32px; }
   .icon, .btn.small.icon { width: 34px; }
   .grid .head .sort:not(.on) { display: none; }
@@ -369,6 +369,9 @@ button.col-line:hover { background: var(--hover); }
 .worldline .scrub line { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 3 3; }
 .worldline .scrub rect { fill: var(--ink); }
 .worldline .scrub text { font: 600 11.5px var(--mono); fill: var(--surface); }
+.worldline .wl-gone { fill: color-mix(in srgb, var(--faint) 14%, transparent); }
+.worldline .scrub.gone line { stroke: var(--faint); }
+.worldline .scrub.gone rect { fill: var(--faint); }
 .worldline .wl-axis { font: 500 10.5px var(--sans); fill: var(--faint); pointer-events: none; }
 .wl-hint { position: absolute; left: 120px; top: 50%; transform: translateY(-50%); font-size: 12px; color: var(--muted); pointer-events: none; }
 @keyframes wl-draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
@@ -662,3 +665,15 @@ button.col-line:hover { background: var(--hover); }
   .item { height: 36px; }
 }
 @media (prefers-reduced-motion: reduce) { .side { transition: none; } }
+
+/* chronos studio --login: the sign-in, and the role in the title bar */
+.signin { height: 100%; display: grid; place-items: center; padding: 24px 16px; overflow: auto; }
+.signin-card { width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: 14px; background: var(--surface); border-radius: var(--r-panel); box-shadow: var(--lift); padding: 28px 24px 24px; }
+.signin-card .logo { width: auto; height: auto; place-items: start; }
+.signin-card h1 { font-size: 18px; font-weight: 650; letter-spacing: -.01em; margin: 0; }
+.signin-card p { margin: 0; }
+.signin-card .field input { width: 100%; }
+.signin-card .btn.primary { justify-content: center; height: 34px; }
+.user-chip { gap: 6px; max-width: 220px; }
+.user-chip .uname { font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 700px) { .user-chip .uname, .user-chip .tag { display: none; } }

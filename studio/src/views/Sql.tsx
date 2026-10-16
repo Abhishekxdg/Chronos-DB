@@ -200,7 +200,7 @@ function Results({ ran }: { ran: Ran }) {
           x.rows.length ? (
             <Grid
               key={cur}
-              columns={x.columns.map((name) => ({ name }))}
+              columns={x.columns.map((name, j) => ({ name, type: x.types?.[j] }))}
               total={x.rows.length}
               first={x.rows.slice(0, PAGE)}
               fetchPage={(p) => Promise.resolve(x.rows.slice(p * PAGE, (p + 1) * PAGE))}
