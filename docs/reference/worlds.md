@@ -356,6 +356,7 @@ alter world payout set (check_reads = false);    -- a person's way past it
 - **Anyone reading it counts:** a person inspecting the world with `SELECT` adds to what it read.
 - **Partial merges:** `ONLY TABLES` and `ONLY KEYS` check every read of the world, not only those of the rows they merge: which reads led to which writes isn't known.
 - **Replaying the log:** a merge that went through is replayed after a restart without checking its reads again.
+- **Attached to Postgres:** in a folder [attached to Postgres](../guides/attach-postgres.md#reads-checked-against-live-postgres), reads of attached tables are checked against Postgres too when the merge is written there, so a row changed or added straight in Postgres since the fork (one an empty result would now find included) holds the merge: `read rows that changed in Postgres since it forked`.
 
 ### Declared scope (may_change, tenant)
 

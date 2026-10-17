@@ -920,6 +920,7 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                 if let Some(l) = &plan.live {
                     out["postgres"] = json!({
                         "source": l.source, "at": l.at, "error": l.error, "triggers": l.triggers,
+                        "stale_reads": l.stale_reads,
                         "summary": chronos::sql::live_summary(l),
                         "rows": l.rows.iter().map(|r| json!({
                             "key": chronos::sql::show_key(&r.key), "changed": r.changed,

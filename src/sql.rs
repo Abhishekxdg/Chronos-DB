@@ -26017,6 +26017,28 @@ pub(crate) fn row_texts(schema: &Val, raw: &str) -> Option<Vec<(String, Option<S
     )
 }
 
+/// A row of SQL table `table` given as each column's text as Postgres writes it (the other way from `row_texts`), as
+/// `v` stores it: its row key and its packed value. For rows read from the Postgres a folder is attached to (see
+/// `crate::attach`); a column not given is null.
+pub(crate) fn row_from_texts(
+    v: &View,
+    table: &str,
+    texts: &[(String, Option<String>)],
+) -> crate::Result<(String, Val)> {
+    let t = load(v, table).map_err(sql_to_db)?.filter(|t| t.schema).ok_or_else(|| crate::Error::Constraint {
+        code: NO_TABLE,
+        message: format!("no table {table} to read Postgres's rows into"),
+    })?;
+    let mut vals = vec![Value::Null; t.cols.len()];
+    for (name, text) in texts {
+        if let (Some(i), Some(s)) = (t.cols.iter().position(|c| c.name == *name), text) {
+            vals[i] = coerce(Value::Text(s.clone()), t.cols[i].ty).map_err(sql_to_db)?;
+        }
+    }
+    let id = t.row_id(&vals).map_err(sql_to_db)?;
+    Ok((row_key(&t.name, &id), pack(&vals, t.layout()).into()))
+}
+
 /// A value as Postgres's output function for type `ty` writes it: what the wire protocol sends in text format.
 pub fn wire_text(v: &Value, ty: Type) -> Option<String> {
     Some(match v {
@@ -27447,6 +27469,9 @@ pub fn live_summary(l: &crate::LiveCheck) -> String {
         l.source,
         l.rows.len() - changed
     );
+    if !l.stale_reads.is_empty() {
+        out.push_str(&format!("; it {} (the merge would be held)", l.stale_reads.join("; it ")));
+    }
     if !l.triggers.is_empty() {
         out.push_str(&format!(
             "; triggers not run, so what they set isn't shown (main takes it after the merge): {}",

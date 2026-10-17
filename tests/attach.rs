@@ -583,3 +583,77 @@ fn a_dry_run_checks_postgres_without_writing() {
     drop(pg);
     drop_db(&name);
 }
+
+/// A world that checks its reads has them checked against Postgres too, at the write-back: an agent finds no row
+/// for an email in a suppression list, decides on that, and before its merge someone adds the email straight into
+/// Postgres. The merge is held, naming what it read, and nothing is written. A row added there that its read couldn't
+/// have found doesn't hold it. Issue #28.
+#[test]
+fn reads_are_checked_against_postgres() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("reads") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table leads (id int primary key, email text, status text);
+         create table suppressed (id serial primary key, email text);
+         create table optout (email text primary key);
+         insert into leads values (1, 'ada@x.com', 'new'), (2, 'bo@x.com', 'new');",
+    )
+    .unwrap();
+    let dir = folder("reads");
+    let (ok, out) = attach(&dir, &["--tables", "leads,suppressed,optout"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+
+    // a filtered scan that found nothing
+    run(&db, MAIN, "create world w with (check_reads = true)", &[]).unwrap();
+    assert_eq!(cell(&db, "w", "select count(*) from suppressed where email = 'ada@x.com'"), "0");
+    run(&db, "w", "update leads set status = 'ready_to_contact' where id = 1", &[]).unwrap();
+    // a row its read couldn't have found: still goes through (checked in a dry run)
+    pg.batch_execute("insert into suppressed (email) values ('someone@else.com')").unwrap();
+    let plan = db.merge_preview("w", &Default::default()).unwrap();
+    assert!(plan.blocked.is_none(), "{:?}", plan.blocked);
+    assert!(plan.live.as_ref().is_some_and(|l| l.stale_reads.is_empty()), "{:?}", plan.live);
+    // the email itself, added straight into Postgres: the dry run says it would be held, and the merge is
+    pg.batch_execute("insert into suppressed (email) values ('ada@x.com')").unwrap();
+    let plan = db.merge_preview("w", &Default::default()).unwrap();
+    let blocked = plan.blocked.unwrap_or_default();
+    assert!(blocked.contains("changed in Postgres since it forked"), "{blocked}");
+    let e = run(&db, MAIN, "merge world w", &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    assert!(e.message.contains("changed in Postgres since it forked"), "{}", e.message);
+    assert_eq!(pg_cell(&mut pg, "select status from leads where id = 1"), "new", "nothing written");
+    assert_eq!(pg_cell(&mut pg, "select count(*) from chronos.merges where id like 'merge:%'"), "0");
+    assert!(db.world("w").is_ok(), "the world stays, to redo or drop");
+    run(&db, MAIN, "drop world w", &[]).unwrap();
+
+    // a key looked up that wasn't there, added in Postgres since
+    run(&db, MAIN, "create world k with (check_reads = true)", &[]).unwrap();
+    assert_eq!(cell(&db, "k", "select count(*) from optout where email = 'bo@x.com'"), "0");
+    run(&db, "k", "update leads set status = 'ready_to_contact' where id = 2", &[]).unwrap();
+    pg.batch_execute("insert into optout values ('bo@x.com')").unwrap();
+    let e = run(&db, MAIN, "merge world k", &[]).unwrap_err();
+    assert!(e.message.contains("optout"), "{}", e.message);
+    assert_eq!(pg_cell(&mut pg, "select status from leads where id = 2"), "new");
+    run(&db, MAIN, "drop world k", &[]).unwrap();
+
+    // a row read and then changed in Postgres
+    run(&db, MAIN, "create world r with (check_reads = true)", &[]).unwrap();
+    assert_eq!(cell(&db, "r", "select status from leads where id = 2"), "new");
+    run(&db, "r", "update leads set status = 'ready_to_contact' where id = 1", &[]).unwrap();
+    pg.batch_execute("update leads set status = 'do_not_contact' where id = 2").unwrap();
+    let e = run(&db, MAIN, "merge world r", &[]).unwrap_err();
+    assert!(e.message.contains("leads"), "{}", e.message);
+    run(&db, MAIN, "drop world r", &[]).unwrap();
+
+    // a world that doesn't check its reads merges as before
+    let e = change(&db, "plain", "update leads set status = 'ready_to_contact' where id = 1");
+    assert!(e.is_none(), "{:?}", e.map(|e| e.message));
+    assert_eq!(pg_cell(&mut pg, "select status from leads where id = 1"), "ready_to_contact");
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}

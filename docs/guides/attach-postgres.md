@@ -60,6 +60,26 @@ attached folder it then checks the rows it would write against Postgres as it is
 The HTTP `merge` op with `dry_run: true` returns the same as `postgres: {source, at, error, triggers, summary,
 rows: [{key, changed, postgres}]}`, and MCP's `merge_preview` shows the column.
 
+### Reads checked against live Postgres
+
+A world forked `with (check_reads = true)` (or by an agent whose merge policy has `check_reads`) has its reads
+checked against Postgres too, inside the write-back's transaction and before anything is written. Within Chronos a
+read is checked against main, Chronos's copy, which a row changed straight in Postgres never reaches; so the
+write-back also reads, for each attached table the world read:
+
+- **rows read by key:** compared with Postgres's as the write-back compares the rows it writes;
+- **ranges, filtered scans (`where email = 'x'`), whole-table reads, lookups through an index, and keys that found
+  no row:** the table is read whole from Postgres (at most 100,000 rows; past that the merge is held for a
+  person), so a row added there that the read would have found counts, an empty result included.
+
+Postgres's rows are put in the world's fork point, with the index entries they make, and checked as a read against
+main is. A row the read couldn't have found (another email) doesn't hold the merge. A read that changed holds it as
+any stale read: refused with `40001` and nothing written (`read rows that changed in Postgres since it forked:
+suppressed/(12)`), or queued for a person under the agent's merge policy. A dry run reports the same.
+
+The check reads without a predicate lock (`READ COMMITTED`): a row Postgres takes between the check and `COMMIT`
+lands after the merge in time, an order in which the world's decision was right.
+
 Main's rows change only this way: writes to main, `RESTORE` and `UNDO` on main are refused, and no statement may
 change a table's shape (do that in Postgres, then attach again into a new folder).
 
@@ -76,11 +96,9 @@ person approves by merging the queued world.
 - At most 10,000 changed rows per merge (`MERGE WORLD w ONLY TABLES (...)` merges part of one).
 - Main is as old as the attach for rows no merge touched: a merge only compares the rows it writes. To pick up
   Postgres's other changes, attach again into a new folder (no refresh yet).
-- Reads are checked against Chronos's copy, not live Postgres. With `check_reads`, a merge is held if a row
-  or range the agent read (an empty result included) changed **in Chronos** since it forked, but a row
-  changed or added directly in Postgres since the attach isn't seen by that check: only the rows a merge
-  writes are compared with Postgres. Checking reads against Postgres too is
-  [issue #28](https://github.com/Abhishekxdg/chronosdb/issues/28).
+- A world that reads a table more broadly than 100,000 rows (a range, a filtered scan or a whole-table read of a
+  bigger table) with `check_reads` on can't have that read checked against Postgres: its merge is held for a
+  person, saying so.
 - Triggers stay in Postgres and run as the merge is written. Rows they change in other tables show up as conflicts
   later, not in main right away.
 - Tested on Neon, both straight to the database and through its pooler (PgBouncer, transaction mode): a merge of

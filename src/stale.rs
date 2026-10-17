@@ -22,7 +22,7 @@
 
 use crate::{Core, Error, Result, State};
 use serde_json::{Map, Value as Json, json};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::Path;
 
@@ -107,6 +107,37 @@ impl ReadSet {
             return self.whole(g);
         }
         self.filters.push((g, f));
+    }
+
+    /// Per table read, by its name as rows are keyed: the row keys read one by one, and whether more of it was read
+    /// than keys (a range, a filtered scan, the whole table, or what's behind its indexes and constraints), for which
+    /// any of its rows counts. For checking reads against the Postgres an attached folder copies (see `attach`).
+    pub(crate) fn by_table(&self) -> BTreeMap<String, (Vec<String>, bool)> {
+        let table = |g: &str| -> Option<String> {
+            let parts: Vec<&str> = g.trim_end_matches('/').split('/').collect();
+            match parts.as_slice() {
+                [t] => Some(t.to_string()),
+                [_, t] => Some(t.to_string()),
+                _ => None,
+            }
+        };
+        let mut out: BTreeMap<String, (Vec<String>, bool)> = BTreeMap::new();
+        for k in &self.keys {
+            let Some(g) = group(k) else { continue };
+            let Some(t) = table(&g) else { continue };
+            let e = out.entry(t).or_default();
+            match g.matches('/').count() > 1 {
+                true => e.1 = true, // an index's or constraint's entry: found through any row
+                false => e.0.push(k.clone()),
+            }
+        }
+        let wider = self.ranges.iter().filter_map(|(p, ..)| group(p).or_else(|| group(&format!("{p}/"))));
+        for g in wider.chain(self.groups.iter().cloned()).chain(self.filters.iter().map(|(g, _)| g.clone())) {
+            if let Some(t) = table(&g) {
+                out.entry(t).or_default().1 = true;
+            }
+        }
+        out
     }
 
     fn whole(&mut self, g: String) {

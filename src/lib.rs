@@ -739,6 +739,9 @@ pub struct LiveCheck {
     pub triggers: Vec<String>,
     /// why Postgres wasn't checked (unreachable, no URL given, another database, a refusal the write-back makes)
     pub error: Option<String>,
+    /// for a world that checks its reads: what it read that Postgres changed since its fork (see `attach::live_reads`),
+    /// which would hold the merge
+    pub stale_reads: Vec<String>,
 }
 
 /// A row a merge would write to Postgres, as the dry run found it there.
@@ -4224,7 +4227,7 @@ impl Core {
         }
         // into main of a folder attached to Postgres: checked there too, now that the merge's locks are let go
         if let (Some(dry), Some(att)) = (dry, self.attached.as_deref()) {
-            let live = attach::dry_run(att, dry);
+            let live = attach::dry_run(self, att, dry);
             plan.blocked = plan.blocked.or_else(|| attach::dry_blocked(&live));
             plan.live = Some(live);
         }
@@ -4662,7 +4665,8 @@ impl Core {
                             after: self.val(&merged, &c.key)?,
                         });
                     }
-                    Some(attach::Dry::new(self, att, b, &theirs_state, &ours_state, &written))
+                    let reads = read_set.as_ref().map(|set| (set.clone(), base_state.clone(), wrote.clone()));
+                    Some(attach::Dry::new(self, att, b, &theirs_state, &ours_state, &written, reads))
                 }
                 None => None,
             };
@@ -4839,11 +4843,23 @@ impl Core {
                     after: self.val(&next, k)?,
                 });
             }
-            if let Err(e) = attach::write_back(self, att, b, &world_id, &theirs_state, &ours_state, &written) {
-                if !locked.is_empty() {
-                    *lock(&child.locked) = locked; // unchanged, should the caller keep the world
+            // a world that checks its reads: what it read of the attached tables, checked against Postgres too
+            let reads = read_set.as_ref().map(|set| attach::Reads { set, base: &base_state, wrote: &wrote });
+            let written =
+                attach::write_back(self, att, b, &world_id, &theirs_state, &ours_state, &written, reads.as_ref());
+            match written {
+                Ok(stale) if stale.is_empty() => {}
+                out => {
+                    if !locked.is_empty() {
+                        *lock(&child.locked) = locked; // unchanged, should the caller keep the world
+                    }
+                    // read rows Postgres changed since the fork: held as any stale read (nothing was written there)
+                    let why = out?;
+                    if let Some(r) = review(why.clone()) {
+                        return Ok(r);
+                    }
+                    return Err(stale::stale(b, "merging", &why));
                 }
-                return Err(e);
             }
         }
         if stays {

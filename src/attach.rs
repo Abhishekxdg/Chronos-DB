@@ -31,7 +31,7 @@ use crate::pgclient::{self, Client, Url, pg_error, text_array};
 use crate::{Core, Error, MAIN, Result, State, Val};
 use serde_json::{Value as Json, json};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -634,10 +634,22 @@ fn rows_of(
     Ok(rows)
 }
 
+/// What a world that checks its reads read (see `stale`), for the write-back to check against Postgres: its read
+/// set, its fork point, and the keys it wrote itself (compared as rows the merge writes).
+pub(crate) struct Reads<'a> {
+    pub(crate) set: &'a crate::Recorder,
+    pub(crate) base: &'a State,
+    pub(crate) wrote: &'a HashSet<String>,
+}
+
 /// The write-back of a merge into main (see the module's doc), run by `merge_locked` under the merge's locks once
 /// everything Chronos checks has passed: `apply` is what the merge changes in main (`theirs`), the world's rows
-/// as `ours` holds them. Ok: Postgres committed, and the merge goes on. Err: nothing was written to Postgres,
-/// and nothing merges; on a conflict main takes Postgres's rows after the locks (see `after_merge`).
+/// as `ours` holds them; `reads`, for a world that checks its reads. Ok, empty: Postgres committed (or there was
+/// nothing to write), and the merge goes on. Ok, reasons: what the world read changed in Postgres since its fork
+/// (see `live_reads`): rolled back, nothing written, and the merge is held as for any stale read. Err: nothing was
+/// written to Postgres, and nothing merges; on a conflict main takes Postgres's rows after the locks (see
+/// `after_merge`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_back(
     core: &Core,
     att: &Attached,
@@ -646,13 +658,14 @@ pub(crate) fn write_back(
     theirs: &State,
     ours: &State,
     apply: &[crate::Change],
-) -> Result<()> {
+    reads: Option<&Reads>,
+) -> Result<Vec<String>> {
     let rows = rows_of(core, att, world, theirs, ours, apply)?;
     if rows.is_empty() {
-        return Ok(());
+        return Ok(vec![]);
     }
     let mut pg = connect().map_err(|e| refused(format!("{e}; nothing was merged")))?;
-    let out = transaction(&mut pg, att, world, world_id, &rows);
+    let out = transaction(core, &mut pg, att, world, world_id, &rows, reads);
     if out.is_err() {
         rollback(&mut pg);
     }
@@ -666,6 +679,8 @@ pub(crate) fn write_back(
 /// write-back would refuse them.
 pub(crate) struct Dry {
     rows: Result<Vec<Row>>,
+    /// a world that checks its reads: its read set, fork point and own keys (see `Reads`)
+    reads: Option<(crate::Recorder, State, HashSet<String>)>,
 }
 
 impl Dry {
@@ -676,8 +691,9 @@ impl Dry {
         theirs: &State,
         ours: &State,
         apply: &[crate::Change],
+        reads: Option<(crate::Recorder, State, HashSet<String>)>,
     ) -> Dry {
-        Dry { rows: rows_of(core, att, world, theirs, ours, apply) }
+        Dry { rows: rows_of(core, att, world, theirs, ours, apply), reads }
     }
 }
 
@@ -687,7 +703,7 @@ impl Dry {
 /// REPEATABLE READ: one snapshot across the tables), so it says what a merge would meet then, not later; triggers
 /// aren't run (their names are listed), so values they'd set show only after a real merge. Never fails: what went
 /// wrong is the check's `error`.
-pub(crate) fn dry_run(att: &Attached, dry: Dry) -> crate::LiveCheck {
+pub(crate) fn dry_run(core: &Core, att: &Attached, dry: Dry) -> crate::LiveCheck {
     let mut live = crate::LiveCheck { source: att.source(), ..Default::default() };
     let rows = match dry.rows {
         Ok(rows) => rows,
@@ -706,21 +722,33 @@ pub(crate) fn dry_run(att: &Attached, dry: Dry) -> crate::LiveCheck {
             return live;
         }
     };
-    let out = dry_transaction(&mut pg, att, &rows, &mut live);
+    let reads = dry.reads.as_ref().map(|(set, base, wrote)| Reads { set, base, wrote });
+    let out = dry_transaction(core, &mut pg, att, &rows, reads.as_ref(), &mut live);
     rollback(&mut pg);
     if let Err(e) = out {
         live.rows.clear();
+        live.stale_reads.clear();
         live.error = Some(e.to_string());
     }
     live
 }
 
-fn dry_transaction(pg: &mut Client, att: &Attached, rows: &[Row], live: &mut crate::LiveCheck) -> Result<()> {
+fn dry_transaction(
+    core: &Core,
+    pg: &mut Client,
+    att: &Attached,
+    rows: &[Row],
+    reads: Option<&Reads>,
+    live: &mut crate::LiveCheck,
+) -> Result<()> {
     begin(pg, att, true)?;
     live.at = crate::now_ms();
     let by_table = by_table(rows);
     for &ti in by_table.keys() {
         same_shape(pg, &att.tables[ti])?;
+    }
+    if let Some(r) = reads {
+        live.stale_reads = live_reads(core, pg, att, r)?;
     }
     for (&ti, rs) in &by_table {
         let t = &att.tables[ti];
@@ -746,6 +774,9 @@ fn dry_transaction(pg: &mut Client, att: &Attached, rows: &[Row], live: &mut cra
 /// or None.
 pub(crate) fn dry_blocked(live: &crate::LiveCheck) -> Option<String> {
     let changed = live.rows.iter().filter(|r| r.changed).count();
+    if changed == 0 && !live.stale_reads.is_empty() {
+        return Some(format!("merging it would be held: it {} ({})", live.stale_reads.join("; it "), live.source));
+    }
     (changed > 0).then(|| {
         format!(
             "{changed} rows it would write changed in Postgres since main's copy ({}): merging now is refused, nothing \
@@ -829,11 +860,27 @@ fn run(pg: &mut Client, what: &str, sql: &str, params: &[String]) -> Result<pgcl
 }
 
 /// One write-back transaction (see the module's doc). Err leaves the transaction for the caller to roll back.
-fn transaction(pg: &mut Client, att: &Attached, world: &str, world_id: &str, rows: &[Row]) -> Result<()> {
+fn transaction(
+    core: &Core,
+    pg: &mut Client,
+    att: &Attached,
+    world: &str,
+    world_id: &str,
+    rows: &[Row],
+    reads: Option<&Reads>,
+) -> Result<Vec<String>> {
     begin(pg, att, false)?;
     let by_table = by_table(rows);
     for &ti in by_table.keys() {
         same_shape(pg, &att.tables[ti])?;
+    }
+    // what the world read, as Postgres has it now: before any row is locked or written
+    if let Some(r) = reads {
+        let stale = live_reads(core, pg, att, r)?;
+        if !stale.is_empty() {
+            rollback(pg);
+            return Ok(stale);
+        }
     }
     // every row locked and compared before anything is written: any conflict, and nothing is
     // (table, the row, Postgres's row now, its key as Postgres writes it)
@@ -1013,7 +1060,7 @@ fn transaction(pg: &mut Client, att: &Attached, world: &str, world_id: &str, row
         }
     }
     AFTER.set(Some(After { rows: sent_back, committed: true }));
-    Ok(())
+    Ok(vec![])
 }
 
 /// Starts a transaction on the source (see `SETTINGS`, the timeouts) and checks it is the database this folder was
@@ -1090,6 +1137,139 @@ fn compare(pg: &mut Client, t: &Table, rs: &[&Row]) -> Result<Vec<Compared>> {
             key: r[3..3 + nk].to_vec(),
         });
     }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------- reads checked against Postgres
+
+/// Rows of one attached table a world's read of it may need read whole from Postgres (see `live_reads`): past it,
+/// the read is too broad to check there, and a person decides.
+const LIVE_ROWS: usize = 100_000;
+
+/// What a world that checks its reads read of attached tables, checked against Postgres inside the write-back's
+/// transaction before anything is written (issue #28): within Chronos a read is checked against main, Chronos's copy,
+/// which a row changed straight in Postgres never reaches. Postgres's rows are put in place of the fork point's in a
+/// copy of it (with the index and constraint entries they make), and the same check as against main
+/// (`Core::stale_reasons`) runs on that. A table read only by keys has those rows compared as the write-back compares
+/// them; one read by a range, a filtered scan, whole, through an index or constraint, or by a key that found no row,
+/// is read whole from Postgres (at most `LIVE_ROWS` rows), so a row added there that the read would have found (an
+/// empty result included) counts. Read at READ COMMITTED with no predicate lock: a row Postgres takes between this
+/// and COMMIT comes after the merge in time, a serial order the world's decision holds in. The reasons, said as
+/// changed in Postgres; none: what it read is as Postgres has it.
+fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result<Vec<String>> {
+    let tables = r.set.lock().unwrap_or_else(|p| p.into_inner()).by_table();
+    let base = core.past_view(r.base);
+    let mut live = r.base.clone();
+    let (mut keys, mut out): (Vec<String>, Vec<String>) = (vec![], vec![]);
+    let too_broad = |t: &Table| {
+        format!(
+            "read {} more broadly than can be checked against Postgres (more than {LIVE_ROWS} rows), and Postgres may \
+             have changed it since the copy",
+            crate::sql::shown_name(&t.name)
+        )
+    };
+    for (name, (read, mut whole)) in tables {
+        let Some(ti) = att.table(&name) else { continue };
+        let t = &att.tables[ti];
+        // the fork point's rows the read covers: those read one by one, or every one of the table
+        let mut rows: Vec<Row> = vec![];
+        if !whole {
+            for k in read.iter().filter(|k| !r.wrote.contains(k.as_str())) {
+                match core.val(r.base, k)? {
+                    Some(v) => rows.push(Row {
+                        key: k.clone(),
+                        table: ti,
+                        before: Some(texts(core, r.base, t, k, &v)?),
+                        after: None,
+                    }),
+                    // a key that found no row: its key as Postgres writes it isn't known here, so the table is read whole
+                    None => whole = true,
+                }
+            }
+        }
+        if whole {
+            rows.clear();
+            for kv in base.prefix(&format!("{name}/"))? {
+                let (k, v) = kv?;
+                if rows.len() == LIVE_ROWS {
+                    break;
+                }
+                rows.push(Row { before: Some(texts(core, r.base, t, &k, &v)?), key: k, table: ti, after: None });
+            }
+            if rows.len() == LIVE_ROWS {
+                out.push(too_broad(t));
+                continue;
+            }
+        }
+        let named = |row: &[Option<String>]| -> Vec<(String, Option<String>)> {
+            t.cols.iter().map(|c| c.name.clone()).zip(row.iter().cloned()).collect()
+        };
+        let rs: Vec<&Row> = rows.iter().collect();
+        if !rs.is_empty() {
+            for c in compare(pg, t, &rs)?.into_iter().filter(|c| c.changed) {
+                let key = &rs[c.at].key;
+                if r.wrote.contains(key.as_str()) {
+                    continue;
+                }
+                let now = match &c.now {
+                    Some(row) => Some(crate::sql::row_from_texts(&base, &t.name, &named(row))?.1),
+                    None => None,
+                };
+                live.set(key, now);
+                keys.push(key.clone());
+            }
+        }
+        if whole {
+            // and the rows Postgres has that the fork point didn't
+            let back: Vec<String> = t.cols.iter().map(|c| format!("t.{}::text", q(&c.name))).collect();
+            let sql = format!(
+                "select {} from {} t where not exists (select 1 from {} where {}) limit {}",
+                back.join(", "),
+                t.pg,
+                unnest(t, false, &[], 1),
+                key_match(t, "t"),
+                LIVE_ROWS + 1
+            );
+            let added = run(
+                pg,
+                &format!("reading rows of {} the copy hasn't", t.pg),
+                &sql,
+                &arrays(&rs, t, false, &[], false),
+            )?;
+            if rows.len() + added.len() > LIVE_ROWS {
+                out.push(too_broad(t));
+                continue;
+            }
+            for row in added {
+                let (k, v) = crate::sql::row_from_texts(&base, &t.name, &named(&row))?;
+                if !r.wrote.contains(k.as_str()) {
+                    live.set(&k, Some(v));
+                    keys.push(k);
+                }
+            }
+        }
+    }
+    if keys.is_empty() {
+        return Ok(out);
+    }
+    // the index and constraint entries Postgres's rows make, as a merge makes them: what a lookup through them finds
+    let after = core.past_view(&live);
+    match crate::sql::reindex(&after, &base, &keys) {
+        Ok(entries) => {
+            for (k, v) in entries {
+                live.set(&k, v);
+            }
+        }
+        Err(e) => out.push(format!("read rows Postgres changed in a way that can't be checked here ({})", e.message)),
+    }
+    let stale = core.stale_reasons(r.set, r.base, &live, r.wrote)?;
+    // (reads lost in a restart are main's check's to report: it held the merge already)
+    out.extend(
+        stale
+            .into_iter()
+            .filter(|s| s.contains("changed since it forked"))
+            .map(|s| s.replace("changed since it forked", "changed in Postgres since it forked")),
+    );
     Ok(out)
 }
 
