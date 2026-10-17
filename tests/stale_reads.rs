@@ -245,3 +245,92 @@ fn the_same_filtered_scan_is_kept_once() {
     let e = run(&db, MAIN, "merge world loop", &[]).unwrap_err();
     assert!(e.code == "40001" && e.message.contains("leads/7"), "{}", e.message);
 }
+
+/// CHECK READS: what a world that checks its reads read that changed since its fork, asked between steps without
+/// merging, and with nothing changed (the world's view stays as it was). An empty result read counts: a row added
+/// later that the read would have found is listed. Issue #35.
+#[test]
+fn check_reads_says_what_changed_without_merging() {
+    let db = Db::new();
+    run(
+        &db,
+        MAIN,
+        "create table suppressed (email text primary key); create table leads (id int primary key, email text, status text);
+         insert into leads values (1, 'ada@x.com', 'new'), (2, 'bo@x.com', 'new')",
+        &[],
+    )
+    .unwrap();
+    run(&db, MAIN, "create world w with (check_reads = true)", &[]).unwrap();
+    let mut s = Session::new("w");
+    let count = |s: &mut Session, q: &str| s.run(&db, q, &[]).unwrap().pop().unwrap().rows[0][0].to_text();
+    assert_eq!(count(&mut s, "select count(*) from suppressed where email = 'ada@x.com'"), "0");
+    s.run(&db, "update leads set status = 'ready_to_contact' where id = 1", &[]).unwrap();
+    let check = |s: &mut Session, q: &str| s.run(&db, q, &[]).unwrap().pop().unwrap();
+    // nothing moved: no rows, from the world itself or from main naming it
+    assert_eq!(check(&mut s, "check reads").rows.len(), 0);
+    assert_eq!(run(&db, MAIN, "check reads of world w", &[]).unwrap().pop().unwrap().rows.len(), 0);
+    // a row it couldn't have read changes: still nothing
+    run(&db, MAIN, "update leads set status = 'won' where id = 2; insert into suppressed values ('zed@x.com')", &[])
+        .unwrap();
+    assert_eq!(check(&mut s, "check reads").rows.len(), 0);
+    // the email it found no row for is added on main: listed, against main, and nothing changed in the world
+    run(&db, MAIN, "insert into suppressed values ('ada@x.com')", &[]).unwrap();
+    let found = check(&mut s, "check reads");
+    let cols: Vec<&str> = found.columns.as_ref().unwrap().iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(cols, ["checked_against", "changed"]);
+    assert_eq!(found.rows.len(), 1, "{:?}", found.rows);
+    assert_eq!(found.rows[0][0].to_text(), "main");
+    assert!(found.rows[0][1].to_text().contains("changed since it forked"), "{:?}", found.rows);
+    assert_eq!(count(&mut s, "select count(*) from suppressed where email = 'ada@x.com'"), "0", "no rebase");
+    // its own write isn't a stale read; the merge is held for the same read CHECK READS listed
+    let e = run(&db, MAIN, "merge world w", &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    // a world that doesn't check its reads, and main, are refused with what to do
+    run(&db, MAIN, "create world plain", &[]).unwrap();
+    let e = run(&db, MAIN, "check reads of world plain", &[]).unwrap_err();
+    assert_eq!(e.code, "55000", "{}", e.message);
+    assert!(e.message.contains("check_reads = true"), "{}", e.message);
+    assert!(run(&db, MAIN, "check reads", &[]).is_err(), "main has no fork point");
+}
+
+/// What a world read survives a server's clean stop: `chronos mcp` (and `chronos serve`) close the database and
+/// then exit the process, which runs no destructor, so the read sets kept only by dropping it were lost, and every
+/// world that checks its reads was held after the restart as if after a crash. Here: a `chronos mcp` session that
+/// ends with its input, then the world's reads, checked as before.
+#[test]
+fn reads_survive_a_server_closing_and_exiting() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let dir = std::env::temp_dir().join(format!("chronos-stale-exit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    {
+        let db = Db::open(&dir).unwrap();
+        run(&db, MAIN, "create table s (email text primary key); create world w with (check_reads = true)", &[])
+            .unwrap();
+        Session::new("w").run(&db, "select count(*) from s where email = 'a@x'", &[]).unwrap();
+    } // dropped: kept
+    let mut mcp = Command::new(env!("CARGO_BIN_EXE_chronos"))
+        .args(["mcp", dir.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    mcp.stdin
+        .take()
+        .unwrap()
+        .write_all(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}
+"#,
+        )
+        .unwrap(); // input closed: it closes the database and exits
+    assert!(mcp.wait().unwrap().success());
+    let db = Db::open(&dir).unwrap();
+    assert_eq!(db.reads_changed("w").unwrap(), Vec::<(String, String)>::new(), "kept: nothing changed");
+    run(&db, MAIN, "insert into s values ('a@x')", &[]).unwrap();
+    let found = db.reads_changed("w").unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].1.contains("read rows that changed since it forked"), "{found:?}");
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

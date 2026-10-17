@@ -249,7 +249,7 @@ pub fn call_as(db: &Db, me: &chronos::Acting, op: &str, a: &Value) -> Result<Val
     let branch = s("branch").unwrap_or(chronos::MAIN);
     let _slot = if op == "sql" { None } else { db.slot(&me.agent)? }; // SQL takes one per statement
     match op {
-        "get" | "find" | "world" | "branches" | "worlds" | "history" | "diff" => me.may_read(branch)?,
+        "get" | "find" | "world" | "branches" | "worlds" | "history" | "diff" | "check_reads" => me.may_read(branch)?,
         "put" | "delete" => me.may_write(branch, 1)?,
         "batch" => me.may_write(branch, a.get("rows").and_then(Value::as_array).map_or(0, Vec::len))?,
         "fork" => {
@@ -675,6 +675,16 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                 .map(|e| json!({ "at": e.at, "agent": e.agent, "world": e.world, "action": e.action, "rows": e.rows }))
                 .collect();
             Ok(json!({ "events": events }))
+        }
+        // what a world that checks its reads read that changed since its fork, nothing changed (see `check_reads`)
+        "check_reads" => {
+            let b = db.world(need("branch")?)?.name;
+            let changed: Vec<Value> = db
+                .reads_changed(&b)?
+                .into_iter()
+                .map(|(against, why)| json!({ "checked_against": against, "changed": why }))
+                .collect();
+            Ok(json!({ "ok": true, "branch": b, "stale": !changed.is_empty(), "changed": changed }))
         }
         "merge_outcomes" => {
             let by_policy = s("by") == Some("policy");

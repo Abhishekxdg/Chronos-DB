@@ -672,6 +672,24 @@ pub(crate) fn write_back(
     out
 }
 
+/// `CHECK READS` of a world of main (see `Core::reads_changed`): what it read, checked against Postgres as it is now,
+/// as the write-back checks it (`live_reads`), outside any merge: a read-only transaction (the dry run's start:
+/// settings, source identity), rolled back after. Err: Postgres couldn't be asked (say so, rather than "nothing
+/// changed").
+pub(crate) fn check_reads(
+    core: &Core,
+    att: &Attached,
+    set: &crate::Recorder,
+    base: &State,
+    wrote: &HashSet<String>,
+) -> std::result::Result<Vec<String>, String> {
+    let mut pg = connect()?;
+    let r = Reads { set, base, wrote };
+    let out = begin(&mut pg, att, true).and_then(|()| live_reads(core, &mut pg, att, &r));
+    rollback(&mut pg);
+    out.map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------- a dry run against Postgres
 
 /// What a dry run of a merge into main checks against Postgres (see `dry_run`), worked out by `merge_locked` under

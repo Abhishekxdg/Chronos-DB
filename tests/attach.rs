@@ -615,8 +615,16 @@ fn reads_are_checked_against_postgres() {
     let plan = db.merge_preview("w", &Default::default()).unwrap();
     assert!(plan.blocked.is_none(), "{:?}", plan.blocked);
     assert!(plan.live.as_ref().is_some_and(|l| l.stale_reads.is_empty()), "{:?}", plan.live);
-    // the email itself, added straight into Postgres: the dry run says it would be held, and the merge is
+    // CHECK READS between steps: nothing it relied on moved yet
+    assert_eq!(run(&db, "w", "check reads", &[]).unwrap().pop().unwrap().rows.len(), 0);
+    // the email itself, added straight into Postgres: CHECK READS says so before any merge (against Postgres, not
+    // main, which never saw it), the world's view stays as it was, and the dry run says it would be held
     pg.batch_execute("insert into suppressed (email) values ('ada@x.com')").unwrap();
+    let found = run(&db, MAIN, "check reads of world w", &[]).unwrap().pop().unwrap();
+    assert_eq!(found.rows.len(), 1, "{:?}", found.rows);
+    assert!(found.rows[0][0].to_text().starts_with("Postgres ("), "{:?}", found.rows);
+    assert!(found.rows[0][1].to_text().contains("changed in Postgres since it forked"), "{:?}", found.rows);
+    assert_eq!(cell(&db, "w", "select count(*) from suppressed where email = 'ada@x.com'"), "0", "no rebase");
     let plan = db.merge_preview("w", &Default::default()).unwrap();
     let blocked = plan.blocked.unwrap_or_default();
     assert!(blocked.contains("changed in Postgres since it forked"), "{blocked}");

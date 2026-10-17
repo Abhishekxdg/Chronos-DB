@@ -7554,6 +7554,9 @@ enum Stmt {
     ShowChecks,
     /// SHOW REVIEWS: merges agents' policies sent to a person
     ShowReviews,
+    /// CHECK READS [OF WORLD w]: what a world that checks its reads read that changed since its fork (see
+    /// `Core::check_reads`); None: the session's world
+    CheckReads(Option<String>),
     /// SHOW MERGE OUTCOMES [BY AGENT | BY POLICY]: how worlds ended within the history window
     ShowMergeOutcomes {
         by_policy: bool,
@@ -11145,6 +11148,16 @@ impl Parser {
                 Ok(Stmt::ClaimOutbox { channels, limit, lease, idempotent })
             }
             "show" if self.kw("reviews") => Ok(Stmt::ShowReviews),
+            "check" if self.kw("reads") => {
+                let name = match self.kw("of") {
+                    true => {
+                        let _ = self.kw("world") || self.kw("branch");
+                        Some(self.branch_name()?)
+                    }
+                    false => None,
+                };
+                Ok(Stmt::CheckReads(name))
+            }
             "show" if self.kw("merge") => {
                 if self.kw("checks") {
                     return Ok(Stmt::ShowChecks);
@@ -33669,6 +33682,7 @@ impl Session {
             // checked as they run: 'outbox' or 'admin', policy or not
             Stmt::AckOutbox(_) | Stmt::RetryOutbox(_) | Stmt::ClaimOutbox { .. } => {}
             Stmt::Rebase { name, .. } => me.may_write(&world(name), 0)?, // it changes the world only
+            Stmt::CheckReads(name) => me.may_read(&world(name))?,        // it reads only
             // every agent's results, as /metrics are: the database's own users only
             Stmt::ShowMergeOutcomes { .. } => {
                 return Err(SqlError {
@@ -36037,6 +36051,7 @@ impl Session {
             | Stmt::DropBranch { .. }
             | Stmt::MergeBranch { .. }
             | Stmt::Rebase { .. }
+            | Stmt::CheckReads(_)
             | Stmt::AlterWorld { .. }
             | Stmt::Restore { .. }
             | Stmt::UndoMerge { .. }
@@ -37321,6 +37336,7 @@ impl Statement {
                     ("worker", Type::Text),
                 ]);
             }
+            Stmt::CheckReads(_) => return fixed(&[("checked_against", Type::Text), ("changed", Type::Text)]),
             Stmt::ShowReviews => {
                 return fixed(&[
                     ("world", Type::Text),
@@ -38312,6 +38328,17 @@ impl Statement {
                     .into_iter()
                     .map(|e| outbox_row(e, &landed))
                     .collect();
+                Ok(Output {
+                    typmods: vec![],
+                    tag: format!("SELECT {}", rows.len()),
+                    columns: self.columns(db, branch, &[])?,
+                    rows,
+                })
+            }
+            Stmt::CheckReads(name) => {
+                let b = &db.world(name.as_deref().unwrap_or(branch))?.name;
+                let rows: Vec<Vec<Value>> =
+                    db.reads_changed(b)?.into_iter().map(|(at, why)| vec![Value::Text(at), Value::Text(why)]).collect();
                 Ok(Output {
                     typmods: vec![],
                     tag: format!("SELECT {}", rows.len()),

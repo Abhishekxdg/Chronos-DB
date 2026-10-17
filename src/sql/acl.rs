@@ -1489,6 +1489,7 @@ fn superuser_only(st: &Stmt) -> Option<&'static str> {
         Stmt::ShowHistory { .. } => "SHOW HISTORY",
         Stmt::ShowAudit { .. } => "SHOW AUDIT",
         Stmt::ShowReviews => "SHOW REVIEWS",
+        Stmt::CheckReads(_) => "CHECK READS",
         Stmt::ShowMergeOutcomes { .. } => "SHOW MERGE OUTCOMES",
         Stmt::ShowOutbox | Stmt::AckOutbox(_) | Stmt::RetryOutbox(_) | Stmt::ClaimOutbox { .. } => "the outbox",
         Stmt::CreateAgent { .. } | Stmt::AlterAgent { .. } | Stmt::DropAgent(_) | Stmt::ShowAgents => "agents",

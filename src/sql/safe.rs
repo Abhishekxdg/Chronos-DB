@@ -144,6 +144,7 @@ fn access(s: &Stmt) -> Reach {
         | Stmt::ShowPolicies
         | Stmt::ShowChecks
         | Stmt::ShowReviews
+        | Stmt::CheckReads(_)
         | Stmt::ShowMergeOutcomes { .. }
         | Stmt::ShowOutbox
         | Stmt::ShowAudit { .. }

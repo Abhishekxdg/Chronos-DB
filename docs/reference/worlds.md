@@ -361,6 +361,14 @@ alter world payout set (check_reads = false);    -- a person's way past it
 - **Anyone reading it counts:** a person inspecting the world with `SELECT` adds to what it read.
 - **Partial merges:** `ONLY TABLES` and `ONLY KEYS` check every read of the world, not only those of the rows they merge: which reads led to which writes isn't known.
 - **Replaying the log:** a merge that went through is replayed after a restart without checking its reads again.
+- **Checking between steps, without merging:** `CHECK READS [OF WORLD w]` (the session's world without `OF`) lists what the world read that changed since it forked, with what it was checked against, and changes nothing: the world's view stays as it was. Empty: nothing it relied on moved. An agent on a long task runs it at the start of each step, and when something changed, reads it again and decides again (`REBASE WORLD` first, to see its parent as it is now) before writing, instead of finding out at its merge. Rebasing on every read instead would move the data under a decision in progress. In a folder attached to Postgres, a world of main's reads of attached tables are checked against Postgres as it is now too (a read-only transaction, rolled back), so a row changed or added straight in Postgres shows here before the merge would hold it. Refused (55000) for a world that doesn't check its reads. Also the MCP tool [`check_reads`](mcp.md#check_reads) and the HTTP op `check_reads`.
+
+  ```sql
+  check reads of world payout;
+  --  checked_against | changed
+  -- -----------------+-----------------------------------------------------------
+  --  main            | read rows that changed since it forked: accounts/1
+  ```
 - **Attached to Postgres:** in a folder [attached to Postgres](../guides/attach-postgres.md#reads-checked-against-live-postgres), reads of attached tables are checked against Postgres too when the merge is written there, so a row changed or added straight in Postgres since the fork (one an empty result would now find included) holds the merge: `read rows that changed in Postgres since it forked`.
 
 ### Declared scope (may_change, tenant)

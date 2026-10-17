@@ -155,7 +155,7 @@ fn mcp_session() {
 
     assert_eq!(replies.len(), 10, "one reply per request, none for the notification:\n{out}");
     assert_eq!(replies[0]["result"]["serverInfo"]["name"], "chronos");
-    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 29);
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 30);
     let text = |i: usize| replies[i]["result"]["content"][0]["text"].as_str().unwrap().to_string();
     let is_err = |i: usize| replies[i]["result"]["isError"].as_bool().unwrap();
     assert_eq!(text(5), "merged 1 change from task-1 into main");
@@ -212,7 +212,7 @@ fn mcp_safe_mode() {
     assert_eq!(r.len(), 26, "{r:#?}");
     let names: Vec<&str> =
         r[0]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names.len(), 26, "{names:?}"); // rebase too: on its own branches only
+    assert_eq!(names.len(), 27, "{names:?}"); // rebase too: on its own branches only; check_reads only reads
     assert!(!names.contains(&"merge") && !names.contains(&"restore") && !names.contains(&"undo_merge"), "{names:?}");
     let text = |id: usize| r[id - 1]["result"]["content"][0]["text"].as_str().unwrap().to_string();
     let refused = |id: usize, why: &str| {

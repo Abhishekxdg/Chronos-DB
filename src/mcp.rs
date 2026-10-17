@@ -518,6 +518,18 @@ fn call(sh: &mut Shell, g: &mut Guard, name: &str, a: &Value) -> Result<String, 
         "rebase" => sh
             .sql_as(&format!("rebase world {}", merge_clauses(word("branch")?, a)?), &[], g.agent.as_deref())
             .map(no_cursor),
+        "check_reads" => {
+            let out = sh.sql_as(&format!("check reads of world {}", lit(word("branch")?)), &[], g.agent.as_deref())?;
+            Ok(match out.contains("(0 rows)") {
+                true => {
+                    format!("Nothing {} read changed since it forked: what it decided on still holds.", word("branch")?)
+                }
+                false => format!(
+                    "{out}\n\nThese reads changed since the branch forked: read them again and decide again before \
+                     writing on them (rebase first to see the parent as it is now). Its merge would be held for them."
+                ),
+            })
+        }
         "merge"
             if ["by_columns", "rows", "into", "only_tables", "only_keys", "version", "target", "confirm_deletes"]
                 .iter()
@@ -1058,6 +1070,17 @@ fn tools(hidden: &[&str]) -> Value {
                 "resolve": { "type": "string", "enum": ["fail", "ours", "theirs"], "description": "On conflict: fail (default), ours (keep this branch's values), theirs (take the parent's)" },
                 "version": { "type": "integer", "description": "Rebase only if the branch is still at this version" },
             }),
+            &["branch"],
+        ),
+        tool(
+            "check_reads",
+            "Whether anything a branch read changed since it forked (a branch forked with check_reads), without \
+             merging or changing anything: the rows, key ranges and filtered scans it read (an empty result \
+             included) compared with its parent as it is now, and in a folder attached to Postgres with Postgres \
+             as it is now too. Run it between steps of a long task: if something changed, read it again and \
+             decide again (rebase first) before writing; its merge would be held for it anyway. Nothing changes: \
+             the branch's view stays as it was.",
+            json!({ "branch": branch }),
             &["branch"],
         ),
         tool(

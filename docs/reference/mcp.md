@@ -14,9 +14,9 @@ claude mcp add chronos -- chronos mcp /path/to/mydb
 
 | Command | Acts as | Tools listed | Changes |
 |---|---|---|---|
-| `chronos mcp mydb` | [safe mode](#safe-mode) (the default) | 26: all but `merge`, `restore`, `undo_merge` | only worlds forked in this session |
+| `chronos mcp mydb` | [safe mode](#safe-mode) (the default) | 27: all but `merge`, `restore`, `undo_merge` | only worlds forked in this session |
 | `chronos mcp mydb --agent bot` | the agent `bot` | those `bot` has the rights for ([below](#as-an-agent)) | what `bot` may change; its forks stay its own across sessions |
-| `chronos mcp mydb --allow-merge` | the database's own user | all 29 | everything |
+| `chronos mcp mydb --allow-merge` | the database's own user | all 30 | everything |
 
 - **`--agent` wins:** with both `--agent` and `--allow-merge`, the session acts as the agent.
 - **`--agent` takes a name, not a token:** an unknown or disabled agent is refused at start (`chronos: ...`, exit 1). Anyone who can run `chronos mcp` on the folder can name any agent; see [security](../security.md).
@@ -105,6 +105,7 @@ Every tool that reads or writes rows takes `branch` (string, default `main`). A 
 | [`merge`](#merge) | apply a branch to its parent | not listed |
 | [`merge_preview`](#merge_preview) | what a merge would do | yes |
 | [`rebase`](#rebase) | take in what changed in the parent, keep the branch's own changes | on its own worlds |
+| [`check_reads`](#check_reads) | whether anything the branch read changed since it forked | yes |
 | [`undo_merge`](#undo_merge) | undo a branch's latest merge | not listed |
 | [`checkpoint`](#checkpoint) | name a moment of a branch | on its own worlds |
 | [`rollback`](#rollback) | go back to a checkpoint | on its own worlds |
@@ -283,6 +284,16 @@ Moves a branch's fork point up to its parent as it is now, keeping the branch's 
 | `version` | integer | no | none; rebase only if the branch is still at this version |
 
 Returns `REBASE n`, n the parent's rows it took in.
+
+### check_reads
+
+Whether anything a branch read changed since it forked, without merging or changing anything: for a branch forked `with (check_reads = true)` (or by an agent whose merge policy has `check_reads`). The rows, key ranges and filtered scans it read, an empty result included, compared with its parent as it is now, and in a folder attached to Postgres with Postgres as it is now too. Meant for the start of each step of a long task: if something changed, read it again and decide again (`rebase` first) before writing; the branch's merge would be held for it anyway. The branch's view doesn't change. Runs [`CHECK READS`](worlds.md#stale-reads-check_reads).
+
+| Parameter | Type | Required | Default |
+|---|---|---|---|
+| `branch` | string | yes | |
+
+Returns "Nothing ... read changed since it forked" or a table: `checked_against` (the parent, or `Postgres (...)`) and `changed` (what, and why).
 
 ### merge_preview
 

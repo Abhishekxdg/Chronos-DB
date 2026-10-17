@@ -3109,6 +3109,49 @@ impl Core {
         self.branch(b).ok()?.recorder()
     }
 
+    /// What world `b` (one that checks its reads: see `stale`) read that changed since its fork, without merging or
+    /// changing anything: `CHECK READS`. An agent runs it between steps, to re-read and decide again before writing on
+    /// facts that are gone, instead of finding out at its merge; the world's own view stays as it was (no rebase:
+    /// shifting the data under a decision in progress is a bug of its own). Each as (what it was checked against,
+    /// why): its parent as it is now; and, for a world of main in a folder attached to Postgres, Postgres as it is
+    /// now too (see `attach::check_reads`), since rows changed there never reach main. Empty: nothing it relied on
+    /// moved. The same checks a merge makes, without the merge's plan around them.
+    pub fn reads_changed(&self, b: &str) -> Result<Vec<(String, String)>> {
+        not_tx(b)?;
+        let parent = {
+            let m = self.branches.read().unwrap();
+            let e = m.get(b).ok_or_else(|| Error::NoBranch(b.into()))?;
+            e.parent.clone().ok_or(Error::IsMain)?
+        };
+        let br = self.branch(b)?;
+        let Some(set) = br.recorder() else {
+            return Err(Error::Constraint {
+                code: "55000",
+                message: format!(
+                    "{b} doesn't check its reads: fork it WITH (check_reads = true), or as an agent whose merge \
+                     policy has check_reads"
+                ),
+            });
+        };
+        let (base, ours) = (br.base(), br.snapshot());
+        // (rows it wrote itself conflict or settle at its merge on their own: not reads that went stale)
+        let wrote: std::collections::HashSet<String> =
+            self.state_diff(&base, &ours)?.into_iter().map(|c| c.key).collect();
+        let now = self.branch(&parent)?.snapshot();
+        let mut out: Vec<(String, String)> =
+            self.stale_reasons(&set, &base, &now, &wrote)?.into_iter().map(|r| (parent.clone(), r)).collect();
+        if parent == MAIN
+            && let Some(att) = self.attached.as_deref()
+        {
+            let against = format!("Postgres ({})", att.source());
+            match attach::check_reads(self, att, &set, &base, &wrote) {
+                Ok(found) => out.extend(found.into_iter().map(|r| (against.clone(), r))),
+                Err(e) => out.push((against, format!("couldn't be checked: {e}"))),
+            }
+        }
+        Ok(out)
+    }
+
     /// A view of state `s`, of no world: for reading a state a merge compares (see `stale`).
     pub(crate) fn past_view(&self, s: &State) -> View<'_> {
         View { core: self, born: PAST, s: s.clone(), branch: String::new(), reads: None }
@@ -3563,6 +3606,19 @@ impl Core {
         self.checkpoint_closing()?;
         std::mem::forget(self.gate.write().unwrap()); // no more writes: they'd come after the Close
         self.flush_batches(); // those since the checkpoint
+        // what dropping the database keeps for the next open, kept here too: `chronos serve` (on a signal) and
+        // `chronos mcp` (at the end of its input) close and then exit the process, which runs no destructor, so
+        // worlds that check their reads lost them (their merges held as after a crash) and agents' hourly counts
+        // started again. Kept again by the drop, if one follows: the same files, written whole
+        if let Err(e) = self.save_read_sets() {
+            eprintln!("chronos: could not keep what worlds read; their merges will be held after the restart: {e}");
+        }
+        if let Err(e) = self.save_reads() {
+            eprintln!("chronos: could not save the reads recorded: {e}");
+        }
+        if let Err(e) = self.save_tallies() {
+            eprintln!("chronos: could not save agents' hourly merge counts: {e}");
+        }
         log.close()
     }
 
