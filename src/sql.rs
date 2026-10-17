@@ -26598,6 +26598,10 @@ static SPARE: LazyLock<std::sync::atomic::AtomicUsize> =
 
 type Job = Box<dyn FnOnce() + Send>;
 
+/// Milliseconds a pooled helper waits after a job before taking the next (tests: a helper slow to get there).
+#[cfg(test)]
+static LINGER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Helper threads waiting for work, each by the channel that hands it its next job: kept
 /// between queries, so a query's steps don't each start threads (on 32 cores, starting them
 /// cost more than a 20,000-row join's work).
@@ -26623,7 +26627,9 @@ fn helper(mut job: Job, pooled: bool) -> bool {
         let mut job = job;
         loop {
             job();
-            STOP.set(None); // the statement's, not the next one's
+            #[cfg(test)]
+            std::thread::sleep(std::time::Duration::from_millis(LINGER.load(std::sync::atomic::Ordering::Relaxed)));
+            STOP.set(None); // (the job clears it: see `par_run_on`)
             {
                 let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
                 if idle.len() >= *HELPERS {
@@ -26765,11 +26771,14 @@ fn par_run_on<T: Send>(
                         panicked.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(p);
                     }
                 }
-                // (a pooled helper keeps no statement's world, or role)
+                // (a pooled helper keeps no statement's world, or role, or its stop: that holds the
+                // database (`Stop::ctx`), and a helper still holding it once the caller went on could
+                // be what closes it, after the caller dropped its Db: the folder stayed locked a moment)
                 catalog::restore_world(None);
                 roles::restore(None);
                 PATH.set(None);
                 SESSION.set(None);
+                STOP.set(None);
                 finished(&mine);
             };
             let job: Box<dyn FnOnce() + Send + '_> = Box::new(job);
@@ -62624,6 +62633,27 @@ mod tests {
         let out = par_run(64, |i, _| Ok(i)).unwrap();
         assert_eq!(out, (0..64).collect::<Vec<_>>(), "and the pool still works");
         assert!(IDLE.lock().unwrap().len() <= *super::HELPERS);
+    }
+
+    /// A helper lets go of the statement's stop (which holds the database) before the statement
+    /// goes on: one that still held it could close the database after its Db was dropped, and the
+    /// folder stayed locked a moment (a reopen right after `drop` failed under load).
+    #[test]
+    fn helpers_let_go_of_the_statement_before_it_goes_on() {
+        use super::{LINGER, STOP, Stop, par_run};
+        use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
+        LINGER.store(300, Ordering::Relaxed); // helpers slow to get back to the pool
+        let cancel = Arc::new(AtomicBool::new(false));
+        STOP.set(Some(Stop { deadline: None, cancel: cancel.clone(), gone: None, ctx: None, mem: None }));
+        let out = par_run(64, |i, _| {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            Ok(i)
+        });
+        let held = Arc::strong_count(&cancel);
+        STOP.set(None);
+        LINGER.store(0, Ordering::Relaxed);
+        assert_eq!(out.unwrap(), (0..64).collect::<Vec<_>>());
+        assert_eq!(held, 2, "only this test and its own STOP hold the statement once par_run returns");
     }
 
     #[test]
