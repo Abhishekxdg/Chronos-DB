@@ -1,0 +1,9 @@
+{
+  "name": "chronos-drivers-prisma",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@prisma/client": "6.2.1",
+    "prisma": "6.2.1"
+  }
+}

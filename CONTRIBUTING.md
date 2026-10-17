@@ -1,8 +1,13 @@
 # Contributing
 
-Thanks for helping. The Chronos DB engine is closed source, so this repository takes
-contributions to the Studio, the clients, the docs and the examples, and bug reports and
-ideas for everything, the engine included.
+Thanks for helping. Bug reports and ideas are welcome for everything. The engine's source
+(`src/`, `tests/`) is here under the Business Source License, mirrored from the repository it is
+developed in, so a pull request to it isn't merged here directly: open it anyway (or an issue
+with the patch), and a change taken is applied upstream with you credited, then shows up here.
+Pull requests to the Studio, the clients, the docs and the examples are taken the same way.
+
+To build and test the engine: `cargo build --release`, then `cargo test --release`. Tests that
+compare with Postgres need a Postgres 16 at host=/tmp, port 5432 (they skip without one).
 
 ## Reporting bugs
 

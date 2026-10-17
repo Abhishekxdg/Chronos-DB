@@ -1,6 +1,6 @@
 # Benchmarks
 
-> The numbers and methods are public; the harness code that produced them lives with the engine's source, which is private.
+> The numbers, the methods and the engine's source are public (most harnesses are `examples/*.rs`); a few runner scripts stay in the private development repository.
 
 **Machine.** Unless a section says otherwise, everything here was rerun end to end on 2026-09-28 on one Linux server: GCP `c2d-standard-32` (32 vCPUs: an AMD EPYC 7B13, 16 cores with 2 threads each; 128 GB of RAM; a 500 GB pd-ssd; Ubuntu 24.04). Every rival ran on the same machine, driven by the same client as Chronos DB, one job at a time on an otherwise idle machine (a queue ran the jobs; each section gives the load average where it matters). The raw output of every run, and the script that made it, is in [`bench/results/2026-09-28-rerun/`](bench/results/2026-09-28-rerun).
 

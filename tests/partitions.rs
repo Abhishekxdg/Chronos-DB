@@ -1,0 +1,1011 @@
+//! Declarative partitioning (PARTITION BY, PARTITION OF, ATTACH and DETACH PARTITION) and table inheritance
+//! (INHERITS): routing, bounds, keys, indexes, foreign keys, triggers, the catalog and its functions. Every answer
+//! and SQLSTATE below is what Postgres 16 gives for the same statements (tests/pgdiff.rs compares them live);
+//! these run without one.
+
+use chronos::sql::{Session, Value};
+use chronos::{Db, MAIN};
+
+/// Statements run in order in one session: a query's rows (a row a string, its columns joined with `|` and
+/// booleans as `t`/`f` the way psql prints them), or the SQLSTATE of the statement Postgres refuses. Every
+/// statement that answers otherwise is reported, not only the first.
+fn script(steps: &[(&str, Result<&[&str], &str>)]) {
+    let (db, mut s) = (Db::new(), Session::new(MAIN));
+    let mut failures = vec![];
+    let text = |v: &Value| match v {
+        Value::Bool(b) => (if *b { "t" } else { "f" }).to_string(),
+        v => v.to_text(),
+    };
+    for (q, want) in steps {
+        match (want, s.run(&db, q, &[])) {
+            (Ok(want), Ok(out)) => {
+                let got: Vec<String> =
+                    out.last().unwrap().rows.iter().map(|r| r.iter().map(text).collect::<Vec<_>>().join("|")).collect();
+                if got != *want {
+                    failures.push(format!("{q}\n  want {want:?}\n  got  {got:?}"));
+                }
+            }
+            (Ok(want), Err(e)) => failures.push(format!("{q}\n  want {want:?}\n  got  {} {}", e.code, e.message)),
+            (Err(code), Ok(_)) => failures.push(format!("{q}\n  want SQLSTATE {code}\n  got  success")),
+            (Err(code), Err(e)) if e.code != *code => {
+                failures.push(format!("{q}\n  want SQLSTATE {code}\n  got  {} {}", e.code, e.message));
+            }
+            (Err(_), Err(_)) => {}
+        }
+    }
+    assert!(failures.is_empty(), "{} differences:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// Rows go to the partition their key belongs to: INSERT (also SELECT and ON CONFLICT), UPDATE that moves a row, DELETE, TRUNCATE.
+#[test]
+fn range_and_list_routing() {
+    script(&[
+        (
+            r"create table events (id int, day date not null, kind text not null default 'k', n int default 0, primary key (id, day, kind)) partition by range (day)",
+            Ok(&[]),
+        ),
+        (r"create table events_2023 partition of events for values from ('2023-01-01') to ('2024-01-01')", Ok(&[])),
+        (
+            r"create table events_2024 partition of events for values from ('2024-01-01') to ('2025-01-01') partition by list (kind)",
+            Ok(&[]),
+        ),
+        (r"create table events_2024_ab partition of events_2024 for values in ('a', 'b')", Ok(&[])),
+        (r"create table events_2024_x partition of events_2024 default", Ok(&[])),
+        (r"create table events_rest partition of events default", Ok(&[])),
+        (
+            r"insert into events values (1, '2023-05-05', 'a', 1), (2, '2024-02-02', 'b', 2), (3, '2024-12-31', 'c', 3), (4, '2030-01-01', 'a', 4)",
+            Ok(&[]),
+        ),
+        (
+            r"select tableoid::regclass::text, id from events order by id",
+            Ok(&[r"events_2023|1", r"events_2024_ab|2", r"events_2024_x|3", r"events_rest|4"]),
+        ),
+        (r"select count(*) from only events", Ok(&[r"0"])),
+        (r"select count(*) from events_2024", Ok(&[r"2"])),
+        (r"select count(*) from only events_2024", Ok(&[r"0"])),
+        (
+            r"insert into events (id, day) values (6, '2023-03-03') returning tableoid::regclass::text, id, day, kind, n",
+            Ok(&[r"events_2023|6|2023-03-03|k|0"]),
+        ),
+        (r"insert into events values (7, null, 'a', 1)", Err("23502")),
+        (
+            r"update events set day = '2024-03-03' where id = 1 returning tableoid::regclass::text, id",
+            Ok(&[r"events_2024_ab|1"]),
+        ),
+        (
+            r"update events set kind = 'z', day = day + 1 where id in (2, 4) returning tableoid::regclass::text, id, kind, day",
+            Ok(&[r"events_2024_x|2|z|2024-02-03", r"events_rest|4|z|2030-01-02"]),
+        ),
+        (
+            r"select tableoid::regclass::text, id, day, kind from events order by id",
+            Ok(&[
+                r"events_2024_ab|1|2024-03-03|a",
+                r"events_2024_x|2|2024-02-03|z",
+                r"events_2024_x|3|2024-12-31|c",
+                r"events_rest|4|2030-01-02|z",
+                r"events_2023|6|2023-03-03|k",
+            ]),
+        ),
+        (r"update events_2024 set day = '2023-06-06' where id = 3", Err("23514")),
+        (r"update events set n = n + 10 where n > 2 returning id, n", Ok(&[r"3|13", r"4|14"])),
+        (r"delete from events where id = 3 returning tableoid::regclass::text, id", Ok(&[r"events_2024_x|3"])),
+        (r"insert into events select g, '2024-01-01'::date + g, 'a', g from generate_series(10, 14) g", Ok(&[])),
+        (
+            r"select tableoid::regclass::text, count(*) from events group by 1 order by 1",
+            Ok(&[r"events_2023|1", r"events_2024_ab|6", r"events_2024_x|1", r"events_rest|1"]),
+        ),
+        (r"insert into events values (10, '2024-01-11', 'a', 0)", Err("23505")),
+        (r"insert into events values (10, '2024-01-11', 'a', 0) on conflict do nothing", Ok(&[])),
+        (
+            r"insert into events values (10, '2024-01-11', 'a', 5) on conflict (id, day, kind) do update set n = events.n + excluded.n returning tableoid::regclass::text, id, n",
+            Ok(&[r"events_2024_ab|10|15"]),
+        ),
+        (r"select id, kind, n from events where id in (10, 11) order by id", Ok(&[r"10|a|15", r"11|a|11"])),
+        (r"update events set id = id + 100 where id = 12 returning *", Ok(&[r"112|2024-01-13|a|12"])),
+        (r"delete from events where id > 100", Ok(&[])),
+        (
+            r"select sum(n), count(*), min(day), max(day) from events where day between '2024-01-01' and '2024-12-31'",
+            Ok(&[r"56|6|2024-01-11|2024-03-03"]),
+        ),
+        (
+            r"select e.id, p.relname from events e join pg_class p on p.oid = e.tableoid where e.id < 3 order by 1",
+            Ok(&[r"1|events_2024_ab", r"2|events_2024_x"]),
+        ),
+        (r"truncate events_2024", Ok(&[])),
+        (r"select tableoid::regclass::text, id from events order by id", Ok(&[r"events_rest|4", r"events_2023|6"])),
+        (r"truncate only events", Err("42809")),
+        (r"truncate events", Ok(&[])),
+        (r"select count(*) from events", Ok(&[r"0"])),
+    ]);
+}
+
+/// FOR VALUES of each strategy: what a partition may be, overlaps and empty ranges, DEFAULT, hash moduli.
+#[test]
+fn bounds_of_every_strategy() {
+    script(&[
+        (r"create table l (code text, v int) partition by list (code)", Ok(&[])),
+        (r"create table l_xy partition of l for values in ('x', 'y')", Ok(&[])),
+        (r"create table l_z partition of l for values in ('z', null)", Ok(&[])),
+        (r"select partstrat, partnatts from pg_partitioned_table where partrelid = 'l'::regclass", Ok(&[r"l|1"])),
+        (r"insert into l values ('x', 1), ('z', 2), (null, 3)", Ok(&[])),
+        (r"insert into l values ('q', 4)", Err("23514")),
+        (r"create table l_dup partition of l for values in ('y')", Err("42P17")),
+        (r"create table l_dup partition of l for values in (null)", Err("42P17")),
+        (r"create table l_bad partition of l for values from ('a') to ('b')", Err("42P16")),
+        (r"create table l_def partition of l default", Ok(&[])),
+        (r"create table l_def2 partition of l default", Err("42P17")),
+        (r"insert into l values ('q', 4), ('w', 5)", Ok(&[])),
+        (
+            r"select tableoid::regclass::text, code, v from l order by v",
+            Ok(&[r"l_xy|x|1", r"l_z|z|2", r"l_z||3", r"l_def|q|4", r"l_def|w|5"]),
+        ),
+        (r"create table l_late partition of l for values in ('w')", Err("23514")),
+        (r"update l set code = 'x' where v = 4", Ok(&[])),
+        (
+            r"select tableoid::regclass::text, code, v from l order by v",
+            Ok(&[r"l_xy|x|1", r"l_z|z|2", r"l_z||3", r"l_xy|x|4", r"l_def|w|5"]),
+        ),
+        (r"create table r (a int, b int) partition by range (a, b)", Ok(&[])),
+        (r"create table r1 partition of r for values from (1, 1) to (1, 10)", Ok(&[])),
+        (r"create table r2 partition of r for values from (1, 10) to (2, 5)", Ok(&[])),
+        (r"create table r3 partition of r for values from (minvalue, minvalue) to (1, 1)", Ok(&[])),
+        (r"create table r4 partition of r for values from (2, 5) to (maxvalue, maxvalue)", Ok(&[])),
+        (r"create table r_overlap partition of r for values from (1, 5) to (2, 1)", Err("42P17")),
+        (r"create table r_empty partition of r for values from (3, 3) to (3, 3)", Err("42P17")),
+        (r"create table r_one partition of r for values from (5) to (6)", Err("42P16")),
+        (r"insert into r values (0, 0), (1, 1), (1, 9), (1, 10), (2, 4), (2, 5), (100, 100)", Ok(&[])),
+        (r"insert into r values (null, 1)", Err("23514")),
+        (
+            r"select tableoid::regclass::text, a, b from r order by a, b",
+            Ok(&[r"r3|0|0", r"r1|1|1", r"r1|1|9", r"r2|1|10", r"r2|2|4", r"r4|2|5", r"r4|100|100"]),
+        ),
+        (r"create table h (a int) partition by hash (a)", Ok(&[])),
+        (r"create table h0 partition of h for values with (modulus 4, remainder 0)", Ok(&[])),
+        (r"create table h1 partition of h for values with (modulus 4, remainder 1)", Ok(&[])),
+        (r"create table h_same partition of h for values with (modulus 4, remainder 1)", Err("42P17")),
+        (r"create table h_bad partition of h for values with (modulus 3, remainder 1)", Err("42P17")),
+        (r"create table h_zero partition of h for values with (modulus 0, remainder 0)", Err("42P16")),
+        (r"create table h_rem partition of h for values with (modulus 4, remainder 4)", Err("42P16")),
+        (r"create table h_big partition of h for values with (modulus 8, remainder 2)", Ok(&[])),
+        (r"create table h_small partition of h for values with (modulus 2, remainder 0)", Err("42P17")),
+        (r"insert into h select g from generate_series(1, 30) g", Err("23514")),
+        (r"insert into h values (1)", Ok(&[])),
+        (r"select tableoid::regclass::text, count(*) from h group by 1 order by 1", Ok(&[r"h0|1"])),
+        (r"create table ht (a text, b numeric(5,2), c uuid, d timestamptz) partition by hash (a, b, c, d)", Ok(&[])),
+        (r"create table ht0 partition of ht for values with (modulus 2, remainder 0)", Ok(&[])),
+        (r"create table ht1 partition of ht for values with (modulus 2, remainder 1)", Ok(&[])),
+        (
+            r"insert into ht values ('a', 1.5, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '2024-01-01 00:00:00+00'), ('b', 2.25, '00000000-0000-0000-0000-000000000001', '2024-06-01 12:00:00+00'), ('c', null, null, null), (null, null, null, null), ('é', -3, 'ffffffff-ffff-ffff-ffff-ffffffffffff', '1999-12-31 23:59:59+00')",
+            Ok(&[]),
+        ),
+        (
+            r"select tableoid::regclass::text, a, b from ht order by 1, 2, 3",
+            Ok(&[r"ht0|c|", r"ht0|é|-3.00", r"ht0||", r"ht1|a|1.50", r"ht1|b|2.25"]),
+        ),
+        (r"create table e (a int, b text) partition by range ((a * 2), lower(b))", Ok(&[])),
+        (r"create table e1 partition of e for values from (0, 'a') to (10, 'm')", Ok(&[])),
+        (r"insert into e values (1, 'ABC'), (4, 'Z'), (6, 'a')", Err("23514")),
+        (r"insert into e values (5, 'a')", Ok(&[])),
+        (r"select tableoid::regclass::text, a, b from e order by a", Ok(&[r"e1|5|a"])),
+        (
+            r"select pg_get_partkeydef('e'::regclass), pg_get_partkeydef('h'::regclass), pg_get_partkeydef('r'::regclass), pg_get_partkeydef('l'::regclass)",
+            Ok(&[r"RANGE (((a * 2)), lower(b))|HASH (a)|RANGE (a, b)|LIST (code)"]),
+        ),
+    ]);
+}
+
+/// ATTACH PARTITION checks a table against the parent and its bound; DETACH makes it its own again.
+#[test]
+fn attach_and_detach() {
+    script(&[
+        (
+            r"create table p (a int not null, b text, c int, constraint pc check (c > 0), primary key (a), unique (b, a)) partition by list (a)",
+            Ok(&[]),
+        ),
+        (r"create index p_c on p (c)", Ok(&[])),
+        (r"create table k1 (a int, b text, c int)", Ok(&[])),
+        (r"alter table p attach partition k1 for values in (1)", Err("42804")),
+        (r"create table k1b (a int not null, b text, c int)", Ok(&[])),
+        (r"alter table p attach partition k1b for values in (1)", Err("42804")),
+        (r"alter table k1b add constraint pc check (c > 0)", Ok(&[])),
+        (r"insert into k1b values (1, 'x', 5)", Ok(&[])),
+        (r"alter table p attach partition k1b for values in (1)", Ok(&[])),
+        (r"select tableoid::regclass::text, a, b, c from p", Ok(&[r"k1b|1|x|5"])),
+        (r"alter table p attach partition k1b for values in (2)", Err("42809")),
+        (r"create table k2 (a int not null, b text, c int, e int, constraint pc check (c > 0))", Ok(&[])),
+        (r"alter table p attach partition k2 for values in (2)", Err("42804")),
+        (r"create table k3 (c int, b text, a int not null, constraint pc check (c > 0), primary key (a))", Ok(&[])),
+        (r"insert into k3 values (7, 'z', 5), (8, 'y', 6)", Ok(&[])),
+        (r"alter table p attach partition k3 for values in (4)", Err("23514")),
+        (r"alter table p attach partition k3 for values in (5, 6)", Ok(&[])),
+        (r"select tableoid::regclass::text, a, b, c from p order by a", Ok(&[r"k1b|1|x|5", r"k3|5|z|7", r"k3|6|y|8"])),
+        (r"create table pd partition of p default", Ok(&[])),
+        (r"insert into p values (100, 'q', 1)", Ok(&[])),
+        (r"create table k4 (a int not null, b text, c int, constraint pc check (c > 0))", Ok(&[])),
+        (r"insert into k4 values (100, 'q', 1)", Ok(&[])),
+        (r"alter table p attach partition k4 for values in (100)", Err("23514")),
+        (r"alter table p attach partition k4 for values in (101)", Err("23514")),
+        (r"select tableoid::regclass::text, a from p order by a", Ok(&[r"k1b|1", r"k3|5", r"k3|6", r"pd|100"])),
+        (r"alter table p detach partition k3", Ok(&[])),
+        (r"select tableoid::regclass::text, a from p order by a", Ok(&[r"k1b|1", r"pd|100"])),
+        (r"select a, b, c from k3 order by a", Ok(&[r"5|z|7", r"6|y|8"])),
+        (
+            r"select attname, attislocal, attinhcount from pg_attribute where attrelid = 'k3'::regclass and attnum > 0 order by attnum",
+            Ok(&[r"c|t|0", r"b|t|0", r"a|t|0"]),
+        ),
+        (
+            r"select conname, conislocal, coninhcount from pg_constraint where conrelid = 'k3'::regclass order by conname",
+            Ok(&[r"k3_b_a_key|t|0", r"k3_pkey|t|0", r"pc|t|0"]),
+        ),
+        (r"alter table p detach partition k3", Err("42P01")),
+        (r"alter table p detach partition p", Err("42P01")),
+        (r"begin", Ok(&[])),
+        (r"alter table p detach partition k4 concurrently", Err("25001")),
+        (r"rollback", Ok(&[])),
+        (r"alter table p detach partition k4 concurrently", Err("55000")),
+        (r"alter table p detach partition k4 finalize", Err("42P01")),
+        (r"insert into p values (5, 'back', 1)", Ok(&[])),
+        (r"alter table p attach partition k3 for values in (5)", Err("23514")),
+        (r"alter table k3 add constraint z check (a > 0)", Ok(&[])),
+        (r"alter table p attach partition k3 for values in (6)", Err("23514")),
+        (r"drop table k3", Ok(&[])),
+        (r"select tableoid::regclass::text, a from p order by a", Ok(&[r"k1b|1", r"pd|5", r"pd|100"])),
+        (r"alter table p attach partition p for values in (9)", Err("42P07")),
+        (r"create table np (a int)", Ok(&[])),
+        (r"alter table np attach partition k4 for values in (9)", Err("42P17")),
+        (r"create table ih (a int not null, b text, c int, check (c > 0))", Ok(&[])),
+        (r"create table ihc () inherits (ih)", Ok(&[])),
+        (r"alter table p attach partition ih for values in (10)", Err("42809")),
+        (r"alter table p attach partition ihc for values in (10)", Err("42809")),
+        (r"drop table p", Ok(&[])),
+        (r"drop table p cascade", Err("42P01")),
+        (
+            r"select count(*) from pg_class where relname in ('p', 'k1b', 'pd', 'k4') and relnamespace = (select oid from pg_namespace where nspname = current_schema())",
+            Ok(&[r"1"]),
+        ),
+    ]);
+}
+
+/// Primary keys, unique constraints, indexes, foreign keys (from and to a partitioned table) and row triggers.
+#[test]
+fn keys_indexes_foreign_keys_and_triggers() {
+    script(&[
+        (r"create table ref (id int primary key, name text)", Ok(&[])),
+        (r"insert into ref values (1, 'one'), (2, 'two')", Ok(&[])),
+        (
+            r"create table m (id int, ref_id int, ts date not null, v text, primary key (id, ts)) partition by range (ts)",
+            Ok(&[]),
+        ),
+        (r"create table m1 partition of m for values from ('2024-01-01') to ('2025-01-01')", Ok(&[])),
+        (r"create table m2 partition of m for values from ('2025-01-01') to ('2026-01-01')", Ok(&[])),
+        (r"create index m_v on m (v)", Ok(&[])),
+        (r"create unique index m_u on m (v, ts)", Ok(&[])),
+        (r"create unique index m_bad on m (v)", Err("0A000")),
+        (r"alter table m add constraint m_bad unique (v)", Err("0A000")),
+        (r"alter table m add constraint m_ok unique (ref_id, ts)", Ok(&[])),
+        (r"alter table m add constraint m_fk foreign key (ref_id) references ref (id)", Ok(&[])),
+        (r"create table m3 partition of m for values from ('2026-01-01') to ('2027-01-01')", Ok(&[])),
+        (
+            r"select tablename, indexname from pg_indexes where tablename like 'm%' and schemaname = current_schema() order by 1, 2",
+            Ok(&[
+                r"m|m_ok",
+                r"m|m_pkey",
+                r"m|m_u",
+                r"m|m_v",
+                r"m1|m1_pkey",
+                r"m1|m1_ref_id_ts_key",
+                r"m1|m1_v_idx",
+                r"m1|m1_v_ts_idx",
+                r"m2|m2_pkey",
+                r"m2|m2_ref_id_ts_key",
+                r"m2|m2_v_idx",
+                r"m2|m2_v_ts_idx",
+                r"m3|m3_pkey",
+                r"m3|m3_ref_id_ts_key",
+                r"m3|m3_v_idx",
+                r"m3|m3_v_ts_idx",
+            ]),
+        ),
+        (
+            r"select conrelid::regclass::text, conname, contype from pg_constraint where connamespace = (select oid from pg_namespace where nspname = current_schema()) and conrelid::regclass::text like 'm%' order by 1, 2",
+            Ok(&[
+                r"m|m_fk|f",
+                r"m|m_ok|u",
+                r"m|m_pkey|p",
+                r"m1|m1_pkey|p",
+                r"m1|m1_ref_id_ts_key|u",
+                r"m1|m_fk|f",
+                r"m2|m2_pkey|p",
+                r"m2|m2_ref_id_ts_key|u",
+                r"m2|m_fk|f",
+                r"m3|m3_pkey|p",
+                r"m3|m3_ref_id_ts_key|u",
+                r"m3|m_fk|f",
+            ]),
+        ),
+        (
+            r"select indexrelid::regclass::text, indrelid::regclass::text, indisvalid from pg_index where indrelid in ('m'::regclass, 'm1'::regclass, 'm2'::regclass, 'm3'::regclass) order by 1",
+            Ok(&[
+                r"m1_pkey|m1|t",
+                r"m1_ref_id_ts_key|m1|t",
+                r"m1_v_idx|m1|t",
+                r"m1_v_ts_idx|m1|t",
+                r"m2_pkey|m2|t",
+                r"m2_ref_id_ts_key|m2|t",
+                r"m2_v_idx|m2|t",
+                r"m2_v_ts_idx|m2|t",
+                r"m3_pkey|m3|t",
+                r"m3_ref_id_ts_key|m3|t",
+                r"m3_v_idx|m3|t",
+                r"m3_v_ts_idx|m3|t",
+                r"m_ok|m|t",
+                r"m_pkey|m|t",
+                r"m_u|m|t",
+                r"m_v|m|t",
+            ]),
+        ),
+        (
+            r"select relname, relkind, relispartition from pg_class where relname like 'm%' and relnamespace = (select oid from pg_namespace where nspname = current_schema()) order by 1",
+            Ok(&[
+                r"m|p|f",
+                r"m1|r|t",
+                r"m1_pkey|i|t",
+                r"m1_ref_id_ts_key|i|t",
+                r"m1_v_idx|i|t",
+                r"m1_v_ts_idx|i|t",
+                r"m2|r|t",
+                r"m2_pkey|i|t",
+                r"m2_ref_id_ts_key|i|t",
+                r"m2_v_idx|i|t",
+                r"m2_v_ts_idx|i|t",
+                r"m3|r|t",
+                r"m3_pkey|i|t",
+                r"m3_ref_id_ts_key|i|t",
+                r"m3_v_idx|i|t",
+                r"m3_v_ts_idx|i|t",
+                r"m_ok|I|f",
+                r"m_pkey|I|f",
+                r"m_u|I|f",
+                r"m_v|I|f",
+            ]),
+        ),
+        (r"insert into m values (1, 1, '2024-05-05', 'a')", Ok(&[])),
+        (r"insert into m values (2, 3, '2024-05-05', 'a')", Err("23505")),
+        (r"insert into m values (1, 2, '2024-05-05', 'a')", Err("23505")),
+        (r"insert into m values (3, 2, '2024-05-05', 'a')", Err("23505")),
+        (r"insert into m values (3, null, '2025-05-05', 'b')", Ok(&[])),
+        (r"insert into m values (4, 1, '2025-05-05', 'b')", Err("23505")),
+        (r"update m set ref_id = 9 where id = 1", Err("23503")),
+        (r"update m set ref_id = 2 where id = 1", Ok(&[])),
+        (r"delete from ref where id = 2", Err("23503")),
+        (r"delete from ref where id = 1", Ok(&[])),
+        (r"select id, ref_id from m order by id", Ok(&[r"1|2", r"3|"])),
+        (r"drop index m_v", Ok(&[])),
+        (r"drop index m1_v_idx", Err("42704")),
+        (
+            r"select count(*) from pg_indexes where tablename like 'm%' and indexname like '%_v_idx' and schemaname = current_schema()",
+            Ok(&[r"0"]),
+        ),
+        (r"alter table m1 drop constraint m_fk", Err("42P16")),
+        (r"alter table m drop constraint m_fk", Ok(&[])),
+        (r"alter table m1 drop constraint m_ok", Err("42704")),
+        (r"alter table m drop constraint m_ok", Ok(&[])),
+        (
+            r"select conrelid::regclass::text, conname from pg_constraint where connamespace = (select oid from pg_namespace where nspname = current_schema()) and conrelid::regclass::text like 'm%' and contype in ('u', 'f') order by 1, 2",
+            Ok(&[]),
+        ),
+        (r"alter table m add constraint m_fk foreign key (ref_id) references ref (id) on delete cascade", Ok(&[])),
+        (r"delete from ref where id = 2", Ok(&[])),
+        (r"select id, ref_id from m order by id", Ok(&[r"3|"])),
+        (r"create table pk (a int primary key, b int) partition by range (a)", Ok(&[])),
+        (r"create table pk1 partition of pk for values from (1) to (5)", Ok(&[])),
+        (r"create table pk2 partition of pk for values from (5) to (10)", Ok(&[])),
+        (r"create table fkto (x int references pk(a))", Ok(&[])),
+        (r"insert into pk values (1, 1), (6, 6)", Ok(&[])),
+        (r"insert into fkto values (1), (6)", Ok(&[])),
+        (r"insert into fkto values (2)", Err("23503")),
+        (r"insert into fkto values (11)", Err("23503")),
+        (r"delete from pk where a = 1", Err("23503")),
+        (r"update pk set a = 2 where a = 6", Err("23503")),
+        (r"update pk set b = 7 where a = 6", Ok(&[])),
+        (r"drop table pk", Err("2BP01")),
+        (r"drop table pk cascade", Ok(&[])),
+        (r"create table t_noidx (a int, b int) partition by hash (a)", Ok(&[])),
+        (r"create table t_noidx0 partition of t_noidx for values with (modulus 2, remainder 0)", Ok(&[])),
+        (r"alter table t_noidx add unique (b)", Err("0A000")),
+        (r"alter table t_noidx add unique (a, b)", Ok(&[])),
+        (r"alter table t_noidx add primary key (a)", Ok(&[])),
+        (
+            r"select conname, contype from pg_constraint where conrelid = 't_noidx0'::regclass order by 1",
+            Ok(&[r"t_noidx0_a_b_key|u", r"t_noidx0_pkey|p"]),
+        ),
+        (r"create table lk (a int, b text) partition by list (b)", Ok(&[])),
+        (r"create table lk1 partition of lk for values in ('x')", Ok(&[])),
+        (r"create index on lk (lower(b))", Ok(&[])),
+        (r"create index on lk (a) where a > 0", Ok(&[])),
+        (r"create index on only lk (a)", Ok(&[])),
+        (r"create index on lk (a)", Ok(&[])),
+        (r"create index concurrently on lk (a)", Err("0A000")),
+        (
+            r"select indexname, replace(indexdef, current_schema() || '.', '') from pg_indexes where tablename in ('lk', 'lk1') and schemaname = current_schema() order by 1",
+            Ok(&[
+                r"lk1_a_idx|CREATE INDEX lk1_a_idx ON lk1 USING btree (a) WHERE (a > 0)",
+                r"lk1_a_idx1|CREATE INDEX lk1_a_idx1 ON lk1 USING btree (a)",
+                r"lk1_lower_idx|CREATE INDEX lk1_lower_idx ON lk1 USING btree (lower(b))",
+                r"lk_a_idx|CREATE INDEX lk_a_idx ON ONLY lk USING btree (a) WHERE (a > 0)",
+                r"lk_a_idx1|CREATE INDEX lk_a_idx1 ON ONLY lk USING btree (a)",
+                r"lk_a_idx2|CREATE INDEX lk_a_idx2 ON ONLY lk USING btree (a)",
+                r"lk_lower_idx|CREATE INDEX lk_lower_idx ON ONLY lk USING btree (lower(b))",
+            ]),
+        ),
+        (r"alter index lk_a_idx1 attach partition lk1_a_idx", Err("55000")),
+        (
+            r"select i.relname, i.relkind from pg_class i where i.relname like 'lk%' and i.relnamespace = (select oid from pg_namespace where nspname = current_schema()) order by 1",
+            Ok(&[
+                r"lk|p",
+                r"lk1|r",
+                r"lk1_a_idx|i",
+                r"lk1_a_idx1|i",
+                r"lk1_lower_idx|i",
+                r"lk_a_idx|I",
+                r"lk_a_idx1|I",
+                r"lk_a_idx2|I",
+                r"lk_lower_idx|I",
+            ]),
+        ),
+        (
+            r"create function note() returns trigger language plpgsql as $$ begin new.b := coalesce(new.b, '') || '!'; return new; end $$",
+            Ok(&[]),
+        ),
+        (r"create table tg (a int, b text) partition by range (a)", Ok(&[])),
+        (r"create table tg1 partition of tg for values from (0) to (10)", Ok(&[])),
+        (r"create trigger tg_ins before insert on tg for each row execute function note()", Ok(&[])),
+        (r"create table tg2 partition of tg for values from (10) to (20)", Ok(&[])),
+        (r"insert into tg values (1, 'x'), (11, 'y')", Ok(&[])),
+        (r"select tableoid::regclass::text, a, b from tg order by a", Ok(&[r"tg1|1|x!", r"tg2|11|y!"])),
+        (
+            r"select tgname, tgrelid::regclass::text from pg_trigger where tgrelid in ('tg'::regclass, 'tg1'::regclass, 'tg2'::regclass) order by 2",
+            Ok(&[r"tg_ins|tg", r"tg_ins|tg1", r"tg_ins|tg2"]),
+        ),
+        (r"drop trigger tg_ins on tg1", Err("2BP01")),
+        (r"drop trigger tg_ins on tg", Ok(&[])),
+        (r"insert into tg values (2, 'z')", Ok(&[])),
+        (r"select a, b from tg where a = 2", Ok(&[r"2|z"])),
+    ]);
+}
+
+/// INHERITS: reads of a parent include its children, column merging, ALTER TABLE going down, INHERIT and NO INHERIT.
+#[test]
+fn inheritance() {
+    script(&[
+        (
+            r"create table animal (id serial primary key, name text not null, legs int default 4, check (legs >= 0))",
+            Ok(&[]),
+        ),
+        (r"create table dog (breed text) inherits (animal)", Ok(&[])),
+        (r"create table bird (wings int default 2) inherits (animal)", Ok(&[])),
+        (r"insert into animal (name) values ('generic')", Ok(&[])),
+        (r"insert into dog (name, breed) values ('rex', 'lab'), ('fido', 'pug')", Ok(&[])),
+        (r"insert into bird (name, legs) values ('tweety', 2)", Ok(&[])),
+        (
+            r"select id, name, legs from animal order by id",
+            Ok(&[r"1|generic|4", r"2|rex|4", r"3|fido|4", r"4|tweety|2"]),
+        ),
+        (
+            r"select tableoid::regclass::text, id, name from animal order by id",
+            Ok(&[r"animal|1|generic", r"dog|2|rex", r"dog|3|fido", r"bird|4|tweety"]),
+        ),
+        (r"select tableoid::regclass::text, * from only animal", Ok(&[r"animal|1|generic|4"])),
+        (r"select * from dog order by id", Ok(&[r"2|rex|4|lab", r"3|fido|4|pug"])),
+        (r"select count(*) from animal", Ok(&[r"4"])),
+        (r"select count(*) from only animal", Ok(&[r"1"])),
+        (r"select a.name, d.breed from animal a join dog d on d.id = a.id order by 1", Ok(&[r"fido|pug", r"rex|lab"])),
+        (r"update animal set legs = 3 where name like '%o%'", Ok(&[])),
+        (r"select name, legs from animal order by id", Ok(&[r"generic|4", r"rex|4", r"fido|3", r"tweety|2"])),
+        (r"update only animal set legs = 9", Ok(&[])),
+        (r"select name, legs from animal order by id", Ok(&[r"generic|9", r"rex|4", r"fido|3", r"tweety|2"])),
+        (r"delete from animal where name = 'rex' returning id, name, legs", Ok(&[r"2|rex|4"])),
+        (r"delete from only animal where name = 'generic'", Ok(&[])),
+        (r"select name from animal order by id", Ok(&[r"fido", r"tweety"])),
+        (
+            r"update animal set name = upper(name) returning tableoid::regclass::text, name",
+            Ok(&[r"dog|FIDO", r"bird|TWEETY"]),
+        ),
+        (r"insert into animal (name) values (null)", Err("23502")),
+        (r"insert into dog (name, legs) values ('bad', -1)", Err("23514")),
+        (r"insert into dog (id, name) values (1, 'dupe')", Ok(&[])),
+        (r"create table lizard (scales int) inherits (animal, dog)", Ok(&[])),
+        (r"create table mixed (name varchar(10), x int) inherits (animal)", Err("42804")),
+        (r"create table mixed2 (name text, x int) inherits (animal, dog)", Ok(&[])),
+        (r"create table mixed3 (legs bigint) inherits (animal)", Err("42804")),
+        (r"create table m4 (id int, k int) inherits (animal)", Ok(&[])),
+        (r"create table gc () inherits (dog)", Ok(&[])),
+        (
+            r"select relname, relkind, relhassubclass from pg_class where oid in ('animal'::regclass, 'dog'::regclass, 'bird'::regclass, 'gc'::regclass) order by 1",
+            Ok(&[r"animal|r|t", r"bird|r|f", r"dog|r|t", r"gc|r|f"]),
+        ),
+        (
+            r"select inhrelid::regclass::text, inhparent::regclass::text, inhseqno from pg_inherits where inhparent in ('animal'::regclass, 'dog'::regclass) order by 1, 3",
+            Ok(&[
+                r"bird|animal|1",
+                r"dog|animal|1",
+                r"gc|dog|1",
+                r"lizard|animal|1",
+                r"lizard|dog|2",
+                r"m4|animal|1",
+                r"mixed2|animal|1",
+                r"mixed2|dog|2",
+            ]),
+        ),
+        (
+            r"select attrelid::regclass::text, attname, attislocal, attinhcount from pg_attribute where attrelid in ('animal'::regclass, 'dog'::regclass, 'mixed2'::regclass) and attnum > 0 order by 1, attnum",
+            Ok(&[
+                r"animal|id|t|0",
+                r"animal|name|t|0",
+                r"animal|legs|t|0",
+                r"dog|id|f|1",
+                r"dog|name|f|1",
+                r"dog|legs|f|1",
+                r"dog|breed|t|0",
+                r"mixed2|id|f|2",
+                r"mixed2|name|t|2",
+                r"mixed2|legs|f|2",
+                r"mixed2|breed|f|1",
+                r"mixed2|x|t|0",
+            ]),
+        ),
+        (
+            r"select conrelid::regclass::text, conname, conislocal, coninhcount, connoinherit from pg_constraint where conrelid in ('animal'::regclass, 'dog'::regclass, 'gc'::regclass) order by 1, 2",
+            Ok(&[
+                r"animal|animal_legs_check|t|0|f",
+                r"animal|animal_pkey|t|0|t",
+                r"dog|animal_legs_check|f|1|f",
+                r"gc|animal_legs_check|f|1|f",
+            ]),
+        ),
+        (r"truncate only animal", Ok(&[])),
+        (r"select count(*) from animal", Ok(&[r"3"])),
+        (r"truncate animal", Ok(&[])),
+        (r"select count(*) from animal", Ok(&[r"0"])),
+        (r"insert into gc (name, breed) values ('x', 'y')", Ok(&[])),
+        (r"select tableoid::regclass::text, name from animal", Ok(&[r"gc|x"])),
+        (r"drop table dog", Err("2BP01")),
+        (r"drop table dog cascade", Ok(&[])),
+        (r"select tableoid::regclass::text, name from animal", Ok(&[])),
+        (r"create table c1 (a int, a int) inherits (animal)", Err("42701")),
+        (r"create table c2 () inherits (animal, animal)", Err("42P07")),
+        (r"create table c3 () inherits (nope)", Err("42P01")),
+        (r"create table c4 (x int) inherits (animal) partition by range (x)", Err("42P17")),
+        (r"create table c5 (name text) inherits (animal)", Ok(&[])),
+        (r"alter table only animal add column weight numeric(5,2)", Err("42P16")),
+        (r"alter table animal add column weight numeric(5,2) default 1.5", Ok(&[])),
+        (r"select * from c5", Ok(&[])),
+        (r"alter table only animal drop column legs", Ok(&[])),
+        (r"select * from c5", Ok(&[])),
+        (r"alter table animal drop column legs", Err("42703")),
+        (r"alter table animal rename column name to nm", Ok(&[])),
+        (r"select id, nm from c5", Ok(&[])),
+        (r"alter table c5 rename column nm to nm2", Err("42P16")),
+        (r"alter table c5 alter column weight type text", Err("42P16")),
+        (r"alter table animal alter column weight type numeric(6,2)", Ok(&[])),
+        (r"alter table animal add constraint c_nm check (nm <> '')", Ok(&[])),
+        (r"insert into c5 (nm) values ('')", Err("23514")),
+        (r"alter table c5 drop constraint c_nm", Err("42P16")),
+        (r"alter table animal drop constraint c_nm", Ok(&[])),
+        (r"alter table c5 add constraint c_nm check (nm <> 'x')", Ok(&[])),
+        (r"alter table animal add constraint c_nm check (nm <> '')", Err("42710")),
+        (r"alter table only animal add constraint c_only check (nm <> 'o')", Err("42P16")),
+        (r"alter table animal add constraint c_noinh check (nm <> 'n') no inherit", Ok(&[])),
+        (
+            r"select conrelid::regclass::text, conname, connoinherit from pg_constraint where conname like 'c\_%' and connamespace = (select oid from pg_namespace where nspname = current_schema()) order by 1, 2",
+            Ok(&[r"animal|c_noinh|t", r"c5|c_nm|f"]),
+        ),
+        (r"alter table c5 no inherit animal", Ok(&[])),
+        (
+            r"select attname, attislocal, attinhcount from pg_attribute where attrelid = 'c5'::regclass and attnum > 0 order by attnum",
+            Ok(&[r"id|t|0", r"nm|t|0", r"legs|t|0", r"weight|t|0"]),
+        ),
+        (r"alter table c5 no inherit animal", Err("42P01")),
+        (r"alter table c5 inherit animal", Ok(&[])),
+        (r"alter table c5 inherit animal", Err("42P07")),
+        (r"create table c6 (id int not null, nm text)", Ok(&[])),
+        (r"alter table c6 inherit animal", Err("42804")),
+        (r"alter table animal inherit c5", Err("42P07")),
+        (r"alter table c5 inherit c5", Err("42P07")),
+        (r"create table c7 (id int, nm text not null, weight text)", Ok(&[])),
+        (r"alter table c7 inherit animal", Err("42804")),
+        (r"select tableoid::regclass::text, id from animal order by id", Ok(&[])),
+        (r"drop table animal", Err("2BP01")),
+        (r"drop table animal cascade", Ok(&[])),
+        (
+            r"select count(*) from pg_class where relname in ('animal', 'c5', 'c6', 'c7') and relnamespace = (select oid from pg_namespace where nspname = current_schema())",
+            Ok(&[r"2"]),
+        ),
+    ]);
+}
+
+/// pg_get_partkeydef, pg_get_partition_constraintdef, pg_partition_tree, pg_partition_root, pg_partitioned_table and pg_inherits.
+#[test]
+fn catalog_functions() {
+    script(&[
+        (
+            r"create table r1 (a int, b bigint, c text, d date, e timestamp, f numeric(5,2), g varchar(5), h boolean, k smallint) partition by range (a)",
+            Ok(&[]),
+        ),
+        (r"create table r1a partition of r1 for values from (1) to (10)", Ok(&[])),
+        (r"create table r1b partition of r1 for values from (minvalue) to (0)", Ok(&[])),
+        (r"create table r1c partition of r1 for values from (10) to (maxvalue)", Ok(&[])),
+        (
+            r"select pg_get_partition_constraintdef('r1a'::regclass), pg_get_partition_constraintdef('r1b'::regclass), pg_get_partition_constraintdef('r1c'::regclass)",
+            Ok(&[
+                r"((a IS NOT NULL) AND (a >= 1) AND (a < 10))|((a IS NOT NULL) AND (a < 0))|((a IS NOT NULL) AND (a >= 10))",
+            ]),
+        ),
+        (
+            r"select pg_get_expr(relpartbound, oid) from pg_class where oid in ('r1a'::regclass, 'r1b'::regclass, 'r1c'::regclass) order by relname",
+            Ok(&[
+                r"FOR VALUES FROM (1) TO (10)",
+                r"FOR VALUES FROM (MINVALUE) TO (0)",
+                r"FOR VALUES FROM (10) TO (MAXVALUE)",
+            ]),
+        ),
+        (r"create table r2 (a int, b int, c int) partition by range (a, b, c)", Ok(&[])),
+        (r"create table r2a partition of r2 for values from (1, 2, 3) to (1, 2, 9)", Ok(&[])),
+        (r"create table r2b partition of r2 for values from (1, 3, minvalue) to (1, 5, 7)", Ok(&[])),
+        (
+            r"create table r2c partition of r2 for values from (2, minvalue, minvalue) to (3, maxvalue, maxvalue)",
+            Ok(&[]),
+        ),
+        (
+            r"select pg_get_partition_constraintdef('r2a'::regclass), pg_get_partition_constraintdef('r2b'::regclass), pg_get_partition_constraintdef('r2c'::regclass)",
+            Ok(&[
+                r"((a IS NOT NULL) AND (b IS NOT NULL) AND (c IS NOT NULL) AND (a = 1) AND (b = 2) AND (c >= 3) AND (c < 9))|((a IS NOT NULL) AND (b IS NOT NULL) AND (c IS NOT NULL) AND (a = 1) AND (b >= 3) AND ((b < 5) OR ((b = 5) AND (c < 7))))|((a IS NOT NULL) AND (b IS NOT NULL) AND (c IS NOT NULL) AND (a >= 2) AND (a <= 3))",
+            ]),
+        ),
+        (r"create table rb (b bigint) partition by range (b)", Ok(&[])),
+        (r"create table rb1 partition of rb for values from (-5) to (5)", Ok(&[])),
+        (
+            r"select pg_get_partition_constraintdef('rb1'::regclass)",
+            Ok(&[r"((b IS NOT NULL) AND (b >= '-5'::bigint) AND (b < '5'::bigint))"]),
+        ),
+        (r"create table rd (d date, t text, ts timestamp, n numeric(5,2)) partition by range (d)", Ok(&[])),
+        (r"create table rd1 partition of rd for values from ('2024-01-01') to ('2025-01-01')", Ok(&[])),
+        (
+            r"select pg_get_partition_constraintdef('rd1'::regclass), pg_get_expr(relpartbound, oid) from pg_class where relname = 'rd1'",
+            Ok(&[
+                r"((d IS NOT NULL) AND (d >= '2024-01-01'::date) AND (d < '2025-01-01'::date))|FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')",
+            ]),
+        ),
+        (r"create table rt (t text) partition by range (t)", Ok(&[])),
+        (r"create table rt1 partition of rt for values from ('a') to ('m')", Ok(&[])),
+        (
+            r"select pg_get_partition_constraintdef('rt1'::regclass)",
+            Ok(&[r"((t IS NOT NULL) AND (t >= 'a'::text) AND (t < 'm'::text))"]),
+        ),
+        (r"create table rn (n numeric(5,2)) partition by range (n)", Ok(&[])),
+        (r"create table rn1 partition of rn for values from (1.5) to (10)", Ok(&[])),
+        (
+            r"select pg_get_partition_constraintdef('rn1'::regclass), pg_get_expr(relpartbound, oid) from pg_class where relname = 'rn1'",
+            Ok(&[
+                r"((n IS NOT NULL) AND (n >= 1.50::numeric(5,2)) AND (n < 10.00::numeric(5,2)))|FOR VALUES FROM (1.50) TO (10.00)",
+            ]),
+        ),
+        (r"create table lv (v varchar(5)) partition by list (v)", Ok(&[])),
+        (r"create table lv1 partition of lv for values in ('a', 'b')", Ok(&[])),
+        (r"create table lv2 partition of lv for values in ('c')", Ok(&[])),
+        (r"create table lv3 partition of lv for values in (null, 'z')", Ok(&[])),
+        (r"create table lvd partition of lv default", Ok(&[])),
+        (
+            r"select pg_get_partition_constraintdef('lv1'::regclass), pg_get_partition_constraintdef('lv2'::regclass), pg_get_partition_constraintdef('lv3'::regclass)",
+            Ok(&[
+                r"((v IS NOT NULL) AND ((v)::text = ANY (ARRAY['a'::character varying(5), 'b'::character varying(5)])))|((v IS NOT NULL) AND ((v)::text = 'c'::character varying(5)))|((v IS NULL) OR ((v)::text = 'z'::character varying(5)))",
+            ]),
+        ),
+        (
+            r"select pg_get_partition_constraintdef('lvd'::regclass)",
+            Ok(&[
+                r"(NOT ((v IS NULL) OR ((v)::text = ANY (ARRAY['a'::character varying(5), 'b'::character varying(5), 'c'::character varying(5), 'z'::character varying(5)]))))",
+            ]),
+        ),
+        (r"create table li (i int) partition by list (i)", Ok(&[])),
+        (r"create table li1 partition of li for values in (1, 2, 3)", Ok(&[])),
+        (r"create table li2 partition of li for values in (7)", Ok(&[])),
+        (r"create table lid partition of li default", Ok(&[])),
+        (
+            r"select pg_get_partition_constraintdef('li1'::regclass), pg_get_partition_constraintdef('li2'::regclass), pg_get_partition_constraintdef('lid'::regclass)",
+            Ok(&[
+                r"((i IS NOT NULL) AND (i = ANY (ARRAY[1, 2, 3])))|((i IS NOT NULL) AND (i = 7))|(NOT ((i IS NOT NULL) AND (i = ANY (ARRAY[1, 2, 3, 7]))))",
+            ]),
+        ),
+        (r"create table ri (i int) partition by range (i)", Ok(&[])),
+        (r"create table ri1 partition of ri for values from (1) to (5)", Ok(&[])),
+        (r"create table ri2 partition of ri for values from (7) to (9)", Ok(&[])),
+        (r"create table rid partition of ri default", Ok(&[])),
+        (
+            r"select pg_get_partition_constraintdef('rid'::regclass)",
+            Ok(&[r"(NOT ((i IS NOT NULL) AND (((i >= 1) AND (i < 5)) OR ((i >= 7) AND (i < 9)))))"]),
+        ),
+        (r"create table re (i int, j text) partition by range ((i + 1), lower(j))", Ok(&[])),
+        (r"create table re1 partition of re for values from (1, 'a') to (5, 'm')", Ok(&[])),
+        (
+            r"select pg_get_partition_constraintdef('re1'::regclass)",
+            Ok(&[
+                r"(((i + 1) IS NOT NULL) AND (lower(j) IS NOT NULL) AND (((i + 1) > 1) OR (((i + 1) = 1) AND (lower(j) >= 'a'::text))) AND (((i + 1) < 5) OR (((i + 1) = 5) AND (lower(j) < 'm'::text))))",
+            ]),
+        ),
+        (
+            r"select pg_get_partkeydef('re'::regclass), pg_get_partkeydef('r2'::regclass), pg_get_partkeydef('li'::regclass), pg_get_partkeydef('r1a'::regclass)",
+            Ok(&[r"RANGE (((i + 1)), lower(j))|RANGE (a, b, c)|LIST (i)|"]),
+        ),
+        (r"create table sp (a int, b int) partition by range (a)", Ok(&[])),
+        (r"create table sp1 partition of sp for values from (0) to (100) partition by list (b)", Ok(&[])),
+        (r"create table sp11 partition of sp1 for values in (1, 2)", Ok(&[])),
+        (
+            r"select pg_get_partition_constraintdef('sp1'::regclass), pg_get_partition_constraintdef('sp11'::regclass), pg_get_partition_constraintdef('sp'::regclass)",
+            Ok(&[
+                r"((a IS NOT NULL) AND (a >= 0) AND (a < 100))|((a IS NOT NULL) AND (a >= 0) AND (a < 100) AND (b IS NOT NULL) AND (b = ANY (ARRAY[1, 2])))|",
+            ]),
+        ),
+        (r"select * from pg_partition_tree('sp')", Ok(&[r"sp||f|0", r"sp1|sp|f|1", r"sp11|sp1|t|2"])),
+        (r"select * from pg_partition_tree('sp1')", Ok(&[r"sp1|sp|f|0", r"sp11|sp1|t|1"])),
+        (r"select * from pg_partition_tree('sp11')", Ok(&[r"sp11|sp1|t|0"])),
+        (r"select * from pg_partition_tree('r1')", Ok(&[r"r1||f|0", r"r1a|r1|t|1", r"r1b|r1|t|1", r"r1c|r1|t|1"])),
+        (r"select * from pg_partition_tree('ref_none')", Err("42P01")),
+        (r"select * from pg_partition_ancestors('sp11')", Ok(&[r"sp11", r"sp1", r"sp"])),
+        (r"select * from pg_partition_ancestors('sp')", Ok(&[r"sp"])),
+        (r"select pg_partition_root('sp11'), pg_partition_root('sp'), pg_partition_root('sp1')", Ok(&[r"sp|sp|sp"])),
+        (r"create table notp (a int)", Ok(&[])),
+        (
+            r"select pg_partition_root('notp'), pg_get_partkeydef('notp'::regclass), pg_get_partition_constraintdef('notp'::regclass)",
+            Ok(&[r"||"]),
+        ),
+        (r"select count(*) from pg_partition_tree('notp')", Ok(&[r"0"])),
+        (
+            r"select relname, relkind, relispartition, relhassubclass from pg_class where relname in ('sp', 'sp1', 'sp11', 'notp') and relnamespace = (select oid from pg_namespace where nspname = current_schema()) order by 1",
+            Ok(&[r"notp|r|f|f", r"sp|p|f|t", r"sp1|p|t|t", r"sp11|r|t|f"]),
+        ),
+        (
+            r"select partrelid::regclass::text, partstrat, partnatts, partattrs, partdefid <> 0 from pg_partitioned_table where partrelid in ('sp'::regclass, 'sp1'::regclass, 're'::regclass, 'li'::regclass, 'r2'::regclass) order by 1",
+            Ok(&[r"li|l|1|1|t", r"r2|r|3|1 2 3|f", r"re|r|2|0 0|f", r"sp|r|1|1|f", r"sp1|l|1|2|f"]),
+        ),
+        (
+            r"select table_name, table_type from information_schema.tables where table_name in ('sp', 'sp1', 'sp11', 'notp') and table_schema = current_schema() order by 1",
+            Ok(&[r"notp|BASE TABLE", r"sp|BASE TABLE", r"sp1|BASE TABLE", r"sp11|BASE TABLE"]),
+        ),
+        (
+            r"select tablename from pg_tables where tablename in ('sp', 'sp1', 'sp11', 'notp') and schemaname = current_schema() order by 1",
+            Ok(&[r"notp", r"sp", r"sp1", r"sp11"]),
+        ),
+        (
+            r"select inhrelid::regclass::text, inhparent::regclass::text from pg_inherits where inhparent in ('sp'::regclass, 'sp1'::regclass) order by 1",
+            Ok(&[r"sp1|sp", r"sp11|sp1"]),
+        ),
+        (
+            r"select c.relname, p.relname from pg_class c join pg_inherits i on i.inhrelid = c.oid join pg_class p on p.oid = i.inhparent where c.relispartition and p.relname like 'sp%' and c.relnamespace = (select oid from pg_namespace where nspname = current_schema()) order by 1",
+            Ok(&[r"sp1|sp", r"sp11|sp1"]),
+        ),
+    ]);
+}
+
+/// A row lands in the hash partition Postgres puts it in, for every type a key can have.
+#[test]
+fn hash_partitions_of_every_type() {
+    script(&[
+        (r"create table hi (a int) partition by hash (a)", Ok(&[])),
+        (r"create table hi0 partition of hi for values with (modulus 4, remainder 0)", Ok(&[])),
+        (r"create table hi1 partition of hi for values with (modulus 4, remainder 1)", Ok(&[])),
+        (r"create table hi2 partition of hi for values with (modulus 4, remainder 2)", Ok(&[])),
+        (r"create table hi3 partition of hi for values with (modulus 4, remainder 3)", Ok(&[])),
+        (r"insert into hi select g from generate_series(-50, 50) g", Ok(&[])),
+        (
+            r"select tableoid::regclass::text, count(*), min(a), max(a), sum(a) from hi group by 1 order by 1",
+            Ok(&[r"hi0|25|-47|50|15", r"hi1|28|-49|46|43", r"hi2|26|-50|49|21", r"hi3|22|-46|40|-79"]),
+        ),
+        (r"create table hb (a bigint) partition by hash (a)", Ok(&[])),
+        (r"create table hb0 partition of hb for values with (modulus 3, remainder 0)", Ok(&[])),
+        (r"create table hb1 partition of hb for values with (modulus 3, remainder 1)", Ok(&[])),
+        (r"create table hb2 partition of hb for values with (modulus 3, remainder 2)", Ok(&[])),
+        (r"insert into hb select g from generate_series(-30, 30) g", Ok(&[])),
+        (r"insert into hb values (9999999999), (-9999999999), (4294967296), (-1)", Ok(&[])),
+        (
+            r"select tableoid::regclass::text, count(*), sum(a) from hb group by 1 order by 1",
+            Ok(&[r"hb0|20|11", r"hb1|20|-76", r"hb2|25|4294967360"]),
+        ),
+        (r"create table hs (a smallint) partition by hash (a)", Ok(&[])),
+        (r"create table hs0 partition of hs for values with (modulus 2, remainder 0)", Ok(&[])),
+        (r"create table hs1 partition of hs for values with (modulus 2, remainder 1)", Ok(&[])),
+        (r"insert into hs select g from generate_series(-20, 20) g", Ok(&[])),
+        (
+            r"select tableoid::regclass::text, count(*), sum(a) from hs group by 1 order by 1",
+            Ok(&[r"hs0|17|17", r"hs1|24|-17"]),
+        ),
+        (r"create table ht (a text) partition by hash (a)", Ok(&[])),
+        (r"create table ht0 partition of ht for values with (modulus 3, remainder 0)", Ok(&[])),
+        (r"create table ht1 partition of ht for values with (modulus 3, remainder 1)", Ok(&[])),
+        (r"create table ht2 partition of ht for values with (modulus 3, remainder 2)", Ok(&[])),
+        (r"insert into ht select 'k' || g from generate_series(1, 40) g", Ok(&[])),
+        (
+            r"insert into ht values (''), ('a'), ('ab'), ('abc'), ('abcd'), ('abcde'), ('abcdefghijkl'), ('abcdefghijklmnopqrstuvwxyz'), ('é'), ('日本語')",
+            Ok(&[]),
+        ),
+        (
+            r"select tableoid::regclass::text, count(*), min(a), max(a) from ht group by 1 order by 1",
+            Ok(&[r"ht0|15|ab|日本語", r"ht1|15|abc|é", r"ht2|20||k9"]),
+        ),
+        (r"create table hd (a date) partition by hash (a)", Ok(&[])),
+        (r"create table hd0 partition of hd for values with (modulus 2, remainder 0)", Ok(&[])),
+        (r"create table hd1 partition of hd for values with (modulus 2, remainder 1)", Ok(&[])),
+        (r"insert into hd select '2024-01-01'::date + g from generate_series(0, 40) g", Ok(&[])),
+        (
+            r"select tableoid::regclass::text, count(*), min(a), max(a) from hd group by 1 order by 1",
+            Ok(&[r"hd0|17|2024-01-03|2024-02-10", r"hd1|24|2024-01-01|2024-02-06"]),
+        ),
+        (r"create table hts (a timestamp, b timestamptz, c time) partition by hash (a, b, c)", Ok(&[])),
+        (r"create table hts0 partition of hts for values with (modulus 2, remainder 0)", Ok(&[])),
+        (r"create table hts1 partition of hts for values with (modulus 2, remainder 1)", Ok(&[])),
+        (
+            r"insert into hts select '2024-01-01'::timestamp + (g || ' hours')::interval, '2024-01-01 00:00:00+00'::timestamptz + (g || ' minutes')::interval, '00:00'::time + (g || ' seconds')::interval from generate_series(0, 40) g",
+            Ok(&[]),
+        ),
+        (
+            r"select tableoid::regclass::text, count(*), min(a) from hts group by 1 order by 1",
+            Ok(&[r"hts0|17|2024-01-01 01:00:00", r"hts1|24|2024-01-01 00:00:00"]),
+        ),
+        (r"create table hn (a numeric) partition by hash (a)", Ok(&[])),
+        (r"create table hn0 partition of hn for values with (modulus 2, remainder 0)", Ok(&[])),
+        (r"create table hn1 partition of hn for values with (modulus 2, remainder 1)", Ok(&[])),
+        (r"insert into hn select g / 4.0 from generate_series(-10, 40) g", Ok(&[])),
+        (r"insert into hn values (0), (0.0), (100), (1e20), (123456789.123456789)", Ok(&[])),
+        (
+            r"select tableoid::regclass::text, count(*), min(a), max(a) from hn group by 1 order by 1",
+            Ok(&[r"hn0|22|-2.5000000000000000|100000000000000000000", r"hn1|34|-2.2500000000000000|100"]),
+        ),
+        (r"create table hbo (a boolean) partition by hash (a)", Ok(&[])),
+        (r"create table hbo0 partition of hbo for values with (modulus 2, remainder 0)", Ok(&[])),
+        (r"create table hbo1 partition of hbo for values with (modulus 2, remainder 1)", Ok(&[])),
+        (r"insert into hbo values (true), (false)", Ok(&[])),
+        (r"select tableoid::regclass::text, a from hbo order by 1", Ok(&[r"hbo0|t", r"hbo0|f"])),
+        (r"create table hu (a uuid) partition by hash (a)", Ok(&[])),
+        (r"create table hu0 partition of hu for values with (modulus 2, remainder 0)", Ok(&[])),
+        (r"create table hu1 partition of hu for values with (modulus 2, remainder 1)", Ok(&[])),
+        (
+            r"insert into hu values ('00000000-0000-0000-0000-000000000001'), ('11111111-1111-1111-1111-111111111111'), ('ffffffff-ffff-ffff-ffff-ffffffffffff'), ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11')",
+            Ok(&[]),
+        ),
+        (
+            r"select tableoid::regclass::text, a from hu order by 1, 2",
+            Ok(&[
+                r"hu0|11111111-1111-1111-1111-111111111111",
+                r"hu0|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+                r"hu1|00000000-0000-0000-0000-000000000001",
+                r"hu1|ffffffff-ffff-ffff-ffff-ffffffffffff",
+            ]),
+        ),
+        (r"create table hf (a float8) partition by hash (a)", Ok(&[])),
+        (r"create table hf0 partition of hf for values with (modulus 2, remainder 0)", Ok(&[])),
+        (r"create table hf1 partition of hf for values with (modulus 2, remainder 1)", Ok(&[])),
+        (r"insert into hf select g / 2.0 from generate_series(-10, 10) g", Ok(&[])),
+        (r"insert into hf values (-0.0), ('NaN'), ('Infinity'), ('-Infinity'), (1e300)", Ok(&[])),
+        (
+            r"select tableoid::regclass::text, count(*), min(a) from hf group by 1 order by 1",
+            Ok(&[r"hf0|14|-Infinity", r"hf1|12|-5"]),
+        ),
+        (r"create table hm (a int, b text, c date) partition by hash (a, b, c)", Ok(&[])),
+        (r"create table hm0 partition of hm for values with (modulus 3, remainder 0)", Ok(&[])),
+        (r"create table hm1 partition of hm for values with (modulus 3, remainder 1)", Ok(&[])),
+        (r"create table hm2 partition of hm for values with (modulus 3, remainder 2)", Ok(&[])),
+        (r"insert into hm select g, 'x' || g, '2024-01-01'::date + g from generate_series(1, 60) g", Ok(&[])),
+        (r"insert into hm values (null, null, null), (1, null, null), (null, 'a', null)", Ok(&[])),
+        (
+            r"select tableoid::regclass::text, count(*), sum(a) from hm group by 1 order by 1",
+            Ok(&[r"hm0|27|792", r"hm1|20|611", r"hm2|16|428"]),
+        ),
+        (r"create table he (a int) partition by hash ((a * 2 + 1))", Ok(&[])),
+        (r"create table he0 partition of he for values with (modulus 2, remainder 0)", Ok(&[])),
+        (r"create table he1 partition of he for values with (modulus 2, remainder 1)", Ok(&[])),
+        (r"insert into he select g from generate_series(1, 20) g", Ok(&[])),
+        (
+            r"select tableoid::regclass::text, count(*), sum(a) from he group by 1 order by 1",
+            Ok(&[r"he0|6|69", r"he1|14|141"]),
+        ),
+        (r"create table hbt (a bytea) partition by hash (a)", Ok(&[])),
+        (r"create table hbt0 partition of hbt for values with (modulus 2, remainder 0)", Ok(&[])),
+        (r"create table hbt1 partition of hbt for values with (modulus 2, remainder 1)", Ok(&[])),
+        (r"insert into hbt values ('\x00'), ('\x01'), ('\xdeadbeef'), ('')", Ok(&[])),
+        (
+            r"select tableoid::regclass::text, a from hbt order by 1, 2",
+            Ok(&[r"hbt0|\x", r"hbt0|\x00", r"hbt1|\x01", r"hbt1|\xdeadbeef"]),
+        ),
+        (r"create table hv (a varchar(5)) partition by hash (a)", Ok(&[])),
+        (r"create table hv0 partition of hv for values with (modulus 2, remainder 0)", Ok(&[])),
+        (r"create table hv1 partition of hv for values with (modulus 2, remainder 1)", Ok(&[])),
+        (r"insert into hv values ('a'), ('b'), ('abc'), ('hello')", Ok(&[])),
+        (
+            r"select tableoid::regclass::text, a from hv order by 1, 2",
+            Ok(&[r"hv0|a", r"hv0|b", r"hv0|hello", r"hv1|abc"]),
+        ),
+        (r"create table hin (a inet) partition by hash (a)", Ok(&[])),
+        (r"create table hin0 partition of hin for values with (modulus 2, remainder 0)", Ok(&[])),
+        (r"create table hin1 partition of hin for values with (modulus 2, remainder 1)", Ok(&[])),
+        (r"insert into hin values ('10.0.0.1'), ('192.168.1.1'), ('::1'), ('10.0.0.0/8')", Ok(&[])),
+        (
+            r"select tableoid::regclass::text, a from hin order by 1, 2",
+            Ok(&[r"hin0|10.0.0.0/8", r"hin0|10.0.0.1", r"hin0|::1", r"hin1|192.168.1.1"]),
+        ),
+        (r"create table hiv (a interval) partition by hash (a)", Ok(&[])),
+        (r"create table hiv0 partition of hiv for values with (modulus 2, remainder 0)", Ok(&[])),
+        (r"create table hiv1 partition of hiv for values with (modulus 2, remainder 1)", Ok(&[])),
+        (r"insert into hiv values ('1 day'), ('2 hours'), ('1 month'), ('30 days')", Ok(&[])),
+        (
+            r"select tableoid::regclass::text, a from hiv order by 1, 2",
+            Ok(&[r"hiv0|02:00:00", r"hiv1|1 day", r"hiv1|1 mon", r"hiv1|30 days"]),
+        ),
+    ]);
+}
+
+/// Found by comparing with Postgres 16: a row an UPDATE moves to another partition is a change of key for the
+/// rows that reference it (ON UPDATE actions, not ON DELETE), and its AFTER DELETE trigger fires on the source;
+/// a rename stays in its schema; NOT NULL and added columns on partitions; serial and temp parents; defaults
+/// merged from several parents; ALTER ... ADD CONSTRAINT's message.
+#[test]
+fn row_moves_renames_and_inheritance_edges() {
+    script(&[
+        (r"create table pk (id int primary key, g int) partition by range (id)", Ok(&[])),
+        (r"create table pk1 partition of pk for values from (0) to (10)", Ok(&[])),
+        (r"create table pk2 partition of pk for values from (10) to (20)", Ok(&[])),
+        (r"create table c (x int references pk(id) on delete cascade on update cascade)", Ok(&[])),
+        (r"insert into pk values (1,0),(11,0)", Ok(&[])),
+        (r"insert into c values (1),(11),(1)", Ok(&[])),
+        (r"update pk set id = 12 where id=1", Ok(&[])),
+        (r"select x from c order by x", Ok(&["11", "12", "12"])),
+        (r"select tableoid::regclass::text, id from pk order by id", Ok(&["pk2|11", "pk2|12"])),
+        (r"create table log(t text)", Ok(&[])),
+        (r"create table lp (id int) partition by range (id)", Ok(&[])),
+        (r"create table lp1 partition of lp for values from (0) to (10)", Ok(&[])),
+        (r"create table lp2 partition of lp for values from (10) to (20)", Ok(&[])),
+        (
+            r"create function lg() returns trigger as $$ begin if tg_op = 'DELETE' then insert into log values ('DELETE ' || tg_table_name || old.id); return old; else insert into log values (tg_op || ' ' || tg_table_name || new.id); return new; end if; end $$ language plpgsql",
+            Ok(&[]),
+        ),
+        (r"create trigger lt after insert or update or delete on lp for each row execute function lg()", Ok(&[])),
+        (r"insert into lp values (1)", Ok(&[])),
+        (r"delete from log", Ok(&[])),
+        (r"update lp set id = 12 where id = 1", Ok(&[])),
+        (r"select t from log", Ok(&["DELETE lp11", "INSERT lp212"])),
+        (r"create schema s9", Ok(&[])),
+        (r"create table s9.t(a int)", Ok(&[])),
+        (r"alter table s9.t rename to t2", Ok(&[])),
+        (r"select relname from pg_class where relnamespace = 's9'::regnamespace", Ok(&["t2"])),
+        (r"create table q(a int, b int) partition by range(a)", Ok(&[])),
+        (r"create table q1 partition of q for values from (0) to (10)", Ok(&[])),
+        (r"alter table q alter column b set not null", Ok(&[])),
+        (r"alter table q1 alter column b drop not null", Err("42P16")),
+        (r"alter table q1 add column b int", Err("42809")),
+        (r"create table mm (d date, v int) partition by range (date_trunc('month', d))", Err("42P17")),
+        (r"select * from pg_partition_tree(0)", Ok(&[])),
+        (r"select pg_partition_root('nonexistent')", Err("42P01")),
+        (
+            r"select (to_jsonb(i) - 'inhrelid' - 'inhparent')::text from (select * from pg_inherits limit 1) i",
+            Ok(&[r#"{"inhseqno": 1, "inhdetachpending": false}"#]),
+        ),
+        (r"create table sr(id serial, b int)", Ok(&[])),
+        (r"create table sr2(z int) inherits (sr)", Ok(&[])),
+        (r"insert into sr2(id,b) values (null,1)", Err("23502")),
+        (r"drop table sr2", Ok(&[])),
+        (r"drop table sr", Ok(&[])),
+        (r"create table sr(id serial, b int)", Ok(&[])),
+        (r"insert into sr(b) values (1)", Ok(&[])),
+        (r"select id from sr", Ok(&["1"])),
+        (r"create table m1(a int default 1, b text)", Ok(&[])),
+        (r"create table m2(a int default 2, c int not null)", Ok(&[])),
+        (r"create table m3() inherits (m1, m2)", Err("42611")),
+        (r"create table m4(a int default 9) inherits (m1, m2)", Ok(&[])),
+        (r"insert into m4(c) values (1)", Ok(&[])),
+        (r"select a from m4", Ok(&["9"])),
+        (r"create table pp(a int)", Ok(&[])),
+        (r"insert into pp values (1)", Ok(&[])),
+        (r"alter table pp add constraint ck check (a > 5)", Err("23514")),
+        (r"create temp table tp(a int)", Ok(&[])),
+        (r"create table tc() inherits (tp)", Err("42809")),
+    ]);
+}

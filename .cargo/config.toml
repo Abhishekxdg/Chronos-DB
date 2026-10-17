@@ -1,0 +1,11 @@
+# x86-64 builds assume x86-64-v2 (POPCNT, SSE4.2: every x86 server CPU since about 2009) rather
+# than the 2003 baseline, so the 1-bit vector scans count bits with POPCNT instead of a software
+# routine. RUSTFLAGS in the environment replaces these.
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=x86-64-v2"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v2"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=x86-64-v2"]

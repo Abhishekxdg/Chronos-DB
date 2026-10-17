@@ -1,0 +1,803 @@
+# Postgres 16's built-in operators (pg_catalog's pg_operator), one a line: oid, name, left and right operand type oids
+# (0 for a prefix operator's left) and those types as format_type names them (NONE for none). What regoper and
+# regoperator read and show; made from a real Postgres 16 with
+#   select oid, oprname, oprleft, oprright, format_type(oprleft), format_type(oprright) from pg_operator
+15	=	23	20	integer	bigint
+36	<>	23	20	integer	bigint
+37	<	23	20	integer	bigint
+58	<	16	16	boolean	boolean
+59	>	16	16	boolean	boolean
+76	>	23	20	integer	bigint
+80	<=	23	20	integer	bigint
+82	>=	23	20	integer	bigint
+85	<>	16	16	boolean	boolean
+91	=	16	16	boolean	boolean
+92	=	18	18	"char"	"char"
+93	=	19	19	name	name
+94	=	21	21	smallint	smallint
+95	<	21	21	smallint	smallint
+96	=	23	23	integer	integer
+97	<	23	23	integer	integer
+98	=	25	25	text	text
+254	=	19	25	name	text
+255	<	19	25	name	text
+256	<=	19	25	name	text
+257	>=	19	25	name	text
+258	>	19	25	name	text
+259	<>	19	25	name	text
+260	=	25	19	text	name
+261	<	25	19	text	name
+262	<=	25	19	text	name
+263	>=	25	19	text	name
+264	>	25	19	text	name
+265	<>	25	19	text	name
+349	||	5078	5077	anycompatiblearray	anycompatible
+352	=	28	28	xid	xid
+353	=	28	23	xid	integer
+374	||	5077	5078	anycompatible	anycompatiblearray
+375	||	5078	5078	anycompatiblearray	anycompatiblearray
+385	=	29	29	cid	cid
+387	=	27	27	tid	tid
+402	<>	27	27	tid	tid
+410	=	20	20	bigint	bigint
+411	<>	20	20	bigint	bigint
+412	<	20	20	bigint	bigint
+413	>	20	20	bigint	bigint
+414	<=	20	20	bigint	bigint
+415	>=	20	20	bigint	bigint
+416	=	20	23	bigint	integer
+417	<>	20	23	bigint	integer
+418	<	20	23	bigint	integer
+419	>	20	23	bigint	integer
+420	<=	20	23	bigint	integer
+430	>=	20	23	bigint	integer
+433	@>	603	600	box	point
+439	%	20	20	bigint	bigint
+473	@	0	20	NONE	bigint
+484	-	0	20	NONE	bigint
+485	<<	604	604	polygon	polygon
+486	&<	604	604	polygon	polygon
+487	&>	604	604	polygon	polygon
+488	>>	604	604	polygon	polygon
+489	<@	604	604	polygon	polygon
+490	@>	604	604	polygon	polygon
+491	~=	604	604	polygon	polygon
+492	&&	604	604	polygon	polygon
+493	<<	603	603	box	box
+494	&<	603	603	box	box
+495	&>	603	603	box	box
+496	>>	603	603	box	box
+497	<@	603	603	box	box
+498	@>	603	603	box	box
+499	~=	603	603	box	box
+500	&&	603	603	box	box
+501	>=	603	603	box	box
+502	>	603	603	box	box
+503	=	603	603	box	box
+504	<	603	603	box	box
+505	<=	603	603	box	box
+506	>^	600	600	point	point
+507	<<	600	600	point	point
+508	>>	600	600	point	point
+509	<^	600	600	point	point
+510	~=	600	600	point	point
+511	<@	600	603	point	box
+512	<@	600	602	point	path
+513	@@	0	603	NONE	box
+514	*	23	23	integer	integer
+517	<->	600	600	point	point
+518	<>	23	23	integer	integer
+519	<>	21	21	smallint	smallint
+520	>	21	21	smallint	smallint
+521	>	23	23	integer	integer
+522	<=	21	21	smallint	smallint
+523	<=	23	23	integer	integer
+524	>=	21	21	smallint	smallint
+525	>=	23	23	integer	integer
+526	*	21	21	smallint	smallint
+527	/	21	21	smallint	smallint
+528	/	23	23	integer	integer
+529	%	21	21	smallint	smallint
+530	%	23	23	integer	integer
+531	<>	25	25	text	text
+532	=	21	23	smallint	integer
+533	=	23	21	integer	smallint
+534	<	21	23	smallint	integer
+535	<	23	21	integer	smallint
+536	>	21	23	smallint	integer
+537	>	23	21	integer	smallint
+538	<>	21	23	smallint	integer
+539	<>	23	21	integer	smallint
+540	<=	21	23	smallint	integer
+541	<=	23	21	integer	smallint
+542	>=	21	23	smallint	integer
+543	>=	23	21	integer	smallint
+544	*	21	23	smallint	integer
+545	*	23	21	integer	smallint
+546	/	21	23	smallint	integer
+547	/	23	21	integer	smallint
+550	+	21	21	smallint	smallint
+551	+	23	23	integer	integer
+552	+	21	23	smallint	integer
+553	+	23	21	integer	smallint
+554	-	21	21	smallint	smallint
+555	-	23	23	integer	integer
+556	-	21	23	smallint	integer
+557	-	23	21	integer	smallint
+558	-	0	23	NONE	integer
+559	-	0	21	NONE	smallint
+584	-	0	700	NONE	real
+585	-	0	701	NONE	double precision
+586	+	700	700	real	real
+587	-	700	700	real	real
+588	/	700	700	real	real
+589	*	700	700	real	real
+590	@	0	700	NONE	real
+591	+	701	701	double precision	double precision
+592	-	701	701	double precision	double precision
+593	/	701	701	double precision	double precision
+594	*	701	701	double precision	double precision
+595	@	0	701	NONE	double precision
+596	|/	0	701	NONE	double precision
+597	||/	0	701	NONE	double precision
+606	<->	603	600	box	point
+607	=	26	26	oid	oid
+608	<>	26	26	oid	oid
+609	<	26	26	oid	oid
+610	>	26	26	oid	oid
+611	<=	26	26	oid	oid
+612	>=	26	26	oid	oid
+613	<->	600	628	point	line
+614	<->	600	601	point	lseg
+615	<->	600	603	point	box
+616	<->	601	628	lseg	line
+617	<->	601	603	lseg	box
+618	<->	600	602	point	path
+620	=	700	700	real	real
+621	<>	700	700	real	real
+622	<	700	700	real	real
+623	>	700	700	real	real
+624	<=	700	700	real	real
+625	>=	700	700	real	real
+630	<>	18	18	"char"	"char"
+631	<	18	18	"char"	"char"
+632	<=	18	18	"char"	"char"
+633	>	18	18	"char"	"char"
+634	>=	18	18	"char"	"char"
+639	~	19	25	name	text
+640	!~	19	25	name	text
+641	~	25	25	text	text
+642	!~	25	25	text	text
+643	<>	19	19	name	name
+644	<>	30	30	oidvector	oidvector
+645	<	30	30	oidvector	oidvector
+646	>	30	30	oidvector	oidvector
+647	<=	30	30	oidvector	oidvector
+648	>=	30	30	oidvector	oidvector
+649	=	30	30	oidvector	oidvector
+654	||	25	25	text	text
+660	<	19	19	name	name
+661	<=	19	19	name	name
+662	>	19	19	name	name
+663	>=	19	19	name	name
+664	<	25	25	text	text
+665	<=	25	25	text	text
+666	>	25	25	text	text
+667	>=	25	25	text	text
+670	=	701	701	double precision	double precision
+671	<>	701	701	double precision	double precision
+672	<	701	701	double precision	double precision
+673	<=	701	701	double precision	double precision
+674	>	701	701	double precision	double precision
+675	>=	701	701	double precision	double precision
+682	@	0	21	NONE	smallint
+684	+	20	20	bigint	bigint
+685	-	20	20	bigint	bigint
+686	*	20	20	bigint	bigint
+687	/	20	20	bigint	bigint
+688	+	20	23	bigint	integer
+689	-	20	23	bigint	integer
+690	*	20	23	bigint	integer
+691	/	20	23	bigint	integer
+692	+	23	20	integer	bigint
+693	-	23	20	integer	bigint
+694	*	23	20	integer	bigint
+695	/	23	20	integer	bigint
+706	<->	603	603	box	box
+707	<->	602	602	path	path
+708	<->	628	628	line	line
+709	<->	601	601	lseg	lseg
+712	<->	604	604	polygon	polygon
+713	<>	600	600	point	point
+731	+	600	600	point	point
+732	-	600	600	point	point
+733	*	600	600	point	point
+734	/	600	600	point	point
+735	+	602	602	path	path
+736	+	602	600	path	point
+737	-	602	600	path	point
+738	*	602	600	path	point
+739	/	602	600	path	point
+755	@>	602	600	path	point
+756	<@	600	604	point	polygon
+757	@>	604	600	polygon	point
+758	<@	600	718	point	circle
+759	@>	718	600	circle	point
+760	<->	628	600	line	point
+761	<->	601	600	lseg	point
+762	<->	628	601	line	lseg
+763	<->	603	601	box	lseg
+773	@	0	23	NONE	integer
+784	<->	602	600	path	point
+792	=	602	602	path	path
+793	<	602	602	path	path
+794	>	602	602	path	path
+795	<=	602	602	path	path
+796	>=	602	602	path	path
+797	#	0	602	NONE	path
+798	?#	602	602	path	path
+799	@-@	0	602	NONE	path
+800	>^	603	603	box	box
+801	<^	603	603	box	box
+802	?#	603	603	box	box
+803	#	603	603	box	box
+804	+	603	600	box	point
+805	-	603	600	box	point
+806	*	603	600	box	point
+807	/	603	600	box	point
+808	?-	600	600	point	point
+809	?|	600	600	point	point
+818	+	20	21	bigint	smallint
+819	-	20	21	bigint	smallint
+820	*	20	21	bigint	smallint
+821	/	20	21	bigint	smallint
+822	+	21	20	smallint	bigint
+823	-	21	20	smallint	bigint
+824	*	21	20	smallint	bigint
+825	/	21	20	smallint	bigint
+843	*	790	700	money	real
+844	/	790	700	money	real
+845	*	700	790	real	money
+900	=	790	790	money	money
+901	<>	790	790	money	money
+902	<	790	790	money	money
+903	>	790	790	money	money
+904	<=	790	790	money	money
+905	>=	790	790	money	money
+906	+	790	790	money	money
+907	-	790	790	money	money
+908	*	790	701	money	double precision
+909	/	790	701	money	double precision
+912	*	790	23	money	integer
+913	/	790	23	money	integer
+914	*	790	21	money	smallint
+915	/	790	21	money	smallint
+916	*	701	790	double precision	money
+917	*	23	790	integer	money
+918	*	21	790	smallint	money
+931	<<	869	869	inet	inet
+932	<<=	869	869	inet	inet
+933	>>	869	869	inet	inet
+934	>>=	869	869	inet	inet
+965	^	701	701	double precision	double precision
+966	+	1034	1033	aclitem[]	aclitem
+967	-	1034	1033	aclitem[]	aclitem
+968	@>	1034	1033	aclitem[]	aclitem
+969	@@	0	601	NONE	lseg
+971	@@	0	604	NONE	polygon
+974	=	1033	1033	aclitem	aclitem
+1038	^	1700	1700	numeric	numeric
+1054	=	1042	1042	character	character
+1055	~	1042	25	character	text
+1056	!~	1042	25	character	text
+1057	<>	1042	1042	character	character
+1058	<	1042	1042	character	character
+1059	<=	1042	1042	character	character
+1060	>	1042	1042	character	character
+1061	>=	1042	1042	character	character
+1070	=	2277	2277	anyarray	anyarray
+1071	<>	2277	2277	anyarray	anyarray
+1072	<	2277	2277	anyarray	anyarray
+1073	>	2277	2277	anyarray	anyarray
+1074	<=	2277	2277	anyarray	anyarray
+1075	>=	2277	2277	anyarray	anyarray
+1076	+	1082	1186	date	interval
+1077	-	1082	1186	date	interval
+1093	=	1082	1082	date	date
+1094	<>	1082	1082	date	date
+1095	<	1082	1082	date	date
+1096	<=	1082	1082	date	date
+1097	>	1082	1082	date	date
+1098	>=	1082	1082	date	date
+1099	-	1082	1082	date	date
+1100	+	1082	23	date	integer
+1101	-	1082	23	date	integer
+1108	=	1083	1083	time without time zone	time without time zone
+1109	<>	1083	1083	time without time zone	time without time zone
+1110	<	1083	1083	time without time zone	time without time zone
+1111	<=	1083	1083	time without time zone	time without time zone
+1112	>	1083	1083	time without time zone	time without time zone
+1113	>=	1083	1083	time without time zone	time without time zone
+1116	+	700	701	real	double precision
+1117	-	700	701	real	double precision
+1118	/	700	701	real	double precision
+1119	*	700	701	real	double precision
+1120	=	700	701	real	double precision
+1121	<>	700	701	real	double precision
+1122	<	700	701	real	double precision
+1123	>	700	701	real	double precision
+1124	<=	700	701	real	double precision
+1125	>=	700	701	real	double precision
+1126	+	701	700	double precision	real
+1127	-	701	700	double precision	real
+1128	/	701	700	double precision	real
+1129	*	701	700	double precision	real
+1130	=	701	700	double precision	real
+1131	<>	701	700	double precision	real
+1132	<	701	700	double precision	real
+1133	>	701	700	double precision	real
+1134	<=	701	700	double precision	real
+1135	>=	701	700	double precision	real
+1201	=	869	869	inet	inet
+1202	<>	869	869	inet	inet
+1203	<	869	869	inet	inet
+1204	<=	869	869	inet	inet
+1205	>	869	869	inet	inet
+1206	>=	869	869	inet	inet
+1207	~~	19	25	name	text
+1208	!~~	19	25	name	text
+1209	~~	25	25	text	text
+1210	!~~	25	25	text	text
+1211	~~	1042	25	character	text
+1212	!~~	1042	25	character	text
+1220	=	829	829	macaddr	macaddr
+1221	<>	829	829	macaddr	macaddr
+1222	<	829	829	macaddr	macaddr
+1223	<=	829	829	macaddr	macaddr
+1224	>	829	829	macaddr	macaddr
+1225	>=	829	829	macaddr	macaddr
+1226	~*	19	25	name	text
+1227	!~*	19	25	name	text
+1228	~*	25	25	text	text
+1229	!~*	25	25	text	text
+1234	~*	1042	25	character	text
+1235	!~*	1042	25	character	text
+1320	=	1184	1184	timestamp with time zone	timestamp with time zone
+1321	<>	1184	1184	timestamp with time zone	timestamp with time zone
+1322	<	1184	1184	timestamp with time zone	timestamp with time zone
+1323	<=	1184	1184	timestamp with time zone	timestamp with time zone
+1324	>	1184	1184	timestamp with time zone	timestamp with time zone
+1325	>=	1184	1184	timestamp with time zone	timestamp with time zone
+1327	+	1184	1186	timestamp with time zone	interval
+1328	-	1184	1184	timestamp with time zone	timestamp with time zone
+1329	-	1184	1186	timestamp with time zone	interval
+1330	=	1186	1186	interval	interval
+1331	<>	1186	1186	interval	interval
+1332	<	1186	1186	interval	interval
+1333	<=	1186	1186	interval	interval
+1334	>	1186	1186	interval	interval
+1335	>=	1186	1186	interval	interval
+1336	-	0	1186	NONE	interval
+1337	+	1186	1186	interval	interval
+1338	-	1186	1186	interval	interval
+1360	+	1082	1083	date	time without time zone
+1361	+	1082	1266	date	time with time zone
+1363	+	1083	1082	time without time zone	date
+1366	+	1266	1082	time with time zone	date
+1383	<->	604	718	polygon	circle
+1399	-	1083	1083	time without time zone	time without time zone
+1420	@@	0	718	NONE	circle
+1500	=	718	718	circle	circle
+1501	<>	718	718	circle	circle
+1502	<	718	718	circle	circle
+1503	>	718	718	circle	circle
+1504	<=	718	718	circle	circle
+1505	>=	718	718	circle	circle
+1506	<<	718	718	circle	circle
+1507	&<	718	718	circle	circle
+1508	&>	718	718	circle	circle
+1509	>>	718	718	circle	circle
+1510	<@	718	718	circle	circle
+1511	@>	718	718	circle	circle
+1512	~=	718	718	circle	circle
+1513	&&	718	718	circle	circle
+1514	|>>	718	718	circle	circle
+1515	<<|	718	718	circle	circle
+1516	+	718	600	circle	point
+1517	-	718	600	circle	point
+1518	*	718	600	circle	point
+1519	/	718	600	circle	point
+1520	<->	718	718	circle	circle
+1521	#	0	604	NONE	polygon
+1522	<->	600	718	point	circle
+1523	<->	718	604	circle	polygon
+1525	?#	601	601	lseg	lseg
+1526	?||	601	601	lseg	lseg
+1527	?-|	601	601	lseg	lseg
+1528	?-	0	601	NONE	lseg
+1529	?|	0	601	NONE	lseg
+1535	=	601	601	lseg	lseg
+1536	#	601	601	lseg	lseg
+1537	?#	601	628	lseg	line
+1538	?#	601	603	lseg	box
+1539	?#	628	603	line	box
+1546	<@	600	628	point	line
+1547	<@	600	601	point	lseg
+1548	<@	601	628	lseg	line
+1549	<@	601	603	lseg	box
+1550	=	1266	1266	time with time zone	time with time zone
+1551	<>	1266	1266	time with time zone	time with time zone
+1552	<	1266	1266	time with time zone	time with time zone
+1553	<=	1266	1266	time with time zone	time with time zone
+1554	>	1266	1266	time with time zone	time with time zone
+1555	>=	1266	1266	time with time zone	time with time zone
+1557	##	600	628	point	line
+1558	##	600	601	point	lseg
+1559	##	600	603	point	box
+1567	##	601	603	lseg	box
+1577	##	628	601	line	lseg
+1578	##	601	601	lseg	lseg
+1583	*	1186	701	interval	double precision
+1584	*	701	1186	double precision	interval
+1585	/	1186	701	interval	double precision
+1586	<>	601	601	lseg	lseg
+1587	<	601	601	lseg	lseg
+1588	<=	601	601	lseg	lseg
+1589	>	601	601	lseg	lseg
+1590	>=	601	601	lseg	lseg
+1591	@-@	0	601	NONE	lseg
+1611	?#	628	628	line	line
+1612	?||	628	628	line	line
+1613	?-|	628	628	line	line
+1614	?-	0	628	NONE	line
+1615	?|	0	628	NONE	line
+1616	=	628	628	line	line
+1617	#	628	628	line	line
+1625	~~*	19	25	name	text
+1626	!~~*	19	25	name	text
+1627	~~*	25	25	text	text
+1628	!~~*	25	25	text	text
+1629	~~*	1042	25	character	text
+1630	!~~*	1042	25	character	text
+1694	<=	16	16	boolean	boolean
+1695	>=	16	16	boolean	boolean
+1751	-	0	1700	NONE	numeric
+1752	=	1700	1700	numeric	numeric
+1753	<>	1700	1700	numeric	numeric
+1754	<	1700	1700	numeric	numeric
+1755	<=	1700	1700	numeric	numeric
+1756	>	1700	1700	numeric	numeric
+1757	>=	1700	1700	numeric	numeric
+1758	+	1700	1700	numeric	numeric
+1759	-	1700	1700	numeric	numeric
+1760	*	1700	1700	numeric	numeric
+1761	/	1700	1700	numeric	numeric
+1762	%	1700	1700	numeric	numeric
+1763	@	0	1700	NONE	numeric
+1784	=	1560	1560	bit	bit
+1785	<>	1560	1560	bit	bit
+1786	<	1560	1560	bit	bit
+1787	>	1560	1560	bit	bit
+1788	<=	1560	1560	bit	bit
+1789	>=	1560	1560	bit	bit
+1791	&	1560	1560	bit	bit
+1792	|	1560	1560	bit	bit
+1793	#	1560	1560	bit	bit
+1794	~	0	1560	NONE	bit
+1795	<<	1560	23	bit	integer
+1796	>>	1560	23	bit	integer
+1797	||	1562	1562	bit varying	bit varying
+1800	+	1083	1186	time without time zone	interval
+1801	-	1083	1186	time without time zone	interval
+1802	+	1266	1186	time with time zone	interval
+1803	-	1266	1186	time with time zone	interval
+1804	=	1562	1562	bit varying	bit varying
+1805	<>	1562	1562	bit varying	bit varying
+1806	<	1562	1562	bit varying	bit varying
+1807	>	1562	1562	bit varying	bit varying
+1808	<=	1562	1562	bit varying	bit varying
+1809	>=	1562	1562	bit varying	bit varying
+1849	+	1186	1083	interval	time without time zone
+1862	=	21	20	smallint	bigint
+1863	<>	21	20	smallint	bigint
+1864	<	21	20	smallint	bigint
+1865	>	21	20	smallint	bigint
+1866	<=	21	20	smallint	bigint
+1867	>=	21	20	smallint	bigint
+1868	=	20	21	bigint	smallint
+1869	<>	20	21	bigint	smallint
+1870	<	20	21	bigint	smallint
+1871	>	20	21	bigint	smallint
+1872	<=	20	21	bigint	smallint
+1873	>=	20	21	bigint	smallint
+1874	&	21	21	smallint	smallint
+1875	|	21	21	smallint	smallint
+1876	#	21	21	smallint	smallint
+1877	~	0	21	NONE	smallint
+1878	<<	21	23	smallint	integer
+1879	>>	21	23	smallint	integer
+1880	&	23	23	integer	integer
+1881	|	23	23	integer	integer
+1882	#	23	23	integer	integer
+1883	~	0	23	NONE	integer
+1884	<<	23	23	integer	integer
+1885	>>	23	23	integer	integer
+1886	&	20	20	bigint	bigint
+1887	|	20	20	bigint	bigint
+1888	#	20	20	bigint	bigint
+1889	~	0	20	NONE	bigint
+1890	<<	20	23	bigint	integer
+1891	>>	20	23	bigint	integer
+1916	+	0	20	NONE	bigint
+1917	+	0	21	NONE	smallint
+1918	+	0	23	NONE	integer
+1919	+	0	700	NONE	real
+1920	+	0	701	NONE	double precision
+1921	+	0	1700	NONE	numeric
+1955	=	17	17	bytea	bytea
+1956	<>	17	17	bytea	bytea
+1957	<	17	17	bytea	bytea
+1958	<=	17	17	bytea	bytea
+1959	>	17	17	bytea	bytea
+1960	>=	17	17	bytea	bytea
+2016	~~	17	17	bytea	bytea
+2017	!~~	17	17	bytea	bytea
+2018	||	17	17	bytea	bytea
+2060	=	1114	1114	timestamp without time zone	timestamp without time zone
+2061	<>	1114	1114	timestamp without time zone	timestamp without time zone
+2062	<	1114	1114	timestamp without time zone	timestamp without time zone
+2063	<=	1114	1114	timestamp without time zone	timestamp without time zone
+2064	>	1114	1114	timestamp without time zone	timestamp without time zone
+2065	>=	1114	1114	timestamp without time zone	timestamp without time zone
+2066	+	1114	1186	timestamp without time zone	interval
+2067	-	1114	1114	timestamp without time zone	timestamp without time zone
+2068	-	1114	1186	timestamp without time zone	interval
+2314	~<~	25	25	text	text
+2315	~<=~	25	25	text	text
+2317	~>=~	25	25	text	text
+2318	~>~	25	25	text	text
+2326	~<~	1042	1042	character	character
+2327	~<=~	1042	1042	character	character
+2329	~>=~	1042	1042	character	character
+2330	~>~	1042	1042	character	character
+2345	<	1082	1114	date	timestamp without time zone
+2346	<=	1082	1114	date	timestamp without time zone
+2347	=	1082	1114	date	timestamp without time zone
+2348	>=	1082	1114	date	timestamp without time zone
+2349	>	1082	1114	date	timestamp without time zone
+2350	<>	1082	1114	date	timestamp without time zone
+2358	<	1082	1184	date	timestamp with time zone
+2359	<=	1082	1184	date	timestamp with time zone
+2360	=	1082	1184	date	timestamp with time zone
+2361	>=	1082	1184	date	timestamp with time zone
+2362	>	1082	1184	date	timestamp with time zone
+2363	<>	1082	1184	date	timestamp with time zone
+2371	<	1114	1082	timestamp without time zone	date
+2372	<=	1114	1082	timestamp without time zone	date
+2373	=	1114	1082	timestamp without time zone	date
+2374	>=	1114	1082	timestamp without time zone	date
+2375	>	1114	1082	timestamp without time zone	date
+2376	<>	1114	1082	timestamp without time zone	date
+2384	<	1184	1082	timestamp with time zone	date
+2385	<=	1184	1082	timestamp with time zone	date
+2386	=	1184	1082	timestamp with time zone	date
+2387	>=	1184	1082	timestamp with time zone	date
+2388	>	1184	1082	timestamp with time zone	date
+2389	<>	1184	1082	timestamp with time zone	date
+2534	<	1114	1184	timestamp without time zone	timestamp with time zone
+2535	<=	1114	1184	timestamp without time zone	timestamp with time zone
+2536	=	1114	1184	timestamp without time zone	timestamp with time zone
+2537	>=	1114	1184	timestamp without time zone	timestamp with time zone
+2538	>	1114	1184	timestamp without time zone	timestamp with time zone
+2539	<>	1114	1184	timestamp without time zone	timestamp with time zone
+2540	<	1184	1114	timestamp with time zone	timestamp without time zone
+2541	<=	1184	1114	timestamp with time zone	timestamp without time zone
+2542	=	1184	1114	timestamp with time zone	timestamp without time zone
+2543	>=	1184	1114	timestamp with time zone	timestamp without time zone
+2544	>	1184	1114	timestamp with time zone	timestamp without time zone
+2545	<>	1184	1114	timestamp with time zone	timestamp without time zone
+2551	+	1186	1082	interval	date
+2552	+	1186	1266	interval	time with time zone
+2553	+	1186	1114	interval	timestamp without time zone
+2554	+	1186	1184	interval	timestamp with time zone
+2555	+	23	1082	integer	date
+2570	<<|	603	603	box	box
+2571	&<|	603	603	box	box
+2572	|&>	603	603	box	box
+2573	|>>	603	603	box	box
+2574	<<|	604	604	polygon	polygon
+2575	&<|	604	604	polygon	polygon
+2576	|&>	604	604	polygon	polygon
+2577	|>>	604	604	polygon	polygon
+2589	&<|	718	718	circle	circle
+2590	|&>	718	718	circle	circle
+2634	~	0	869	NONE	inet
+2635	&	869	869	inet	inet
+2636	|	869	869	inet	inet
+2637	+	869	20	inet	bigint
+2638	+	20	869	bigint	inet
+2639	-	869	20	inet	bigint
+2640	-	869	869	inet	inet
+2750	&&	2277	2277	anyarray	anyarray
+2751	@>	2277	2277	anyarray	anyarray
+2752	<@	2277	2277	anyarray	anyarray
+2779	||	25	2776	text	anynonarray
+2780	||	2776	25	anynonarray	text
+2799	<	27	27	tid	tid
+2800	>	27	27	tid	tid
+2801	<=	27	27	tid	tid
+2802	>=	27	27	tid	tid
+2860	=	4537	4537	anymultirange	anymultirange
+2861	<>	4537	4537	anymultirange	anymultirange
+2862	<	4537	4537	anymultirange	anymultirange
+2863	<=	4537	4537	anymultirange	anymultirange
+2864	>=	4537	4537	anymultirange	anymultirange
+2865	>	4537	4537	anymultirange	anymultirange
+2866	&&	3831	4537	anyrange	anymultirange
+2867	&&	4537	3831	anymultirange	anyrange
+2868	&&	4537	4537	anymultirange	anymultirange
+2869	@>	4537	2283	anymultirange	anyelement
+2870	@>	4537	3831	anymultirange	anyrange
+2871	@>	4537	4537	anymultirange	anymultirange
+2872	<@	2283	4537	anyelement	anymultirange
+2873	<@	3831	4537	anyrange	anymultirange
+2874	<@	4537	4537	anymultirange	anymultirange
+2875	&<	3831	4537	anyrange	anymultirange
+2876	&<	4537	3831	anymultirange	anyrange
+2877	&<	4537	4537	anymultirange	anymultirange
+2972	=	2950	2950	uuid	uuid
+2973	<>	2950	2950	uuid	uuid
+2974	<	2950	2950	uuid	uuid
+2975	>	2950	2950	uuid	uuid
+2976	<=	2950	2950	uuid	uuid
+2977	>=	2950	2950	uuid	uuid
+2988	=	2249	2249	record	record
+2989	<>	2249	2249	record	record
+2990	<	2249	2249	record	record
+2991	>	2249	2249	record	record
+2992	<=	2249	2249	record	record
+2993	>=	2249	2249	record	record
+3147	~	0	829	NONE	macaddr
+3148	&	829	829	macaddr	macaddr
+3149	|	829	829	macaddr	macaddr
+3188	*=	2249	2249	record	record
+3189	*<>	2249	2249	record	record
+3190	*<	2249	2249	record	record
+3191	*>	2249	2249	record	record
+3192	*<=	2249	2249	record	record
+3193	*>=	2249	2249	record	record
+3206	#>>	3802	1009	jsonb	text[]
+3211	->	3802	25	jsonb	text
+3212	->	3802	23	jsonb	integer
+3213	#>	3802	1009	jsonb	text[]
+3222	=	3220	3220	pg_lsn	pg_lsn
+3223	<>	3220	3220	pg_lsn	pg_lsn
+3224	<	3220	3220	pg_lsn	pg_lsn
+3225	>	3220	3220	pg_lsn	pg_lsn
+3226	<=	3220	3220	pg_lsn	pg_lsn
+3227	>=	3220	3220	pg_lsn	pg_lsn
+3228	-	3220	3220	pg_lsn	pg_lsn
+3240	=	3802	3802	jsonb	jsonb
+3241	<>	3802	3802	jsonb	jsonb
+3242	<	3802	3802	jsonb	jsonb
+3243	>	3802	3802	jsonb	jsonb
+3244	<=	3802	3802	jsonb	jsonb
+3245	>=	3802	3802	jsonb	jsonb
+3246	@>	3802	3802	jsonb	jsonb
+3247	?	3802	25	jsonb	text
+3248	?|	3802	1009	jsonb	text[]
+3249	?&	3802	1009	jsonb	text[]
+3250	<@	3802	3802	jsonb	jsonb
+3276	<->	600	604	point	polygon
+3284	||	3802	3802	jsonb	jsonb
+3285	-	3802	25	jsonb	text
+3286	-	3802	23	jsonb	integer
+3287	#-	3802	1009	jsonb	text[]
+3289	<->	604	600	polygon	point
+3291	<->	718	600	circle	point
+3315	<>	28	28	xid	xid
+3316	<>	28	23	xid	integer
+3346	*	790	20	money	bigint
+3347	/	790	20	money	bigint
+3349	*	20	790	bigint	money
+3362	=	774	774	macaddr8	macaddr8
+3363	<>	774	774	macaddr8	macaddr8
+3364	<	774	774	macaddr8	macaddr8
+3365	<=	774	774	macaddr8	macaddr8
+3366	>	774	774	macaddr8	macaddr8
+3367	>=	774	774	macaddr8	macaddr8
+3368	~	0	774	NONE	macaddr8
+3369	&	774	774	macaddr8	macaddr8
+3370	|	774	774	macaddr8	macaddr8
+3398	-	3802	1009	jsonb	text[]
+3477	->>	3802	25	jsonb	text
+3481	->>	3802	23	jsonb	integer
+3516	=	3500	3500	anyenum	anyenum
+3517	<>	3500	3500	anyenum	anyenum
+3518	<	3500	3500	anyenum	anyenum
+3519	>	3500	3500	anyenum	anyenum
+3520	<=	3500	3500	anyenum	anyenum
+3521	>=	3500	3500	anyenum	anyenum
+3552	&&	869	869	inet	inet
+3585	&>	3831	4537	anyrange	anymultirange
+3627	<	3614	3614	tsvector	tsvector
+3628	<=	3614	3614	tsvector	tsvector
+3629	=	3614	3614	tsvector	tsvector
+3630	<>	3614	3614	tsvector	tsvector
+3631	>=	3614	3614	tsvector	tsvector
+3632	>	3614	3614	tsvector	tsvector
+3633	||	3614	3614	tsvector	tsvector
+3636	@@	3614	3615	tsvector	tsquery
+3637	@@	3615	3614	tsquery	tsvector
+3660	@@@	3614	3615	tsvector	tsquery
+3661	@@@	3615	3614	tsquery	tsvector
+3674	<	3615	3615	tsquery	tsquery
+3675	<=	3615	3615	tsquery	tsquery
+3676	=	3615	3615	tsquery	tsquery
+3677	<>	3615	3615	tsquery	tsquery
+3678	>=	3615	3615	tsquery	tsquery
+3679	>	3615	3615	tsquery	tsquery
+3680	&&	3615	3615	tsquery	tsquery
+3681	||	3615	3615	tsquery	tsquery
+3682	!!	0	3615	NONE	tsquery
+3693	@>	3615	3615	tsquery	tsquery
+3694	<@	3615	3615	tsquery	tsquery
+3762	@@	25	25	text	text
+3763	@@	25	3615	text	tsquery
+3825	/	790	790	money	money
+3877	^@	25	25	text	text
+3882	=	3831	3831	anyrange	anyrange
+3883	<>	3831	3831	anyrange	anyrange
+3884	<	3831	3831	anyrange	anyrange
+3885	<=	3831	3831	anyrange	anyrange
+3886	>=	3831	3831	anyrange	anyrange
+3887	>	3831	3831	anyrange	anyrange
+3888	&&	3831	3831	anyrange	anyrange
+3889	@>	3831	2283	anyrange	anyelement
+3890	@>	3831	3831	anyrange	anyrange
+3891	<@	2283	3831	anyelement	anyrange
+3892	<@	3831	3831	anyrange	anyrange
+3893	<<	3831	3831	anyrange	anyrange
+3894	>>	3831	3831	anyrange	anyrange
+3895	&<	3831	3831	anyrange	anyrange
+3896	&>	3831	3831	anyrange	anyrange
+3897	-|-	3831	3831	anyrange	anyrange
+3898	+	3831	3831	anyrange	anyrange
+3899	-	3831	3831	anyrange	anyrange
+3900	*	3831	3831	anyrange	anyrange
+3962	->	114	25	json	text
+3963	->>	114	25	json	text
+3964	->	114	23	json	integer
+3965	->>	114	23	json	integer
+3966	#>	114	1009	json	text[]
+3967	#>>	114	1009	json	text[]
+4012	@?	3802	4072	jsonb	jsonpath
+4013	@@	3802	4072	jsonb	jsonpath
+4035	&>	4537	3831	anymultirange	anyrange
+4142	&>	4537	4537	anymultirange	anymultirange
+4161	|>>	600	600	point	point
+4162	<<|	600	600	point	point
+4179	-|-	3831	4537	anyrange	anymultirange
+4180	-|-	4537	3831	anymultirange	anyrange
+4198	-|-	4537	4537	anymultirange	anymultirange
+4392	+	4537	4537	anymultirange	anymultirange
+4393	-	4537	4537	anymultirange	anymultirange
+4394	*	4537	4537	anymultirange	anymultirange
+4395	<<	3831	4537	anyrange	anymultirange
+4396	<<	4537	3831	anymultirange	anyrange
+4397	<<	4537	4537	anymultirange	anymultirange
+4398	>>	3831	4537	anyrange	anymultirange
+4399	>>	4537	3831	anymultirange	anyrange
+4400	>>	4537	4537	anymultirange	anymultirange
+4539	@>	3831	4537	anyrange	anymultirange
+4540	<@	4537	3831	anymultirange	anyrange
+5005	<->	3615	3615	tsquery	tsquery
+5025	+	3220	1700	pg_lsn	numeric
+5026	+	1700	3220	numeric	pg_lsn
+5027	-	3220	1700	pg_lsn	numeric
+5068	=	5069	5069	xid8	xid8
+5072	<>	5069	5069	xid8	xid8
+5073	<	5069	5069	xid8	xid8
+5074	>	5069	5069	xid8	xid8
+5075	<=	5069	5069	xid8	xid8
+5076	>=	5069	5069	xid8	xid8

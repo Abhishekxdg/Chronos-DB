@@ -1,0 +1,27 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("CHRONOS_URL")
+}
+
+model DrvUser {
+  id    Int       @id @default(autoincrement())
+  email String    @unique
+  name  String?
+  posts DrvPost[]
+
+  @@map("drv_prisma_user")
+}
+
+model DrvPost {
+  id       Int     @id @default(autoincrement())
+  title    String
+  done     Boolean @default(false)
+  author   DrvUser @relation(fields: [authorId], references: [id])
+  authorId Int
+
+  @@map("drv_prisma_post")
+}

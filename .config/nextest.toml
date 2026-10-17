@@ -1,0 +1,16 @@
+# cargo nextest run: every test in a process of its own, as many at once as there are cores (cargo test
+# runs the test binaries one after another, and the big ones' tests take turns through a Mutex: 45 min in CI).
+[profile.ci]
+fail-fast = false
+failure-output = "immediate-final"
+slow-timeout = { period = "120s" }
+
+[test-groups]
+oracle = { max-threads = 1 }
+
+# These compare against the reference Postgres at host=/tmp (skipped without one) under database or schema
+# names that are the same in every process: in one process their tests took turns through a Mutex, and as
+# separate processes they take turns here.
+[[profile.default.overrides]]
+filter = "binary(pgdiff) | binary(schemas) | binary(read_committed) | binary(pgcompat) | binary(copy) | binary(pg_dump) | binary(pgcrypto) | binary(scram) | binary(advisory) | binary(studio_screens)"
+test-group = "oracle"

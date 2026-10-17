@@ -510,9 +510,10 @@ See [CHANGELOG.md](CHANGELOG.md) for everything that has shipped, and [SECURITY.
 
 ## What's in this repository
 
-The Chronos DB engine is closed source; this repository holds everything around it:
+Everything Chronos DB is, in one place:
 
-- **Releases:** signed `chronos` binaries for macOS and Linux, and `install.sh`.
+- **[`src/`](src), [`tests/`](tests):** the database engine's source and its tests (Rust), under the Business Source License (see License below). Build it with `cargo build --release`; the binary is `target/release/chronos`.
+- **Releases:** signed `chronos` binaries for macOS and Linux, built from that source, and `install.sh`.
 - **[`studio/`](studio):** Chronos Studio's source, the web UI built into every release (React, TypeScript, Vite). See [docs/studio.md](docs/studio.md#developing-the-studio) to work on it.
 - **[`clients/`](clients):** the TypeScript and Python clients, one file each, no dependencies.
 - **[`docs/`](docs)** and **[`site/`](site):** the documentation, published at [abhishekxdg.github.io/chronosdb](https://abhishekxdg.github.io/chronosdb/).
@@ -520,5 +521,5 @@ The Chronos DB engine is closed source; this repository holds everything around 
 
 ## License
 
-- **The Studio, the clients, the docs site and the examples** (everything in this repository): the [MIT License](LICENSE).
-- **The `chronos` binaries:** free to use, including in production and inside commercial products, except to offer Chronos DB itself to others as a hosted or managed database service. Running it as your own application's database is fine. See [TERMS.md](TERMS.md).
+- **The engine** (`src/`, `tests/`, the Cargo build, `examples/*.rs`) **and the `chronos` binaries built from it:** the [Business Source License 1.1](LICENSE-ENGINE). Free to use, change and redistribute, including in production and inside commercial products, except to offer Chronos DB itself to others as a hosted or managed database service. Running it as your own application's database is fine. Each version becomes Apache 2.0 four years after it is published. It is source-available, not open source by the OSI's definition. See [TERMS.md](TERMS.md).
+- **The Studio, the clients, the docs site and the guides' examples:** the [MIT License](LICENSE).

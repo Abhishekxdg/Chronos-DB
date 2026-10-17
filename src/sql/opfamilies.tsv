@@ -1,0 +1,2095 @@
+# Postgres 16's operator families (f: oid, access method, name), operator classes (c: oid or \N where
+# initdb numbers it, access method, name, family), operator family members (o: pg_amop, p: pg_amproc: family,
+# left and right types, strategy or support number) and conversions (v: oid, name), from its catalog .dat files.
+f	397	btree	array_ops
+f	627	hash	array_ops
+f	423	btree	bit_ops
+f	424	btree	bool_ops
+f	426	btree	bpchar_ops
+f	427	hash	bpchar_ops
+f	428	btree	bytea_ops
+f	429	btree	char_ops
+f	431	hash	char_ops
+f	434	btree	datetime_ops
+f	435	hash	date_ops
+f	1970	btree	float_ops
+f	1971	hash	float_ops
+f	1974	btree	network_ops
+f	1975	hash	network_ops
+f	3550	gist	network_ops
+f	3794	spgist	network_ops
+f	1976	btree	integer_ops
+f	1977	hash	integer_ops
+f	1982	btree	interval_ops
+f	1983	hash	interval_ops
+f	1984	btree	macaddr_ops
+f	1985	hash	macaddr_ops
+f	3371	btree	macaddr8_ops
+f	3372	hash	macaddr8_ops
+f	1988	btree	numeric_ops
+f	1998	hash	numeric_ops
+f	1989	btree	oid_ops
+f	1990	hash	oid_ops
+f	1991	btree	oidvector_ops
+f	1992	hash	oidvector_ops
+f	2994	btree	record_ops
+f	6194	hash	record_ops
+f	3194	btree	record_image_ops
+f	1994	btree	text_ops
+f	1995	hash	text_ops
+f	1996	btree	time_ops
+f	1997	hash	time_ops
+f	1999	hash	timestamptz_ops
+f	2000	btree	timetz_ops
+f	2001	hash	timetz_ops
+f	2002	btree	varbit_ops
+f	2040	hash	timestamp_ops
+f	2095	btree	text_pattern_ops
+f	2097	btree	bpchar_pattern_ops
+f	2099	btree	money_ops
+f	2222	hash	bool_ops
+f	2223	hash	bytea_ops
+f	2789	btree	tid_ops
+f	2225	hash	xid_ops
+f	5032	hash	xid8_ops
+f	5067	btree	xid8_ops
+f	2226	hash	cid_ops
+f	2227	hash	tid_ops
+f	2229	hash	text_pattern_ops
+f	2231	hash	bpchar_pattern_ops
+f	2235	hash	aclitem_ops
+f	2593	gist	box_ops
+f	2594	gist	poly_ops
+f	2595	gist	circle_ops
+f	1029	gist	point_ops
+f	2745	gin	array_ops
+f	2968	btree	uuid_ops
+f	2969	hash	uuid_ops
+f	3253	btree	pg_lsn_ops
+f	3254	hash	pg_lsn_ops
+f	3522	btree	enum_ops
+f	3523	hash	enum_ops
+f	3626	btree	tsvector_ops
+f	3655	gist	tsvector_ops
+f	3659	gin	tsvector_ops
+f	3683	btree	tsquery_ops
+f	3702	gist	tsquery_ops
+f	3901	btree	range_ops
+f	3903	hash	range_ops
+f	3919	gist	range_ops
+f	3474	spgist	range_ops
+f	4015	spgist	quad_point_ops
+f	4016	spgist	kd_point_ops
+f	4017	spgist	text_ops
+f	4033	btree	jsonb_ops
+f	4034	hash	jsonb_ops
+f	4036	gin	jsonb_ops
+f	4037	gin	jsonb_path_ops
+f	4054	brin	integer_minmax_ops
+f	4602	brin	integer_minmax_multi_ops
+f	4572	brin	integer_bloom_ops
+f	4055	brin	numeric_minmax_ops
+f	4603	brin	numeric_minmax_multi_ops
+f	4056	brin	text_minmax_ops
+f	4573	brin	text_bloom_ops
+f	4574	brin	numeric_bloom_ops
+f	4058	brin	timetz_minmax_ops
+f	4604	brin	timetz_minmax_multi_ops
+f	4575	brin	timetz_bloom_ops
+f	4059	brin	datetime_minmax_ops
+f	4605	brin	datetime_minmax_multi_ops
+f	4576	brin	datetime_bloom_ops
+f	4062	brin	char_minmax_ops
+f	4577	brin	char_bloom_ops
+f	4064	brin	bytea_minmax_ops
+f	4578	brin	bytea_bloom_ops
+f	4065	brin	name_minmax_ops
+f	4579	brin	name_bloom_ops
+f	4068	brin	oid_minmax_ops
+f	4606	brin	oid_minmax_multi_ops
+f	4580	brin	oid_bloom_ops
+f	4069	brin	tid_minmax_ops
+f	4581	brin	tid_bloom_ops
+f	4607	brin	tid_minmax_multi_ops
+f	4070	brin	float_minmax_ops
+f	4608	brin	float_minmax_multi_ops
+f	4582	brin	float_bloom_ops
+f	4074	brin	macaddr_minmax_ops
+f	4609	brin	macaddr_minmax_multi_ops
+f	4583	brin	macaddr_bloom_ops
+f	4109	brin	macaddr8_minmax_ops
+f	4610	brin	macaddr8_minmax_multi_ops
+f	4584	brin	macaddr8_bloom_ops
+f	4075	brin	network_minmax_ops
+f	4611	brin	network_minmax_multi_ops
+f	4102	brin	network_inclusion_ops
+f	4585	brin	network_bloom_ops
+f	4076	brin	bpchar_minmax_ops
+f	4586	brin	bpchar_bloom_ops
+f	4077	brin	time_minmax_ops
+f	4612	brin	time_minmax_multi_ops
+f	4587	brin	time_bloom_ops
+f	4078	brin	interval_minmax_ops
+f	4613	brin	interval_minmax_multi_ops
+f	4588	brin	interval_bloom_ops
+f	4079	brin	bit_minmax_ops
+f	4080	brin	varbit_minmax_ops
+f	4081	brin	uuid_minmax_ops
+f	4614	brin	uuid_minmax_multi_ops
+f	4589	brin	uuid_bloom_ops
+f	4103	brin	range_inclusion_ops
+f	4082	brin	pg_lsn_minmax_ops
+f	4615	brin	pg_lsn_minmax_multi_ops
+f	4590	brin	pg_lsn_bloom_ops
+f	4104	brin	box_inclusion_ops
+f	5000	spgist	box_ops
+f	5008	spgist	poly_ops
+f	4199	btree	multirange_ops
+f	4225	hash	multirange_ops
+f	6158	gist	multirange_ops
+c	\N	btree	array_ops	array_ops
+c	\N	hash	array_ops	array_ops
+c	\N	btree	bit_ops	bit_ops
+c	\N	btree	bool_ops	bool_ops
+c	\N	btree	bpchar_ops	bpchar_ops
+c	\N	hash	bpchar_ops	bpchar_ops
+c	\N	btree	bytea_ops	bytea_ops
+c	\N	btree	char_ops	char_ops
+c	\N	hash	char_ops	char_ops
+c	\N	btree	cidr_ops	network_ops
+c	\N	hash	cidr_ops	network_ops
+c	3122	btree	date_ops	datetime_ops
+c	\N	hash	date_ops	date_ops
+c	\N	btree	float4_ops	float_ops
+c	\N	hash	float4_ops	float_ops
+c	3123	btree	float8_ops	float_ops
+c	\N	hash	float8_ops	float_ops
+c	\N	btree	inet_ops	network_ops
+c	\N	hash	inet_ops	network_ops
+c	\N	gist	inet_ops	network_ops
+c	\N	spgist	inet_ops	network_ops
+c	1979	btree	int2_ops	integer_ops
+c	\N	hash	int2_ops	integer_ops
+c	1978	btree	int4_ops	integer_ops
+c	\N	hash	int4_ops	integer_ops
+c	3124	btree	int8_ops	integer_ops
+c	\N	hash	int8_ops	integer_ops
+c	\N	btree	interval_ops	interval_ops
+c	\N	hash	interval_ops	interval_ops
+c	\N	btree	macaddr_ops	macaddr_ops
+c	\N	hash	macaddr_ops	macaddr_ops
+c	\N	btree	macaddr8_ops	macaddr8_ops
+c	\N	hash	macaddr8_ops	macaddr8_ops
+c	\N	btree	name_ops	text_ops
+c	\N	hash	name_ops	text_ops
+c	3125	btree	numeric_ops	numeric_ops
+c	\N	hash	numeric_ops	numeric_ops
+c	1981	btree	oid_ops	oid_ops
+c	\N	hash	oid_ops	oid_ops
+c	\N	btree	oidvector_ops	oidvector_ops
+c	\N	hash	oidvector_ops	oidvector_ops
+c	\N	btree	record_ops	record_ops
+c	\N	hash	record_ops	record_ops
+c	\N	btree	record_image_ops	record_image_ops
+c	3126	btree	text_ops	text_ops
+c	\N	hash	text_ops	text_ops
+c	\N	btree	time_ops	time_ops
+c	\N	hash	time_ops	time_ops
+c	3127	btree	timestamptz_ops	datetime_ops
+c	\N	hash	timestamptz_ops	timestamptz_ops
+c	\N	btree	timetz_ops	timetz_ops
+c	\N	hash	timetz_ops	timetz_ops
+c	\N	btree	varbit_ops	varbit_ops
+c	\N	btree	varchar_ops	text_ops
+c	\N	hash	varchar_ops	text_ops
+c	3128	btree	timestamp_ops	datetime_ops
+c	\N	hash	timestamp_ops	timestamp_ops
+c	4217	btree	text_pattern_ops	text_pattern_ops
+c	4218	btree	varchar_pattern_ops	text_pattern_ops
+c	4219	btree	bpchar_pattern_ops	bpchar_pattern_ops
+c	\N	btree	money_ops	money_ops
+c	\N	hash	bool_ops	bool_ops
+c	\N	hash	bytea_ops	bytea_ops
+c	\N	btree	tid_ops	tid_ops
+c	\N	hash	xid_ops	xid_ops
+c	\N	hash	xid8_ops	xid8_ops
+c	\N	btree	xid8_ops	xid8_ops
+c	\N	hash	cid_ops	cid_ops
+c	\N	hash	tid_ops	tid_ops
+c	\N	hash	text_pattern_ops	text_pattern_ops
+c	\N	hash	varchar_pattern_ops	text_pattern_ops
+c	\N	hash	bpchar_pattern_ops	bpchar_pattern_ops
+c	\N	hash	aclitem_ops	aclitem_ops
+c	\N	gist	box_ops	box_ops
+c	\N	gist	point_ops	point_ops
+c	\N	gist	poly_ops	poly_ops
+c	\N	gist	circle_ops	circle_ops
+c	\N	gin	array_ops	array_ops
+c	\N	btree	uuid_ops	uuid_ops
+c	\N	hash	uuid_ops	uuid_ops
+c	\N	btree	pg_lsn_ops	pg_lsn_ops
+c	\N	hash	pg_lsn_ops	pg_lsn_ops
+c	\N	btree	enum_ops	enum_ops
+c	\N	hash	enum_ops	enum_ops
+c	\N	btree	tsvector_ops	tsvector_ops
+c	\N	gist	tsvector_ops	tsvector_ops
+c	\N	gin	tsvector_ops	tsvector_ops
+c	\N	btree	tsquery_ops	tsquery_ops
+c	\N	gist	tsquery_ops	tsquery_ops
+c	\N	btree	range_ops	range_ops
+c	\N	hash	range_ops	range_ops
+c	\N	gist	range_ops	range_ops
+c	\N	spgist	range_ops	range_ops
+c	\N	btree	multirange_ops	multirange_ops
+c	\N	hash	multirange_ops	multirange_ops
+c	\N	gist	multirange_ops	multirange_ops
+c	\N	spgist	box_ops	box_ops
+c	\N	spgist	quad_point_ops	quad_point_ops
+c	\N	spgist	kd_point_ops	kd_point_ops
+c	\N	spgist	text_ops	text_ops
+c	\N	spgist	poly_ops	poly_ops
+c	\N	btree	jsonb_ops	jsonb_ops
+c	\N	hash	jsonb_ops	jsonb_ops
+c	\N	gin	jsonb_ops	jsonb_ops
+c	\N	gin	jsonb_path_ops	jsonb_path_ops
+c	\N	brin	bytea_minmax_ops	bytea_minmax_ops
+c	\N	brin	bytea_bloom_ops	bytea_bloom_ops
+c	\N	brin	char_minmax_ops	char_minmax_ops
+c	\N	brin	char_bloom_ops	char_bloom_ops
+c	\N	brin	name_minmax_ops	name_minmax_ops
+c	\N	brin	name_bloom_ops	name_bloom_ops
+c	\N	brin	int8_minmax_ops	integer_minmax_ops
+c	\N	brin	int8_minmax_multi_ops	integer_minmax_multi_ops
+c	\N	brin	int8_bloom_ops	integer_bloom_ops
+c	\N	brin	int2_minmax_ops	integer_minmax_ops
+c	\N	brin	int2_minmax_multi_ops	integer_minmax_multi_ops
+c	\N	brin	int2_bloom_ops	integer_bloom_ops
+c	\N	brin	int4_minmax_ops	integer_minmax_ops
+c	\N	brin	int4_minmax_multi_ops	integer_minmax_multi_ops
+c	\N	brin	int4_bloom_ops	integer_bloom_ops
+c	\N	brin	text_minmax_ops	text_minmax_ops
+c	\N	brin	text_bloom_ops	text_bloom_ops
+c	\N	brin	oid_minmax_ops	oid_minmax_ops
+c	\N	brin	oid_minmax_multi_ops	oid_minmax_multi_ops
+c	\N	brin	oid_bloom_ops	oid_bloom_ops
+c	\N	brin	tid_minmax_ops	tid_minmax_ops
+c	\N	brin	tid_bloom_ops	tid_bloom_ops
+c	\N	brin	tid_minmax_multi_ops	tid_minmax_multi_ops
+c	\N	brin	float4_minmax_ops	float_minmax_ops
+c	\N	brin	float4_minmax_multi_ops	float_minmax_multi_ops
+c	\N	brin	float4_bloom_ops	float_bloom_ops
+c	\N	brin	float8_minmax_ops	float_minmax_ops
+c	\N	brin	float8_minmax_multi_ops	float_minmax_multi_ops
+c	\N	brin	float8_bloom_ops	float_bloom_ops
+c	\N	brin	macaddr_minmax_ops	macaddr_minmax_ops
+c	\N	brin	macaddr_minmax_multi_ops	macaddr_minmax_multi_ops
+c	\N	brin	macaddr_bloom_ops	macaddr_bloom_ops
+c	\N	brin	macaddr8_minmax_ops	macaddr8_minmax_ops
+c	\N	brin	macaddr8_minmax_multi_ops	macaddr8_minmax_multi_ops
+c	\N	brin	macaddr8_bloom_ops	macaddr8_bloom_ops
+c	\N	brin	inet_minmax_ops	network_minmax_ops
+c	\N	brin	inet_minmax_multi_ops	network_minmax_multi_ops
+c	\N	brin	inet_bloom_ops	network_bloom_ops
+c	\N	brin	inet_inclusion_ops	network_inclusion_ops
+c	\N	brin	bpchar_minmax_ops	bpchar_minmax_ops
+c	\N	brin	bpchar_bloom_ops	bpchar_bloom_ops
+c	\N	brin	time_minmax_ops	time_minmax_ops
+c	\N	brin	time_minmax_multi_ops	time_minmax_multi_ops
+c	\N	brin	time_bloom_ops	time_bloom_ops
+c	\N	brin	date_minmax_ops	datetime_minmax_ops
+c	\N	brin	date_minmax_multi_ops	datetime_minmax_multi_ops
+c	\N	brin	date_bloom_ops	datetime_bloom_ops
+c	\N	brin	timestamp_minmax_ops	datetime_minmax_ops
+c	\N	brin	timestamp_minmax_multi_ops	datetime_minmax_multi_ops
+c	\N	brin	timestamp_bloom_ops	datetime_bloom_ops
+c	\N	brin	timestamptz_minmax_ops	datetime_minmax_ops
+c	\N	brin	timestamptz_minmax_multi_ops	datetime_minmax_multi_ops
+c	\N	brin	timestamptz_bloom_ops	datetime_bloom_ops
+c	\N	brin	interval_minmax_ops	interval_minmax_ops
+c	\N	brin	interval_minmax_multi_ops	interval_minmax_multi_ops
+c	\N	brin	interval_bloom_ops	interval_bloom_ops
+c	\N	brin	timetz_minmax_ops	timetz_minmax_ops
+c	\N	brin	timetz_minmax_multi_ops	timetz_minmax_multi_ops
+c	\N	brin	timetz_bloom_ops	timetz_bloom_ops
+c	\N	brin	bit_minmax_ops	bit_minmax_ops
+c	\N	brin	varbit_minmax_ops	varbit_minmax_ops
+c	\N	brin	numeric_minmax_ops	numeric_minmax_ops
+c	\N	brin	numeric_minmax_multi_ops	numeric_minmax_multi_ops
+c	\N	brin	numeric_bloom_ops	numeric_bloom_ops
+c	\N	brin	uuid_minmax_ops	uuid_minmax_ops
+c	\N	brin	uuid_minmax_multi_ops	uuid_minmax_multi_ops
+c	\N	brin	uuid_bloom_ops	uuid_bloom_ops
+c	\N	brin	range_inclusion_ops	range_inclusion_ops
+c	\N	brin	pg_lsn_minmax_ops	pg_lsn_minmax_ops
+c	\N	brin	pg_lsn_minmax_multi_ops	pg_lsn_minmax_multi_ops
+c	\N	brin	pg_lsn_bloom_ops	pg_lsn_bloom_ops
+c	\N	brin	box_inclusion_ops	box_inclusion_ops
+o	btree/integer_ops	int2	int2	1
+o	btree/integer_ops	int2	int2	2
+o	btree/integer_ops	int2	int2	3
+o	btree/integer_ops	int2	int2	4
+o	btree/integer_ops	int2	int2	5
+o	btree/integer_ops	int2	int4	1
+o	btree/integer_ops	int2	int4	2
+o	btree/integer_ops	int2	int4	3
+o	btree/integer_ops	int2	int4	4
+o	btree/integer_ops	int2	int4	5
+o	btree/integer_ops	int2	int8	1
+o	btree/integer_ops	int2	int8	2
+o	btree/integer_ops	int2	int8	3
+o	btree/integer_ops	int2	int8	4
+o	btree/integer_ops	int2	int8	5
+o	btree/integer_ops	int4	int4	1
+o	btree/integer_ops	int4	int4	2
+o	btree/integer_ops	int4	int4	3
+o	btree/integer_ops	int4	int4	4
+o	btree/integer_ops	int4	int4	5
+o	btree/integer_ops	int4	int2	1
+o	btree/integer_ops	int4	int2	2
+o	btree/integer_ops	int4	int2	3
+o	btree/integer_ops	int4	int2	4
+o	btree/integer_ops	int4	int2	5
+o	btree/integer_ops	int4	int8	1
+o	btree/integer_ops	int4	int8	2
+o	btree/integer_ops	int4	int8	3
+o	btree/integer_ops	int4	int8	4
+o	btree/integer_ops	int4	int8	5
+o	btree/integer_ops	int8	int8	1
+o	btree/integer_ops	int8	int8	2
+o	btree/integer_ops	int8	int8	3
+o	btree/integer_ops	int8	int8	4
+o	btree/integer_ops	int8	int8	5
+o	btree/integer_ops	int8	int2	1
+o	btree/integer_ops	int8	int2	2
+o	btree/integer_ops	int8	int2	3
+o	btree/integer_ops	int8	int2	4
+o	btree/integer_ops	int8	int2	5
+o	btree/integer_ops	int8	int4	1
+o	btree/integer_ops	int8	int4	2
+o	btree/integer_ops	int8	int4	3
+o	btree/integer_ops	int8	int4	4
+o	btree/integer_ops	int8	int4	5
+o	btree/oid_ops	oid	oid	1
+o	btree/oid_ops	oid	oid	2
+o	btree/oid_ops	oid	oid	3
+o	btree/oid_ops	oid	oid	4
+o	btree/oid_ops	oid	oid	5
+o	btree/xid8_ops	xid8	xid8	1
+o	btree/xid8_ops	xid8	xid8	2
+o	btree/xid8_ops	xid8	xid8	3
+o	btree/xid8_ops	xid8	xid8	4
+o	btree/xid8_ops	xid8	xid8	5
+o	btree/tid_ops	tid	tid	1
+o	btree/tid_ops	tid	tid	2
+o	btree/tid_ops	tid	tid	3
+o	btree/tid_ops	tid	tid	4
+o	btree/tid_ops	tid	tid	5
+o	btree/oidvector_ops	oidvector	oidvector	1
+o	btree/oidvector_ops	oidvector	oidvector	2
+o	btree/oidvector_ops	oidvector	oidvector	3
+o	btree/oidvector_ops	oidvector	oidvector	4
+o	btree/oidvector_ops	oidvector	oidvector	5
+o	btree/float_ops	float4	float4	1
+o	btree/float_ops	float4	float4	2
+o	btree/float_ops	float4	float4	3
+o	btree/float_ops	float4	float4	4
+o	btree/float_ops	float4	float4	5
+o	btree/float_ops	float4	float8	1
+o	btree/float_ops	float4	float8	2
+o	btree/float_ops	float4	float8	3
+o	btree/float_ops	float4	float8	4
+o	btree/float_ops	float4	float8	5
+o	btree/float_ops	float8	float8	1
+o	btree/float_ops	float8	float8	2
+o	btree/float_ops	float8	float8	3
+o	btree/float_ops	float8	float8	4
+o	btree/float_ops	float8	float8	5
+o	btree/float_ops	float8	float4	1
+o	btree/float_ops	float8	float4	2
+o	btree/float_ops	float8	float4	3
+o	btree/float_ops	float8	float4	4
+o	btree/float_ops	float8	float4	5
+o	btree/char_ops	char	char	1
+o	btree/char_ops	char	char	2
+o	btree/char_ops	char	char	3
+o	btree/char_ops	char	char	4
+o	btree/char_ops	char	char	5
+o	btree/text_ops	text	text	1
+o	btree/text_ops	text	text	2
+o	btree/text_ops	text	text	3
+o	btree/text_ops	text	text	4
+o	btree/text_ops	text	text	5
+o	btree/text_ops	name	name	1
+o	btree/text_ops	name	name	2
+o	btree/text_ops	name	name	3
+o	btree/text_ops	name	name	4
+o	btree/text_ops	name	name	5
+o	btree/text_ops	name	text	1
+o	btree/text_ops	name	text	2
+o	btree/text_ops	name	text	3
+o	btree/text_ops	name	text	4
+o	btree/text_ops	name	text	5
+o	btree/text_ops	text	name	1
+o	btree/text_ops	text	name	2
+o	btree/text_ops	text	name	3
+o	btree/text_ops	text	name	4
+o	btree/text_ops	text	name	5
+o	btree/bpchar_ops	bpchar	bpchar	1
+o	btree/bpchar_ops	bpchar	bpchar	2
+o	btree/bpchar_ops	bpchar	bpchar	3
+o	btree/bpchar_ops	bpchar	bpchar	4
+o	btree/bpchar_ops	bpchar	bpchar	5
+o	btree/bytea_ops	bytea	bytea	1
+o	btree/bytea_ops	bytea	bytea	2
+o	btree/bytea_ops	bytea	bytea	3
+o	btree/bytea_ops	bytea	bytea	4
+o	btree/bytea_ops	bytea	bytea	5
+o	btree/datetime_ops	date	date	1
+o	btree/datetime_ops	date	date	2
+o	btree/datetime_ops	date	date	3
+o	btree/datetime_ops	date	date	4
+o	btree/datetime_ops	date	date	5
+o	btree/datetime_ops	date	timestamp	1
+o	btree/datetime_ops	date	timestamp	2
+o	btree/datetime_ops	date	timestamp	3
+o	btree/datetime_ops	date	timestamp	4
+o	btree/datetime_ops	date	timestamp	5
+o	btree/datetime_ops	date	timestamptz	1
+o	btree/datetime_ops	date	timestamptz	2
+o	btree/datetime_ops	date	timestamptz	3
+o	btree/datetime_ops	date	timestamptz	4
+o	btree/datetime_ops	date	timestamptz	5
+o	btree/datetime_ops	timestamp	timestamp	1
+o	btree/datetime_ops	timestamp	timestamp	2
+o	btree/datetime_ops	timestamp	timestamp	3
+o	btree/datetime_ops	timestamp	timestamp	4
+o	btree/datetime_ops	timestamp	timestamp	5
+o	btree/datetime_ops	timestamp	date	1
+o	btree/datetime_ops	timestamp	date	2
+o	btree/datetime_ops	timestamp	date	3
+o	btree/datetime_ops	timestamp	date	4
+o	btree/datetime_ops	timestamp	date	5
+o	btree/datetime_ops	timestamp	timestamptz	1
+o	btree/datetime_ops	timestamp	timestamptz	2
+o	btree/datetime_ops	timestamp	timestamptz	3
+o	btree/datetime_ops	timestamp	timestamptz	4
+o	btree/datetime_ops	timestamp	timestamptz	5
+o	btree/datetime_ops	timestamptz	timestamptz	1
+o	btree/datetime_ops	timestamptz	timestamptz	2
+o	btree/datetime_ops	timestamptz	timestamptz	3
+o	btree/datetime_ops	timestamptz	timestamptz	4
+o	btree/datetime_ops	timestamptz	timestamptz	5
+o	btree/datetime_ops	timestamptz	date	1
+o	btree/datetime_ops	timestamptz	date	2
+o	btree/datetime_ops	timestamptz	date	3
+o	btree/datetime_ops	timestamptz	date	4
+o	btree/datetime_ops	timestamptz	date	5
+o	btree/datetime_ops	timestamptz	timestamp	1
+o	btree/datetime_ops	timestamptz	timestamp	2
+o	btree/datetime_ops	timestamptz	timestamp	3
+o	btree/datetime_ops	timestamptz	timestamp	4
+o	btree/datetime_ops	timestamptz	timestamp	5
+o	btree/time_ops	time	time	1
+o	btree/time_ops	time	time	2
+o	btree/time_ops	time	time	3
+o	btree/time_ops	time	time	4
+o	btree/time_ops	time	time	5
+o	btree/timetz_ops	timetz	timetz	1
+o	btree/timetz_ops	timetz	timetz	2
+o	btree/timetz_ops	timetz	timetz	3
+o	btree/timetz_ops	timetz	timetz	4
+o	btree/timetz_ops	timetz	timetz	5
+o	btree/interval_ops	interval	interval	1
+o	btree/interval_ops	interval	interval	2
+o	btree/interval_ops	interval	interval	3
+o	btree/interval_ops	interval	interval	4
+o	btree/interval_ops	interval	interval	5
+o	btree/macaddr_ops	macaddr	macaddr	1
+o	btree/macaddr_ops	macaddr	macaddr	2
+o	btree/macaddr_ops	macaddr	macaddr	3
+o	btree/macaddr_ops	macaddr	macaddr	4
+o	btree/macaddr_ops	macaddr	macaddr	5
+o	btree/macaddr8_ops	macaddr8	macaddr8	1
+o	btree/macaddr8_ops	macaddr8	macaddr8	2
+o	btree/macaddr8_ops	macaddr8	macaddr8	3
+o	btree/macaddr8_ops	macaddr8	macaddr8	4
+o	btree/macaddr8_ops	macaddr8	macaddr8	5
+o	btree/network_ops	inet	inet	1
+o	btree/network_ops	inet	inet	2
+o	btree/network_ops	inet	inet	3
+o	btree/network_ops	inet	inet	4
+o	btree/network_ops	inet	inet	5
+o	btree/numeric_ops	numeric	numeric	1
+o	btree/numeric_ops	numeric	numeric	2
+o	btree/numeric_ops	numeric	numeric	3
+o	btree/numeric_ops	numeric	numeric	4
+o	btree/numeric_ops	numeric	numeric	5
+o	btree/bool_ops	bool	bool	1
+o	btree/bool_ops	bool	bool	2
+o	btree/bool_ops	bool	bool	3
+o	btree/bool_ops	bool	bool	4
+o	btree/bool_ops	bool	bool	5
+o	btree/bit_ops	bit	bit	1
+o	btree/bit_ops	bit	bit	2
+o	btree/bit_ops	bit	bit	3
+o	btree/bit_ops	bit	bit	4
+o	btree/bit_ops	bit	bit	5
+o	btree/varbit_ops	varbit	varbit	1
+o	btree/varbit_ops	varbit	varbit	2
+o	btree/varbit_ops	varbit	varbit	3
+o	btree/varbit_ops	varbit	varbit	4
+o	btree/varbit_ops	varbit	varbit	5
+o	btree/text_pattern_ops	text	text	1
+o	btree/text_pattern_ops	text	text	2
+o	btree/text_pattern_ops	text	text	3
+o	btree/text_pattern_ops	text	text	4
+o	btree/text_pattern_ops	text	text	5
+o	btree/bpchar_pattern_ops	bpchar	bpchar	1
+o	btree/bpchar_pattern_ops	bpchar	bpchar	2
+o	btree/bpchar_pattern_ops	bpchar	bpchar	3
+o	btree/bpchar_pattern_ops	bpchar	bpchar	4
+o	btree/bpchar_pattern_ops	bpchar	bpchar	5
+o	btree/money_ops	money	money	1
+o	btree/money_ops	money	money	2
+o	btree/money_ops	money	money	3
+o	btree/money_ops	money	money	4
+o	btree/money_ops	money	money	5
+o	btree/array_ops	anyarray	anyarray	1
+o	btree/array_ops	anyarray	anyarray	2
+o	btree/array_ops	anyarray	anyarray	3
+o	btree/array_ops	anyarray	anyarray	4
+o	btree/array_ops	anyarray	anyarray	5
+o	btree/record_ops	record	record	1
+o	btree/record_ops	record	record	2
+o	btree/record_ops	record	record	3
+o	btree/record_ops	record	record	4
+o	btree/record_ops	record	record	5
+o	btree/record_image_ops	record	record	1
+o	btree/record_image_ops	record	record	2
+o	btree/record_image_ops	record	record	3
+o	btree/record_image_ops	record	record	4
+o	btree/record_image_ops	record	record	5
+o	btree/uuid_ops	uuid	uuid	1
+o	btree/uuid_ops	uuid	uuid	2
+o	btree/uuid_ops	uuid	uuid	3
+o	btree/uuid_ops	uuid	uuid	4
+o	btree/uuid_ops	uuid	uuid	5
+o	btree/pg_lsn_ops	pg_lsn	pg_lsn	1
+o	btree/pg_lsn_ops	pg_lsn	pg_lsn	2
+o	btree/pg_lsn_ops	pg_lsn	pg_lsn	3
+o	btree/pg_lsn_ops	pg_lsn	pg_lsn	4
+o	btree/pg_lsn_ops	pg_lsn	pg_lsn	5
+o	hash/bpchar_ops	bpchar	bpchar	1
+o	hash/char_ops	char	char	1
+o	hash/date_ops	date	date	1
+o	hash/float_ops	float4	float4	1
+o	hash/float_ops	float8	float8	1
+o	hash/float_ops	float4	float8	1
+o	hash/float_ops	float8	float4	1
+o	hash/network_ops	inet	inet	1
+o	hash/integer_ops	int2	int2	1
+o	hash/integer_ops	int4	int4	1
+o	hash/integer_ops	int8	int8	1
+o	hash/integer_ops	int2	int4	1
+o	hash/integer_ops	int2	int8	1
+o	hash/integer_ops	int4	int2	1
+o	hash/integer_ops	int4	int8	1
+o	hash/integer_ops	int8	int2	1
+o	hash/integer_ops	int8	int4	1
+o	hash/interval_ops	interval	interval	1
+o	hash/macaddr_ops	macaddr	macaddr	1
+o	hash/macaddr8_ops	macaddr8	macaddr8	1
+o	hash/oid_ops	oid	oid	1
+o	hash/oidvector_ops	oidvector	oidvector	1
+o	hash/record_ops	record	record	1
+o	hash/text_ops	text	text	1
+o	hash/text_ops	name	name	1
+o	hash/text_ops	name	text	1
+o	hash/text_ops	text	name	1
+o	hash/time_ops	time	time	1
+o	hash/timestamptz_ops	timestamptz	timestamptz	1
+o	hash/timetz_ops	timetz	timetz	1
+o	hash/timestamp_ops	timestamp	timestamp	1
+o	hash/bool_ops	bool	bool	1
+o	hash/bytea_ops	bytea	bytea	1
+o	hash/xid_ops	xid	xid	1
+o	hash/xid8_ops	xid8	xid8	1
+o	hash/cid_ops	cid	cid	1
+o	hash/tid_ops	tid	tid	1
+o	hash/text_pattern_ops	text	text	1
+o	hash/bpchar_pattern_ops	bpchar	bpchar	1
+o	hash/aclitem_ops	aclitem	aclitem	1
+o	hash/uuid_ops	uuid	uuid	1
+o	hash/pg_lsn_ops	pg_lsn	pg_lsn	1
+o	hash/numeric_ops	numeric	numeric	1
+o	hash/array_ops	anyarray	anyarray	1
+o	gist/box_ops	box	box	1
+o	gist/box_ops	box	box	2
+o	gist/box_ops	box	box	3
+o	gist/box_ops	box	box	4
+o	gist/box_ops	box	box	5
+o	gist/box_ops	box	box	6
+o	gist/box_ops	box	box	7
+o	gist/box_ops	box	box	8
+o	gist/box_ops	box	box	9
+o	gist/box_ops	box	box	10
+o	gist/box_ops	box	box	11
+o	gist/box_ops	box	box	12
+o	gist/box_ops	box	point	15
+o	gist/point_ops	point	point	11
+o	gist/point_ops	point	point	30
+o	gist/point_ops	point	point	1
+o	gist/point_ops	point	point	5
+o	gist/point_ops	point	point	10
+o	gist/point_ops	point	point	29
+o	gist/point_ops	point	point	6
+o	gist/point_ops	point	point	15
+o	gist/point_ops	point	box	28
+o	gist/point_ops	point	polygon	48
+o	gist/point_ops	point	circle	68
+o	gist/poly_ops	polygon	polygon	1
+o	gist/poly_ops	polygon	polygon	2
+o	gist/poly_ops	polygon	polygon	3
+o	gist/poly_ops	polygon	polygon	4
+o	gist/poly_ops	polygon	polygon	5
+o	gist/poly_ops	polygon	polygon	6
+o	gist/poly_ops	polygon	polygon	7
+o	gist/poly_ops	polygon	polygon	8
+o	gist/poly_ops	polygon	polygon	9
+o	gist/poly_ops	polygon	polygon	10
+o	gist/poly_ops	polygon	polygon	11
+o	gist/poly_ops	polygon	polygon	12
+o	gist/poly_ops	polygon	point	15
+o	gist/circle_ops	circle	circle	1
+o	gist/circle_ops	circle	circle	2
+o	gist/circle_ops	circle	circle	3
+o	gist/circle_ops	circle	circle	4
+o	gist/circle_ops	circle	circle	5
+o	gist/circle_ops	circle	circle	6
+o	gist/circle_ops	circle	circle	7
+o	gist/circle_ops	circle	circle	8
+o	gist/circle_ops	circle	circle	9
+o	gist/circle_ops	circle	circle	10
+o	gist/circle_ops	circle	circle	11
+o	gist/circle_ops	circle	circle	12
+o	gist/circle_ops	circle	point	15
+o	gin/array_ops	anyarray	anyarray	1
+o	gin/array_ops	anyarray	anyarray	2
+o	gin/array_ops	anyarray	anyarray	3
+o	gin/array_ops	anyarray	anyarray	4
+o	btree/enum_ops	anyenum	anyenum	1
+o	btree/enum_ops	anyenum	anyenum	2
+o	btree/enum_ops	anyenum	anyenum	3
+o	btree/enum_ops	anyenum	anyenum	4
+o	btree/enum_ops	anyenum	anyenum	5
+o	hash/enum_ops	anyenum	anyenum	1
+o	btree/tsvector_ops	tsvector	tsvector	1
+o	btree/tsvector_ops	tsvector	tsvector	2
+o	btree/tsvector_ops	tsvector	tsvector	3
+o	btree/tsvector_ops	tsvector	tsvector	4
+o	btree/tsvector_ops	tsvector	tsvector	5
+o	gist/tsvector_ops	tsvector	tsquery	1
+o	gin/tsvector_ops	tsvector	tsquery	1
+o	gin/tsvector_ops	tsvector	tsquery	2
+o	btree/tsquery_ops	tsquery	tsquery	1
+o	btree/tsquery_ops	tsquery	tsquery	2
+o	btree/tsquery_ops	tsquery	tsquery	3
+o	btree/tsquery_ops	tsquery	tsquery	4
+o	btree/tsquery_ops	tsquery	tsquery	5
+o	gist/tsquery_ops	tsquery	tsquery	7
+o	gist/tsquery_ops	tsquery	tsquery	8
+o	btree/range_ops	anyrange	anyrange	1
+o	btree/range_ops	anyrange	anyrange	2
+o	btree/range_ops	anyrange	anyrange	3
+o	btree/range_ops	anyrange	anyrange	4
+o	btree/range_ops	anyrange	anyrange	5
+o	hash/range_ops	anyrange	anyrange	1
+o	gist/range_ops	anyrange	anyrange	1
+o	gist/range_ops	anyrange	anymultirange	1
+o	gist/range_ops	anyrange	anyrange	2
+o	gist/range_ops	anyrange	anymultirange	2
+o	gist/range_ops	anyrange	anyrange	3
+o	gist/range_ops	anyrange	anymultirange	3
+o	gist/range_ops	anyrange	anyrange	4
+o	gist/range_ops	anyrange	anymultirange	4
+o	gist/range_ops	anyrange	anyrange	5
+o	gist/range_ops	anyrange	anymultirange	5
+o	gist/range_ops	anyrange	anyrange	6
+o	gist/range_ops	anyrange	anymultirange	6
+o	gist/range_ops	anyrange	anyrange	7
+o	gist/range_ops	anyrange	anymultirange	7
+o	gist/range_ops	anyrange	anyrange	8
+o	gist/range_ops	anyrange	anymultirange	8
+o	gist/range_ops	anyrange	anyelement	16
+o	gist/range_ops	anyrange	anyrange	18
+o	gist/multirange_ops	anymultirange	anymultirange	1
+o	gist/multirange_ops	anymultirange	anyrange	1
+o	gist/multirange_ops	anymultirange	anymultirange	2
+o	gist/multirange_ops	anymultirange	anyrange	2
+o	gist/multirange_ops	anymultirange	anymultirange	3
+o	gist/multirange_ops	anymultirange	anyrange	3
+o	gist/multirange_ops	anymultirange	anymultirange	4
+o	gist/multirange_ops	anymultirange	anyrange	4
+o	gist/multirange_ops	anymultirange	anymultirange	5
+o	gist/multirange_ops	anymultirange	anyrange	5
+o	gist/multirange_ops	anymultirange	anymultirange	6
+o	gist/multirange_ops	anymultirange	anyrange	6
+o	gist/multirange_ops	anymultirange	anymultirange	7
+o	gist/multirange_ops	anymultirange	anyrange	7
+o	gist/multirange_ops	anymultirange	anymultirange	8
+o	gist/multirange_ops	anymultirange	anyrange	8
+o	gist/multirange_ops	anymultirange	anyelement	16
+o	gist/multirange_ops	anymultirange	anymultirange	18
+o	btree/multirange_ops	anymultirange	anymultirange	1
+o	btree/multirange_ops	anymultirange	anymultirange	2
+o	btree/multirange_ops	anymultirange	anymultirange	3
+o	btree/multirange_ops	anymultirange	anymultirange	4
+o	btree/multirange_ops	anymultirange	anymultirange	5
+o	hash/multirange_ops	anymultirange	anymultirange	1
+o	spgist/quad_point_ops	point	point	11
+o	spgist/quad_point_ops	point	point	30
+o	spgist/quad_point_ops	point	point	1
+o	spgist/quad_point_ops	point	point	5
+o	spgist/quad_point_ops	point	point	10
+o	spgist/quad_point_ops	point	point	29
+o	spgist/quad_point_ops	point	point	6
+o	spgist/quad_point_ops	point	box	8
+o	spgist/quad_point_ops	point	point	15
+o	spgist/kd_point_ops	point	point	11
+o	spgist/kd_point_ops	point	point	30
+o	spgist/kd_point_ops	point	point	1
+o	spgist/kd_point_ops	point	point	5
+o	spgist/kd_point_ops	point	point	10
+o	spgist/kd_point_ops	point	point	29
+o	spgist/kd_point_ops	point	point	6
+o	spgist/kd_point_ops	point	box	8
+o	spgist/kd_point_ops	point	point	15
+o	spgist/text_ops	text	text	1
+o	spgist/text_ops	text	text	2
+o	spgist/text_ops	text	text	3
+o	spgist/text_ops	text	text	4
+o	spgist/text_ops	text	text	5
+o	spgist/text_ops	text	text	11
+o	spgist/text_ops	text	text	12
+o	spgist/text_ops	text	text	14
+o	spgist/text_ops	text	text	15
+o	spgist/text_ops	text	text	28
+o	btree/jsonb_ops	jsonb	jsonb	1
+o	btree/jsonb_ops	jsonb	jsonb	2
+o	btree/jsonb_ops	jsonb	jsonb	3
+o	btree/jsonb_ops	jsonb	jsonb	4
+o	btree/jsonb_ops	jsonb	jsonb	5
+o	hash/jsonb_ops	jsonb	jsonb	1
+o	gin/jsonb_ops	jsonb	jsonb	7
+o	gin/jsonb_ops	jsonb	text	9
+o	gin/jsonb_ops	jsonb	_text	10
+o	gin/jsonb_ops	jsonb	_text	11
+o	gin/jsonb_ops	jsonb	jsonpath	15
+o	gin/jsonb_ops	jsonb	jsonpath	16
+o	gin/jsonb_path_ops	jsonb	jsonb	7
+o	gin/jsonb_path_ops	jsonb	jsonpath	15
+o	gin/jsonb_path_ops	jsonb	jsonpath	16
+o	spgist/range_ops	anyrange	anyrange	1
+o	spgist/range_ops	anyrange	anyrange	2
+o	spgist/range_ops	anyrange	anyrange	3
+o	spgist/range_ops	anyrange	anyrange	4
+o	spgist/range_ops	anyrange	anyrange	5
+o	spgist/range_ops	anyrange	anyrange	6
+o	spgist/range_ops	anyrange	anyrange	7
+o	spgist/range_ops	anyrange	anyrange	8
+o	spgist/range_ops	anyrange	anyelement	16
+o	spgist/range_ops	anyrange	anyrange	18
+o	spgist/box_ops	box	box	1
+o	spgist/box_ops	box	box	2
+o	spgist/box_ops	box	box	3
+o	spgist/box_ops	box	box	4
+o	spgist/box_ops	box	box	5
+o	spgist/box_ops	box	box	6
+o	spgist/box_ops	box	box	7
+o	spgist/box_ops	box	box	8
+o	spgist/box_ops	box	box	9
+o	spgist/box_ops	box	box	10
+o	spgist/box_ops	box	box	11
+o	spgist/box_ops	box	box	12
+o	spgist/box_ops	box	point	15
+o	spgist/poly_ops	polygon	polygon	1
+o	spgist/poly_ops	polygon	polygon	2
+o	spgist/poly_ops	polygon	polygon	3
+o	spgist/poly_ops	polygon	polygon	4
+o	spgist/poly_ops	polygon	polygon	5
+o	spgist/poly_ops	polygon	polygon	6
+o	spgist/poly_ops	polygon	polygon	7
+o	spgist/poly_ops	polygon	polygon	8
+o	spgist/poly_ops	polygon	polygon	9
+o	spgist/poly_ops	polygon	polygon	10
+o	spgist/poly_ops	polygon	polygon	11
+o	spgist/poly_ops	polygon	polygon	12
+o	spgist/poly_ops	polygon	point	15
+o	gist/network_ops	inet	inet	3
+o	gist/network_ops	inet	inet	18
+o	gist/network_ops	inet	inet	19
+o	gist/network_ops	inet	inet	20
+o	gist/network_ops	inet	inet	21
+o	gist/network_ops	inet	inet	22
+o	gist/network_ops	inet	inet	23
+o	gist/network_ops	inet	inet	24
+o	gist/network_ops	inet	inet	25
+o	gist/network_ops	inet	inet	26
+o	gist/network_ops	inet	inet	27
+o	spgist/network_ops	inet	inet	3
+o	spgist/network_ops	inet	inet	18
+o	spgist/network_ops	inet	inet	19
+o	spgist/network_ops	inet	inet	20
+o	spgist/network_ops	inet	inet	21
+o	spgist/network_ops	inet	inet	22
+o	spgist/network_ops	inet	inet	23
+o	spgist/network_ops	inet	inet	24
+o	spgist/network_ops	inet	inet	25
+o	spgist/network_ops	inet	inet	26
+o	spgist/network_ops	inet	inet	27
+o	brin/bytea_minmax_ops	bytea	bytea	1
+o	brin/bytea_minmax_ops	bytea	bytea	2
+o	brin/bytea_minmax_ops	bytea	bytea	3
+o	brin/bytea_minmax_ops	bytea	bytea	4
+o	brin/bytea_minmax_ops	bytea	bytea	5
+o	brin/bytea_bloom_ops	bytea	bytea	1
+o	brin/char_minmax_ops	char	char	1
+o	brin/char_minmax_ops	char	char	2
+o	brin/char_minmax_ops	char	char	3
+o	brin/char_minmax_ops	char	char	4
+o	brin/char_minmax_ops	char	char	5
+o	brin/char_bloom_ops	char	char	1
+o	brin/name_minmax_ops	name	name	1
+o	brin/name_minmax_ops	name	name	2
+o	brin/name_minmax_ops	name	name	3
+o	brin/name_minmax_ops	name	name	4
+o	brin/name_minmax_ops	name	name	5
+o	brin/name_bloom_ops	name	name	1
+o	brin/integer_minmax_ops	int8	int8	1
+o	brin/integer_minmax_ops	int8	int8	2
+o	brin/integer_minmax_ops	int8	int8	3
+o	brin/integer_minmax_ops	int8	int8	4
+o	brin/integer_minmax_ops	int8	int8	5
+o	brin/integer_minmax_ops	int8	int2	1
+o	brin/integer_minmax_ops	int8	int2	2
+o	brin/integer_minmax_ops	int8	int2	3
+o	brin/integer_minmax_ops	int8	int2	4
+o	brin/integer_minmax_ops	int8	int2	5
+o	brin/integer_minmax_ops	int8	int4	1
+o	brin/integer_minmax_ops	int8	int4	2
+o	brin/integer_minmax_ops	int8	int4	3
+o	brin/integer_minmax_ops	int8	int4	4
+o	brin/integer_minmax_ops	int8	int4	5
+o	brin/integer_minmax_ops	int2	int2	1
+o	brin/integer_minmax_ops	int2	int2	2
+o	brin/integer_minmax_ops	int2	int2	3
+o	brin/integer_minmax_ops	int2	int2	4
+o	brin/integer_minmax_ops	int2	int2	5
+o	brin/integer_minmax_ops	int2	int8	1
+o	brin/integer_minmax_ops	int2	int8	2
+o	brin/integer_minmax_ops	int2	int8	3
+o	brin/integer_minmax_ops	int2	int8	4
+o	brin/integer_minmax_ops	int2	int8	5
+o	brin/integer_minmax_ops	int2	int4	1
+o	brin/integer_minmax_ops	int2	int4	2
+o	brin/integer_minmax_ops	int2	int4	3
+o	brin/integer_minmax_ops	int2	int4	4
+o	brin/integer_minmax_ops	int2	int4	5
+o	brin/integer_minmax_ops	int4	int4	1
+o	brin/integer_minmax_ops	int4	int4	2
+o	brin/integer_minmax_ops	int4	int4	3
+o	brin/integer_minmax_ops	int4	int4	4
+o	brin/integer_minmax_ops	int4	int4	5
+o	brin/integer_minmax_ops	int4	int2	1
+o	brin/integer_minmax_ops	int4	int2	2
+o	brin/integer_minmax_ops	int4	int2	3
+o	brin/integer_minmax_ops	int4	int2	4
+o	brin/integer_minmax_ops	int4	int2	5
+o	brin/integer_minmax_ops	int4	int8	1
+o	brin/integer_minmax_ops	int4	int8	2
+o	brin/integer_minmax_ops	int4	int8	3
+o	brin/integer_minmax_ops	int4	int8	4
+o	brin/integer_minmax_ops	int4	int8	5
+o	brin/integer_minmax_multi_ops	int8	int8	1
+o	brin/integer_minmax_multi_ops	int8	int8	2
+o	brin/integer_minmax_multi_ops	int8	int8	3
+o	brin/integer_minmax_multi_ops	int8	int8	4
+o	brin/integer_minmax_multi_ops	int8	int8	5
+o	brin/integer_minmax_multi_ops	int8	int2	1
+o	brin/integer_minmax_multi_ops	int8	int2	2
+o	brin/integer_minmax_multi_ops	int8	int2	3
+o	brin/integer_minmax_multi_ops	int8	int2	4
+o	brin/integer_minmax_multi_ops	int8	int2	5
+o	brin/integer_minmax_multi_ops	int8	int4	1
+o	brin/integer_minmax_multi_ops	int8	int4	2
+o	brin/integer_minmax_multi_ops	int8	int4	3
+o	brin/integer_minmax_multi_ops	int8	int4	4
+o	brin/integer_minmax_multi_ops	int8	int4	5
+o	brin/integer_minmax_multi_ops	int2	int2	1
+o	brin/integer_minmax_multi_ops	int2	int2	2
+o	brin/integer_minmax_multi_ops	int2	int2	3
+o	brin/integer_minmax_multi_ops	int2	int2	4
+o	brin/integer_minmax_multi_ops	int2	int2	5
+o	brin/integer_minmax_multi_ops	int2	int8	1
+o	brin/integer_minmax_multi_ops	int2	int8	2
+o	brin/integer_minmax_multi_ops	int2	int8	3
+o	brin/integer_minmax_multi_ops	int2	int8	4
+o	brin/integer_minmax_multi_ops	int2	int8	5
+o	brin/integer_minmax_multi_ops	int2	int4	1
+o	brin/integer_minmax_multi_ops	int2	int4	2
+o	brin/integer_minmax_multi_ops	int2	int4	3
+o	brin/integer_minmax_multi_ops	int2	int4	4
+o	brin/integer_minmax_multi_ops	int2	int4	5
+o	brin/integer_minmax_multi_ops	int4	int4	1
+o	brin/integer_minmax_multi_ops	int4	int4	2
+o	brin/integer_minmax_multi_ops	int4	int4	3
+o	brin/integer_minmax_multi_ops	int4	int4	4
+o	brin/integer_minmax_multi_ops	int4	int4	5
+o	brin/integer_minmax_multi_ops	int4	int2	1
+o	brin/integer_minmax_multi_ops	int4	int2	2
+o	brin/integer_minmax_multi_ops	int4	int2	3
+o	brin/integer_minmax_multi_ops	int4	int2	4
+o	brin/integer_minmax_multi_ops	int4	int2	5
+o	brin/integer_minmax_multi_ops	int4	int8	1
+o	brin/integer_minmax_multi_ops	int4	int8	2
+o	brin/integer_minmax_multi_ops	int4	int8	3
+o	brin/integer_minmax_multi_ops	int4	int8	4
+o	brin/integer_minmax_multi_ops	int4	int8	5
+o	brin/integer_bloom_ops	int8	int8	1
+o	brin/integer_bloom_ops	int2	int2	1
+o	brin/integer_bloom_ops	int4	int4	1
+o	brin/text_minmax_ops	text	text	1
+o	brin/text_minmax_ops	text	text	2
+o	brin/text_minmax_ops	text	text	3
+o	brin/text_minmax_ops	text	text	4
+o	brin/text_minmax_ops	text	text	5
+o	brin/text_bloom_ops	text	text	1
+o	brin/oid_minmax_ops	oid	oid	1
+o	brin/oid_minmax_ops	oid	oid	2
+o	brin/oid_minmax_ops	oid	oid	3
+o	brin/oid_minmax_ops	oid	oid	4
+o	brin/oid_minmax_ops	oid	oid	5
+o	brin/oid_minmax_multi_ops	oid	oid	1
+o	brin/oid_minmax_multi_ops	oid	oid	2
+o	brin/oid_minmax_multi_ops	oid	oid	3
+o	brin/oid_minmax_multi_ops	oid	oid	4
+o	brin/oid_minmax_multi_ops	oid	oid	5
+o	brin/oid_bloom_ops	oid	oid	1
+o	brin/tid_minmax_ops	tid	tid	1
+o	brin/tid_minmax_ops	tid	tid	2
+o	brin/tid_minmax_ops	tid	tid	3
+o	brin/tid_minmax_ops	tid	tid	4
+o	brin/tid_minmax_ops	tid	tid	5
+o	brin/tid_bloom_ops	tid	tid	1
+o	brin/tid_minmax_multi_ops	tid	tid	1
+o	brin/tid_minmax_multi_ops	tid	tid	2
+o	brin/tid_minmax_multi_ops	tid	tid	3
+o	brin/tid_minmax_multi_ops	tid	tid	4
+o	brin/tid_minmax_multi_ops	tid	tid	5
+o	brin/float_minmax_ops	float4	float4	1
+o	brin/float_minmax_ops	float4	float4	2
+o	brin/float_minmax_ops	float4	float4	3
+o	brin/float_minmax_ops	float4	float4	4
+o	brin/float_minmax_ops	float4	float4	5
+o	brin/float_minmax_ops	float4	float8	1
+o	brin/float_minmax_ops	float4	float8	2
+o	brin/float_minmax_ops	float4	float8	3
+o	brin/float_minmax_ops	float4	float8	4
+o	brin/float_minmax_ops	float4	float8	5
+o	brin/float_minmax_ops	float8	float4	1
+o	brin/float_minmax_ops	float8	float4	2
+o	brin/float_minmax_ops	float8	float4	3
+o	brin/float_minmax_ops	float8	float4	4
+o	brin/float_minmax_ops	float8	float4	5
+o	brin/float_minmax_ops	float8	float8	1
+o	brin/float_minmax_ops	float8	float8	2
+o	brin/float_minmax_ops	float8	float8	3
+o	brin/float_minmax_ops	float8	float8	4
+o	brin/float_minmax_ops	float8	float8	5
+o	brin/float_minmax_multi_ops	float4	float4	1
+o	brin/float_minmax_multi_ops	float4	float4	2
+o	brin/float_minmax_multi_ops	float4	float4	3
+o	brin/float_minmax_multi_ops	float4	float4	4
+o	brin/float_minmax_multi_ops	float4	float4	5
+o	brin/float_minmax_multi_ops	float4	float8	1
+o	brin/float_minmax_multi_ops	float4	float8	2
+o	brin/float_minmax_multi_ops	float4	float8	3
+o	brin/float_minmax_multi_ops	float4	float8	4
+o	brin/float_minmax_multi_ops	float4	float8	5
+o	brin/float_minmax_multi_ops	float8	float4	1
+o	brin/float_minmax_multi_ops	float8	float4	2
+o	brin/float_minmax_multi_ops	float8	float4	3
+o	brin/float_minmax_multi_ops	float8	float4	4
+o	brin/float_minmax_multi_ops	float8	float4	5
+o	brin/float_minmax_multi_ops	float8	float8	1
+o	brin/float_minmax_multi_ops	float8	float8	2
+o	brin/float_minmax_multi_ops	float8	float8	3
+o	brin/float_minmax_multi_ops	float8	float8	4
+o	brin/float_minmax_multi_ops	float8	float8	5
+o	brin/float_bloom_ops	float4	float4	1
+o	brin/float_bloom_ops	float8	float8	1
+o	brin/macaddr_minmax_ops	macaddr	macaddr	1
+o	brin/macaddr_minmax_ops	macaddr	macaddr	2
+o	brin/macaddr_minmax_ops	macaddr	macaddr	3
+o	brin/macaddr_minmax_ops	macaddr	macaddr	4
+o	brin/macaddr_minmax_ops	macaddr	macaddr	5
+o	brin/macaddr_minmax_multi_ops	macaddr	macaddr	1
+o	brin/macaddr_minmax_multi_ops	macaddr	macaddr	2
+o	brin/macaddr_minmax_multi_ops	macaddr	macaddr	3
+o	brin/macaddr_minmax_multi_ops	macaddr	macaddr	4
+o	brin/macaddr_minmax_multi_ops	macaddr	macaddr	5
+o	brin/macaddr_bloom_ops	macaddr	macaddr	1
+o	brin/macaddr8_minmax_ops	macaddr8	macaddr8	1
+o	brin/macaddr8_minmax_ops	macaddr8	macaddr8	2
+o	brin/macaddr8_minmax_ops	macaddr8	macaddr8	3
+o	brin/macaddr8_minmax_ops	macaddr8	macaddr8	4
+o	brin/macaddr8_minmax_ops	macaddr8	macaddr8	5
+o	brin/macaddr8_minmax_multi_ops	macaddr8	macaddr8	1
+o	brin/macaddr8_minmax_multi_ops	macaddr8	macaddr8	2
+o	brin/macaddr8_minmax_multi_ops	macaddr8	macaddr8	3
+o	brin/macaddr8_minmax_multi_ops	macaddr8	macaddr8	4
+o	brin/macaddr8_minmax_multi_ops	macaddr8	macaddr8	5
+o	brin/macaddr8_bloom_ops	macaddr8	macaddr8	1
+o	brin/network_minmax_ops	inet	inet	1
+o	brin/network_minmax_ops	inet	inet	2
+o	brin/network_minmax_ops	inet	inet	3
+o	brin/network_minmax_ops	inet	inet	4
+o	brin/network_minmax_ops	inet	inet	5
+o	brin/network_minmax_multi_ops	inet	inet	1
+o	brin/network_minmax_multi_ops	inet	inet	2
+o	brin/network_minmax_multi_ops	inet	inet	3
+o	brin/network_minmax_multi_ops	inet	inet	4
+o	brin/network_minmax_multi_ops	inet	inet	5
+o	brin/network_bloom_ops	inet	inet	1
+o	brin/network_inclusion_ops	inet	inet	3
+o	brin/network_inclusion_ops	inet	inet	7
+o	brin/network_inclusion_ops	inet	inet	8
+o	brin/network_inclusion_ops	inet	inet	18
+o	brin/network_inclusion_ops	inet	inet	24
+o	brin/network_inclusion_ops	inet	inet	26
+o	brin/bpchar_minmax_ops	bpchar	bpchar	1
+o	brin/bpchar_minmax_ops	bpchar	bpchar	2
+o	brin/bpchar_minmax_ops	bpchar	bpchar	3
+o	brin/bpchar_minmax_ops	bpchar	bpchar	4
+o	brin/bpchar_minmax_ops	bpchar	bpchar	5
+o	brin/bpchar_bloom_ops	bpchar	bpchar	1
+o	brin/time_minmax_ops	time	time	1
+o	brin/time_minmax_ops	time	time	2
+o	brin/time_minmax_ops	time	time	3
+o	brin/time_minmax_ops	time	time	4
+o	brin/time_minmax_ops	time	time	5
+o	brin/time_minmax_multi_ops	time	time	1
+o	brin/time_minmax_multi_ops	time	time	2
+o	brin/time_minmax_multi_ops	time	time	3
+o	brin/time_minmax_multi_ops	time	time	4
+o	brin/time_minmax_multi_ops	time	time	5
+o	brin/time_bloom_ops	time	time	1
+o	brin/datetime_minmax_ops	timestamp	timestamp	1
+o	brin/datetime_minmax_ops	timestamp	timestamp	2
+o	brin/datetime_minmax_ops	timestamp	timestamp	3
+o	brin/datetime_minmax_ops	timestamp	timestamp	4
+o	brin/datetime_minmax_ops	timestamp	timestamp	5
+o	brin/datetime_minmax_ops	timestamp	date	1
+o	brin/datetime_minmax_ops	timestamp	date	2
+o	brin/datetime_minmax_ops	timestamp	date	3
+o	brin/datetime_minmax_ops	timestamp	date	4
+o	brin/datetime_minmax_ops	timestamp	date	5
+o	brin/datetime_minmax_ops	timestamp	timestamptz	1
+o	brin/datetime_minmax_ops	timestamp	timestamptz	2
+o	brin/datetime_minmax_ops	timestamp	timestamptz	3
+o	brin/datetime_minmax_ops	timestamp	timestamptz	4
+o	brin/datetime_minmax_ops	timestamp	timestamptz	5
+o	brin/datetime_minmax_ops	date	date	1
+o	brin/datetime_minmax_ops	date	date	2
+o	brin/datetime_minmax_ops	date	date	3
+o	brin/datetime_minmax_ops	date	date	4
+o	brin/datetime_minmax_ops	date	date	5
+o	brin/datetime_minmax_ops	date	timestamp	1
+o	brin/datetime_minmax_ops	date	timestamp	2
+o	brin/datetime_minmax_ops	date	timestamp	3
+o	brin/datetime_minmax_ops	date	timestamp	4
+o	brin/datetime_minmax_ops	date	timestamp	5
+o	brin/datetime_minmax_ops	date	timestamptz	1
+o	brin/datetime_minmax_ops	date	timestamptz	2
+o	brin/datetime_minmax_ops	date	timestamptz	3
+o	brin/datetime_minmax_ops	date	timestamptz	4
+o	brin/datetime_minmax_ops	date	timestamptz	5
+o	brin/datetime_minmax_ops	timestamptz	date	1
+o	brin/datetime_minmax_ops	timestamptz	date	2
+o	brin/datetime_minmax_ops	timestamptz	date	3
+o	brin/datetime_minmax_ops	timestamptz	date	4
+o	brin/datetime_minmax_ops	timestamptz	date	5
+o	brin/datetime_minmax_ops	timestamptz	timestamp	1
+o	brin/datetime_minmax_ops	timestamptz	timestamp	2
+o	brin/datetime_minmax_ops	timestamptz	timestamp	3
+o	brin/datetime_minmax_ops	timestamptz	timestamp	4
+o	brin/datetime_minmax_ops	timestamptz	timestamp	5
+o	brin/datetime_minmax_ops	timestamptz	timestamptz	1
+o	brin/datetime_minmax_ops	timestamptz	timestamptz	2
+o	brin/datetime_minmax_ops	timestamptz	timestamptz	3
+o	brin/datetime_minmax_ops	timestamptz	timestamptz	4
+o	brin/datetime_minmax_ops	timestamptz	timestamptz	5
+o	brin/datetime_minmax_multi_ops	timestamp	timestamp	1
+o	brin/datetime_minmax_multi_ops	timestamp	timestamp	2
+o	brin/datetime_minmax_multi_ops	timestamp	timestamp	3
+o	brin/datetime_minmax_multi_ops	timestamp	timestamp	4
+o	brin/datetime_minmax_multi_ops	timestamp	timestamp	5
+o	brin/datetime_minmax_multi_ops	timestamp	date	1
+o	brin/datetime_minmax_multi_ops	timestamp	date	2
+o	brin/datetime_minmax_multi_ops	timestamp	date	3
+o	brin/datetime_minmax_multi_ops	timestamp	date	4
+o	brin/datetime_minmax_multi_ops	timestamp	date	5
+o	brin/datetime_minmax_multi_ops	timestamp	timestamptz	1
+o	brin/datetime_minmax_multi_ops	timestamp	timestamptz	2
+o	brin/datetime_minmax_multi_ops	timestamp	timestamptz	3
+o	brin/datetime_minmax_multi_ops	timestamp	timestamptz	4
+o	brin/datetime_minmax_multi_ops	timestamp	timestamptz	5
+o	brin/datetime_minmax_multi_ops	date	date	1
+o	brin/datetime_minmax_multi_ops	date	date	2
+o	brin/datetime_minmax_multi_ops	date	date	3
+o	brin/datetime_minmax_multi_ops	date	date	4
+o	brin/datetime_minmax_multi_ops	date	date	5
+o	brin/datetime_minmax_multi_ops	date	timestamp	1
+o	brin/datetime_minmax_multi_ops	date	timestamp	2
+o	brin/datetime_minmax_multi_ops	date	timestamp	3
+o	brin/datetime_minmax_multi_ops	date	timestamp	4
+o	brin/datetime_minmax_multi_ops	date	timestamp	5
+o	brin/datetime_minmax_multi_ops	date	timestamptz	1
+o	brin/datetime_minmax_multi_ops	date	timestamptz	2
+o	brin/datetime_minmax_multi_ops	date	timestamptz	3
+o	brin/datetime_minmax_multi_ops	date	timestamptz	4
+o	brin/datetime_minmax_multi_ops	date	timestamptz	5
+o	brin/datetime_minmax_multi_ops	timestamptz	date	1
+o	brin/datetime_minmax_multi_ops	timestamptz	date	2
+o	brin/datetime_minmax_multi_ops	timestamptz	date	3
+o	brin/datetime_minmax_multi_ops	timestamptz	date	4
+o	brin/datetime_minmax_multi_ops	timestamptz	date	5
+o	brin/datetime_minmax_multi_ops	timestamptz	timestamp	1
+o	brin/datetime_minmax_multi_ops	timestamptz	timestamp	2
+o	brin/datetime_minmax_multi_ops	timestamptz	timestamp	3
+o	brin/datetime_minmax_multi_ops	timestamptz	timestamp	4
+o	brin/datetime_minmax_multi_ops	timestamptz	timestamp	5
+o	brin/datetime_minmax_multi_ops	timestamptz	timestamptz	1
+o	brin/datetime_minmax_multi_ops	timestamptz	timestamptz	2
+o	brin/datetime_minmax_multi_ops	timestamptz	timestamptz	3
+o	brin/datetime_minmax_multi_ops	timestamptz	timestamptz	4
+o	brin/datetime_minmax_multi_ops	timestamptz	timestamptz	5
+o	brin/datetime_bloom_ops	timestamp	timestamp	1
+o	brin/datetime_bloom_ops	date	date	1
+o	brin/datetime_bloom_ops	timestamptz	timestamptz	1
+o	brin/interval_minmax_ops	interval	interval	1
+o	brin/interval_minmax_ops	interval	interval	2
+o	brin/interval_minmax_ops	interval	interval	3
+o	brin/interval_minmax_ops	interval	interval	4
+o	brin/interval_minmax_ops	interval	interval	5
+o	brin/interval_minmax_multi_ops	interval	interval	1
+o	brin/interval_minmax_multi_ops	interval	interval	2
+o	brin/interval_minmax_multi_ops	interval	interval	3
+o	brin/interval_minmax_multi_ops	interval	interval	4
+o	brin/interval_minmax_multi_ops	interval	interval	5
+o	brin/interval_bloom_ops	interval	interval	1
+o	brin/timetz_minmax_ops	timetz	timetz	1
+o	brin/timetz_minmax_ops	timetz	timetz	2
+o	brin/timetz_minmax_ops	timetz	timetz	3
+o	brin/timetz_minmax_ops	timetz	timetz	4
+o	brin/timetz_minmax_ops	timetz	timetz	5
+o	brin/timetz_minmax_multi_ops	timetz	timetz	1
+o	brin/timetz_minmax_multi_ops	timetz	timetz	2
+o	brin/timetz_minmax_multi_ops	timetz	timetz	3
+o	brin/timetz_minmax_multi_ops	timetz	timetz	4
+o	brin/timetz_minmax_multi_ops	timetz	timetz	5
+o	brin/timetz_bloom_ops	timetz	timetz	1
+o	brin/bit_minmax_ops	bit	bit	1
+o	brin/bit_minmax_ops	bit	bit	2
+o	brin/bit_minmax_ops	bit	bit	3
+o	brin/bit_minmax_ops	bit	bit	4
+o	brin/bit_minmax_ops	bit	bit	5
+o	brin/varbit_minmax_ops	varbit	varbit	1
+o	brin/varbit_minmax_ops	varbit	varbit	2
+o	brin/varbit_minmax_ops	varbit	varbit	3
+o	brin/varbit_minmax_ops	varbit	varbit	4
+o	brin/varbit_minmax_ops	varbit	varbit	5
+o	brin/numeric_minmax_ops	numeric	numeric	1
+o	brin/numeric_minmax_ops	numeric	numeric	2
+o	brin/numeric_minmax_ops	numeric	numeric	3
+o	brin/numeric_minmax_ops	numeric	numeric	4
+o	brin/numeric_minmax_ops	numeric	numeric	5
+o	brin/numeric_minmax_multi_ops	numeric	numeric	1
+o	brin/numeric_minmax_multi_ops	numeric	numeric	2
+o	brin/numeric_minmax_multi_ops	numeric	numeric	3
+o	brin/numeric_minmax_multi_ops	numeric	numeric	4
+o	brin/numeric_minmax_multi_ops	numeric	numeric	5
+o	brin/numeric_bloom_ops	numeric	numeric	1
+o	brin/uuid_minmax_ops	uuid	uuid	1
+o	brin/uuid_minmax_ops	uuid	uuid	2
+o	brin/uuid_minmax_ops	uuid	uuid	3
+o	brin/uuid_minmax_ops	uuid	uuid	4
+o	brin/uuid_minmax_ops	uuid	uuid	5
+o	brin/uuid_minmax_multi_ops	uuid	uuid	1
+o	brin/uuid_minmax_multi_ops	uuid	uuid	2
+o	brin/uuid_minmax_multi_ops	uuid	uuid	3
+o	brin/uuid_minmax_multi_ops	uuid	uuid	4
+o	brin/uuid_minmax_multi_ops	uuid	uuid	5
+o	brin/uuid_bloom_ops	uuid	uuid	1
+o	brin/range_inclusion_ops	anyrange	anyrange	1
+o	brin/range_inclusion_ops	anyrange	anyrange	2
+o	brin/range_inclusion_ops	anyrange	anyrange	3
+o	brin/range_inclusion_ops	anyrange	anyrange	4
+o	brin/range_inclusion_ops	anyrange	anyrange	5
+o	brin/range_inclusion_ops	anyrange	anyrange	7
+o	brin/range_inclusion_ops	anyrange	anyrange	8
+o	brin/range_inclusion_ops	anyrange	anyelement	16
+o	brin/range_inclusion_ops	anyrange	anyrange	17
+o	brin/range_inclusion_ops	anyrange	anyrange	18
+o	brin/range_inclusion_ops	anyrange	anyrange	20
+o	brin/range_inclusion_ops	anyrange	anyrange	21
+o	brin/range_inclusion_ops	anyrange	anyrange	22
+o	brin/range_inclusion_ops	anyrange	anyrange	23
+o	brin/pg_lsn_minmax_ops	pg_lsn	pg_lsn	1
+o	brin/pg_lsn_minmax_ops	pg_lsn	pg_lsn	2
+o	brin/pg_lsn_minmax_ops	pg_lsn	pg_lsn	3
+o	brin/pg_lsn_minmax_ops	pg_lsn	pg_lsn	4
+o	brin/pg_lsn_minmax_ops	pg_lsn	pg_lsn	5
+o	brin/pg_lsn_minmax_multi_ops	pg_lsn	pg_lsn	1
+o	brin/pg_lsn_minmax_multi_ops	pg_lsn	pg_lsn	2
+o	brin/pg_lsn_minmax_multi_ops	pg_lsn	pg_lsn	3
+o	brin/pg_lsn_minmax_multi_ops	pg_lsn	pg_lsn	4
+o	brin/pg_lsn_minmax_multi_ops	pg_lsn	pg_lsn	5
+o	brin/pg_lsn_bloom_ops	pg_lsn	pg_lsn	1
+o	brin/box_inclusion_ops	box	box	1
+o	brin/box_inclusion_ops	box	box	2
+o	brin/box_inclusion_ops	box	box	3
+o	brin/box_inclusion_ops	box	box	4
+o	brin/box_inclusion_ops	box	box	5
+o	brin/box_inclusion_ops	box	box	6
+o	brin/box_inclusion_ops	box	box	7
+o	brin/box_inclusion_ops	box	box	8
+o	brin/box_inclusion_ops	box	box	9
+o	brin/box_inclusion_ops	box	box	10
+o	brin/box_inclusion_ops	box	box	11
+o	brin/box_inclusion_ops	box	box	12
+o	brin/box_inclusion_ops	box	point	7
+p	btree/array_ops	anyarray	anyarray	1
+p	btree/bit_ops	bit	bit	1
+p	btree/bit_ops	bit	bit	4
+p	btree/bool_ops	bool	bool	1
+p	btree/bool_ops	bool	bool	4
+p	btree/bpchar_ops	bpchar	bpchar	1
+p	btree/bpchar_ops	bpchar	bpchar	2
+p	btree/bpchar_ops	bpchar	bpchar	4
+p	btree/bytea_ops	bytea	bytea	1
+p	btree/bytea_ops	bytea	bytea	2
+p	btree/bytea_ops	bytea	bytea	4
+p	btree/char_ops	char	char	1
+p	btree/char_ops	char	char	4
+p	btree/datetime_ops	date	date	1
+p	btree/datetime_ops	date	date	2
+p	btree/datetime_ops	date	date	4
+p	btree/datetime_ops	date	timestamp	1
+p	btree/datetime_ops	date	timestamptz	1
+p	btree/datetime_ops	timestamp	timestamp	1
+p	btree/datetime_ops	timestamp	timestamp	2
+p	btree/datetime_ops	timestamp	timestamp	4
+p	btree/datetime_ops	timestamp	date	1
+p	btree/datetime_ops	timestamp	timestamptz	1
+p	btree/datetime_ops	timestamptz	timestamptz	1
+p	btree/datetime_ops	timestamptz	timestamptz	2
+p	btree/datetime_ops	timestamptz	timestamptz	4
+p	btree/datetime_ops	timestamptz	date	1
+p	btree/datetime_ops	timestamptz	timestamp	1
+p	btree/datetime_ops	date	interval	3
+p	btree/datetime_ops	timestamp	interval	3
+p	btree/datetime_ops	timestamptz	interval	3
+p	btree/float_ops	float4	float4	1
+p	btree/float_ops	float4	float4	2
+p	btree/float_ops	float4	float8	1
+p	btree/float_ops	float8	float8	1
+p	btree/float_ops	float8	float8	2
+p	btree/float_ops	float8	float4	1
+p	btree/float_ops	float8	float8	3
+p	btree/float_ops	float4	float8	3
+p	btree/network_ops	inet	inet	1
+p	btree/network_ops	inet	inet	2
+p	btree/network_ops	inet	inet	4
+p	btree/integer_ops	int2	int2	1
+p	btree/integer_ops	int2	int2	2
+p	btree/integer_ops	int2	int2	4
+p	btree/integer_ops	int2	int4	1
+p	btree/integer_ops	int2	int8	1
+p	btree/integer_ops	int2	int8	3
+p	btree/integer_ops	int2	int4	3
+p	btree/integer_ops	int2	int2	3
+p	btree/integer_ops	int4	int4	1
+p	btree/integer_ops	int4	int4	2
+p	btree/integer_ops	int4	int4	4
+p	btree/integer_ops	int4	int8	1
+p	btree/integer_ops	int4	int2	1
+p	btree/integer_ops	int4	int8	3
+p	btree/integer_ops	int4	int4	3
+p	btree/integer_ops	int4	int2	3
+p	btree/integer_ops	int8	int8	1
+p	btree/integer_ops	int8	int8	2
+p	btree/integer_ops	int8	int8	4
+p	btree/integer_ops	int8	int4	1
+p	btree/integer_ops	int8	int2	1
+p	btree/integer_ops	int8	int8	3
+p	btree/interval_ops	interval	interval	1
+p	btree/interval_ops	interval	interval	3
+p	btree/macaddr_ops	macaddr	macaddr	1
+p	btree/macaddr_ops	macaddr	macaddr	2
+p	btree/macaddr_ops	macaddr	macaddr	4
+p	btree/numeric_ops	numeric	numeric	1
+p	btree/numeric_ops	numeric	numeric	2
+p	btree/numeric_ops	numeric	numeric	3
+p	btree/oid_ops	oid	oid	1
+p	btree/oid_ops	oid	oid	2
+p	btree/oid_ops	oid	oid	4
+p	btree/oidvector_ops	oidvector	oidvector	1
+p	btree/oidvector_ops	oidvector	oidvector	4
+p	btree/text_ops	text	text	1
+p	btree/text_ops	text	text	2
+p	btree/text_ops	text	text	4
+p	btree/text_ops	name	name	1
+p	btree/text_ops	name	name	2
+p	btree/text_ops	name	name	4
+p	btree/text_ops	name	text	1
+p	btree/text_ops	text	name	1
+p	btree/time_ops	time	time	1
+p	btree/time_ops	time	time	4
+p	btree/time_ops	time	interval	3
+p	btree/timetz_ops	timetz	timetz	1
+p	btree/timetz_ops	timetz	timetz	4
+p	btree/timetz_ops	timetz	interval	3
+p	btree/varbit_ops	varbit	varbit	1
+p	btree/varbit_ops	varbit	varbit	4
+p	btree/text_pattern_ops	text	text	1
+p	btree/text_pattern_ops	text	text	2
+p	btree/text_pattern_ops	text	text	4
+p	btree/bpchar_pattern_ops	bpchar	bpchar	1
+p	btree/bpchar_pattern_ops	bpchar	bpchar	2
+p	btree/bpchar_pattern_ops	bpchar	bpchar	4
+p	btree/money_ops	money	money	1
+p	btree/money_ops	money	money	4
+p	btree/tid_ops	tid	tid	1
+p	btree/tid_ops	tid	tid	4
+p	btree/uuid_ops	uuid	uuid	1
+p	btree/uuid_ops	uuid	uuid	2
+p	btree/uuid_ops	uuid	uuid	4
+p	btree/record_ops	record	record	1
+p	btree/record_image_ops	record	record	1
+p	btree/pg_lsn_ops	pg_lsn	pg_lsn	1
+p	btree/pg_lsn_ops	pg_lsn	pg_lsn	4
+p	btree/macaddr8_ops	macaddr8	macaddr8	1
+p	btree/macaddr8_ops	macaddr8	macaddr8	4
+p	btree/enum_ops	anyenum	anyenum	1
+p	btree/enum_ops	anyenum	anyenum	4
+p	btree/tsvector_ops	tsvector	tsvector	1
+p	btree/tsquery_ops	tsquery	tsquery	1
+p	btree/range_ops	anyrange	anyrange	1
+p	btree/multirange_ops	anymultirange	anymultirange	1
+p	btree/jsonb_ops	jsonb	jsonb	1
+p	btree/xid8_ops	xid8	xid8	1
+p	btree/xid8_ops	xid8	xid8	4
+p	hash/bpchar_ops	bpchar	bpchar	1
+p	hash/bpchar_ops	bpchar	bpchar	2
+p	hash/char_ops	char	char	1
+p	hash/char_ops	char	char	2
+p	hash/date_ops	date	date	1
+p	hash/date_ops	date	date	2
+p	hash/array_ops	anyarray	anyarray	1
+p	hash/array_ops	anyarray	anyarray	2
+p	hash/float_ops	float4	float4	1
+p	hash/float_ops	float4	float4	2
+p	hash/float_ops	float8	float8	1
+p	hash/float_ops	float8	float8	2
+p	hash/network_ops	inet	inet	1
+p	hash/network_ops	inet	inet	2
+p	hash/integer_ops	int2	int2	1
+p	hash/integer_ops	int2	int2	2
+p	hash/integer_ops	int4	int4	1
+p	hash/integer_ops	int4	int4	2
+p	hash/integer_ops	int8	int8	1
+p	hash/integer_ops	int8	int8	2
+p	hash/interval_ops	interval	interval	1
+p	hash/interval_ops	interval	interval	2
+p	hash/macaddr_ops	macaddr	macaddr	1
+p	hash/macaddr_ops	macaddr	macaddr	2
+p	hash/oid_ops	oid	oid	1
+p	hash/oid_ops	oid	oid	2
+p	hash/oidvector_ops	oidvector	oidvector	1
+p	hash/oidvector_ops	oidvector	oidvector	2
+p	hash/text_ops	text	text	1
+p	hash/text_ops	text	text	2
+p	hash/text_ops	name	name	1
+p	hash/text_ops	name	name	2
+p	hash/time_ops	time	time	1
+p	hash/time_ops	time	time	2
+p	hash/numeric_ops	numeric	numeric	1
+p	hash/numeric_ops	numeric	numeric	2
+p	hash/timestamptz_ops	timestamptz	timestamptz	1
+p	hash/timestamptz_ops	timestamptz	timestamptz	2
+p	hash/timetz_ops	timetz	timetz	1
+p	hash/timetz_ops	timetz	timetz	2
+p	hash/timestamp_ops	timestamp	timestamp	1
+p	hash/timestamp_ops	timestamp	timestamp	2
+p	hash/bool_ops	bool	bool	1
+p	hash/bool_ops	bool	bool	2
+p	hash/bytea_ops	bytea	bytea	1
+p	hash/bytea_ops	bytea	bytea	2
+p	hash/xid_ops	xid	xid	1
+p	hash/xid_ops	xid	xid	2
+p	hash/xid8_ops	xid8	xid8	1
+p	hash/xid8_ops	xid8	xid8	2
+p	hash/cid_ops	cid	cid	1
+p	hash/cid_ops	cid	cid	2
+p	hash/tid_ops	tid	tid	1
+p	hash/tid_ops	tid	tid	2
+p	hash/text_pattern_ops	text	text	1
+p	hash/text_pattern_ops	text	text	2
+p	hash/bpchar_pattern_ops	bpchar	bpchar	1
+p	hash/bpchar_pattern_ops	bpchar	bpchar	2
+p	hash/aclitem_ops	aclitem	aclitem	1
+p	hash/aclitem_ops	aclitem	aclitem	2
+p	hash/uuid_ops	uuid	uuid	1
+p	hash/uuid_ops	uuid	uuid	2
+p	hash/record_ops	record	record	1
+p	hash/record_ops	record	record	2
+p	hash/pg_lsn_ops	pg_lsn	pg_lsn	1
+p	hash/pg_lsn_ops	pg_lsn	pg_lsn	2
+p	hash/macaddr8_ops	macaddr8	macaddr8	1
+p	hash/macaddr8_ops	macaddr8	macaddr8	2
+p	hash/enum_ops	anyenum	anyenum	1
+p	hash/enum_ops	anyenum	anyenum	2
+p	hash/range_ops	anyrange	anyrange	1
+p	hash/range_ops	anyrange	anyrange	2
+p	hash/multirange_ops	anymultirange	anymultirange	1
+p	hash/multirange_ops	anymultirange	anymultirange	2
+p	hash/jsonb_ops	jsonb	jsonb	1
+p	hash/jsonb_ops	jsonb	jsonb	2
+p	gist/point_ops	point	point	1
+p	gist/point_ops	point	point	2
+p	gist/point_ops	point	point	3
+p	gist/point_ops	point	point	5
+p	gist/point_ops	point	point	6
+p	gist/point_ops	point	point	7
+p	gist/point_ops	point	point	8
+p	gist/point_ops	point	point	9
+p	gist/point_ops	point	point	11
+p	gist/box_ops	box	box	1
+p	gist/box_ops	box	box	2
+p	gist/box_ops	box	box	5
+p	gist/box_ops	box	box	6
+p	gist/box_ops	box	box	7
+p	gist/box_ops	box	box	8
+p	gist/poly_ops	polygon	polygon	1
+p	gist/poly_ops	polygon	polygon	2
+p	gist/poly_ops	polygon	polygon	3
+p	gist/poly_ops	polygon	polygon	5
+p	gist/poly_ops	polygon	polygon	6
+p	gist/poly_ops	polygon	polygon	7
+p	gist/poly_ops	polygon	polygon	8
+p	gist/circle_ops	circle	circle	1
+p	gist/circle_ops	circle	circle	2
+p	gist/circle_ops	circle	circle	3
+p	gist/circle_ops	circle	circle	5
+p	gist/circle_ops	circle	circle	6
+p	gist/circle_ops	circle	circle	7
+p	gist/circle_ops	circle	circle	8
+p	gist/tsvector_ops	tsvector	tsvector	1
+p	gist/tsvector_ops	tsvector	tsvector	2
+p	gist/tsvector_ops	tsvector	tsvector	3
+p	gist/tsvector_ops	tsvector	tsvector	4
+p	gist/tsvector_ops	tsvector	tsvector	5
+p	gist/tsvector_ops	tsvector	tsvector	6
+p	gist/tsvector_ops	tsvector	tsvector	7
+p	gist/tsvector_ops	tsvector	tsvector	10
+p	gist/tsquery_ops	tsquery	tsquery	1
+p	gist/tsquery_ops	tsquery	tsquery	2
+p	gist/tsquery_ops	tsquery	tsquery	3
+p	gist/tsquery_ops	tsquery	tsquery	5
+p	gist/tsquery_ops	tsquery	tsquery	6
+p	gist/tsquery_ops	tsquery	tsquery	7
+p	gist/range_ops	anyrange	anyrange	1
+p	gist/range_ops	anyrange	anyrange	2
+p	gist/range_ops	anyrange	anyrange	5
+p	gist/range_ops	anyrange	anyrange	6
+p	gist/range_ops	anyrange	anyrange	7
+p	gist/network_ops	inet	inet	1
+p	gist/network_ops	inet	inet	2
+p	gist/network_ops	inet	inet	3
+p	gist/network_ops	inet	inet	5
+p	gist/network_ops	inet	inet	6
+p	gist/network_ops	inet	inet	7
+p	gist/network_ops	inet	inet	9
+p	gist/multirange_ops	anymultirange	anymultirange	1
+p	gist/multirange_ops	anymultirange	anymultirange	2
+p	gist/multirange_ops	anymultirange	anymultirange	3
+p	gist/multirange_ops	anymultirange	anymultirange	5
+p	gist/multirange_ops	anymultirange	anymultirange	6
+p	gist/multirange_ops	anymultirange	anymultirange	7
+p	gin/array_ops	anyarray	anyarray	2
+p	gin/array_ops	anyarray	anyarray	3
+p	gin/array_ops	anyarray	anyarray	4
+p	gin/array_ops	anyarray	anyarray	6
+p	gin/tsvector_ops	tsvector	tsvector	1
+p	gin/tsvector_ops	tsvector	tsvector	2
+p	gin/tsvector_ops	tsvector	tsvector	3
+p	gin/tsvector_ops	tsvector	tsvector	4
+p	gin/tsvector_ops	tsvector	tsvector	5
+p	gin/tsvector_ops	tsvector	tsvector	6
+p	gin/jsonb_ops	jsonb	jsonb	1
+p	gin/jsonb_ops	jsonb	jsonb	2
+p	gin/jsonb_ops	jsonb	jsonb	3
+p	gin/jsonb_ops	jsonb	jsonb	4
+p	gin/jsonb_ops	jsonb	jsonb	6
+p	gin/jsonb_path_ops	jsonb	jsonb	1
+p	gin/jsonb_path_ops	jsonb	jsonb	2
+p	gin/jsonb_path_ops	jsonb	jsonb	3
+p	gin/jsonb_path_ops	jsonb	jsonb	4
+p	gin/jsonb_path_ops	jsonb	jsonb	6
+p	spgist/range_ops	anyrange	anyrange	1
+p	spgist/range_ops	anyrange	anyrange	2
+p	spgist/range_ops	anyrange	anyrange	3
+p	spgist/range_ops	anyrange	anyrange	4
+p	spgist/range_ops	anyrange	anyrange	5
+p	spgist/network_ops	inet	inet	1
+p	spgist/network_ops	inet	inet	2
+p	spgist/network_ops	inet	inet	3
+p	spgist/network_ops	inet	inet	4
+p	spgist/network_ops	inet	inet	5
+p	spgist/quad_point_ops	point	point	1
+p	spgist/quad_point_ops	point	point	2
+p	spgist/quad_point_ops	point	point	3
+p	spgist/quad_point_ops	point	point	4
+p	spgist/quad_point_ops	point	point	5
+p	spgist/kd_point_ops	point	point	1
+p	spgist/kd_point_ops	point	point	2
+p	spgist/kd_point_ops	point	point	3
+p	spgist/kd_point_ops	point	point	4
+p	spgist/kd_point_ops	point	point	5
+p	spgist/text_ops	text	text	1
+p	spgist/text_ops	text	text	2
+p	spgist/text_ops	text	text	3
+p	spgist/text_ops	text	text	4
+p	spgist/text_ops	text	text	5
+p	spgist/box_ops	box	box	1
+p	spgist/box_ops	box	box	2
+p	spgist/box_ops	box	box	3
+p	spgist/box_ops	box	box	4
+p	spgist/box_ops	box	box	5
+p	spgist/poly_ops	polygon	polygon	1
+p	spgist/poly_ops	polygon	polygon	2
+p	spgist/poly_ops	polygon	polygon	3
+p	spgist/poly_ops	polygon	polygon	4
+p	spgist/poly_ops	polygon	polygon	5
+p	spgist/poly_ops	polygon	polygon	6
+p	brin/bytea_minmax_ops	bytea	bytea	1
+p	brin/bytea_minmax_ops	bytea	bytea	2
+p	brin/bytea_minmax_ops	bytea	bytea	3
+p	brin/bytea_minmax_ops	bytea	bytea	4
+p	brin/bytea_bloom_ops	bytea	bytea	1
+p	brin/bytea_bloom_ops	bytea	bytea	2
+p	brin/bytea_bloom_ops	bytea	bytea	3
+p	brin/bytea_bloom_ops	bytea	bytea	4
+p	brin/bytea_bloom_ops	bytea	bytea	5
+p	brin/bytea_bloom_ops	bytea	bytea	11
+p	brin/char_minmax_ops	char	char	1
+p	brin/char_minmax_ops	char	char	2
+p	brin/char_minmax_ops	char	char	3
+p	brin/char_minmax_ops	char	char	4
+p	brin/char_bloom_ops	char	char	1
+p	brin/char_bloom_ops	char	char	2
+p	brin/char_bloom_ops	char	char	3
+p	brin/char_bloom_ops	char	char	4
+p	brin/char_bloom_ops	char	char	5
+p	brin/char_bloom_ops	char	char	11
+p	brin/name_minmax_ops	name	name	1
+p	brin/name_minmax_ops	name	name	2
+p	brin/name_minmax_ops	name	name	3
+p	brin/name_minmax_ops	name	name	4
+p	brin/name_bloom_ops	name	name	1
+p	brin/name_bloom_ops	name	name	2
+p	brin/name_bloom_ops	name	name	3
+p	brin/name_bloom_ops	name	name	4
+p	brin/name_bloom_ops	name	name	5
+p	brin/name_bloom_ops	name	name	11
+p	brin/integer_minmax_ops	int8	int8	1
+p	brin/integer_minmax_ops	int8	int8	2
+p	brin/integer_minmax_ops	int8	int8	3
+p	brin/integer_minmax_ops	int8	int8	4
+p	brin/integer_minmax_ops	int2	int2	1
+p	brin/integer_minmax_ops	int2	int2	2
+p	brin/integer_minmax_ops	int2	int2	3
+p	brin/integer_minmax_ops	int2	int2	4
+p	brin/integer_minmax_ops	int4	int4	1
+p	brin/integer_minmax_ops	int4	int4	2
+p	brin/integer_minmax_ops	int4	int4	3
+p	brin/integer_minmax_ops	int4	int4	4
+p	brin/integer_minmax_multi_ops	int2	int2	1
+p	brin/integer_minmax_multi_ops	int2	int2	2
+p	brin/integer_minmax_multi_ops	int2	int2	3
+p	brin/integer_minmax_multi_ops	int2	int2	4
+p	brin/integer_minmax_multi_ops	int2	int2	5
+p	brin/integer_minmax_multi_ops	int2	int2	11
+p	brin/integer_minmax_multi_ops	int4	int4	1
+p	brin/integer_minmax_multi_ops	int4	int4	2
+p	brin/integer_minmax_multi_ops	int4	int4	3
+p	brin/integer_minmax_multi_ops	int4	int4	4
+p	brin/integer_minmax_multi_ops	int4	int4	5
+p	brin/integer_minmax_multi_ops	int4	int4	11
+p	brin/integer_minmax_multi_ops	int8	int8	1
+p	brin/integer_minmax_multi_ops	int8	int8	2
+p	brin/integer_minmax_multi_ops	int8	int8	3
+p	brin/integer_minmax_multi_ops	int8	int8	4
+p	brin/integer_minmax_multi_ops	int8	int8	5
+p	brin/integer_minmax_multi_ops	int8	int8	11
+p	brin/integer_bloom_ops	int8	int8	1
+p	brin/integer_bloom_ops	int8	int8	2
+p	brin/integer_bloom_ops	int8	int8	3
+p	brin/integer_bloom_ops	int8	int8	4
+p	brin/integer_bloom_ops	int8	int8	5
+p	brin/integer_bloom_ops	int8	int8	11
+p	brin/integer_bloom_ops	int2	int2	1
+p	brin/integer_bloom_ops	int2	int2	2
+p	brin/integer_bloom_ops	int2	int2	3
+p	brin/integer_bloom_ops	int2	int2	4
+p	brin/integer_bloom_ops	int2	int2	5
+p	brin/integer_bloom_ops	int2	int2	11
+p	brin/integer_bloom_ops	int4	int4	1
+p	brin/integer_bloom_ops	int4	int4	2
+p	brin/integer_bloom_ops	int4	int4	3
+p	brin/integer_bloom_ops	int4	int4	4
+p	brin/integer_bloom_ops	int4	int4	5
+p	brin/integer_bloom_ops	int4	int4	11
+p	brin/text_minmax_ops	text	text	1
+p	brin/text_minmax_ops	text	text	2
+p	brin/text_minmax_ops	text	text	3
+p	brin/text_minmax_ops	text	text	4
+p	brin/text_bloom_ops	text	text	1
+p	brin/text_bloom_ops	text	text	2
+p	brin/text_bloom_ops	text	text	3
+p	brin/text_bloom_ops	text	text	4
+p	brin/text_bloom_ops	text	text	5
+p	brin/text_bloom_ops	text	text	11
+p	brin/oid_minmax_ops	oid	oid	1
+p	brin/oid_minmax_ops	oid	oid	2
+p	brin/oid_minmax_ops	oid	oid	3
+p	brin/oid_minmax_ops	oid	oid	4
+p	brin/oid_minmax_multi_ops	oid	oid	1
+p	brin/oid_minmax_multi_ops	oid	oid	2
+p	brin/oid_minmax_multi_ops	oid	oid	3
+p	brin/oid_minmax_multi_ops	oid	oid	4
+p	brin/oid_minmax_multi_ops	oid	oid	5
+p	brin/oid_minmax_multi_ops	oid	oid	11
+p	brin/oid_bloom_ops	oid	oid	1
+p	brin/oid_bloom_ops	oid	oid	2
+p	brin/oid_bloom_ops	oid	oid	3
+p	brin/oid_bloom_ops	oid	oid	4
+p	brin/oid_bloom_ops	oid	oid	5
+p	brin/oid_bloom_ops	oid	oid	11
+p	brin/tid_minmax_ops	tid	tid	1
+p	brin/tid_minmax_ops	tid	tid	2
+p	brin/tid_minmax_ops	tid	tid	3
+p	brin/tid_minmax_ops	tid	tid	4
+p	brin/tid_bloom_ops	tid	tid	1
+p	brin/tid_bloom_ops	tid	tid	2
+p	brin/tid_bloom_ops	tid	tid	3
+p	brin/tid_bloom_ops	tid	tid	4
+p	brin/tid_bloom_ops	tid	tid	5
+p	brin/tid_bloom_ops	tid	tid	11
+p	brin/tid_minmax_multi_ops	tid	tid	1
+p	brin/tid_minmax_multi_ops	tid	tid	2
+p	brin/tid_minmax_multi_ops	tid	tid	3
+p	brin/tid_minmax_multi_ops	tid	tid	4
+p	brin/tid_minmax_multi_ops	tid	tid	5
+p	brin/tid_minmax_multi_ops	tid	tid	11
+p	brin/float_minmax_ops	float4	float4	1
+p	brin/float_minmax_ops	float4	float4	2
+p	brin/float_minmax_ops	float4	float4	3
+p	brin/float_minmax_ops	float4	float4	4
+p	brin/float_minmax_ops	float8	float8	1
+p	brin/float_minmax_ops	float8	float8	2
+p	brin/float_minmax_ops	float8	float8	3
+p	brin/float_minmax_ops	float8	float8	4
+p	brin/float_minmax_multi_ops	float4	float4	1
+p	brin/float_minmax_multi_ops	float4	float4	2
+p	brin/float_minmax_multi_ops	float4	float4	3
+p	brin/float_minmax_multi_ops	float4	float4	4
+p	brin/float_minmax_multi_ops	float4	float4	5
+p	brin/float_minmax_multi_ops	float4	float4	11
+p	brin/float_minmax_multi_ops	float8	float8	1
+p	brin/float_minmax_multi_ops	float8	float8	2
+p	brin/float_minmax_multi_ops	float8	float8	3
+p	brin/float_minmax_multi_ops	float8	float8	4
+p	brin/float_minmax_multi_ops	float8	float8	5
+p	brin/float_minmax_multi_ops	float8	float8	11
+p	brin/float_bloom_ops	float4	float4	1
+p	brin/float_bloom_ops	float4	float4	2
+p	brin/float_bloom_ops	float4	float4	3
+p	brin/float_bloom_ops	float4	float4	4
+p	brin/float_bloom_ops	float4	float4	5
+p	brin/float_bloom_ops	float4	float4	11
+p	brin/float_bloom_ops	float8	float8	1
+p	brin/float_bloom_ops	float8	float8	2
+p	brin/float_bloom_ops	float8	float8	3
+p	brin/float_bloom_ops	float8	float8	4
+p	brin/float_bloom_ops	float8	float8	5
+p	brin/float_bloom_ops	float8	float8	11
+p	brin/macaddr_minmax_ops	macaddr	macaddr	1
+p	brin/macaddr_minmax_ops	macaddr	macaddr	2
+p	brin/macaddr_minmax_ops	macaddr	macaddr	3
+p	brin/macaddr_minmax_ops	macaddr	macaddr	4
+p	brin/macaddr_minmax_multi_ops	macaddr	macaddr	1
+p	brin/macaddr_minmax_multi_ops	macaddr	macaddr	2
+p	brin/macaddr_minmax_multi_ops	macaddr	macaddr	3
+p	brin/macaddr_minmax_multi_ops	macaddr	macaddr	4
+p	brin/macaddr_minmax_multi_ops	macaddr	macaddr	5
+p	brin/macaddr_minmax_multi_ops	macaddr	macaddr	11
+p	brin/macaddr_bloom_ops	macaddr	macaddr	1
+p	brin/macaddr_bloom_ops	macaddr	macaddr	2
+p	brin/macaddr_bloom_ops	macaddr	macaddr	3
+p	brin/macaddr_bloom_ops	macaddr	macaddr	4
+p	brin/macaddr_bloom_ops	macaddr	macaddr	5
+p	brin/macaddr_bloom_ops	macaddr	macaddr	11
+p	brin/macaddr8_minmax_ops	macaddr8	macaddr8	1
+p	brin/macaddr8_minmax_ops	macaddr8	macaddr8	2
+p	brin/macaddr8_minmax_ops	macaddr8	macaddr8	3
+p	brin/macaddr8_minmax_ops	macaddr8	macaddr8	4
+p	brin/macaddr8_minmax_multi_ops	macaddr8	macaddr8	1
+p	brin/macaddr8_minmax_multi_ops	macaddr8	macaddr8	2
+p	brin/macaddr8_minmax_multi_ops	macaddr8	macaddr8	3
+p	brin/macaddr8_minmax_multi_ops	macaddr8	macaddr8	4
+p	brin/macaddr8_minmax_multi_ops	macaddr8	macaddr8	5
+p	brin/macaddr8_minmax_multi_ops	macaddr8	macaddr8	11
+p	brin/macaddr8_bloom_ops	macaddr8	macaddr8	1
+p	brin/macaddr8_bloom_ops	macaddr8	macaddr8	2
+p	brin/macaddr8_bloom_ops	macaddr8	macaddr8	3
+p	brin/macaddr8_bloom_ops	macaddr8	macaddr8	4
+p	brin/macaddr8_bloom_ops	macaddr8	macaddr8	5
+p	brin/macaddr8_bloom_ops	macaddr8	macaddr8	11
+p	brin/network_minmax_ops	inet	inet	1
+p	brin/network_minmax_ops	inet	inet	2
+p	brin/network_minmax_ops	inet	inet	3
+p	brin/network_minmax_ops	inet	inet	4
+p	brin/network_minmax_multi_ops	inet	inet	1
+p	brin/network_minmax_multi_ops	inet	inet	2
+p	brin/network_minmax_multi_ops	inet	inet	3
+p	brin/network_minmax_multi_ops	inet	inet	4
+p	brin/network_minmax_multi_ops	inet	inet	5
+p	brin/network_minmax_multi_ops	inet	inet	11
+p	brin/network_bloom_ops	inet	inet	1
+p	brin/network_bloom_ops	inet	inet	2
+p	brin/network_bloom_ops	inet	inet	3
+p	brin/network_bloom_ops	inet	inet	4
+p	brin/network_bloom_ops	inet	inet	5
+p	brin/network_bloom_ops	inet	inet	11
+p	brin/network_inclusion_ops	inet	inet	1
+p	brin/network_inclusion_ops	inet	inet	2
+p	brin/network_inclusion_ops	inet	inet	3
+p	brin/network_inclusion_ops	inet	inet	4
+p	brin/network_inclusion_ops	inet	inet	11
+p	brin/network_inclusion_ops	inet	inet	12
+p	brin/network_inclusion_ops	inet	inet	13
+p	brin/bpchar_minmax_ops	bpchar	bpchar	1
+p	brin/bpchar_minmax_ops	bpchar	bpchar	2
+p	brin/bpchar_minmax_ops	bpchar	bpchar	3
+p	brin/bpchar_minmax_ops	bpchar	bpchar	4
+p	brin/bpchar_bloom_ops	bpchar	bpchar	1
+p	brin/bpchar_bloom_ops	bpchar	bpchar	2
+p	brin/bpchar_bloom_ops	bpchar	bpchar	3
+p	brin/bpchar_bloom_ops	bpchar	bpchar	4
+p	brin/bpchar_bloom_ops	bpchar	bpchar	5
+p	brin/bpchar_bloom_ops	bpchar	bpchar	11
+p	brin/time_minmax_ops	time	time	1
+p	brin/time_minmax_ops	time	time	2
+p	brin/time_minmax_ops	time	time	3
+p	brin/time_minmax_ops	time	time	4
+p	brin/time_minmax_multi_ops	time	time	1
+p	brin/time_minmax_multi_ops	time	time	2
+p	brin/time_minmax_multi_ops	time	time	3
+p	brin/time_minmax_multi_ops	time	time	4
+p	brin/time_minmax_multi_ops	time	time	5
+p	brin/time_minmax_multi_ops	time	time	11
+p	brin/time_bloom_ops	time	time	1
+p	brin/time_bloom_ops	time	time	2
+p	brin/time_bloom_ops	time	time	3
+p	brin/time_bloom_ops	time	time	4
+p	brin/time_bloom_ops	time	time	5
+p	brin/time_bloom_ops	time	time	11
+p	brin/datetime_minmax_ops	timestamp	timestamp	1
+p	brin/datetime_minmax_ops	timestamp	timestamp	2
+p	brin/datetime_minmax_ops	timestamp	timestamp	3
+p	brin/datetime_minmax_ops	timestamp	timestamp	4
+p	brin/datetime_minmax_ops	timestamptz	timestamptz	1
+p	brin/datetime_minmax_ops	timestamptz	timestamptz	2
+p	brin/datetime_minmax_ops	timestamptz	timestamptz	3
+p	brin/datetime_minmax_ops	timestamptz	timestamptz	4
+p	brin/datetime_minmax_ops	date	date	1
+p	brin/datetime_minmax_ops	date	date	2
+p	brin/datetime_minmax_ops	date	date	3
+p	brin/datetime_minmax_ops	date	date	4
+p	brin/datetime_minmax_multi_ops	timestamp	timestamp	1
+p	brin/datetime_minmax_multi_ops	timestamp	timestamp	2
+p	brin/datetime_minmax_multi_ops	timestamp	timestamp	3
+p	brin/datetime_minmax_multi_ops	timestamp	timestamp	4
+p	brin/datetime_minmax_multi_ops	timestamp	timestamp	5
+p	brin/datetime_minmax_multi_ops	timestamp	timestamp	11
+p	brin/datetime_minmax_multi_ops	timestamptz	timestamptz	1
+p	brin/datetime_minmax_multi_ops	timestamptz	timestamptz	2
+p	brin/datetime_minmax_multi_ops	timestamptz	timestamptz	3
+p	brin/datetime_minmax_multi_ops	timestamptz	timestamptz	4
+p	brin/datetime_minmax_multi_ops	timestamptz	timestamptz	5
+p	brin/datetime_minmax_multi_ops	timestamptz	timestamptz	11
+p	brin/datetime_minmax_multi_ops	date	date	1
+p	brin/datetime_minmax_multi_ops	date	date	2
+p	brin/datetime_minmax_multi_ops	date	date	3
+p	brin/datetime_minmax_multi_ops	date	date	4
+p	brin/datetime_minmax_multi_ops	date	date	5
+p	brin/datetime_minmax_multi_ops	date	date	11
+p	brin/datetime_bloom_ops	timestamp	timestamp	1
+p	brin/datetime_bloom_ops	timestamp	timestamp	2
+p	brin/datetime_bloom_ops	timestamp	timestamp	3
+p	brin/datetime_bloom_ops	timestamp	timestamp	4
+p	brin/datetime_bloom_ops	timestamp	timestamp	5
+p	brin/datetime_bloom_ops	timestamp	timestamp	11
+p	brin/datetime_bloom_ops	timestamptz	timestamptz	1
+p	brin/datetime_bloom_ops	timestamptz	timestamptz	2
+p	brin/datetime_bloom_ops	timestamptz	timestamptz	3
+p	brin/datetime_bloom_ops	timestamptz	timestamptz	4
+p	brin/datetime_bloom_ops	timestamptz	timestamptz	5
+p	brin/datetime_bloom_ops	timestamptz	timestamptz	11
+p	brin/datetime_bloom_ops	date	date	1
+p	brin/datetime_bloom_ops	date	date	2
+p	brin/datetime_bloom_ops	date	date	3
+p	brin/datetime_bloom_ops	date	date	4
+p	brin/datetime_bloom_ops	date	date	5
+p	brin/datetime_bloom_ops	date	date	11
+p	brin/interval_minmax_ops	interval	interval	1
+p	brin/interval_minmax_ops	interval	interval	2
+p	brin/interval_minmax_ops	interval	interval	3
+p	brin/interval_minmax_ops	interval	interval	4
+p	brin/interval_minmax_multi_ops	interval	interval	1
+p	brin/interval_minmax_multi_ops	interval	interval	2
+p	brin/interval_minmax_multi_ops	interval	interval	3
+p	brin/interval_minmax_multi_ops	interval	interval	4
+p	brin/interval_minmax_multi_ops	interval	interval	5
+p	brin/interval_minmax_multi_ops	interval	interval	11
+p	brin/interval_bloom_ops	interval	interval	1
+p	brin/interval_bloom_ops	interval	interval	2
+p	brin/interval_bloom_ops	interval	interval	3
+p	brin/interval_bloom_ops	interval	interval	4
+p	brin/interval_bloom_ops	interval	interval	5
+p	brin/interval_bloom_ops	interval	interval	11
+p	brin/timetz_minmax_ops	timetz	timetz	1
+p	brin/timetz_minmax_ops	timetz	timetz	2
+p	brin/timetz_minmax_ops	timetz	timetz	3
+p	brin/timetz_minmax_ops	timetz	timetz	4
+p	brin/timetz_minmax_multi_ops	timetz	timetz	1
+p	brin/timetz_minmax_multi_ops	timetz	timetz	2
+p	brin/timetz_minmax_multi_ops	timetz	timetz	3
+p	brin/timetz_minmax_multi_ops	timetz	timetz	4
+p	brin/timetz_minmax_multi_ops	timetz	timetz	5
+p	brin/timetz_minmax_multi_ops	timetz	timetz	11
+p	brin/timetz_bloom_ops	timetz	timetz	1
+p	brin/timetz_bloom_ops	timetz	timetz	2
+p	brin/timetz_bloom_ops	timetz	timetz	3
+p	brin/timetz_bloom_ops	timetz	timetz	4
+p	brin/timetz_bloom_ops	timetz	timetz	5
+p	brin/timetz_bloom_ops	timetz	timetz	11
+p	brin/bit_minmax_ops	bit	bit	1
+p	brin/bit_minmax_ops	bit	bit	2
+p	brin/bit_minmax_ops	bit	bit	3
+p	brin/bit_minmax_ops	bit	bit	4
+p	brin/varbit_minmax_ops	varbit	varbit	1
+p	brin/varbit_minmax_ops	varbit	varbit	2
+p	brin/varbit_minmax_ops	varbit	varbit	3
+p	brin/varbit_minmax_ops	varbit	varbit	4
+p	brin/numeric_minmax_ops	numeric	numeric	1
+p	brin/numeric_minmax_ops	numeric	numeric	2
+p	brin/numeric_minmax_ops	numeric	numeric	3
+p	brin/numeric_minmax_ops	numeric	numeric	4
+p	brin/numeric_minmax_multi_ops	numeric	numeric	1
+p	brin/numeric_minmax_multi_ops	numeric	numeric	2
+p	brin/numeric_minmax_multi_ops	numeric	numeric	3
+p	brin/numeric_minmax_multi_ops	numeric	numeric	4
+p	brin/numeric_minmax_multi_ops	numeric	numeric	5
+p	brin/numeric_minmax_multi_ops	numeric	numeric	11
+p	brin/numeric_bloom_ops	numeric	numeric	1
+p	brin/numeric_bloom_ops	numeric	numeric	2
+p	brin/numeric_bloom_ops	numeric	numeric	3
+p	brin/numeric_bloom_ops	numeric	numeric	4
+p	brin/numeric_bloom_ops	numeric	numeric	5
+p	brin/numeric_bloom_ops	numeric	numeric	11
+p	brin/uuid_minmax_ops	uuid	uuid	1
+p	brin/uuid_minmax_ops	uuid	uuid	2
+p	brin/uuid_minmax_ops	uuid	uuid	3
+p	brin/uuid_minmax_ops	uuid	uuid	4
+p	brin/uuid_minmax_multi_ops	uuid	uuid	1
+p	brin/uuid_minmax_multi_ops	uuid	uuid	2
+p	brin/uuid_minmax_multi_ops	uuid	uuid	3
+p	brin/uuid_minmax_multi_ops	uuid	uuid	4
+p	brin/uuid_minmax_multi_ops	uuid	uuid	5
+p	brin/uuid_minmax_multi_ops	uuid	uuid	11
+p	brin/uuid_bloom_ops	uuid	uuid	1
+p	brin/uuid_bloom_ops	uuid	uuid	2
+p	brin/uuid_bloom_ops	uuid	uuid	3
+p	brin/uuid_bloom_ops	uuid	uuid	4
+p	brin/uuid_bloom_ops	uuid	uuid	5
+p	brin/uuid_bloom_ops	uuid	uuid	11
+p	brin/range_inclusion_ops	anyrange	anyrange	1
+p	brin/range_inclusion_ops	anyrange	anyrange	2
+p	brin/range_inclusion_ops	anyrange	anyrange	3
+p	brin/range_inclusion_ops	anyrange	anyrange	4
+p	brin/range_inclusion_ops	anyrange	anyrange	11
+p	brin/range_inclusion_ops	anyrange	anyrange	13
+p	brin/range_inclusion_ops	anyrange	anyrange	14
+p	brin/pg_lsn_minmax_ops	pg_lsn	pg_lsn	1
+p	brin/pg_lsn_minmax_ops	pg_lsn	pg_lsn	2
+p	brin/pg_lsn_minmax_ops	pg_lsn	pg_lsn	3
+p	brin/pg_lsn_minmax_ops	pg_lsn	pg_lsn	4
+p	brin/pg_lsn_minmax_multi_ops	pg_lsn	pg_lsn	1
+p	brin/pg_lsn_minmax_multi_ops	pg_lsn	pg_lsn	2
+p	brin/pg_lsn_minmax_multi_ops	pg_lsn	pg_lsn	3
+p	brin/pg_lsn_minmax_multi_ops	pg_lsn	pg_lsn	4
+p	brin/pg_lsn_minmax_multi_ops	pg_lsn	pg_lsn	5
+p	brin/pg_lsn_minmax_multi_ops	pg_lsn	pg_lsn	11
+p	brin/pg_lsn_bloom_ops	pg_lsn	pg_lsn	1
+p	brin/pg_lsn_bloom_ops	pg_lsn	pg_lsn	2
+p	brin/pg_lsn_bloom_ops	pg_lsn	pg_lsn	3
+p	brin/pg_lsn_bloom_ops	pg_lsn	pg_lsn	4
+p	brin/pg_lsn_bloom_ops	pg_lsn	pg_lsn	5
+p	brin/pg_lsn_bloom_ops	pg_lsn	pg_lsn	11
+p	brin/box_inclusion_ops	box	box	1
+p	brin/box_inclusion_ops	box	box	2
+p	brin/box_inclusion_ops	box	box	3
+p	brin/box_inclusion_ops	box	box	4
+p	brin/box_inclusion_ops	box	box	11
+p	brin/box_inclusion_ops	box	box	13
+v	4402	koi8_r_to_mic
+v	4403	mic_to_koi8_r
+v	4404	iso_8859_5_to_mic
+v	4405	mic_to_iso_8859_5
+v	4406	windows_1251_to_mic
+v	4407	mic_to_windows_1251
+v	4408	windows_866_to_mic
+v	4409	mic_to_windows_866
+v	4410	koi8_r_to_windows_1251
+v	4411	windows_1251_to_koi8_r
+v	4412	koi8_r_to_windows_866
+v	4413	windows_866_to_koi8_r
+v	4414	windows_866_to_windows_1251
+v	4415	windows_1251_to_windows_866
+v	4416	iso_8859_5_to_koi8_r
+v	4417	koi8_r_to_iso_8859_5
+v	4418	iso_8859_5_to_windows_1251
+v	4419	windows_1251_to_iso_8859_5
+v	4420	iso_8859_5_to_windows_866
+v	4421	windows_866_to_iso_8859_5
+v	4422	euc_cn_to_mic
+v	4423	mic_to_euc_cn
+v	4424	euc_jp_to_sjis
+v	4425	sjis_to_euc_jp
+v	4426	euc_jp_to_mic
+v	4427	sjis_to_mic
+v	4428	mic_to_euc_jp
+v	4429	mic_to_sjis
+v	4430	euc_kr_to_mic
+v	4431	mic_to_euc_kr
+v	4432	euc_tw_to_big5
+v	4433	big5_to_euc_tw
+v	4434	euc_tw_to_mic
+v	4435	big5_to_mic
+v	4436	mic_to_euc_tw
+v	4437	mic_to_big5
+v	4438	iso_8859_2_to_mic
+v	4439	mic_to_iso_8859_2
+v	4440	windows_1250_to_mic
+v	4441	mic_to_windows_1250
+v	4442	iso_8859_2_to_windows_1250
+v	4443	windows_1250_to_iso_8859_2
+v	4444	iso_8859_1_to_mic
+v	4445	mic_to_iso_8859_1
+v	4446	iso_8859_3_to_mic
+v	4447	mic_to_iso_8859_3
+v	4448	iso_8859_4_to_mic
+v	4449	mic_to_iso_8859_4
+v	4452	big5_to_utf8
+v	4453	utf8_to_big5
+v	4454	utf8_to_koi8_r
+v	4455	koi8_r_to_utf8
+v	4456	utf8_to_koi8_u
+v	4457	koi8_u_to_utf8
+v	4458	utf8_to_windows_866
+v	4459	windows_866_to_utf8
+v	4460	utf8_to_windows_874
+v	4461	windows_874_to_utf8
+v	4462	utf8_to_windows_1250
+v	4463	windows_1250_to_utf8
+v	4464	utf8_to_windows_1251
+v	4465	windows_1251_to_utf8
+v	4466	utf8_to_windows_1252
+v	4467	windows_1252_to_utf8
+v	4468	utf8_to_windows_1253
+v	4469	windows_1253_to_utf8
+v	4470	utf8_to_windows_1254
+v	4471	windows_1254_to_utf8
+v	4472	utf8_to_windows_1255
+v	4473	windows_1255_to_utf8
+v	4474	utf8_to_windows_1256
+v	4475	windows_1256_to_utf8
+v	4476	utf8_to_windows_1257
+v	4477	windows_1257_to_utf8
+v	4478	utf8_to_windows_1258
+v	4479	windows_1258_to_utf8
+v	4480	euc_cn_to_utf8
+v	4481	utf8_to_euc_cn
+v	4482	euc_jp_to_utf8
+v	4483	utf8_to_euc_jp
+v	4484	euc_kr_to_utf8
+v	4485	utf8_to_euc_kr
+v	4486	euc_tw_to_utf8
+v	4487	utf8_to_euc_tw
+v	4488	gb18030_to_utf8
+v	4489	utf8_to_gb18030
+v	4490	gbk_to_utf8
+v	4491	utf8_to_gbk
+v	4492	utf8_to_iso_8859_2
+v	4493	iso_8859_2_to_utf8
+v	4494	utf8_to_iso_8859_3
+v	4495	iso_8859_3_to_utf8
+v	4496	utf8_to_iso_8859_4
+v	4497	iso_8859_4_to_utf8
+v	4498	utf8_to_iso_8859_9
+v	4499	iso_8859_9_to_utf8
+v	4500	utf8_to_iso_8859_10
+v	4501	iso_8859_10_to_utf8
+v	4502	utf8_to_iso_8859_13
+v	4503	iso_8859_13_to_utf8
+v	4504	utf8_to_iso_8859_14
+v	4505	iso_8859_14_to_utf8
+v	4506	utf8_to_iso_8859_15
+v	4507	iso_8859_15_to_utf8
+v	4508	utf8_to_iso_8859_16
+v	4509	iso_8859_16_to_utf8
+v	4510	utf8_to_iso_8859_5
+v	4511	iso_8859_5_to_utf8
+v	4512	utf8_to_iso_8859_6
+v	4513	iso_8859_6_to_utf8
+v	4514	utf8_to_iso_8859_7
+v	4515	iso_8859_7_to_utf8
+v	4516	utf8_to_iso_8859_8
+v	4517	iso_8859_8_to_utf8
+v	4518	iso_8859_1_to_utf8
+v	4519	utf8_to_iso_8859_1
+v	4520	johab_to_utf8
+v	4521	utf8_to_johab
+v	4522	sjis_to_utf8
+v	4523	utf8_to_sjis
+v	4524	uhc_to_utf8
+v	4525	utf8_to_uhc
+v	4526	euc_jis_2004_to_utf8
+v	4527	utf8_to_euc_jis_2004
+v	4528	shift_jis_2004_to_utf8
+v	4529	utf8_to_shift_jis_2004
+v	4530	euc_jis_2004_to_shift_jis_2004
+v	4531	shift_jis_2004_to_euc_jis_2004

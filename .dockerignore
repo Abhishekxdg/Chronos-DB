@@ -1,0 +1,14 @@
+# What the Dockerfile's build doesn't need (Cargo.toml names examples/sample_data.rs, so examples/ stays)
+.git
+.agent
+.claude
+target
+studio/node_modules
+studio/dist
+bench
+demo
+company
+site
+*.pptx
+**/__pycache__
+**/.DS_Store

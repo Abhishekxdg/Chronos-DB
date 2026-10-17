@@ -1,0 +1,84 @@
+[package]
+name = "chronos"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.90"
+description = "An embeddable database for AI agents: instant copy-on-write branches, merge, and fast search"
+license = "BUSL-1.1"
+publish = false
+
+[dependencies]
+aes = "0.9.3"
+blake3 = "1.8.7"
+blowfish = { version = "0.10.0", features = ["bcrypt"] }
+cast5 = "0.12.0"
+crc32fast = "1.5.2"
+des = "0.9.0"
+futures = { version = "0.3.34", optional = true }
+hmac = "0.13.0"
+# ICU collations (CREATE COLLATION, COLLATE "de-x-icu") and their upper() and lower(): ICU4X, pure Rust, with its
+# compiled data; pinned so an order kept in an index doesn't change under a CLDR or algorithm update
+# (see src/sql/collation.rs)
+icu_casemap = { version = "=2.3.0", default-features = false, features = ["compiled_data"] }
+icu_collator = { version = "=2.3.1", default-features = false, features = ["compiled_data"] }
+icu_locale_core = { version = "=2.3.0", default-features = false }
+# (not used directly: pinned too, as their code and data decide sort keys an index keeps; see collation::VERSION)
+icu_casemap_data = { version = "=2.3.0", default-features = false }
+icu_collator_data = { version = "=2.3.0", default-features = false }
+icu_collections = { version = "=2.3.0", default-features = false }
+icu_locale_fallback = { version = "=2.3.0", default-features = false }
+icu_locale_fallback_data = { version = "=2.3.0", default-features = false }
+icu_normalizer = { version = "=2.3.0", default-features = false }
+icu_normalizer_data = { version = "=2.3.0", default-features = false }
+icu_properties = { version = "=2.3.0", default-features = false }
+icu_properties_data = { version = "=2.3.0", default-features = false }
+icu_provider = { version = "=2.3.1", default-features = false }
+imbl = "7.0.2"
+libc = "0.2.189"
+lz4_flex = "0.14.0"
+md-5 = "0.11.0"
+miniz_oxide = "0.9.1"
+object_store = { version = "0.14.2", features = ["aws"], optional = true }
+ring = "0.17.14"
+ripemd = "0.2.0"
+roaring = "0.11.5"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustyline = "18.0.1"
+serde = "1.0.229"
+serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+shuttle = { version = "0.9.4", optional = true }
+# RFC 3454's tables, for SASLprep of SCRAM passwords as Postgres does it (src/sql/scram.rs; its NFKC is icu_normalizer's)
+stringprep = "0.1.5"
+tokio = { version = "1.53.1", features = ["net", "rt", "time"], optional = true }
+
+# musl's malloc is slow under threads (it dominated a vector search profile on Linux), and glibc's
+# maps and unmaps a big query's batches on every run, so Linux builds use mimalloc (see src/main.rs)
+[target.'cfg(target_os = "linux")'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
+[dev-dependencies]
+pgvector = { version = "0.4.2", features = ["postgres"] }
+postgres = "0.19.14"
+# tokio-postgres's own SCRAM verifiers and md5 hashes (tests/scram.rs)
+postgres-protocol = "0.6.12"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+# a TLS stream with channel binding for the postgres crate (tests/scram.rs)
+tokio = "1.53.1"
+tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12"] }
+
+[features]
+# cloud storage for pages (S3, R2, MinIO, ...): cargo build --features s3
+s3 = ["dep:object_store", "dep:tokio", "dep:futures"]
+shuttle = ["dep:shuttle"]
+
+
+# its self-check (exactly 1,240 churners, any day) runs with cargo test
+[[example]]
+name = "sample_data"
+test = true
+
