@@ -989,7 +989,8 @@ impl Shell {
                 let target = if rest.is_empty() { b } else { rest.to_string() };
                 let version = self.db.version(&target).map_err(msg)?; // first: merging at it merges no more than shown
                 let mut d = self.db.diff(&target).map_err(msg)?;
-                d.sort_by(|a, b| key_order(&a.key).cmp(&key_order(&b.key)));
+                // destructive first: the rows it deletes (with what they held), then the rest
+                d.sort_by(|a, b| (a.after.is_some(), key_order(&a.key)).cmp(&(b.after.is_some(), key_order(&b.key))));
                 if d.is_empty() {
                     return Ok(format!("no changes on {target}"));
                 }
@@ -997,13 +998,16 @@ impl Shell {
                     .iter()
                     .map(|c| match (&c.before, &c.after) {
                         (None, Some(a)) => format!("+ {}  {a}", show_key(&c.key)),
-                        (Some(_), None) => format!("- {}", show_key(&c.key)),
+                        (Some(x), None) => format!("- DELETE {}  {x}", show_key(&c.key)),
                         (Some(x), Some(y)) => format!("~ {}  {}", show_key(&c.key), field_diff(x, y)),
                         (None, None) => unreachable!(),
                     })
                     .collect();
+                // per table, deletes first, on the first line: what a person reads before approving
+                let summary = chronos::sql::summary(self.db.diff_kinds(&target, None).map_err(msg)?);
+                let summary = if summary.is_empty() { String::new() } else { format!(" ({summary})") };
                 Ok(format!(
-                    "{} on {target}\n{}\n(at version {version}: merge {target} at {version} merges exactly this)",
+                    "{} on {target}{summary}\n{}\n(at version {version}: merge {target} at {version} merges exactly this)",
                     plural(d.len(), "change"),
                     lines.join("\n")
                 ))

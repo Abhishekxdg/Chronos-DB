@@ -57,7 +57,7 @@ fn several_column_keys_through_forks_merges_and_reopening() {
         let out = s.run(&db, "diff", &[]).unwrap().pop().unwrap();
         let ids: Vec<String> =
             out.rows.iter().filter(|r| r[0] == Value::Text("ol".into())).map(|r| r[1].to_text()).collect();
-        assert_eq!(ids, ["(1,2)", "(2,1)", "(3,1)"], "{out:?}");
+        assert_eq!(ids, ["(2,1)", "(1,2)", "(3,1)"], "the delete first: {out:?}");
         let sql = s.run(&db, "diff as sql", &[]).unwrap().pop().unwrap();
         let sql: Vec<String> = sql.rows.iter().map(|r| r[0].to_text()).collect();
         assert!(sql.contains(&"update ol set note = 'w' where ord = 1 and line = 2;".to_string()), "{sql:?}");

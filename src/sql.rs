@@ -7612,11 +7612,14 @@ enum Stmt {
         critical: bool,
     },
     /// MERGE WORLD [name] [INTO world] [ONLY TABLES (t, ...)] [ONLY KEYS ('t/1', ...)]
-    /// [USING OURS|THEIRS] [BY COLUMNS] [RESOLVE ('t/1' = OURS, ...)] [CONFIRM | AT VERSION n] [DRY RUN]
+    /// [USING OURS|THEIRS] [BY COLUMNS] [RESOLVE ('t/1' = OURS, ...)] [CONFIRM | AT VERSION n]
+    /// [CONFIRM DELETES n] [DRY RUN]
     MergeBranch {
         name: Option<String>,
         how: crate::Resolve,
         confirm: bool,
+        /// CONFIRM DELETES n: the rows it deletes, given by the person approving it (see `MergeOptions`)
+        confirm_deletes: Option<u64>,
         /// AT VERSION n: only if the world is still at version n (what a person reviewed)
         version: Option<u64>,
         /// TARGET n: only if the world merged into is as the dry run naming n saw it
@@ -11316,6 +11319,7 @@ impl Parser {
                     name,
                     how: c.how,
                     confirm: c.confirm,
+                    confirm_deletes: c.confirm_deletes,
                     version: c.version,
                     target: c.target,
                     columns: c.columns,
@@ -11334,6 +11338,7 @@ impl Parser {
                 };
                 let c = self.merge_clauses()?;
                 if c.confirm
+                    || c.confirm_deletes.is_some()
                     || c.dry
                     || c.into.is_some()
                     || c.target.is_some()
@@ -13119,7 +13124,20 @@ impl Parser {
                     _ => return self.fail("expected a version number after AT VERSION"),
                 };
             } else if self.kw("confirm") {
-                c.confirm = true;
+                // CONFIRM DELETES n: the count of rows the merge deletes, for a policy's confirm_deletes_over; CONFIRM
+                // alone: a world open during a crash, merged as it is now
+                if self.kw("deletes") {
+                    c.confirm_deletes = match self.next() {
+                        Some(Tok::Num(n)) => Some(n.parse().map_err(|_| SqlError {
+                            code: BAD_INPUT,
+                            message: format!("CONFIRM DELETES takes the number of rows the merge deletes, not {n}"),
+                            info: None,
+                        })?),
+                        _ => return self.fail("expected the number of rows the merge deletes after CONFIRM DELETES"),
+                    };
+                } else {
+                    c.confirm = true;
+                }
             } else if self.kw("by") {
                 self.expect_kw("columns")?;
                 c.columns = true;
@@ -27319,6 +27337,7 @@ fn scan_par(
 struct MergeClauses {
     how: crate::Resolve,
     confirm: bool,
+    confirm_deletes: Option<u64>,
     version: Option<u64>,
     target: Option<u64>,
     columns: bool,
@@ -27450,6 +27469,94 @@ fn scan(
         }
     }
     Ok(())
+}
+
+/// Whether a dry run's plan shows row `p`: a table's row, or a table, view or sequence itself.
+fn shown_planned(p: &crate::Planned) -> bool {
+    !p.key.starts_with("_sonos_") || p.key.starts_with(SCHEMAS) || schema_object(&p.key)
+}
+
+/// Whether the merge planned deletes row `p` from the world it merges into.
+fn planned_delete(p: &crate::Planned) -> bool {
+    p.outcome != "conflict" && p.result.is_none() && p.theirs.is_some() && !p.key.starts_with("_sonos_")
+}
+
+/// Rows a change deletes, updates and inserts in one table (see `counts_line`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Counts {
+    pub deleted: usize,
+    pub updated: usize,
+    pub inserted: usize,
+}
+
+impl Counts {
+    /// Counts one change of a row, from whether it was there before and is after.
+    pub fn add(&mut self, before: bool, after: bool) {
+        match (before, after) {
+            (true, false) => self.deleted += 1,
+            (true, true) => self.updated += 1,
+            (false, true) => self.inserted += 1,
+            (false, false) => {}
+        }
+    }
+}
+
+/// A number as people read it: `4,812`.
+pub fn thousands(n: usize) -> String {
+    let d = n.to_string();
+    let mut out = String::with_capacity(d.len() + d.len() / 3);
+    for (i, c) in d.chars().enumerate() {
+        if i > 0 && (d.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// One table's counts as a review leads with them, deletes first: `4,812 deleted, 69 updated, 0 inserted`.
+pub fn counts_line(c: &Counts) -> String {
+    format!("{} deleted, {} updated, {} inserted", thousands(c.deleted), thousands(c.updated), thousands(c.inserted))
+}
+
+/// Tables' counts, those that delete most first (then by name), leaving out the database's own rows: the order a
+/// review shows them in, so a big delete is read first.
+pub fn by_deletes(counts: impl IntoIterator<Item = (String, Counts)>) -> Vec<(String, Counts)> {
+    let mut v: Vec<(String, Counts)> = counts.into_iter().filter(|(t, _)| !crate::reserved_table(t)).collect();
+    v.sort_by(|(a, x), (b, y)| y.deleted.cmp(&x.deleted).then_with(|| a.cmp(b)));
+    v
+}
+
+/// Every table's counts in one line, as `SHOW REVIEWS` and `DIFF WORLD` lead with them: `leads: 4,812 deleted, 69
+/// updated, 0 inserted; accounts: ...` (empty for no rows changed).
+pub fn summary(counts: impl IntoIterator<Item = (String, Counts)>) -> String {
+    by_deletes(counts)
+        .iter()
+        .map(|(t, c)| format!("{}: {}", shown_name(t), counts_line(c)))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// What a merge plan does per table (rows it would change in the world merged into; conflicts aren't changes yet).
+fn plan_counts(rows: &[crate::Planned]) -> Vec<(String, Counts)> {
+    let mut by: BTreeMap<String, Counts> = BTreeMap::new();
+    for p in rows.iter().filter(|p| p.outcome != "conflict" && !p.key.starts_with("_sonos_") && p.result != p.theirs) {
+        let table = p.key.split_once('/').map_or(p.key.as_str(), |(t, _)| t);
+        by.entry(table.to_string()).or_default().add(p.theirs.is_some(), p.result.is_some());
+    }
+    by_deletes(by)
+}
+
+/// The notice a dry run gives when the person merging must give the count of rows it deletes.
+fn confirm_line(b: &str, c: &crate::ConfirmDeletes) -> String {
+    format!(
+        "{b} deletes {} rows, more than merge policy {} lets a person approve without giving the count (over {}): \
+         MERGE WORLD {b} CONFIRM DELETES {} approves it",
+        thousands(c.deletes as usize),
+        c.policy,
+        c.over,
+        c.deletes
+    )
 }
 
 /// What a dry run's check against Postgres found (see `crate::attach::dry_run`), in a line for its plan.
@@ -37021,6 +37128,7 @@ impl Statement {
                     ("max_effects", Type::BigInt),
                     ("effects_per_hour", Type::BigInt),
                     ("review_channels", Type::Text),
+                    ("confirm_deletes_over", Type::BigInt),
                 ]);
             }
             Stmt::ShowChecks | Stmt::CreateCheck { .. } => {
@@ -37056,6 +37164,7 @@ impl Statement {
                     ("version", Type::BigInt),
                     ("changed_since", Type::Bool),
                     ("scope", Type::Json),
+                    ("changes", Type::Text),
                 ]);
             }
             Stmt::ShowMergeOutcomes { by_policy } => return fixed(&outcome_columns(*by_policy)),
@@ -37679,6 +37788,7 @@ impl Statement {
                 name,
                 how,
                 confirm,
+                confirm_deletes,
                 version,
                 target,
                 columns,
@@ -37703,6 +37813,7 @@ impl Statement {
                     only_keys: only_keys.iter().map(|k| row_key_of(db, b, k)).collect(),
                     into: into.as_deref().map(|y| db.world(y).map(|w| w.name)).transpose()?,
                     target: *target,
+                    confirm_deletes: *confirm_deletes,
                 };
                 if !*dry {
                     return Ok(Output::tag(format!("MERGE {}", db.merge_with(b, &o)?)));
@@ -37720,13 +37831,16 @@ impl Statement {
                 let json = |v: Option<Val>| {
                     v.map_or(Value::Null, |r| Value::Json(serde_json::from_str(&r).unwrap_or(Json::Null)))
                 };
+                if let Some(c) = &plan.confirm_deletes {
+                    notice("NOTICE", confirm_line(b, c));
+                }
                 // in a folder attached to Postgres, each row it would write as Postgres has it now (see `attach`)
                 let live: HashMap<&str, &crate::LiveRow> =
                     plan.live.iter().flat_map(|l| &l.rows).map(|r| (r.key.as_str(), r)).collect();
-                let mut rows: Vec<Vec<Value>> = plan
+                let rows: Vec<Vec<Value>> = plan
                     .rows
                     .iter()
-                    .filter(|p| !p.key.starts_with("_sonos_") || p.key.starts_with(SCHEMAS) || schema_object(&p.key))
+                    .filter(|p| shown_planned(p))
                     .map(|p| {
                         let (t, id) = p.key.split_once('/').unwrap_or((&p.key, ""));
                         let (t, id) = match t {
@@ -37741,6 +37855,10 @@ impl Statement {
                                  Postgres's row (postgres)"
                                     .to_string(),
                             ),
+                            // a row it deletes: said, as well as shown by its null result
+                            _ if planned_delete(p) && p.detail.is_empty() => {
+                                (p.outcome.to_string(), "DELETE: the merge deletes this row".to_string())
+                            }
                             _ => (p.outcome.to_string(), p.detail.clone()),
                         };
                         vec![
@@ -37761,6 +37879,21 @@ impl Statement {
                     r.resize(9, Value::Null);
                     r
                 };
+                // destructive first: a line per table (rows deleted, updated, inserted), then the rows it deletes,
+                // then the rest, each in key order
+                let shown: Vec<&crate::Planned> = plan.rows.iter().filter(|p| shown_planned(p)).collect();
+                let mut deletes_first: Vec<(bool, Vec<Value>)> =
+                    shown.iter().map(|p| !planned_delete(p)).zip(rows).collect();
+                deletes_first.sort_by_key(|(rest, _)| *rest);
+                let mut rows: Vec<Vec<Value>> = plan_counts(&plan.rows)
+                    .into_iter()
+                    .map(|(t, c)| {
+                        let mut r = line("summary", counts_line(&c));
+                        r[0] = Value::Text(t);
+                        r
+                    })
+                    .collect();
+                rows.extend(deletes_first.into_iter().map(|(_, r)| r));
                 if let Some(l) = &plan.live {
                     rows.push(line("postgres", live_summary(l)));
                 }
@@ -37890,6 +38023,7 @@ impl Statement {
                             limit(p.max_effects),
                             limit(p.effects_per_hour),
                             Value::Text(crate::agents::listed(&p.review_channels)),
+                            limit(p.confirm_deletes_over),
                         ]
                     })
                     .collect();
@@ -37956,6 +38090,8 @@ impl Statement {
                     .into_iter()
                     .map(|r| {
                         let changed = r.changed_since();
+                        // what it does per table, deletes first, counted now
+                        let changes = db.diff_kinds(&r.world, None).map_or(Value::Null, |c| Value::Text(summary(c)));
                         vec![
                             Value::Text(r.world),
                             r.owner.map_or(Value::Null, Value::Text),
@@ -37965,6 +38101,7 @@ impl Statement {
                             Value::Int(r.version as i64),
                             Value::Bool(changed),
                             r.scope.map_or(Value::Null, Value::Json),
+                            changes,
                         ]
                     })
                     .collect();
@@ -38227,7 +38364,16 @@ impl Statement {
                     (Some(b), None) => db.diff_between(a, b)?,
                     (None, None) => db.diff(a)?,
                 };
-                let described = describe(&changes);
+                let mut described = describe(&changes);
+                // destructive first: a line per table (deleted, updated, inserted), then deletes before the rest (a
+                // page, LIMIT, stays in key order: the next one starts after its last key)
+                let counts = by_deletes(db.diff_kinds(a, to.as_deref())?);
+                if !counts.is_empty() && !*as_sql {
+                    notice("NOTICE", format!("{a}: {}", summary(counts)));
+                }
+                if limit.is_none() && !*as_sql {
+                    described.sort_by_key(|d| d.change != "delete");
+                }
                 if *as_sql {
                     let after = db.view_tx(to.as_deref().unwrap_or(a))?;
                     let rows: Vec<Vec<Value>> =

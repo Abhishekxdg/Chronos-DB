@@ -690,6 +690,9 @@ pub struct MergeOptions {
     /// merge only if the world merged into is as a preview that settled rows (OURS, THEIRS, BY
     /// COLUMNS, picks) saw it: its `MergePlan::target`
     pub target: Option<u64>,
+    /// the rows the merge deletes, as the person merging read them: asked for when the world's merge policy has
+    /// `confirm_deletes_over` and the merge deletes more (see `ConfirmDeletes`); a wrong count is refused
+    pub confirm_deletes: Option<u64>,
 }
 
 /// What a merge would do, row by row (see `Core::merge_preview`).
@@ -722,6 +725,17 @@ pub struct MergePlan {
     /// in a folder attached to Postgres, a merge into main: the rows it would write checked against Postgres as it
     /// is now (see `attach::dry_run`)
     pub live: Option<LiveCheck>,
+    /// a person merging it must give the count of rows it deletes (`MergeOptions::confirm_deletes`)
+    pub confirm_deletes: Option<ConfirmDeletes>,
+}
+
+/// A merge that deletes more rows than its world's merge policy lets a person approve without giving the count
+/// (`confirm_deletes_over`): counted from the merge's own plan, never from what the agent says.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfirmDeletes {
+    pub deletes: u64,
+    pub over: u64,
+    pub policy: String,
 }
 
 /// A dry run's check of a merge into main against the Postgres an attached folder copies (see `attach::dry_run`):
@@ -4056,6 +4070,22 @@ impl Core {
         Ok(tables)
     }
 
+    /// `diff_count`, split per table into rows deleted, updated and inserted (see `sql::summary`): what a review
+    /// leads with, deletes first.
+    pub fn diff_kinds(&self, b: &str, to: Option<&str>) -> Result<std::collections::BTreeMap<String, sql::Counts>> {
+        let _t = self.metrics.time(metrics::Op::Diff);
+        let (x, y) = self.diff_ends(b, to)?;
+        let mut tables: std::collections::BTreeMap<String, sql::Counts> = std::collections::BTreeMap::new();
+        for c in self.state_diff_iter(&x, &y, None)? {
+            let c = c?;
+            if shown(&c.key) {
+                let t = c.key.split_once('/').map_or(c.key.as_str(), |t| t.0);
+                tables.entry(t.to_string()).or_default().add(c.before.is_some(), c.after.is_some());
+            }
+        }
+        Ok(tables)
+    }
+
     /// One page of `diff` (or `diff_between` with `to`): up to `limit` changes with key > `after`,
     /// in key order, and the key to pass as `after` for the next page (None on the last). Reads
     /// only as far as the page, so memory follows the page, not the diff.
@@ -4066,9 +4096,24 @@ impl Core {
         after: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<Change>, Option<String>)> {
+        self.diff_page_of(b, to, after, limit, None)
+    }
+
+    /// `diff_page` of only the rows deleted (`deletes` true) or only the others (false): a review lists the deletes
+    /// first, a page at a time, then the rest.
+    pub fn diff_page_of(
+        &self,
+        b: &str,
+        to: Option<&str>,
+        after: Option<&str>,
+        limit: usize,
+        deletes: Option<bool>,
+    ) -> Result<(Vec<Change>, Option<String>)> {
         let _t = self.metrics.time(metrics::Op::Diff);
         let (x, y) = self.diff_ends(b, to)?;
-        let mut it = self.state_diff_iter(&x, &y, after)?.filter(|c| c.as_ref().map_or(true, |c| shown(&c.key)));
+        let kind = |c: &Change| deletes.is_none_or(|d| d == (c.before.is_some() && c.after.is_none()));
+        let mut it =
+            self.state_diff_iter(&x, &y, after)?.filter(|c| c.as_ref().map_or(true, |c| shown(&c.key) && kind(c)));
         let mut out = vec![];
         for c in it.by_ref().take(limit) {
             out.push(self.show_change(&x, &y, c?)?);
@@ -4637,6 +4682,9 @@ impl Core {
             )?;
             p.version = actual;
             p.target = target_now;
+            if !tx && !rebase {
+                p.confirm_deletes = self.deletes_to_confirm(b, &apply)?;
+            }
             // with conflicts nothing would merge, so there's no result to check yet
             if !tx && p.blocked.is_none() && p.conflicts == 0 {
                 let keys: Vec<String> = apply.iter().map(|c| c.key.clone()).collect();
@@ -4699,6 +4747,18 @@ impl Core {
                 })
                 .collect::<Result<_>>()?;
             return Err(Error::Conflicts(conflicts));
+        }
+        // a person approving a merge that deletes more rows than its policy lets go unread gives the count: before
+        // anything is written (to Postgres too, in an attached folder). An agent's merge is held by `broken` instead
+        if !tx
+            && !rebase
+            && disk::actor().is_empty()
+            && self.me.get().is_some()
+            && !RECOVERING.get()
+            && let Some(c) = self.deletes_to_confirm(b, &apply)?
+            && o.confirm_deletes != Some(c.deletes)
+        {
+            return Err(agents::count_refused(b, c.deletes, &c.policy, c.over, o.confirm_deletes));
         }
         let n = apply.len();
         let keys: Vec<String> = apply.iter().map(|c| c.key.clone()).collect();
@@ -4994,6 +5054,14 @@ impl Core {
         Ok(outbox::notes(&landed))
     }
 
+    /// Whether merging world `b`, which changes `apply`, needs the person merging it to give the count of rows it
+    /// deletes (see `ConfirmDeletes`), counted from `apply` itself.
+    fn deletes_to_confirm(&self, b: &str, apply: &[Change]) -> Result<Option<ConfirmDeletes>> {
+        let Some((policy, over)) = self.confirm_deletes(b)? else { return Ok(None) };
+        let (_, deletes, _) = agents::counts(apply);
+        Ok((deletes > over).then_some(ConfirmDeletes { deletes, over, policy }))
+    }
+
     /// A dry run's plan (see `merge_preview`): every row the branch changed and what the merge
     /// would do with it, shown as JSON, and whether constraints would block it; and the parent
     /// as the merge would leave it.
@@ -5065,7 +5133,18 @@ impl Core {
             rows.push(Planned { key: c.key.clone(), outcome: "conflict", detail, base, ours, theirs, result: None });
         }
         rows.sort_by(|a, b| a.key.cmp(&b.key));
-        Ok((MergePlan { conflicts: conflicts.len(), rows, blocked, version: 0, target: 0, live: None }, next))
+        Ok((
+            MergePlan {
+                conflicts: conflicts.len(),
+                rows,
+                blocked,
+                version: 0,
+                target: 0,
+                live: None,
+                confirm_deletes: None,
+            },
+            next,
+        ))
     }
 
     /// Drops world `b` and what it changed; refused while it has forks of its own.

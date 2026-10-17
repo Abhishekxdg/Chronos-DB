@@ -387,6 +387,23 @@ impl Core {
     }
 }
 
+/// A person's merge of world `b`, which deletes `deletes` rows, refused for want of the count merge policy `policy`
+/// asks for above `over` (`given`: the count given, if one was).
+pub(crate) fn count_refused(b: &str, deletes: u64, policy: &str, over: u64, given: Option<u64>) -> Error {
+    let said = match given {
+        Some(g) => format!("CONFIRM DELETES {g} doesn't match: it deletes {deletes}"),
+        None => format!("it deletes {deletes} rows"),
+    };
+    Error::Constraint {
+        code: "55000",
+        message: format!(
+            "merging {b}: {said}, and merge policy {policy} has a person approve more than {over} deletes only by \
+             giving the count: MERGE WORLD {b} CONFIRM DELETES {deletes} (after reading them: DIFF WORLD {b}); \
+             nothing was merged"
+        ),
+    }
+}
+
 /// The error an agent's merge gets when its merge policy sends it to a person.
 pub(crate) fn needs_review(b: &str, policy: &str, reasons: &[String]) -> Error {
     refused(format!(
@@ -912,6 +929,9 @@ pub struct MergePolicy {
     pub rows_per_hour: Option<u64>,
     /// most rows an agent's merges into main may delete in an hour, this one's included
     pub deletes_per_hour: Option<u64>,
+    /// a merge deleting more rows than this waits for a person, who approves it only by giving the count it deletes
+    /// (`MERGE WORLD x CONFIRM DELETES n`): a big delete is approved by someone who read the number
+    pub confirm_deletes_over: Option<u64>,
     /// the oldest a world may be (ms since its fork) and still merge on its own
     pub max_age: Option<u64>,
     /// most effects one merge may queue (NOTIFY ON MERGE: see `outbox`)
@@ -1013,6 +1033,7 @@ impl MergePolicy {
                 "max_deletes" => self.max_deletes = limit()?,
                 "rows_per_hour" => self.rows_per_hour = limit()?,
                 "deletes_per_hour" => self.deletes_per_hour = limit()?,
+                "confirm_deletes_over" => self.confirm_deletes_over = limit()?,
                 "max_effects" => self.max_effects = limit()?,
                 "effects_per_hour" => self.effects_per_hour = limit()?,
                 "review_channels" => self.review_channels = list(k, v)?,
@@ -1037,7 +1058,7 @@ impl MergePolicy {
                 "require_scope" => self.require_scope = flag()?,
                 k => {
                     return Err(bad(format!(
-                        "merge policies have no setting {k} (max_rows, max_deletes, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, require_scope)"
+                        "merge policies have no setting {k} (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, require_scope)"
                     )));
                 }
             }
@@ -1049,6 +1070,7 @@ impl MergePolicy {
         json!({
             "max_rows": self.max_rows, "max_deletes": self.max_deletes, "tables": self.tables,
             "rows_per_hour": self.rows_per_hour, "deletes_per_hour": self.deletes_per_hour, "max_age": self.max_age,
+            "confirm_deletes_over": self.confirm_deletes_over,
             "max_effects": self.max_effects, "effects_per_hour": self.effects_per_hour,
             "review_channels": self.review_channels,
             "review_tables": self.review_tables, "review_columns": self.review_columns, "schema": self.schema, "overwrite": self.overwrite,
@@ -1068,6 +1090,7 @@ impl MergePolicy {
             max_deletes: j["max_deletes"].as_u64(),
             rows_per_hour: j["rows_per_hour"].as_u64(),
             deletes_per_hour: j["deletes_per_hour"].as_u64(),
+            confirm_deletes_over: j["confirm_deletes_over"].as_u64(),
             max_age: j["max_age"].as_u64(),
             max_effects: j["max_effects"].as_u64(),
             effects_per_hour: j["effects_per_hour"].as_u64(),
@@ -1225,6 +1248,12 @@ impl MergePolicy {
         }
         if let Some(n) = self.max_deletes.filter(|n| deletes > *n) {
             out.push(format!("deletes {deletes} rows (at most {n})"));
+        }
+        // (an agent can't give the count for itself: a person does, approving it)
+        if let Some(n) =
+            self.confirm_deletes_over.filter(|n| deletes > *n && self.max_deletes.is_none_or(|m| deletes <= m))
+        {
+            out.push(format!("deletes {deletes} rows (over {n}: a person approves it by giving the count)"));
         }
         if let Some(n) = self.max_effects.filter(|n| effects > *n) {
             out.push(format!("queues {effects} effects (at most {n})"));
@@ -1436,6 +1465,25 @@ impl Core {
         }
         let br = self.branch(&self.world(b)?.name)?;
         Ok(p.broken(&self.state_diff(&br.base(), &br.snapshot())?, 0))
+    }
+
+    /// The merge policy that asks a person merging world `b` to give the count of rows it deletes, and its
+    /// `confirm_deletes_over`: the policy the world's queue entry names (a merge held for review), else its owning
+    /// agent's. None: no count is asked.
+    pub(crate) fn confirm_deletes(&self, b: &str) -> Result<Option<(String, u64)>> {
+        let w = self.world(b)?;
+        let queued = w.meta.get(REVIEW).and_then(|r| r["policy"].as_str()).and_then(|p| self.policy(p).ok());
+        let owners = || -> Result<Option<MergePolicy>> {
+            match w.owner.as_deref().map(|o| self.agent(o)) {
+                Some(Ok(a)) => self.policy_of(&a),
+                _ => Ok(None),
+            }
+        };
+        let p = match queued {
+            Some(p) => Some(p),
+            None => owners()?,
+        };
+        Ok(p.and_then(|p| p.confirm_deletes_over.map(|n| (p.name, n))))
     }
 
     /// Agent `a`'s merge policy, if it has one.

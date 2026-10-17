@@ -1,6 +1,8 @@
 // Where the decision happens: what the active world changed since its fork (a per-table summary,
-// then the paged diff with only the changed columns, before → after), a dry-run preview with
-// conflicts explained and settled one by one, then Merge into <parent>, Discard, or Undo merge.
+// deletes first, then the paged diff: the rows it deletes first, in red with what they held, then the
+// rest with only the changed columns, before → after), a dry-run preview with conflicts explained and
+// settled one by one, then Merge into <parent>, Discard, or Undo merge. A merge whose policy asks for it
+// (confirm_deletes_over) is approved only by typing the number of rows it deletes.
 import { useEffect, useState } from 'react';
 import { api, type ApiError, type Change, type Reader, type Row } from '../api';
 import { useApp, worldOf, type App } from '../context';
@@ -27,6 +29,15 @@ interface Plan {
   version: number;
   /** the world merged into as this plan saw it: the picks settle against it */
   target: number;
+  /** the person merging it must type the number of rows it deletes (its merge policy's confirm_deletes_over) */
+  confirm_deletes?: { deletes: number; over: number; policy: string };
+}
+/** One table's rows deleted, updated and inserted: tables that delete most come first. */
+interface TableCounts {
+  table: string;
+  deleted: number;
+  updated: number;
+  inserted: number;
 }
 type Pick = 'ours' | 'theirs';
 
@@ -37,12 +48,16 @@ export function ChangesView() {
   const [counts, setCounts] = useState<{
     total: number;
     tables: Record<string, number>;
+    summary?: TableCounts[];
     readers?: Reader[];
     coverage?: string[];
     version?: number;
   } | null>(null);
   const [changes, setChanges] = useState<Change[]>([]);
   const [next, setNext] = useState<string | null>(null);
+  // the rows it deletes are read first (a page at a time), then the rest
+  const [deletes, setDeletes] = useState(true);
+  const [deleted, setDeleted] = useState(0);
   const [error, setError] = useState<unknown>(null);
   const [loading, setLoading] = useState(false);
   const [plan, setPlan] = useState<Plan | null>(null);
@@ -51,20 +66,29 @@ export function ChangesView() {
   // the version the review is of: the first page's. Later pages are read at it (refused if the world
   // changed since), and the merge merges it, so nothing merges that the pages didn't show
   const [reviewed, setReviewed] = useState<number | null>(null);
-  const page = async (after: string | null) => {
+  const page = async (after: string | null, dels: boolean, pinned: number | null, start = false) => {
     setLoading(true);
     try {
       const r = await api<{ changes: Change[]; next: string | null; version: number }>('diff', {
         branch: app.world,
         limit: PAGE,
         after,
-        version: after ? reviewed : undefined,
+        deletes: dels,
+        version: start ? undefined : pinned,
       });
-      setChanges((c) => [...(after ? c : []), ...r.changes]);
+      setChanges((c) => [...(start ? [] : c), ...r.changes]);
+      if (dels) setDeleted((n) => (start ? 0 : n) + r.changes.length);
+      if (start) setReviewed(r.version);
+      const version = start ? r.version : pinned;
+      setDeletes(dels);
       setNext(r.next);
-      if (!after) setReviewed(r.version);
+      // the deletes all read: on to the other changes
+      if (dels && !r.next) {
+        setLoading(false);
+        return page(null, false, version);
+      }
     } catch (e) {
-      if ((e as ApiError).status === 409 && after) return again();
+      if ((e as ApiError).status === 409 && !start) return again();
       setError(e);
     }
     setLoading(false);
@@ -72,7 +96,7 @@ export function ChangesView() {
   const load = () => {
     setPlan(null);
     api('diff', { branch: app.world, count: true, readers: true }).then(setCounts, setError);
-    page(null);
+    page(null, true, null, true);
   };
   // written to (or partly merged) since the review started: start it again, as the world is now
   const again = () => {
@@ -122,10 +146,21 @@ export function ChangesView() {
     if (reviewed === null) return toast('Still reading the changes');
     if (plan && plan.version !== reviewed) return again(); // the preview is of a later version than the pages
     const live = parent === 'main' ? ' (the live data)' : '';
+    // a merge its policy says deletes too many rows to approve unread: the count, counted by the merge itself
+    let confirm = plan?.confirm_deletes;
+    if (!plan) {
+      try {
+        confirm = (await api<Plan>('merge', { branch: app.world, dry_run: true })).confirm_deletes;
+      } catch {
+        // (the merge itself says what's wrong)
+      }
+    }
+    const dels = confirm ? ` It deletes ${n(confirm.deletes)} rows: merge policy ${confirm.policy} asks you to type that number to approve it.` : '';
     const ok = await dlg.confirm(
       `Merge into ${parent}?`,
-      `${counts ? plural(counts.total, 'change') : 'The changes'} from ${app.world} go into ${parent}${live}, and ${app.world} closes. You can undo the merge afterwards.`,
+      `${counts ? plural(counts.total, 'change') : 'The changes'} from ${app.world} go into ${parent}${live}, and ${app.world} closes. You can undo the merge afterwards.${dels}`,
       `Merge into ${parent}`,
+      confirm ? { danger: true, typed: String(confirm.deletes) } : undefined,
     );
     if (!ok) return;
     setBusy(true);
@@ -137,6 +172,7 @@ export function ChangesView() {
         version: reviewed,
         target: plan?.target, // the picks were chosen against the parent as the preview saw it
         picks,
+        confirm_deletes: confirm?.deletes,
       });
       await app.drawBack(app.world);
       const rows = counts?.total ?? r.merged; // what the user reviewed (the merge also counts index entries)
@@ -156,6 +192,8 @@ export function ChangesView() {
     }
   };
   const tables = Object.entries(counts?.tables || {});
+  const kinds = counts?.summary || [];
+  const deletedTotal = kinds.reduce((t, k) => t + k.deleted, 0);
   const conflicts = plan?.rows.filter((r) => r.outcome === 'conflict') || [];
   const pickAll = (s: Pick) => setPicks(Object.fromEntries(conflicts.map((c) => [c.key, s])));
   return (
@@ -178,11 +216,17 @@ export function ChangesView() {
             ) : (
               <>
                 <span className="muted">{plural(counts.total, 'change')}:</span>
-                {tables.map(([t, k]) => (
-                  <span className="t" key={t}>
-                    {t} <b>{n(k)}</b>
-                  </span>
-                ))}
+                {kinds.length
+                  ? kinds.map((k) => (
+                      <span className={'t' + (k.deleted ? ' has-del' : '')} key={k.table}>
+                        {k.table} <b className={k.deleted ? 'del' : ''}>{n(k.deleted)} deleted</b>, <b>{n(k.updated)}</b> updated, <b>{n(k.inserted)}</b> inserted
+                      </span>
+                    ))
+                  : tables.map(([t, k]) => (
+                      <span className="t" key={t}>
+                        {t} <b>{n(k)}</b>
+                      </span>
+                    ))}
               </>
             )}
           </div>
@@ -254,20 +298,35 @@ export function ChangesView() {
               )}
             </div>
           )}
-          {changes.length > 0 && (
-            <div className="changes">
-              {changes.map((c) => (
-                <ChangeRow key={c.key} c={c} />
-              ))}
-            </div>
+          {deleted > 0 && (
+            <>
+              <h3 className="label del">
+                Deleted: {n(deletedTotal || deleted)} {deletedTotal === 1 ? 'row' : 'rows'}
+              </h3>
+              <div className="changes deleted">
+                {changes.slice(0, deleted).map((c) => (
+                  <ChangeRow key={c.key} c={c} />
+                ))}
+              </div>
+            </>
+          )}
+          {changes.length > deleted && (
+            <>
+              {deleted > 0 && <h3 className="label">Other changes</h3>}
+              <div className="changes">
+                {changes.slice(deleted).map((c) => (
+                  <ChangeRow key={c.key} c={c} />
+                ))}
+              </div>
+            </>
           )}
           {loading ? (
             <p className="note">Loading…</p>
           ) : (
             next && (
               <div>
-                <button className="btn" type="button" onClick={() => page(next)}>
-                  Load {PAGE} more
+                <button className="btn" type="button" onClick={() => page(next, deletes, reviewed)}>
+                  Load {PAGE} more {deletes ? 'deleted rows' : ''}
                 </button>
               </div>
             )
@@ -355,12 +414,13 @@ const Pair = ({ k, before, after }: { k: string; before: unknown; after: unknown
 );
 
 function ChangeRow({ c }: { c: Change }) {
-  const [cls, label] = !c.before ? ['add', 'added'] : !c.after ? ['del', 'removed'] : ['chg', 'changed'];
+  const [cls, label] = !c.before ? ['add', 'added'] : !c.after ? ['del', 'deleted'] : ['chg', 'changed'];
   const row = (c.after || c.before) as Row;
-  const [open, setOpen] = useState(false);
+  // a deleted row shows every value it held, struck through: what goes is read, not summed up
+  const [open, setOpen] = useState(cls === 'del');
   const fields = Object.entries(row).filter(([, v]) => v !== null && v !== '');
   return (
-    <div className="change">
+    <div className={'change' + (cls === 'del' ? ' deleted' : '')}>
       <div className="key">
         <span className="id" title={c.key}>
           {c.key}

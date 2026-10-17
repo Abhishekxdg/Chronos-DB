@@ -584,6 +584,9 @@ button.col-line:hover { background: var(--hover); }
 .summary { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .summary .t { font-family: var(--mono); font-size: 12px; padding: 3px 8px; border-radius: var(--r); background: var(--surface); border: 1px solid var(--line); }
 .summary .t b { font-variant-numeric: tabular-nums; }
+.summary .t.has-del { border-color: var(--del); }
+.summary .t b.del, .label.del { color: var(--del); }
+.change.deleted { background: var(--del-soft); box-shadow: inset 3px 0 0 var(--del); }
 .changes { border: 1px solid var(--line); border-radius: var(--r-panel); background: var(--surface); overflow: hidden; }
 .change { display: grid; grid-template-columns: minmax(140px, 220px) 1fr; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
 .change:last-child { border-bottom: 0; }

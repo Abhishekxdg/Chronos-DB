@@ -96,6 +96,7 @@ Every rule is optional. A rule left out doesn't limit anything, except `schema` 
 | `max_deletes` | it deletes more rows than this; `0` means any delete | no limit |
 | `rows_per_hour` | together with the agent's other merges into `main` in the last hour, it changes more rows than this | no limit |
 | `deletes_per_hour` | together with the agent's other merges into `main` in the last hour, it deletes more rows than this | no limit |
+| `confirm_deletes_over` | it deletes more rows than this; and the person approving it must type the count (below) | no count asked |
 | `max_age` | its world was forked longer ago than this (`'1h'`): the longer a world stays open, the more its merge rests on what it read long ago | no limit |
 | `max_effects` | it queues more effects than this: the emails, webhooks and payments `NOTIFY ON MERGE` sends once the merge lands (a merge that changes one row can queue a thousand) | no limit |
 | `effects_per_hour` | together with the agent's other merges into `main` in the last hour, it queues more effects than this | no limit |
@@ -198,10 +199,10 @@ show reviews;
 ```
 
 ```
-   world    | owner | policy  |              reasons               |           asked            | version | changed_since | scope
-------------+-------+---------+------------------------------------+----------------------------+---------+---------------+-------
- bot_bulk   | bot   | careful | changes 6 rows (at most 3)         | 2026-09-27 16:19:35.137+00 |       1 | f             |
- bot_refund | bot   | careful | changes payments (always reviewed) | 2026-09-27 16:19:35.141+00 |       1 | f             |
+   world    | owner | policy  |              reasons               |           asked            | version | changed_since | scope |                    changes
+------------+-------+---------+------------------------------------+----------------------------+---------+---------------+-------+------------------------------------------------
+ bot_bulk   | bot   | careful | changes 6 rows (at most 3)         | 2026-09-27 16:19:35.137+00 |       1 | f             |       | orders: 0 deleted, 6 updated, 0 inserted
+ bot_refund | bot   | careful | changes payments (always reviewed) | 2026-09-27 16:19:35.141+00 |       1 | f             |       | payments: 0 deleted, 0 updated, 1 inserted
 ```
 
 Oldest first. Look at a merge as you would any world, then approve it by merging, or reject it by dropping:
@@ -213,6 +214,8 @@ drop world bot_bulk;         -- reject
 show reviews;                -- (0 rows)
 ```
 
+- **Read what goes first:** `SHOW REVIEWS`' `changes` column, `DIFF WORLD` and `MERGE ... DRY RUN` lead with what each table loses (`leads: 4,812 deleted, 69 updated, 0 inserted`), the tables that delete most first, and list the deleted rows before the other changes. The Studio's Changes view does the same, the deleted rows in red with what they held.
+- **Give the count for a big delete:** with `confirm_deletes_over = 100`, a merge deleting more than 100 rows waits for a person, and the person approves it only by giving the number: `merge world bot_cleanup confirm deletes 4812`. Without it, or with another number, the merge is refused and says the real count. The count comes from the merge itself, not from the agent; an agent can't give it for its own merge. (Updates that null out a column across many rows are as destructive and look harmless in a count: a check for them is a later change.)
 - **Approve what you read:** `merge world bot_refund at version 1` (the `version` column) merges only if the world is still as you read it; if the agent wrote to it since, or part of it was merged, nothing merges (55000) and you read the diff again. If `changed_since` is already `t`, read the diff before approving. Over HTTP, `merge` takes the same `version` (`409` otherwise), and `diff` and a `dry_run` return it.
 - **Approve part of it:** `MERGE WORLD bot_bulk ONLY TABLES (orders)` or `ONLY KEYS ('orders/1', ...)` merges some rows and leaves the world open with the rest.
 - **The agent can't skip the queue:** its queue entry is in the world's metadata under a key only the database sets. The agent can't remove it, and can't merge the world until a person does, or until it fits the rules.

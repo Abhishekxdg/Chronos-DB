@@ -49,7 +49,7 @@ merge agent-8 theirs
     assert!(out.contains("role  string  one of: \"admin\", \"user\""), "describe spots enums:\n{out}");
     assert!(out.contains("forked main -> agent-7; now on agent-7"), "{out}");
     assert!(out.contains(r#"~ users/1  name: "Ada" -> "Ada L.""#), "field-level diff:\n{out}");
-    assert!(out.contains("- users/2"), "{out}");
+    assert!(out.contains("- DELETE users/2"), "{out}");
     assert!(out.contains("merged 2 changes from agent-7 into main; now on main"), "{out}");
     assert!(err.contains("1 conflict: both agent-8 and main changed these rows"), "{err}");
     assert!(err.contains("resolve with: merge agent-8 ours"), "conflicts say how to fix:\n{err}");
@@ -496,7 +496,7 @@ diff
     assert!(lines[at("put docs/4") + 1] == "1 match", "only the core doc with billing:\n{out}");
     assert!(out.contains("0 matches"), "words no row has match nothing:\n{out}");
     assert!(out.contains("3 matches"), "filters alone count every row that passes:\n{out}");
-    let diff: Vec<&str> = lines[at("4 changes on f") + 1..]
+    let diff: Vec<&str> = lines[at("4 changes on f (users: 0 deleted, 0 updated, 4 inserted)") + 1..]
         .iter()
         .take_while(|l| !l.starts_with("(at version"))
         .map(|l| l.split("  ").next().unwrap())

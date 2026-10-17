@@ -404,8 +404,12 @@ fn call(sh: &mut Shell, g: &mut Guard, name: &str, a: &Value) -> Result<String, 
                 // how big the change is, per table, without reading it into memory
                 let b = word("branch")?;
                 let tables = sh.db.diff_count(b, opt("to")).map_err(|e| e.to_string())?;
+                let kinds = sh.db.diff_kinds(b, opt("to")).map_err(|e| e.to_string())?;
+                // per table, deletes first: `leads: 4,812 deleted, 69 updated, 0 inserted`
+                let summary = chronos::sql::summary(kinds);
                 let per: Vec<String> = tables.iter().map(|(t, n)| format!("{t}: {n}")).collect();
-                return Ok(format!("{} changes on {b} ({})", tables.values().sum::<usize>(), per.join(", ")));
+                let summary = if summary.is_empty() { per.join(", ") } else { summary };
+                return Ok(format!("{} changes on {b} ({summary})", tables.values().sum::<usize>()));
             }
             if let Some(after) = a.get("after").and_then(Value::as_str) {
                 // a page after a cursor: reads only this page, in storage key order
@@ -509,7 +513,7 @@ fn call(sh: &mut Shell, g: &mut Guard, name: &str, a: &Value) -> Result<String, 
             .sql_as(&format!("rebase world {}", merge_clauses(word("branch")?, a)?), &[], g.agent.as_deref())
             .map(no_cursor),
         "merge"
-            if ["by_columns", "rows", "into", "only_tables", "only_keys", "version", "target"]
+            if ["by_columns", "rows", "into", "only_tables", "only_keys", "version", "target", "confirm_deletes"]
                 .iter()
                 .any(|k| a.get(*k).is_some()) =>
         {
@@ -706,7 +710,7 @@ fn policy_sql(db: &chronos::Db, tool: &str, name: &str, a: &Value) -> Result<Str
     for (k, v) in &rules {
         if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(format!(
-                "'{k}' isn't a rule (max_rows, max_deletes, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, require_scope)"
+                "'{k}' isn't a rule (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, require_scope)"
             ));
         }
         let v = match v {
@@ -825,6 +829,13 @@ fn merge_clauses(branch: &str, a: &Value) -> Result<String, String> {
         None | Some(Value::Null) => {}
         Some(v) => q.push_str(&format!(" target {}", v.as_u64().ok_or("'target' must be a whole number")?)),
     }
+    match a.get("confirm_deletes") {
+        None | Some(Value::Null) => {}
+        Some(v) => q.push_str(&format!(
+            " confirm deletes {}",
+            v.as_u64().ok_or("'confirm_deletes' must be the number of rows the merge deletes")?
+        )),
+    }
     Ok(q)
 }
 
@@ -899,6 +910,7 @@ fn tools(hidden: &[&str]) -> Value {
             "check_reads": { "type": "boolean", "description": "Keep what its worlds read, and hold a merge whose reads changed since the fork (default false)" },
             "rows_per_hour": { "type": ["integer", "null"], "description": "Most rows one agent's merges into main may change in an hour, together (null: no limit)" },
             "deletes_per_hour": { "type": ["integer", "null"], "description": "Most rows one agent's merges into main may delete in an hour, together (null: no limit)" },
+            "confirm_deletes_over": { "type": ["integer", "null"], "description": "A merge deleting more rows than this waits for a person, who approves it only by giving the count (MERGE WORLD x CONFIRM DELETES n)" },
             "max_age": { "type": ["string", "integer", "null"], "description": "The oldest a branch may be and still merge on its own, e.g. \"1h\" (older ones wait for a person)" },
             "require_scope": { "type": "boolean", "description": "Its agents must say what a world may change (meta may_change or tenant) when forking it (default false)" },
             "max_effects": { "type": ["integer", "null"], "description": "Most effects (NOTIFY ON MERGE: emails, webhooks) one merge may queue (null: no limit)" },
@@ -1023,6 +1035,7 @@ fn tools(hidden: &[&str]) -> Value {
                 "confirm": { "type": "boolean", "description": "After a crash, merge the branch as it is now; check its diff first, since some of its writes may be lost" },
                 "version": { "type": "integer", "description": "Merge only if the branch is still at this version (the one merge_preview or the review showed): what was reviewed is what merges" },
                 "target": { "type": "integer", "description": "With rows settled (resolve, by_columns, rows): the target merge_preview named, so they settle against the parent as the preview saw it (refused if it changed)" },
+                "confirm_deletes": { "type": "integer", "description": "For a person approving a merge whose merge policy has confirm_deletes_over: the number of rows it deletes, as merge_preview counts them (a wrong count is refused with the real one; an agent's own merge goes to review instead)" },
             }),
             &["branch"],
         ),

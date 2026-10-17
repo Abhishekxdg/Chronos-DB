@@ -216,6 +216,8 @@ Rows:
 | `after` | jsonb | the row after, or null |
 | `columns` | jsonb | the columns that changed; for a table, what changed in it (`"+email text"`, `"-age"`) |
 
+Destructive first: a NOTICE leads with what each table loses, the tables that delete most first (`agent_7: leads: 4,812 deleted, 69 updated, 0 inserted; notes: 0 deleted, 1 updated, 1 inserted`), and the rows deleted come before the other changes (each part in key order). With `LIMIT n`, a page stays in key order, so the next one can start after its last key.
+
 With `AS SQL`: one column, `sql` (text), one statement per row (`INSERT`, `UPDATE`, `DELETE`, `CREATE`/`ALTER TABLE`, ...). Run them on the other side to make the same change.
 
 ```sql
@@ -282,6 +284,7 @@ MERGE BRANCH [name] [clause ...]
 | `BY COLUMNS` | a row both sides changed merges column by column; only a column both changed conflicts. A table set `ALTER TABLE t SET (merge_by_columns = true)` merges this way in every merge into a world that has the setting |
 | `RESOLVE ('t/1' = OURS \| THEIRS \| DELETE \| '<row as JSON>', ...)` | settle rows one by one |
 | `CONFIRM` | after a crash: merge the world as it is now (check `DIFF` first) |
+| `CONFIRM DELETES n` | the number of rows the merge deletes, given by the person approving it when the world's merge policy has `confirm_deletes_over` and the merge deletes more (see [merge policies](#merge-policies)); a missing or wrong count is refused (55000) with the real one. Not the same as `CONFIRM`; both may be given |
 | `TARGET n` | with rows settled by `USING`, `BY COLUMNS` or `RESOLVE`: merge only if the world merged into is as the `DRY RUN` that named `n` saw it (its NOTICE does), so the settling can't overwrite a change made there since (55000 otherwise). Not with `REBASE` |
 | `AT VERSION n` | merge only if the world is still at version `n`: the version a person reviewed (`SHOW REVIEWS`, a `DRY RUN`'s notice, HTTP `diff`). Written to or partly merged since, the merge is refused (55000) and nothing merges. Not with `CONFIRM` |
 | `DRY RUN` | change nothing; see [below](#merge-dry-run) |
@@ -299,7 +302,7 @@ Returns tag `MERGE n`, n the rows applied.
 | 23505 | both sides added rows with the same unique values |
 | 23503 / 23514 | the merged result breaks a foreign key or `CHECK` |
 | 22023 | `INTO` itself; `ONLY KEYS` given something that isn't `'table/id'`; a row tied (unique value or reference) to one left out; a row of a table the world changed itself (use `ONLY TABLES`) |
-| 55000 | the world was open when the database crashed: `CONFIRM` after checking `DIFF`, or drop it; or `AT VERSION n` and the world isn't at `n` |
+| 55000 | the world was open when the database crashed: `CONFIRM` after checking `DIFF`, or drop it; or `AT VERSION n` and the world isn't at `n`; or its merge policy asks for `CONFIRM DELETES n` and the count is missing or wrong |
 | 0A000 | main has no parent |
 | 3D000 | no such world |
 
@@ -332,6 +335,8 @@ What the merge would do with the same clauses, row by row. Changes nothing.
 | `theirs` | jsonb | the parent's (or `INTO` world's) row |
 | `result` | jsonb | the row after the merge; null for a conflict |
 | `postgres` | jsonb | in a folder [attached to Postgres](../guides/attach-postgres.md#dry-run-against-live-postgres), a merge into main: the row as Postgres has it now (null: no row there, or not attached) |
+
+Destructive first: the plan leads with a row per table, outcome `summary`, whose `detail` counts what the merge does to it (`4,812 deleted, 69 updated, 0 inserted`; the tables that delete most first; rows that conflict aren't counted). Then the rows it deletes, with `detail` `DELETE: the merge deletes this row`, then the rest. When the world's merge policy has `confirm_deletes_over` and the merge deletes more, a NOTICE gives the `CONFIRM DELETES n` that approves it.
 
 A last row with outcome `blocked` (and null `table`) means constraints would refuse the merge; `detail` says why.
 
@@ -654,10 +659,12 @@ DROP MERGE POLICY name [CASCADE]                    -- refused (22023) while an 
 SHOW MERGE POLICIES                                 -- name, max_rows, max_deletes, tables, review_tables, review_columns,
                                                     -- schema, overwrite, critical, check_reads, require_scope,
                                                     -- rows_per_hour, deletes_per_hour, max_age, created,
-                                                    -- max_effects, effects_per_hour, review_channels
+                                                    -- max_effects, effects_per_hour, review_channels,
+                                                    -- confirm_deletes_over
 SHOW REVIEWS                                        -- world, owner, policy, reasons, asked, version,
                                                     -- changed_since (written to, or partly merged, since the agent asked),
-                                                    -- scope (what the world was forked to change)
+                                                    -- scope (what the world was forked to change),
+                                                    -- changes (per table: deleted, updated, inserted; deletes first)
 ALTER AGENT name SET (policy = 'name')              -- or policy = null
 ```
 
@@ -667,6 +674,7 @@ ALTER AGENT name SET (policy = 'name')              -- or policy = null
 | `max_deletes` | it deletes more rows than this (`0`: any delete, the recommended start for any agent) | `null` (no limit) |
 | `rows_per_hour` | it's a merge into `main`, and with the agent's other merges into `main` in the last hour it changes more rows than this | `null` (no limit) |
 | `deletes_per_hour` | likewise for deleted rows (`50`: at most 50 deletes an hour, however the job is split) | `null` (no limit) |
+| `confirm_deletes_over` | it deletes more rows than this. And the person approving it must give the count: `MERGE WORLD x CONFIRM DELETES 4812`, counted from the merge's own plan; a missing or wrong count is refused (55000) with the real one, before anything is written (to Postgres too, in an [attached folder](../guides/attach-postgres.md)). It applies to a person merging a world queued under this policy, or owned by an agent keeping to it; an agent's own count doesn't count | `null` (no count asked) |
 | `max_age` | the world was forked longer ago than this (`'1h'`, `'30 minutes'`, or ms): its merge rests on what it read then | `null` (no limit) |
 | `max_effects` | it queues more effects than this (`NOTIFY ON MERGE`: the emails, webhooks and payments that happen once it lands; see the [outbox](../sql.md#effects-on-merge-notify-on-merge-and-the-outbox)) | `null` (no limit) |
 | `effects_per_hour` | it's a merge into `main`, and with the agent's other merges into `main` in the last hour it queues more effects than this | `null` (no limit) |

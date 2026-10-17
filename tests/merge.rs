@@ -44,8 +44,15 @@ fn dry_run_explains_and_changes_nothing() {
     let plan = q(&db, MAIN, "merge world x dry run");
     let cols: Vec<String> = plan.columns.clone().unwrap().into_iter().map(|c| c.0).collect();
     assert_eq!(cols, ["table", "id", "outcome", "detail", "base", "ours", "theirs", "result", "postgres"]);
-    let got: Vec<String> =
-        plan.rows.iter().map(|r| format!("{}: {} ({})", r[1].to_text(), r[2].to_text(), r[3].to_text())).collect();
+    // (led by a line per table: rows deleted, updated, inserted)
+    assert_eq!(plan.rows[0][2].to_text(), "summary");
+    assert_eq!(plan.rows[0][3].to_text(), "0 deleted, 1 updated, 0 inserted");
+    let got: Vec<String> = plan
+        .rows
+        .iter()
+        .filter(|r| r[2].to_text() != "summary")
+        .map(|r| format!("{}: {} ({})", r[1].to_text(), r[2].to_text(), r[3].to_text()))
+        .collect();
     assert_eq!(
         got,
         [
@@ -65,7 +72,7 @@ fn dry_run_explains_and_changes_nothing() {
 
     // by columns, a is combined; b and d still need a choice
     let plan = q(&db, MAIN, "merge world x by columns dry run");
-    let a = &plan.rows[0];
+    let a = plan.rows.iter().find(|r| r[2].to_text() != "summary").unwrap();
     assert_eq!(a[2].to_text(), "by columns");
     let result = a[7].to_text();
     assert!(result.contains("\"name\": \"Ada L.\"") && result.contains("\"email\": \"ada@y\""), "{result}");

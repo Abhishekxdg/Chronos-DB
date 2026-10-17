@@ -230,7 +230,7 @@ What changed on a branch since it was forked, row by row and field by field: the
 | `limit` | integer | no | 20 |
 | `offset` | integer | no | 0 |
 
-Without `to`: `2 changes on task-1`, then one line per change, `+ table/id  {row}`, `- table/id`, or `~ table/id  field: old -> new`. With `to`, the table from [`DIFF ... TO`](worlds.md#diff). A longer diff ends with `(showing changes 1-20 of 57; call diff again with offset=20 for the next ones)`.
+Without `to`: `2 changes on task-1 (leads: 1 deleted, 1 updated, 0 inserted)`, what each table loses first, then one line per change, the deleted rows first with what they held: `- DELETE table/id  {row}`, then `+ table/id  {row}` or `~ table/id  field: old -> new`. With `count: true`, the same per-table line alone. With `to`, the table from [`DIFF ... TO`](worlds.md#diff). A longer diff ends with `(showing changes 1-20 of 57; call diff again with offset=20 for the next ones)`.
 
 ### history
 
@@ -266,6 +266,7 @@ Applies a branch's changes to its parent and deletes the branch. If rows both si
 | `confirm` | boolean | no | `false`; after a crash, merge the flagged branch as it is now (check its `diff` first) |
 | `version` | integer | no | none; merge only if the branch is still at this version (what `merge_preview` or `reviews` showed), refused otherwise |
 | `target` | integer | no | none; with rows settled (`resolve`, `by_columns`, `rows`), the target `merge_preview` named: refused if the parent changed since |
+| `confirm_deletes` | integer | no | none; for a person approving a merge whose merge policy has `confirm_deletes_over`: the number of rows it deletes (`merge_preview` gives it). A wrong count is refused with the real one; an agent's own merge goes to review instead |
 
 Returns `merged 1 change from task-1 into main`. `confirm` applies to a plain merge only: it's ignored when `into`, `only_tables`, `only_keys`, `by_columns`, `rows` or `version` is given.
 
@@ -285,7 +286,7 @@ Returns `REBASE n`, n the parent's rows it took in.
 
 ### merge_preview
 
-What `merge` would do with the same parameters, without doing it: per row, whether it applies or conflicts and why, with the fork point's, the branch's and the parent's versions. Runs [`MERGE ... DRY RUN`](worlds.md#merge-dry-run); its columns are `table`, `id`, `outcome`, `detail`, `base`, `ours`, `theirs`, `result`, `postgres`. In a folder attached to Postgres, a merge into main is checked against Postgres as it is now too (read only, rolled back): `postgres` is each row as Postgres has it, a row changed there since the copy has outcome `changed in postgres`, and a row with outcome `postgres` says when it was read. Then `What reads the changed columns:` and the table from [`DIFF ... READERS`](worlds.md#diff--readers) for the branch, and the branch's version: pass it as `version` with later pages (`offset`), which are refused if the branch changed since, and with `merge`, which then merges exactly what the pages showed.
+What `merge` would do with the same parameters, without doing it: per row, whether it applies or conflicts and why, with the fork point's, the branch's and the parent's versions. Runs [`MERGE ... DRY RUN`](worlds.md#merge-dry-run); its columns are `table`, `id`, `outcome`, `detail`, `base`, `ours`, `theirs`, `result`, `postgres`. It leads with a row per table (outcome `summary`: `150 deleted, 1 updated, 1 inserted`), then the rows it deletes (`DELETE: the merge deletes this row`), then the rest. In a folder attached to Postgres, a merge into main is checked against Postgres as it is now too (read only, rolled back): `postgres` is each row as Postgres has it, a row changed there since the copy has outcome `changed in postgres`, and a row with outcome `postgres` says when it was read. Then `What reads the changed columns:` and the table from [`DIFF ... READERS`](worlds.md#diff--readers) for the branch, and the branch's version: pass it as `version` with later pages (`offset`), which are refused if the branch changed since, and with `merge`, which then merges exactly what the pages showed.
 
 | Parameter | Type | Required | Default |
 |---|---|---|---|
@@ -419,7 +420,7 @@ Removes a merge policy. Refused while an agent keeps to it, unless `release_agen
 
 ### reviews
 
-Merges a policy sent to a person, oldest first: `world`, `owner`, `policy`, `reasons`, `asked`, `version`, `changed_since` (the branch was written to, or partly merged, after its agent asked). A person approves with `merge` (or `MERGE WORLD`), or throws it away with `discard`. No parameters. Runs [`SHOW REVIEWS`](worlds.md#merge-policies).
+Merges a policy sent to a person, oldest first: `world`, `owner`, `policy`, `reasons`, `asked`, `version`, `changed_since` (the branch was written to, or partly merged, after its agent asked), `scope`, `changes` (per table, deleted, updated and inserted, deletes first). A person approves with `merge` (or `MERGE WORLD`), or throws it away with `discard`. No parameters. Runs [`SHOW REVIEWS`](worlds.md#merge-policies).
 
 ### merge_checks
 

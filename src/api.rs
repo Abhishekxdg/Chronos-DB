@@ -742,9 +742,16 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                 None | Some(Value::Null) => None,
                 Some(v) => Some(v.as_str().ok_or_else(|| bad("'after' must be the 'next' of a previous page"))?),
             };
+            // per table, with what it deletes, updates and inserts ("kinds"), tables that delete most first
+            // ("summary"): what a review leads with
             let total = |db: &Db| -> Result<Value, Error> {
                 let tables = db.diff_count(b, s("to"))?;
-                Ok(json!({ "total": tables.values().sum::<usize>(), "tables": tables }))
+                let kinds = chronos::sql::by_deletes(db.diff_kinds(b, s("to"))?);
+                let summary: Vec<Value> = kinds
+                    .iter()
+                    .map(|(t, c)| json!({ "table": t, "deleted": c.deleted, "updated": c.updated, "inserted": c.inserted }))
+                    .collect();
+                Ok(json!({ "total": tables.values().sum::<usize>(), "tables": tables, "summary": summary }))
             };
             // "version": the branch's, read first, so merging at it merges no more than this shows
             let version = match s("to") {
@@ -813,7 +820,12 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                 if a.get("sql").and_then(Value::as_bool) == Some(true) {
                     return Err(bad("'sql' can't be paged; leave out 'limit' and 'after'"));
                 }
-                let (changes, next) = db.diff_page(b, s("to"), after, limit.unwrap_or(usize::MAX))?;
+                // "deletes": true pages through only the rows deleted, false only the others (deletes first)
+                let deletes = match a.get("deletes") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(v.as_bool().ok_or_else(|| bad("'deletes' must be true or false"))?),
+                };
+                let (changes, next) = db.diff_page_of(b, s("to"), after, limit.unwrap_or(usize::MAX), deletes)?;
                 unchanged(db)?; // and not while it was read
                 let mut out = json!({ "changes": show(&changes), "next": next });
                 if count {
@@ -891,15 +903,32 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                 into,
                 // "target": a dry run's, so rows settled are settled against what it saw (409 otherwise)
                 target: a.get("target").and_then(Value::as_u64),
+                // "confirm_deletes": the rows it deletes, as the person approving read them (a policy's
+                // confirm_deletes_over asks for it; a wrong count is refused with the real one)
+                confirm_deletes: a.get("confirm_deletes").and_then(Value::as_u64),
             };
             if a.get("dry_run").and_then(Value::as_bool) == Some(true) {
                 let plan = db.merge_preview(b, &o)?;
-                let rows: Vec<Value> = plan
-                    .rows
+                // the rows it deletes first, marked ("delete": true), then the rest
+                let mut ordered: Vec<&chronos::Planned> = plan.rows.iter().collect();
+                let deletes = |p: &chronos::Planned| {
+                    p.outcome != "conflict" && p.result.is_none() && p.theirs.is_some() && !p.key.starts_with("_sonos_")
+                };
+                ordered.sort_by_key(|&p| !deletes(p));
+                let mut by_table: std::collections::BTreeMap<String, chronos::sql::Counts> = Default::default();
+                for p in plan.rows.iter().filter(|p| p.outcome != "conflict" && p.result != p.theirs) {
+                    let t = p.key.split_once('/').map_or(p.key.as_str(), |(t, _)| t);
+                    by_table.entry(t.to_string()).or_default().add(p.theirs.is_some(), p.result.is_some());
+                }
+                let summary: Vec<Value> = chronos::sql::by_deletes(by_table)
                     .iter()
+                    .map(|(t, c)| json!({ "table": t, "deleted": c.deleted, "updated": c.updated, "inserted": c.inserted }))
+                    .collect();
+                let rows: Vec<Value> = ordered
+                    .into_iter()
                     .map(|p| {
                         json!({
-                            "key": chronos::sql::show_key(&p.key), "outcome": p.outcome, "detail": p.detail,
+                            "key": chronos::sql::show_key(&p.key), "outcome": p.outcome, "detail": p.detail, "delete": deletes(p),
                             "base": p.base.as_deref().map(row), "ours": p.ours.as_deref().map(row),
                             "theirs": p.theirs.as_deref().map(row), "result": p.result.as_deref().map(row),
                         })
@@ -915,7 +944,11 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                 };
                 let i = chronos::sql::impact(db, &target, &changes).map_err(|e| bad(e.message))?;
                 // "version": pass it back to merge only what this showed (409 if the branch changed since)
-                let mut out = json!({ "rows": rows, "conflicts": plan.conflicts, "blocked": plan.blocked, "version": plan.version, "target": plan.target });
+                let mut out = json!({ "rows": rows, "summary": summary, "conflicts": plan.conflicts, "blocked": plan.blocked, "version": plan.version, "target": plan.target });
+                // the person merging it gives the count of rows it deletes (its policy's confirm_deletes_over)
+                if let Some(c) = &plan.confirm_deletes {
+                    out["confirm_deletes"] = json!({ "deletes": c.deletes, "over": c.over, "policy": c.policy });
+                }
                 // into main of a folder attached to Postgres: the rows it would write, as Postgres has them now
                 if let Some(l) = &plan.live {
                     out["postgres"] = json!({

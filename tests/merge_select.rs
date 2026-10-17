@@ -13,6 +13,11 @@ fn fails(db: &Db, world: &str, sql: &str) -> chronos::sql::SqlError {
     chronos::sql::run(db, world, sql, &[]).err().unwrap_or_else(|| panic!("{sql} should fail"))
 }
 
+/// A dry run's rows without the line per table it leads with.
+fn plan_rows(o: &Output) -> Vec<String> {
+    rows(o).into_iter().filter(|r| !r.contains("|summary|")).collect()
+}
+
 fn rows(o: &Output) -> Vec<String> {
     o.rows
         .iter()
@@ -58,7 +63,7 @@ fn part_then_the_rest_without_false_conflicts() {
 
     // main now holds x's values for t: they aren't conflicts, they're merged
     q(&db, MAIN, "insert into t values (3, 'three')");
-    assert_eq!(rows(&q(&db, MAIN, "merge world x dry run")).len(), 1);
+    assert_eq!(plan_rows(&q(&db, MAIN, "merge world x dry run")).len(), 1);
     assert_eq!(q(&db, MAIN, "merge world x").tag, "MERGE 1");
     assert!(db.world("x").is_err(), "merging the rest finishes it");
     assert_eq!(rows(&q(&db, MAIN, "select v from u")), ["UNO"]);
@@ -111,7 +116,7 @@ fn into_another_world() {
     db.fork(MAIN, "y").unwrap();
     q(&db, "y", "update u set v = 'y' where id = 1");
     // y changed u/1 since x forked: a conflict; t merges cleanly
-    let plan = rows(&q(&db, MAIN, "merge world x into y dry run"));
+    let plan = plan_rows(&q(&db, MAIN, "merge world x into y dry run"));
     assert_eq!(plan.len(), 3, "{plan:?}");
     assert!(plan[2].starts_with("u|1|conflict|both changed v"), "{plan:?}");
     let e = fails(&db, MAIN, "merge world x into y");
@@ -285,7 +290,11 @@ fn agents_need_the_right_to_change_the_target() {
     assert!(e.code == "42501" && e.message.contains("change y"), "{}", e.message);
     // its own world into its own world: merge_own and write_own are enough
     assert_eq!(run(&mut s, "merge world mine into scratch").unwrap(), "MERGE 1");
-    assert_eq!(run(&mut s, "merge world mine only keys ('t/5') dry run").unwrap(), "SELECT 1");
+    assert_eq!(
+        run(&mut s, "merge world mine only keys ('t/5') dry run").unwrap(),
+        "SELECT 2",
+        "a summary line and the row"
+    );
     assert_eq!(run(&mut s, "merge world mine only keys ('t/5')").unwrap(), "MERGE 1");
     assert_eq!(rows(&q(&db, MAIN, "select v from t where id = 5")), ["five"]);
     assert!(db.world("mine").is_ok());

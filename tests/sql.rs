@@ -344,8 +344,9 @@ fn branches_in_sql() {
     assert_eq!(
         rows(&d),
         [
-            r#"people|1|update|{"id": 1, "age": 36, "name": "Ada", "admin": false, "email": "ada@example.com"}|{"id": 1, "age": 37, "name": "Ada", "admin": false, "email": "ada@example.com"}|["age"]"#,
+            // the delete first
             r#"people|4|delete|{"id": 4, "name": "Linus", "admin": false, "email": "l@kernel.org"}|null|[]"#,
+            r#"people|1|update|{"id": 1, "age": 36, "name": "Ada", "admin": false, "email": "ada@example.com"}|{"id": 1, "age": 37, "name": "Ada", "admin": false, "email": "ada@example.com"}|["age"]"#,
         ]
     );
     let b = q(&mut s, "show branches").unwrap();
@@ -2094,15 +2095,16 @@ fn diff_engine() {
     assert_eq!(
         got,
         [
+            // deleted rows first, then the rest in key order
+            r#"old 1 delete []"#,
+            r#"t 2 delete []"#,
             r#"newt - create table []"#,
             r#"old - drop table []"#,
             r#"t - alter table ["+email text", "+index t_age"]"#,
             r#"newt 1 insert ["id", "n", "v"]"#,
             r#"newt 2 insert ["id", "n", "v"]"#,
             r#"notes 1 insert ["text"]"#,
-            r#"old 1 delete []"#,
             r#"t 1 update ["age", "email", "name"]"#,
-            r#"t 2 delete []"#,
             r#"t 3 insert ["email", "id", "meta", "name"]"#, // a null is no field
         ],
         "\n{}",
