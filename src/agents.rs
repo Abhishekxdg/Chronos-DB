@@ -297,6 +297,9 @@ pub struct Outcome {
     pub check_refusals: u64,
     /// merges sent to a person by a merge policy
     pub holds: u64,
+    /// effects (NOTIFY ON MERGE) discarded with their worlds, never sent: vetoed, dropped, or swept (see
+    /// `outbox::Discarded`)
+    pub effects_discarded: u64,
 }
 
 impl Outcome {
@@ -352,7 +355,7 @@ pub(crate) enum Step {
 /// Where `Core::walk` starts: the oldest retained segment, its time, and the worlds open then.
 pub(crate) struct Window {
     seg: u64,
-    cut: u64,
+    pub(crate) cut: u64,
     open: Vec<disk::ManBranch>,
 }
 
@@ -887,6 +890,18 @@ impl Core {
             o.stale_reads += s.refusals[1] - s.refused_before[1].min(s.refusals[1]);
             o.check_refusals += s.refusals[2] - s.refused_before[2].min(s.refusals[2]);
             o.holds += s.holds;
+        }
+        // effects discarded with their worlds, by the world's owner (or its policy then)
+        for d in self.discarded_effects(win.cut) {
+            let key = if by_policy { d.policy.clone() } else { d.owner.clone() };
+            let p = policy(&d.owner);
+            rows.entry(key.clone())
+                .or_insert_with(|| Outcome {
+                    name: key,
+                    policy: if by_policy { String::new() } else { p },
+                    ..Default::default()
+                })
+                .effects_discarded += 1;
         }
         let mut rows: Vec<Outcome> = rows.into_values().collect();
         rows.sort_by(|a, b| b.worlds.cmp(&a.worlds).then_with(|| a.name.cmp(&b.name)));

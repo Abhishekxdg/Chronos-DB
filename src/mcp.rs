@@ -409,7 +409,13 @@ fn call(sh: &mut Shell, g: &mut Guard, name: &str, a: &Value) -> Result<String, 
                 let summary = chronos::sql::summary(kinds);
                 let per: Vec<String> = tables.iter().map(|(t, n)| format!("{t}: {n}")).collect();
                 let summary = if summary.is_empty() { per.join(", ") } else { summary };
-                return Ok(format!("{} changes on {b} ({summary})", tables.values().sum::<usize>()));
+                // and what its merge would send (NOTIFY ON MERGE)
+                let effects = match opt("to") {
+                    None => chronos::sql::effects_line(&sh.db.world_effects(b).map_err(|e| e.to_string())?),
+                    Some(_) => String::new(),
+                };
+                let effects = if effects.is_empty() { String::new() } else { format!("; effects on merge: {effects}") };
+                return Ok(format!("{} changes on {b} ({summary}){effects}", tables.values().sum::<usize>()));
             }
             if let Some(after) = a.get("after").and_then(Value::as_str) {
                 // a page after a cursor: reads only this page, in storage key order

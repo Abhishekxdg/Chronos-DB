@@ -49,6 +49,8 @@ export function ChangesView() {
     total: number;
     tables: Record<string, number>;
     summary?: TableCounts[];
+    /** what its merge would send (NOTIFY ON MERGE): approving the merge approves these too */
+    effects?: { id: string; channel: string; payload: string; by: string }[];
     readers?: Reader[];
     coverage?: string[];
     version?: number;
@@ -230,6 +232,7 @@ export function ChangesView() {
               </>
             )}
           </div>
+          {counts?.effects && counts.effects.length > 0 && <Effects effects={counts.effects} parent={parent} />}
           {counts && counts.total > 0 && <Readers readers={counts.readers || []} coverage={counts.coverage || []} />}
           {plan && (
             <div className="plan">
@@ -345,6 +348,26 @@ export function ChangesView() {
           Discard world
         </button>
       </div>
+    </div>
+  );
+}
+
+/** What the world's merge sends once it lands (NOTIFY ON MERGE), so approving the merge means approving these. */
+function Effects({ effects, parent }: { effects: { id: string; channel: string; payload: string; by: string }[]; parent: string }) {
+  return (
+    <div className="readers">
+      <h3 className="label">
+        Sends on merge: {plural(effects.length, 'effect')}
+      </h3>
+      <p className="note">Queued in this world, sent by a worker once it merges into {parent === 'main' ? 'main' : 'main (through ' + parent + ')'}; dropped with it if it's discarded.</p>
+      <ul>
+        {effects.map((e) => (
+          <li key={e.id}>
+            <span className="kind">{e.channel}</span> <code>{text(e.payload, 200)}</code>
+            {e.by && <span className="muted"> queued by {e.by}</span>}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

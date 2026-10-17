@@ -688,6 +688,7 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                         "rejected": o.rejected, "discarded": o.discarded, "open": o.open,
                         "partly_merged": o.partly_merged, "before_window": o.before_window, "conflicts": o.conflicts,
                         "stale_reads": o.stale_reads, "check_refusals": o.check_refusals, "holds": o.holds,
+                        "effects_discarded": o.effects_discarded,
                         "rules_rate": o.rules_rate(),
                     });
                     let name = (!o.name.is_empty()).then(|| o.name.clone());
@@ -751,7 +752,17 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                     .iter()
                     .map(|(t, c)| json!({ "table": t, "deleted": c.deleted, "updated": c.updated, "inserted": c.inserted }))
                     .collect();
-                Ok(json!({ "total": tables.values().sum::<usize>(), "tables": tables, "summary": summary }))
+                let mut out = json!({ "total": tables.values().sum::<usize>(), "tables": tables, "summary": summary });
+                // what its merge would send (NOTIFY ON MERGE), which the rows don't show
+                if s("to").is_none() {
+                    let effects: Vec<Value> = db
+                        .world_effects(b)?
+                        .into_iter()
+                        .map(|e| json!({ "id": e.id, "channel": e.channel, "payload": e.payload, "by": e.by, "queued": e.at }))
+                        .collect();
+                    out["effects"] = json!(effects);
+                }
+                Ok(out)
             };
             // "version": the branch's, read first, so merging at it merges no more than this shows
             let version = match s("to") {

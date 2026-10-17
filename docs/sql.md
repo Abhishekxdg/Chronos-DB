@@ -439,9 +439,9 @@ notify on merge billing, '{"refund": 42}';
 -- a person merges fix: listeners on main hear  billing  '{"refund": 42}'  now,
 -- and it waits in main's outbox until a worker says it's done
 show outbox;
---            id                  | channel |    payload     | world |          queued           | by  | state  | attempts | worker | lease_until
--- -------------------------------+---------+----------------+-------+---------------------------+-----+--------+----------+--------+-------------
---  1790590000000-9f2c41d07e6a13b5 | billing | {"refund": 42} | fix   | 2026-09-28 10:00:00.00+00 | bot | queued |        0 |        |
+--            id                  | channel |    payload     | world |          queued           | by  | state  | attempts | worker | lease_until | merged_from |      approved
+-- -------------------------------+---------+----------------+-------+---------------------------+-----+--------+----------+--------+-------------+-------------+--------------------
+--  1790590000000-9f2c41d07e6a13b5 | billing | {"refund": 42} | fix   | 2026-09-28 10:00:00.00+00 | bot | queued |        0 |        |             | fix         | merged by a person
 
 -- a worker: take it, do it, say so
 claim outbox for billing lease '30 seconds';   -- the same columns, state claimed, attempts 1
@@ -463,7 +463,14 @@ queued ──CLAIM OUTBOX──> claimed (a worker, a lease, attempt n) ──AC
 - **CLAIM OUTBOX [FOR channel, ...] [LIMIT n] [LEASE 'interval'] [IDEMPOTENT]:** takes up to `n` (default 1) queued effects, oldest first, on those channels (default any), for the lease (default 5 minutes), and returns them as `SHOW OUTBOX` shows them. Two claims never get the same effect. The id is the same from queueing to acknowledgement: pass it to the receiver as an idempotency key where it takes one, and claim with `IDEMPOTENT` then.
 - **A lease that runs out** puts an `IDEMPOTENT` claim back in the queue. Any other becomes `ambiguous`: the worker may have called the receiver and died before `ACK`. No `CLAIM` returns it, and it stays in `SHOW OUTBOX` until someone checks the receiver and runs `ACK OUTBOX` (it went out) or `RETRY OUTBOX 'id' ATTEMPT n, ...` (it didn't: queued again, `RETRY n`). `n` is the `attempts` its claim showed: only that attempt is retried, so a retry that arrives late, or twice, after the effect was claimed again never takes the new claim from its worker (`RETRY 0`). A worker that knows a call failed retries it at once the same way.
 - **Who:** `NOTIFY ON MERGE` is a write to the session's world (an agent needs to be allowed to write it; one keeping to a merge policy can't queue on `main` directly). Merge policies count effects apart from rows (`max_effects`, `effects_per_hour`, `review_channels`: see [merge policies](reference/worlds.md#merge-policies)). `SHOW OUTBOX` lists the entries in the session's world (in a world, its own and `main`'s as they were at the fork). `CLAIM`, `ACK` and `RETRY OUTBOX` need the database's own user, or an agent with `outbox` or `admin`, not `write_main`: an agent that may merge can't take back the effects its merges queued. A merge policy doesn't stop them.
-- **Partial merges:** `ONLY TABLES` and `ONLY KEYS` leave a world's effects in it until it merges whole. `DIFF` doesn't list effects; `MERGE ... DRY RUN` shows them as rows of `_sonos_outbox`.
+- **Partial merges:** `ONLY TABLES` and `ONLY KEYS` leave a world's effects in it until it merges whole.
+- **In the review:** what a world's merge would send is shown beside its rows: `DIFF WORLD` gives a NOTICE (`fix queues 2 effects, sent when it merges into main: billing (1), email (1)`), `SHOW REVIEWS` an `effects` column, and the Studio's Changes view lists each effect, so approving the merge is approving what it sends. `MERGE ... DRY RUN` shows them as rows of `_sonos_outbox`.
+- **Where an effect came from:** `SHOW OUTBOX` (and `CLAIM OUTBOX`) in `main` add `merged_from`, the world whose merge brought it in, and `approved`: `on merge policy p's rules` (an agent merging within its policy), `approved by a person after review (merge policy p)`, `merged by a person`, or `merged by agent x, which keeps to no merge policy`.
+- **What a merge sent:** `SHOW MERGE world EFFECTS` (a name or a world id) lists what that world's merges brought into `main`: `id`, `channel`, `world`, `world_id`, `landed`, `merged_by` (NULL: a person), `approved`, and `state`: `queued`, `claimed`, `ambiguous`, or `done` once acknowledged, with `attempts` and `worker`. Whoever approved a merge looks there to see whether what it sent went out.
+- **Ambiguous is said:** when an entry turns ambiguous, a NOTIFY on `chronos_outbox_ambiguous` says so, once per attempt, with a JSON payload: `id`, `channel`, `attempt`, `worker`, `world` (where it came from) and `approved`. `LISTEN chronos_outbox_ambiguous` in whatever pages a person. It's noticed by the background worker (every 30 seconds) and whenever `SHOW OUTBOX`, `CLAIM OUTBOX` or `SHOW MERGE ... EFFECTS` look at the outbox; after a restart one may be said again.
+- **Discarded, never sent:** dropping a world that holds effects (`DROP WORLD`, rejecting a held merge, the idle sweeper) sends none of them, and records each: `SHOW OUTBOX DISCARDED [SINCE 'time' | SINCE '-1 day']` lists `id`, `channel`, `payload` (NULL unless kept, below), `payload_sha256`, `world`, `world_id`, `queued_by`, `queued`, `discarded`, `discarded_by` and `why` (`rejected: dropped by a person while its merge waited for review (merge policy p)`, `dropped by agent x`, `swept: its time ran out, or it went unused`). So "the agent went quiet" and "the agent's email was vetoed" can be told apart. `SHOW MERGE OUTCOMES` counts them per agent (`effects_discarded`). A rolled-back transaction's effects aren't recorded: nothing proposed them for review.
+- **Payloads:** a payload can hold personal data, so a discarded effect keeps only its SHA-256 unless `ALTER SYSTEM SET outbox_keep_payloads = on` (`show outbox_keep_payloads`); effects in `main` keep theirs until acknowledged, as before.
+- **Kept how long:** where effects came from, and those discarded, are kept beside the log (the folder's `outbox.ledger`, sealed with the folder) for the history window (`history_retention`), at most 100,000 of each; an in-memory database keeps them in memory.
 - **Limits:** channels and payloads as for `NOTIFY` (a channel under 64 bytes, a payload under 8000). An effect is delivered once per landing: `UNDO MERGE` doesn't take back a notification already heard.
 
 ## TRUNCATE
@@ -754,7 +761,8 @@ world once, by how it ended:
 
 and counts attempts: `conflicts` (rows both sides changed), `stale_reads` (rows it relied on changed since it read
 them), `check_refusals` (a merge check or a CHECK constraint the result breaks) and `holds` (a merge policy sent it to a
-person). A merge retried in a loop adds attempts, never worlds. `rules_rate` is `on_rules / (on_rules + approved +
+person), and `effects_discarded`: effects (`NOTIFY ON MERGE`) dropped with their worlds, never sent (see `SHOW OUTBOX
+DISCARDED`). A merge retried in a loop adds attempts, never worlds. `rules_rate` is `on_rules / (on_rules + approved +
 rejected)`: the share of decided worlds that merged on their rules alone (NULL when none were). `agent` is NULL for the
 database's own users; `policy` is each agent's policy now. A transaction's COMMIT that conflicts isn't counted (it's no
 agent's merge).
@@ -824,6 +832,7 @@ alter system set statement_timeout = '30s';   -- every session starts with it (0
 alter system set max_worlds = 10000;          -- live worlds besides main (0: no limit, the default)
 alter system set world_idle_ttl = '7 days';   -- unused worlds are discarded (0: never, the default)
 alter system set protect_main = on;           -- main's rows change only by merging a world (off by default)
+alter system set outbox_keep_payloads = on;   -- discarded effects keep their payloads, not only a hash (off by default)
 show max_worlds;
 show world_idle_ttl;
 show protect_main;

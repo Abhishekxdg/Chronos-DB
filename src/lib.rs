@@ -562,7 +562,7 @@ pub struct Core {
     /// bumped, and waiters woken, whenever intents are let go (std's, not shuttle's: nothing in the simulations waits)
     intent_wake: (std::sync::Mutex<u64>, std::sync::Condvar),
     metrics: Metrics,
-    settings: Mutex<[u64; 4]>, // by `Setting`: loaded from the folder after replay, so replay never applies them
+    settings: Mutex<[u64; 5]>, // by `Setting`: loaded from the folder after replay, so replay never applies them
     replay_clock: AtomicU64,   // while replaying the log: the time it has reached (0 otherwise)
     running: Mutex<HashMap<String, u64>>, // agents' statements in flight (see `slot`)
     dropped: (AtomicU64, AtomicU64), // worlds discarded since the last cleanup, and the rows they changed
@@ -582,6 +582,8 @@ pub struct Core {
     merging: Mutex<HashMap<String, State>>,
     /// the columns clients' SQL read, and when (see `reads`)
     reads: Mutex<reads::Log>,
+    /// where effects that landed in main came from, and those discarded with their worlds (see `outbox::Ledger`)
+    ledger: Mutex<outbox::Ledger>,
     tallies: Mutex<tally::Tallies>, // agents' merges into main in the last hour (see `tally`)
     /// the folder is attached to a Postgres database (see `attach`): its main changes only by merges written there
     attached: Option<Arc<attach::Attached>>,
@@ -598,11 +600,19 @@ pub enum Setting {
     WorldIdleTtl = 2,
     /// 1: main's rows change only by merging a world (see `Core::guard_main`); 0: directly too.
     ProtectMain = 3,
+    /// 1: an effect discarded with its world keeps its payload in the outbox ledger; 0: only its SHA-256 (a payload
+    /// can hold personal data). See `outbox::Discarded`.
+    OutboxKeepPayloads = 4,
 }
 
 impl Setting {
-    pub const ALL: [Setting; 4] =
-        [Setting::StatementTimeout, Setting::MaxWorlds, Setting::WorldIdleTtl, Setting::ProtectMain];
+    pub const ALL: [Setting; 5] = [
+        Setting::StatementTimeout,
+        Setting::MaxWorlds,
+        Setting::WorldIdleTtl,
+        Setting::ProtectMain,
+        Setting::OutboxKeepPayloads,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -610,6 +620,7 @@ impl Setting {
             Setting::MaxWorlds => "max_worlds",
             Setting::WorldIdleTtl => "world_idle_ttl",
             Setting::ProtectMain => "protect_main",
+            Setting::OutboxKeepPayloads => "outbox_keep_payloads",
         }
     }
 
@@ -1004,6 +1015,7 @@ impl Db {
                 // aborts instead, see `disk::fatal`): say so, and try again in a while
                 while next() && !stop.load(Ordering::Relaxed) {
                     let _ = core.expire_worlds();
+                    let _ = core.announce_ambiguous(); // an effect whose lease ran out: said on its channel
                     if let Err(e) = core.save_reads() {
                         eprintln!("chronos: could not save the reads recorded: {e}");
                     }
@@ -1118,7 +1130,7 @@ impl Core {
             intents: Mutex::new(Intents::default()),
             intent_wake: (std::sync::Mutex::new(0), std::sync::Condvar::new()),
             metrics: Metrics::default(),
-            settings: Mutex::new([0; 4]),
+            settings: Mutex::new([0; 5]),
             replay_clock: AtomicU64::new(0),
             running: Mutex::new(HashMap::new()),
             dropped: (AtomicU64::new(0), AtomicU64::new(0)),
@@ -1129,6 +1141,7 @@ impl Core {
             },
             merging: Mutex::new(HashMap::new()),
             reads: Mutex::new(reads::Log::new()),
+            ledger: Mutex::new(outbox::Ledger::default()),
             tallies: Default::default(),
             attached: None,
         }
@@ -1226,6 +1239,7 @@ impl Core {
         *db.reads.get_mut().unwrap() = reads::load(dir, crypt.as_deref());
         stale::load(&mut db, dir, crypt.as_deref(), clean)?; // what worlds read, if it closed cleanly
         *db.tallies.get_mut().unwrap() = tally::load(dir, crypt.as_deref());
+        *db.ledger.get_mut().unwrap() = outbox::load_ledger(dir, crypt.as_deref());
         db.attached = attach::Attached::load(dir)?.map(Arc::new);
         let saved = disk::settings(dir)?;
         for s in Setting::ALL {
@@ -4214,6 +4228,7 @@ impl Core {
         {
             let _ = self.rebase_tx(b);
         }
+        outbox::LANDED.take(); // (a merge that failed after `landing` left its own)
         let merged = {
             let _g = self.gate();
             self.merge_locked(b, o, &picks, Mode::Merge)
@@ -4246,6 +4261,8 @@ impl Core {
         self.after(pos, durable);
         // written back to Postgres: main takes the rows Postgres changed as it wrote them
         attach::after_merge(self);
+        self.keep_landed(); // the effects it brought into main, and who let them through
+
         // effects it brought into main happen now: their NOTIFYs, as the rows are there
         sql::deliver(self, MAIN, 0, &notes);
         if !whole && into.is_none() {
@@ -4767,6 +4784,12 @@ impl Core {
             self.guard_main(&name, keys.iter().map(String::as_str))?;
         }
         let notes = if name == MAIN { outbox::notes(&apply) } else { vec![] };
+        // the effects it lands in main, and who lets them through: kept once the merge is done (see `keep_landed`)
+        if name == MAIN && !tx && !rebase && !notes.is_empty() {
+            let info = child.info.read().unwrap();
+            let review = info.meta.get(agents::REVIEW).and_then(|r| r["policy"].as_str());
+            self.landing(b, &info.id, review, policy.as_ref().map(|p| p.name.as_str()), &apply);
+        }
         // an agent's merge into main counts toward its policy's hourly limits once it's done
         let counted = (name == MAIN && policy.is_some()).then(|| agents::counts(&apply));
         for ch in apply {
@@ -5175,6 +5198,7 @@ impl Core {
         todo.sort_by_key(|(_, br)| std::cmp::Reverse(br.born)); // the lock order: the later fork first
         let mut recs: Vec<_> = todo.iter().map(|(i, _)| self.record(|| Op::Discard(names[*i].as_ref()))).collect();
         let (mut borns, mut worlds) = (vec![], vec![]);
+        let mut effects = vec![]; // what each world held to send, recorded once it's gone (see `discarding`)
         let pos = {
             let _g = self.gate();
             let mut gone: Vec<_> = todo.iter().map(|(_, br)| lock(&br.writer)).collect();
@@ -5206,6 +5230,13 @@ impl Core {
                 }
                 borns.push(br.born);
                 if !b.starts_with("_tx_") {
+                    if self.me.get().is_some() && !RECOVERING.get() {
+                        let held = self.effects_of(br).unwrap_or_default();
+                        if !held.is_empty() {
+                            let info = br.info.read().unwrap();
+                            effects.push((b, info.id.clone(), info.meta.clone(), held));
+                        }
+                    }
                     worlds.push(b);
                     self.dropped.0.fetch_add(1, Ordering::Relaxed);
                     self.dropped.1.fetch_add(br.changed.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -5213,6 +5244,9 @@ impl Core {
             }
             pos
         };
+        for (b, id, meta, held) in effects {
+            self.discarding(b, &id, &meta, held);
+        }
         self.forget(&borns);
         sql::forget_world_stats(self.uid, &worlds); // a world made again by that name starts with none
         if self.reclaim_due()

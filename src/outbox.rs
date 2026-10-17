@@ -269,3 +269,367 @@ impl Core {
         Ok(n)
     }
 }
+
+// ---------------------------------------------------------------- the ledger: where effects came from, and those that never went
+
+/// The file the ledger is kept in, beside the log (as `reads` is): not rows of main, which replaying the log must
+/// rebuild exactly, while who merged or dropped a world isn't in what replay applies.
+const LEDGER: &str = "outbox.ledger";
+/// Entries the ledger keeps at most of each kind, past the history window's own limit: the oldest go first.
+const LEDGER_MOST: usize = 100_000;
+/// The channel a NOTIFY goes out on when an effect in main turns ambiguous (see the module docs).
+pub const AMBIGUOUS_CHANNEL: &str = "chronos_outbox_ambiguous";
+
+/// An effect that landed in main, and how (issue #30): kept from the merge on, after it's acknowledged too, so
+/// whoever approved a merge can see what it sent and whether it went out (`Core::merge_effects`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Landed {
+    pub id: String,
+    pub channel: String,
+    /// the world whose merge brought it into main, by name and id
+    pub world: String,
+    pub world_id: String,
+    /// when it landed (ms since 1970)
+    pub at: u64,
+    /// who merged it (an agent; empty: the database's own user)
+    pub by: String,
+    /// who let it through, in words: a merge policy's rules, a person after a review, a person, an agent with none
+    pub approved: String,
+}
+
+/// An effect discarded with its world, never sent (issue #31): kept so that "the agent went quiet" and "the
+/// agent's email was vetoed" can be told apart from outside.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Discarded {
+    pub id: String,
+    pub channel: String,
+    /// SHA-256 of the payload, as hex: whether two were the same, without keeping what they said
+    pub payload_sha256: String,
+    /// the payload itself, only while `outbox_keep_payloads` is on (a payload can hold personal data)
+    pub payload: Option<String>,
+    pub world: String,
+    pub world_id: String,
+    /// who queued it (an agent; empty: the database's own user), and when
+    pub queued_by: String,
+    pub queued_at: u64,
+    /// the world's owner and its merge policy then (for `SHOW MERGE OUTCOMES`)
+    pub owner: String,
+    pub policy: String,
+    /// when it was discarded, by whom (`system`: the sweeper), and why, in words
+    pub at: u64,
+    pub by: String,
+    pub why: String,
+}
+
+/// What the ledger holds (see `Landed`, `Discarded`), and the ambiguous effects already told about.
+#[derive(Default)]
+pub(crate) struct Ledger {
+    landed: Vec<Landed>,
+    discarded: Vec<Discarded>,
+    /// (id, attempt) of effects whose turning ambiguous was announced (in memory: after a restart one may be
+    /// announced again, which a listener takes as the same news)
+    told: std::collections::HashSet<(String, u64)>,
+}
+
+impl Landed {
+    fn to_json(&self) -> Json {
+        json!({"id": self.id, "channel": self.channel, "world": self.world, "world_id": self.world_id, "at": self.at,
+               "by": self.by, "approved": self.approved})
+    }
+    fn from_json(j: &Json) -> Option<Landed> {
+        let s = |k: &str| j[k].as_str().map(String::from);
+        Some(Landed {
+            id: s("id")?,
+            channel: s("channel")?,
+            world: s("world").unwrap_or_default(),
+            world_id: s("world_id").unwrap_or_default(),
+            at: j["at"].as_u64().unwrap_or(0),
+            by: s("by").unwrap_or_default(),
+            approved: s("approved").unwrap_or_default(),
+        })
+    }
+}
+
+impl Discarded {
+    fn to_json(&self) -> Json {
+        json!({"id": self.id, "channel": self.channel, "payload_sha256": self.payload_sha256, "payload": self.payload,
+               "world": self.world, "world_id": self.world_id, "queued_by": self.queued_by,
+               "queued_at": self.queued_at, "owner": self.owner, "policy": self.policy, "at": self.at, "by": self.by,
+               "why": self.why})
+    }
+    fn from_json(j: &Json) -> Option<Discarded> {
+        let s = |k: &str| j[k].as_str().map(String::from);
+        Some(Discarded {
+            id: s("id")?,
+            channel: s("channel")?,
+            payload_sha256: s("payload_sha256").unwrap_or_default(),
+            payload: s("payload"),
+            world: s("world").unwrap_or_default(),
+            world_id: s("world_id").unwrap_or_default(),
+            queued_by: s("queued_by").unwrap_or_default(),
+            queued_at: j["queued_at"].as_u64().unwrap_or(0),
+            owner: s("owner").unwrap_or_default(),
+            policy: s("policy").unwrap_or_default(),
+            at: j["at"].as_u64().unwrap_or(0),
+            by: s("by").unwrap_or_default(),
+            why: s("why").unwrap_or_default(),
+        })
+    }
+}
+
+/// The folder's ledger; an empty one if there is none. A damaged file starts a new one, said on stderr: what it held
+/// is lost, not the database.
+pub(crate) fn load_ledger(dir: &std::path::Path, crypt: Option<&crate::crypt::Crypt>) -> Ledger {
+    let path = dir.join(LEDGER);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ledger::default(),
+        Err(e) => {
+            eprintln!("chronos: could not read {}: {e}; the outbox ledger starts empty", path.display());
+            return Ledger::default();
+        }
+    };
+    let parsed = crate::crypt::open_file(crypt, bytes, &path.display().to_string())
+        .and_then(|b| serde_json::from_slice::<Json>(&b).map_err(std::io::Error::other));
+    match parsed {
+        Ok(j) => Ledger {
+            landed: j["landed"].as_array().into_iter().flatten().filter_map(Landed::from_json).collect(),
+            discarded: j["discarded"].as_array().into_iter().flatten().filter_map(Discarded::from_json).collect(),
+            told: Default::default(),
+        },
+        Err(e) => {
+            eprintln!("chronos: {} is damaged ({e}); the outbox ledger starts empty", path.display());
+            Ledger::default()
+        }
+    }
+}
+
+thread_local! {
+    /// What the merge just made in `merge_locked` landed in main, for `merge_kept` to keep once it's done (see
+    /// `Core::keep_landed`).
+    pub(crate) static LANDED: std::cell::RefCell<Vec<Landed>> = const { std::cell::RefCell::new(vec![]) };
+}
+
+/// SHA-256 of `s`, as hex.
+fn sha256_hex(s: &str) -> String {
+    ring::digest::digest(&ring::digest::SHA256, s.as_bytes()).as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+impl Core {
+    /// The effects a world queued itself (or took in from worlds merged into it), oldest first: those its merge
+    /// would send, not those it saw in its parent when it forked. What a review lists beside the world's rows.
+    pub fn world_effects(&self, b: &str) -> Result<Vec<Effect>> {
+        crate::not_tx(b)?;
+        self.effects_of(&*self.branch(b)?)
+    }
+
+    /// `world_effects` of a branch in hand (`discard_many` holds the map's lock, so can't look one up).
+    pub(crate) fn effects_of(&self, br: &crate::Branch) -> Result<Vec<Effect>> {
+        let (base, now) = (br.base(), br.snapshot());
+        let prefix = format!("{OUTBOX}/");
+        let t = disk::now_ms();
+        let mut out = vec![];
+        for c in self.state_diff_iter(&base, &now, Some(&prefix))? {
+            let c = c?;
+            if !c.key.starts_with(&prefix) {
+                break;
+            }
+            if let (None, Some(v)) = (&c.before, &c.after)
+                && let Ok(j) = serde_json::from_str::<Json>(v)
+            {
+                out.extend(effect(&c.key[prefix.len()..], &j, t));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether this process records what happens to effects now: a database in use, not one replaying its log
+    /// (whose merges and drops were recorded when they happened).
+    fn records_effects(&self) -> bool {
+        self.me.get().is_some() && !crate::RECOVERING.get()
+    }
+
+    /// The effects a merge of world `b` (forked from `base`, now `ours`) into main lands, as `apply` (the rows it
+    /// writes there) has them, with who let them through: kept for after the merge (see `keep_landed`), by
+    /// `merge_locked` once it can't fail any more. `policy`: the acting agent's merge policy.
+    pub(crate) fn landing(
+        &self,
+        b: &str,
+        world_id: &str,
+        review: Option<&str>,
+        policy: Option<&str>,
+        apply: &[crate::Change],
+    ) {
+        if !self.records_effects() {
+            return;
+        }
+        let by = disk::actor();
+        let approved = match (by.is_empty(), review, policy) {
+            (true, Some(p), _) => format!("approved by a person after review (merge policy {p})"),
+            (true, None, _) => "merged by a person".to_string(),
+            (false, _, Some(p)) => format!("on merge policy {p}'s rules"),
+            (false, _, None) => format!("merged by agent {by}, which keeps to no merge policy"),
+        };
+        let at = disk::now_ms();
+        let landed: Vec<Landed> = apply
+            .iter()
+            .filter(|c| entry(&c.key) && c.before.is_none())
+            .filter_map(|c| {
+                Some(Landed {
+                    id: c.key[OUTBOX.len() + 1..].to_string(),
+                    channel: channel_of(c.after.as_deref()?)?,
+                    world: b.to_string(),
+                    world_id: world_id.to_string(),
+                    at,
+                    by: by.clone(),
+                    approved: approved.clone(),
+                })
+            })
+            .collect();
+        LANDED.set(landed);
+    }
+
+    /// Keeps what the merge just made landed (see `landing`), now that it's done.
+    pub(crate) fn keep_landed(&self) {
+        let landed = LANDED.take();
+        if landed.is_empty() {
+            return;
+        }
+        let mut l = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+        l.landed.extend(landed);
+        self.save_ledger(&mut l);
+    }
+
+    /// Records the effects world `b` held as it's discarded (see `Discarded`), with why: called by `discard_many`
+    /// before the world goes. `meta`: its metadata then.
+    pub(crate) fn discarding(
+        &self,
+        b: &str,
+        world_id: &str,
+        meta: &serde_json::Map<String, Json>,
+        effects: Vec<Effect>,
+    ) {
+        if effects.is_empty() || !self.records_effects() {
+            return;
+        }
+        let by = disk::actor();
+        let owner = meta.get(crate::agents::OWNER).and_then(Json::as_str).unwrap_or_default().to_string();
+        let policy = self.agent(&owner).ok().and_then(|a| a.policy).unwrap_or_default();
+        let review = meta.get(crate::agents::REVIEW).and_then(|r| r["policy"].as_str());
+        let who = if by.is_empty() { "a person".to_string() } else { format!("agent {by}") };
+        let why = match review {
+            _ if by == crate::agents::SYSTEM => "swept: its time ran out, or it went unused".to_string(),
+            Some(p) => format!("rejected: dropped by {who} while its merge waited for review (merge policy {p})"),
+            None => format!("dropped by {who}"),
+        };
+        let keep = self.setting(crate::Setting::OutboxKeepPayloads) != 0;
+        let at = disk::now_ms();
+        let mut l = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+        for e in effects {
+            l.discarded.push(Discarded {
+                payload_sha256: sha256_hex(&e.payload),
+                payload: keep.then_some(e.payload),
+                id: e.id,
+                channel: e.channel,
+                world: b.to_string(),
+                world_id: world_id.to_string(),
+                queued_by: e.by,
+                queued_at: e.at,
+                owner: owner.clone(),
+                policy: policy.clone(),
+                at,
+                by: by.clone(),
+                why: why.clone(),
+            });
+        }
+        self.save_ledger(&mut l);
+    }
+
+    /// Writes the ledger to the folder, after dropping what's older than the history window (and past
+    /// `LEDGER_MOST`): what the merge outcomes read is kept as long. A file that can't be written is said on stderr:
+    /// the merge or drop it records has happened, and the next one writes it all again.
+    fn save_ledger(&self, l: &mut Ledger) {
+        let cut = self.window().ok().flatten().map_or(0, |w| w.cut);
+        l.landed.retain(|x| x.at >= cut);
+        l.discarded.retain(|x| x.at >= cut);
+        if l.landed.len() > LEDGER_MOST {
+            let n = l.landed.len() - LEDGER_MOST;
+            l.landed.drain(..n);
+        }
+        if l.discarded.len() > LEDGER_MOST {
+            let n = l.discarded.len() - LEDGER_MOST;
+            l.discarded.drain(..n);
+        }
+        let Some(log) = &self.log else { return };
+        let j = json!({
+            "landed": l.landed.iter().map(Landed::to_json).collect::<Vec<_>>(),
+            "discarded": l.discarded.iter().map(Discarded::to_json).collect::<Vec<_>>(),
+        });
+        let bytes = j.to_string().into_bytes();
+        let bytes = match &log.crypt {
+            Some(c) => c.seal_file(&bytes),
+            None => bytes,
+        };
+        if let Err(e) = disk::write_file(&log.dir.join(LEDGER), &bytes) {
+            eprintln!("chronos: could not save the outbox ledger: {e}");
+        }
+    }
+
+    /// Effects discarded with their worlds since `since` (ms since 1970), oldest first.
+    pub fn discarded_effects(&self, since: u64) -> Vec<Discarded> {
+        let l = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+        l.discarded.iter().filter(|d| d.at >= since).cloned().collect()
+    }
+
+    /// How each effect that landed in main came there (see `Landed`), by its id.
+    pub fn landed_effects(&self) -> std::collections::HashMap<String, Landed> {
+        let l = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+        l.landed.iter().map(|x| (x.id.clone(), x.clone())).collect()
+    }
+
+    /// What the merges of world `w` (by name or id) brought into main, and where each effect is now: `queued`,
+    /// `claimed`, `ambiguous`, or `done` once acknowledged (gone from the outbox). Oldest first. What whoever
+    /// approved the merge looks at to see whether what it sent went out.
+    pub fn merge_effects(&self, w: &str) -> Result<Vec<(Landed, Option<Effect>)>> {
+        let now: std::collections::HashMap<String, Effect> =
+            self.outbox(MAIN)?.into_iter().map(|e| (e.id.clone(), e)).collect();
+        let l = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(l.landed
+            .iter()
+            .filter(|x| x.world == w || x.world_id == w)
+            .map(|x| (x.clone(), now.get(&x.id).cloned()))
+            .collect())
+    }
+
+    /// Announces, on `AMBIGUOUS_CHANNEL`, each effect in main that turned ambiguous since it was last looked at (its
+    /// lease ran out on a claim that wasn't IDEMPOTENT): so a worker or an alert can page someone, instead of it
+    /// waiting unseen in SHOW OUTBOX. The payload is JSON: its id, channel, attempt, worker, and where it came from.
+    /// Run by the background worker, and as SHOW OUTBOX and CLAIM OUTBOX look at the outbox.
+    pub fn announce_ambiguous(&self) -> Result<usize> {
+        let ambiguous: Vec<Effect> = self.outbox(MAIN)?.into_iter().filter(|e| e.state == "ambiguous").collect();
+        if ambiguous.is_empty() {
+            return Ok(0);
+        }
+        let notes: Vec<(String, String)> = {
+            let mut l = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+            let from: std::collections::HashMap<&str, &Landed> = l.landed.iter().map(|x| (x.id.as_str(), x)).collect();
+            let mut out = vec![];
+            for e in &ambiguous {
+                let origin = from.get(e.id.as_str());
+                out.push((
+                    (e.id.clone(), e.attempts),
+                    json!({"id": e.id, "channel": e.channel, "attempt": e.attempts, "worker": e.worker,
+                           "world": origin.map(|o| o.world.as_str()), "approved": origin.map(|o| o.approved.as_str())})
+                    .to_string(),
+                ));
+            }
+            out.retain(|(k, _)| !l.told.contains(k));
+            for (k, _) in &out {
+                l.told.insert(k.clone());
+            }
+            out.into_iter().map(|(_, p)| (AMBIGUOUS_CHANNEL.to_string(), p)).collect()
+        };
+        crate::sql::deliver(self, MAIN, 0, &notes);
+        Ok(notes.len())
+    }
+}

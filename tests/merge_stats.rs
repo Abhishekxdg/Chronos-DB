@@ -224,18 +224,19 @@ fn a_known_mix_of_merges_gives_exactly_its_counts_and_keeps_them_across_a_restar
                 "stale_reads",
                 "check_refusals",
                 "holds",
+                "effects_discarded",
                 "rules_rate"
             ]
         );
         assert_eq!(out.rows.len(), 3);
         assert_eq!(out.rows[0][1].to_text(), "bot");
         assert_eq!(out.rows[0][3].to_text(), "60");
-        assert_eq!(out.rows[0][16].to_text(), "0.8");
+        assert_eq!(out.rows[0][17].to_text(), "0.8");
         let own = out.rows.iter().find(|r| r[1].to_text().is_empty()).unwrap();
         assert!(matches!(own[1], chronos::sql::Value::Null), "the database's own users show as NULL");
         let by = run(&db, MAIN, "show merge outcomes by policy", &[]).unwrap().pop().unwrap();
         assert_eq!(by.columns.as_ref().unwrap()[1].0, "policy");
-        assert_eq!(by.columns.as_ref().unwrap().len(), 16);
+        assert_eq!(by.columns.as_ref().unwrap().len(), 17);
         assert_eq!(run(&db, MAIN, "show merge outcomes by agent", &[]).unwrap().pop().unwrap().rows.len(), 3);
     }
     let db = Db::open(&dir).unwrap();

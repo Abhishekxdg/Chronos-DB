@@ -74,7 +74,7 @@ Any `branch` that is read (`get`, `find`, `sql`, `diff`) can be a world as it wa
 
 For big diffs, `diff` can count or page without reading every change into memory:
 
-- `"count": true` (alone): `{total, tables: {name: n}, summary: [{table, deleted, updated, inserted}]}` (`summary`: the tables that delete most first). Walks the diff once, keeping no rows.
+- `"count": true` (alone): `{total, tables: {name: n}, summary: [{table, deleted, updated, inserted}], effects: [{id, channel, payload, by, queued}]}` (`summary`: the tables that delete most first; `effects`, without `to`: what the world's merge would send, `NOTIFY ON MERGE`). Walks the diff once, keeping no rows.
 - `"limit": n` and/or `"after": cursor`: `{changes, next}`, the first `n` changes with key after `after` (leave it out, or `null`, for the first page), in key order. `next` is the cursor for the next page, `null` on the last one. It reads only as far as the page, so memory follows `n`, not the size of the diff; a later page skips what came before without re-reading it. Add `"count": true` to get `total` and `tables` too (a full walk). Pages can't be combined with `"sql": true`.
 
 Pages concatenated equal the unpaged `changes`. SQL has the same as `DIFF WORLD w [TO v] LIMIT n` (the first `n` changes); the MCP `diff` tool takes `count` and `after`.

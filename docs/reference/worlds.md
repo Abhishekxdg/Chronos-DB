@@ -664,7 +664,8 @@ SHOW MERGE POLICIES                                 -- name, max_rows, max_delet
 SHOW REVIEWS                                        -- world, owner, policy, reasons, asked, version,
                                                     -- changed_since (written to, or partly merged, since the agent asked),
                                                     -- scope (what the world was forked to change),
-                                                    -- changes (per table: deleted, updated, inserted; deletes first)
+                                                    -- changes (per table: deleted, updated, inserted; deletes first),
+                                                    -- effects (what its merge would send, per channel: email (2))
 ALTER AGENT name SET (policy = 'name')              -- or policy = null
 ```
 

@@ -3482,8 +3482,10 @@ fn unseen<T>(f: impl FnOnce() -> T) -> T {
 }
 
 /// An effect as SHOW OUTBOX and CLAIM OUTBOX show it.
-fn outbox_row(e: crate::Effect) -> Vec<Value> {
+fn outbox_row(e: crate::Effect, landed: &HashMap<String, crate::outbox::Landed>) -> Vec<Value> {
     let text = |s: String| if s.is_empty() { Value::Null } else { Value::Text(s) };
+    let from = landed.get(&e.id);
+    let (merged_from, approved) = (from.map(|l| l.world.clone()), from.map(|l| l.approved.clone()));
     vec![
         Value::Text(e.id),
         Value::Text(e.channel),
@@ -3495,7 +3497,18 @@ fn outbox_row(e: crate::Effect) -> Vec<Value> {
         Value::Int(e.attempts as i64),
         text(e.worker),
         e.lease.map_or(Value::Null, |ms| Value::TimestampTz(ms as i64 * 1000)),
+        merged_from.map_or(Value::Null, Value::Text),
+        approved.map_or(Value::Null, Value::Text),
     ]
+}
+
+/// A world's effects as a review lists them: per channel, how many (`email (2), webhook (1)`); empty for none.
+pub fn effects_line(effects: &[crate::Effect]) -> String {
+    let mut by: BTreeMap<&str, usize> = BTreeMap::new();
+    for e in effects {
+        *by.entry(e.channel.as_str()).or_default() += 1;
+    }
+    by.iter().map(|(c, n)| format!("{c} ({n})")).collect::<Vec<_>>().join(", ")
 }
 
 /// SHOW MERGE OUTCOMES's columns: the window's start, who (an agent, or with `by_policy` a merge policy), then
@@ -3519,6 +3532,7 @@ fn outcome_columns(by_policy: bool) -> Vec<(&'static str, Type)> {
         "stale_reads",
         "check_refusals",
         "holds",
+        "effects_discarded",
     ] {
         c.push((n, Type::BigInt));
     }
@@ -7541,6 +7555,10 @@ enum Stmt {
         by_policy: bool,
     },
     ShowOutbox,
+    /// SHOW OUTBOX DISCARDED [SINCE 'time']: effects discarded with their worlds, never sent (see `outbox`)
+    ShowDiscarded(Option<String>),
+    /// SHOW MERGE world EFFECTS: what the world's merges brought into main's outbox, and where each is now
+    ShowMergeEffects(String),
     /// SHOW AUDIT [FOR AGENT name] [LIMIT n]
     ShowAudit {
         agent: Option<String>,
@@ -10945,6 +10963,7 @@ impl Parser {
             "show" if self.kw("max_worlds") => Ok(Stmt::ShowSystem(crate::Setting::MaxWorlds)),
             "show" if self.kw("world_idle_ttl") => Ok(Stmt::ShowSystem(crate::Setting::WorldIdleTtl)),
             "show" if self.kw("protect_main") => Ok(Stmt::ShowSystem(crate::Setting::ProtectMain)),
+            "show" if self.kw("outbox_keep_payloads") => Ok(Stmt::ShowSystem(crate::Setting::OutboxKeepPayloads)),
             "show" if self.kw("disk") => Ok(Stmt::ShowDisk),
             "show" if self.kw("synchronous_commit") => Ok(Stmt::ShowSync),
             "show" if self.kw("storage") => {
@@ -11016,7 +11035,19 @@ impl Parser {
                 Ok(Stmt::Checkpoint { world, label: self.branch_name()? })
             }
             "show" if self.kw("agents") => Ok(Stmt::ShowAgents),
-            "show" if self.kw("outbox") => Ok(Stmt::ShowOutbox),
+            "show" if self.kw("outbox") => {
+                if !self.kw("discarded") {
+                    return Ok(Stmt::ShowOutbox);
+                }
+                let since = match self.kw("since") {
+                    false => None,
+                    true => match self.next() {
+                        Some(Tok::Str(t)) => Some(t),
+                        _ => return self.fail("expected a time or a time ago ('-1 day') after SINCE"),
+                    },
+                };
+                Ok(Stmt::ShowDiscarded(since))
+            }
             "ack" if self.kw("outbox") => {
                 let mut ids = vec![];
                 loop {
@@ -11121,6 +11152,14 @@ impl Parser {
                     };
                     return Ok(Stmt::ShowMergeOutcomes { by_policy });
                 }
+                // SHOW MERGE world EFFECTS (a world named policies included)
+                let at = self.i;
+                if let Ok(w) = self.branch_name()
+                    && self.kw("effects")
+                {
+                    return Ok(Stmt::ShowMergeEffects(w));
+                }
+                self.i = at;
                 self.expect_kw("policies")?;
                 Ok(Stmt::ShowPolicies)
             }
@@ -11249,9 +11288,10 @@ impl Parser {
                         None => self.fail("expected synchronous_commit = full, normal or off"),
                     };
                 }
-                let system = ["statement_timeout", "max_worlds", "world_idle_ttl", "protect_main"]
-                    .into_iter()
-                    .find(|k| self.kw(k));
+                let system =
+                    ["statement_timeout", "max_worlds", "world_idle_ttl", "protect_main", "outbox_keep_payloads"]
+                        .into_iter()
+                        .find(|k| self.kw(k));
                 if let Some(k) = system.and_then(crate::Setting::parse) {
                     if !self.sym("=") {
                         self.expect_kw("to")?;
@@ -11275,7 +11315,7 @@ impl Parser {
                             },
                             _ => return self.fail(IDLE_TTL),
                         },
-                        crate::Setting::ProtectMain => match self.next() {
+                        crate::Setting::ProtectMain | crate::Setting::OutboxKeepPayloads => match self.next() {
                             Some(Tok::Word(w) | Tok::Str(w))
                                 if ["on", "true", "yes"].contains(&w.to_lowercase().as_str()) =>
                             {
@@ -11287,7 +11327,7 @@ impl Parser {
                                 0
                             }
                             Some(Tok::Num(n)) if n == "0" || n == "1" => n.parse().unwrap_or(0),
-                            _ => return self.fail("expected protect_main = on or off"),
+                            _ => return self.fail(&format!("expected {} = on or off", k.name())),
                         },
                     };
                     return Ok(Stmt::SetSystem(k, v));
@@ -37063,7 +37103,9 @@ impl Statement {
             Stmt::ShowPath => return fixed(&[("search_path", Type::Text)]),
             Stmt::ShowSync => return fixed(&[("synchronous_commit", Type::Text)]),
             Stmt::ShowSystem(crate::Setting::WorldIdleTtl) => return fixed(&[("world_idle_ttl", Type::Interval)]),
-            Stmt::ShowSystem(crate::Setting::ProtectMain) => return fixed(&[("protect_main", Type::Text)]),
+            Stmt::ShowSystem(k @ (crate::Setting::ProtectMain | crate::Setting::OutboxKeepPayloads)) => {
+                return fixed(&[(k.name(), Type::Text)]);
+            }
             Stmt::ShowSystem(k) => return fixed(&[(k.name(), Type::BigInt)]),
             Stmt::ShowDisk => return fixed(&[("what", Type::Text), ("bytes", Type::BigInt)]),
             Stmt::ShowStorage(_) => {
@@ -37176,6 +37218,37 @@ impl Statement {
                     ("attempts", Type::BigInt),
                     ("worker", Type::Text),
                     ("lease_until", Type::TimestampTz),
+                    ("merged_from", Type::Text),
+                    ("approved", Type::Text),
+                ]);
+            }
+            Stmt::ShowDiscarded(_) => {
+                return fixed(&[
+                    ("id", Type::Text),
+                    ("channel", Type::Text),
+                    ("payload", Type::Text),
+                    ("payload_sha256", Type::Text),
+                    ("world", Type::Text),
+                    ("world_id", Type::Text),
+                    ("queued_by", Type::Text),
+                    ("queued", Type::TimestampTz),
+                    ("discarded", Type::TimestampTz),
+                    ("discarded_by", Type::Text),
+                    ("why", Type::Text),
+                ]);
+            }
+            Stmt::ShowMergeEffects(_) => {
+                return fixed(&[
+                    ("id", Type::Text),
+                    ("channel", Type::Text),
+                    ("world", Type::Text),
+                    ("world_id", Type::Text),
+                    ("landed", Type::TimestampTz),
+                    ("merged_by", Type::Text),
+                    ("approved", Type::Text),
+                    ("state", Type::Text),
+                    ("attempts", Type::BigInt),
+                    ("worker", Type::Text),
                 ]);
             }
             Stmt::ShowReviews => {
@@ -37189,6 +37262,7 @@ impl Statement {
                     ("changed_since", Type::Bool),
                     ("scope", Type::Json),
                     ("changes", Type::Text),
+                    ("effects", Type::Text),
                 ]);
             }
             Stmt::ShowMergeOutcomes { by_policy } => return fixed(&outcome_columns(*by_policy)),
@@ -37616,7 +37690,9 @@ impl Statement {
                         days: (v / 86_400_000) as i32,
                         micros: (v % 86_400_000) as i64 * 1000,
                     }),
-                    crate::Setting::ProtectMain => Value::Text(if v == 0 { "off" } else { "on" }.into()),
+                    crate::Setting::ProtectMain | crate::Setting::OutboxKeepPayloads => {
+                        Value::Text(if v == 0 { "off" } else { "on" }.into())
+                    }
                     _ => Value::Int(v as i64),
                 };
                 let columns = self.columns(db, branch, &[])?;
@@ -38088,7 +38164,9 @@ impl Statement {
                 Ok(Output::tag("DROP MERGE CHECK"))
             }
             Stmt::ShowOutbox => {
-                let rows: Vec<Vec<Value>> = db.outbox(branch)?.into_iter().map(outbox_row).collect();
+                let _ = db.announce_ambiguous(); // one whose lease ran out is said on its channel now
+                let landed = db.landed_effects();
+                let rows: Vec<Vec<Value>> = db.outbox(branch)?.into_iter().map(|e| outbox_row(e, &landed)).collect();
                 Ok(Output {
                     tag: format!("SELECT {}", rows.len()),
                     columns: self.columns(db, branch, &[])?,
@@ -38096,11 +38174,74 @@ impl Statement {
                     typmods: vec![],
                 })
             }
+            Stmt::ShowDiscarded(since) => {
+                let since = match since {
+                    None => 0,
+                    Some(t) => moment(t).ok_or_else(|| SqlError {
+                        code: BAD_INPUT,
+                        message: format!("'{t}' is not a time or a time ago"),
+                        info: None,
+                    })?,
+                };
+                let text = |s: String| if s.is_empty() { Value::Null } else { Value::Text(s) };
+                let ts = |ms: u64| Value::TimestampTz(ms as i64 * 1000);
+                let rows: Vec<Vec<Value>> = db
+                    .discarded_effects(since)
+                    .into_iter()
+                    .map(|d| {
+                        vec![
+                            Value::Text(d.id),
+                            Value::Text(d.channel),
+                            d.payload.map_or(Value::Null, Value::Text),
+                            Value::Text(d.payload_sha256),
+                            Value::Text(d.world),
+                            text(d.world_id),
+                            text(d.queued_by),
+                            ts(d.queued_at),
+                            ts(d.at),
+                            text(d.by),
+                            Value::Text(d.why),
+                        ]
+                    })
+                    .collect();
+                let columns = self.columns(db, branch, &[])?;
+                Ok(Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows })
+            }
+            Stmt::ShowMergeEffects(w) => {
+                let _ = db.announce_ambiguous();
+                let text = |s: String| if s.is_empty() { Value::Null } else { Value::Text(s) };
+                let rows: Vec<Vec<Value>> = db
+                    .merge_effects(w)?
+                    .into_iter()
+                    .map(|(l, now)| {
+                        vec![
+                            Value::Text(l.id),
+                            Value::Text(l.channel),
+                            Value::Text(l.world),
+                            text(l.world_id),
+                            Value::TimestampTz(l.at as i64 * 1000),
+                            text(l.by),
+                            Value::Text(l.approved),
+                            // gone from the outbox: a worker acknowledged it
+                            Value::Text(now.as_ref().map_or("done", |e| e.state).into()),
+                            now.as_ref().map_or(Value::Null, |e| Value::Int(e.attempts as i64)),
+                            now.map_or(Value::Null, |e| text(e.worker)),
+                        ]
+                    })
+                    .collect();
+                let columns = self.columns(db, branch, &[])?;
+                Ok(Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows })
+            }
             Stmt::AckOutbox(ids) => Ok(Output::tag(format!("ACK {}", db.ack_outbox(ids)?))),
             Stmt::RetryOutbox(ids) => Ok(Output::tag(format!("RETRY {}", db.retry_outbox(ids)?))),
             Stmt::ClaimOutbox { channels, limit, lease, idempotent } => {
-                let rows: Vec<Vec<Value>> =
-                    db.claim_outbox(channels, *limit, *lease, *idempotent)?.into_iter().map(outbox_row).collect();
+                let _ = db.announce_ambiguous();
+                let landed = db.landed_effects();
+                let rows: Vec<Vec<Value>> = db
+                    .claim_outbox(channels, *limit, *lease, *idempotent)?
+                    .into_iter()
+                    .map(|e| outbox_row(e, &landed))
+                    .collect();
                 Ok(Output {
                     typmods: vec![],
                     tag: format!("SELECT {}", rows.len()),
@@ -38116,6 +38257,11 @@ impl Statement {
                         let changed = r.changed_since();
                         // what it does per table, deletes first, counted now
                         let changes = db.diff_kinds(&r.world, None).map_or(Value::Null, |c| Value::Text(summary(c)));
+                        // and what its merge would send
+                        let effects = match db.world_effects(&r.world).map(|e| effects_line(&e)) {
+                            Ok(line) if !line.is_empty() => Value::Text(line),
+                            _ => Value::Null,
+                        };
                         vec![
                             Value::Text(r.world),
                             r.owner.map_or(Value::Null, Value::Text),
@@ -38126,6 +38272,7 @@ impl Statement {
                             Value::Bool(changed),
                             r.scope.map_or(Value::Null, Value::Json),
                             changes,
+                            effects,
                         ]
                     })
                     .collect();
@@ -38209,6 +38356,7 @@ impl Statement {
                                 o.stale_reads,
                                 o.check_refusals,
                                 o.holds,
+                                o.effects_discarded,
                             ]
                             .map(|n| Value::Int(n as i64)),
                         );
@@ -38397,6 +38545,20 @@ impl Statement {
                 }
                 if limit.is_none() && !*as_sql {
                     described.sort_by_key(|d| d.change != "delete");
+                }
+                // and what its merge would send, which DIFF's rows don't list
+                if to.is_none() && !*as_sql {
+                    let effects = db.world_effects(a)?;
+                    if !effects.is_empty() {
+                        notice(
+                            "NOTICE",
+                            format!(
+                                "{a} queues {} effects, sent when it merges into main: {} (SHOW OUTBOX in it lists them)",
+                                effects.len(),
+                                effects_line(&effects)
+                            ),
+                        );
+                    }
                 }
                 if *as_sql {
                     let after = db.view_tx(to.as_deref().unwrap_or(a))?;

@@ -230,7 +230,7 @@ What changed on a branch since it was forked, row by row and field by field: the
 | `limit` | integer | no | 20 |
 | `offset` | integer | no | 0 |
 
-Without `to`: `2 changes on task-1 (leads: 1 deleted, 1 updated, 0 inserted)`, what each table loses first, then one line per change, the deleted rows first with what they held: `- DELETE table/id  {row}`, then `+ table/id  {row}` or `~ table/id  field: old -> new`. With `count: true`, the same per-table line alone. With `to`, the table from [`DIFF ... TO`](worlds.md#diff). A longer diff ends with `(showing changes 1-20 of 57; call diff again with offset=20 for the next ones)`.
+Without `to`: `2 changes on task-1 (leads: 1 deleted, 1 updated, 0 inserted)`, what each table loses first, then one line per change, the deleted rows first with what they held: `- DELETE table/id  {row}`, then `+ table/id  {row}` or `~ table/id  field: old -> new`. With `count: true`, the same per-table line alone, and what the branch's merge would send (`; effects on merge: email (2)`). With `to`, the table from [`DIFF ... TO`](worlds.md#diff). A longer diff ends with `(showing changes 1-20 of 57; call diff again with offset=20 for the next ones)`.
 
 ### history
 
@@ -420,7 +420,7 @@ Removes a merge policy. Refused while an agent keeps to it, unless `release_agen
 
 ### reviews
 
-Merges a policy sent to a person, oldest first: `world`, `owner`, `policy`, `reasons`, `asked`, `version`, `changed_since` (the branch was written to, or partly merged, after its agent asked), `scope`, `changes` (per table, deleted, updated and inserted, deletes first). A person approves with `merge` (or `MERGE WORLD`), or throws it away with `discard`. No parameters. Runs [`SHOW REVIEWS`](worlds.md#merge-policies).
+Merges a policy sent to a person, oldest first: `world`, `owner`, `policy`, `reasons`, `asked`, `version`, `changed_since` (the branch was written to, or partly merged, after its agent asked), `scope`, `changes` (per table, deleted, updated and inserted, deletes first), `effects` (what its merge would send, per channel). A person approves with `merge` (or `MERGE WORLD`), or throws it away with `discard`. No parameters. Runs [`SHOW REVIEWS`](worlds.md#merge-policies).
 
 ### merge_checks
 
