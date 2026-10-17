@@ -1,6 +1,6 @@
 [package]
 name = "chronos"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.90"
 description = "An embeddable database for AI agents: instant copy-on-write branches, merge, and fast search"
