@@ -1476,6 +1476,11 @@ impl P<'_> {
             "commit" | "rollback" | "call" => return refuse("COMMIT in a function, ROLLBACK and CALL"),
             // DDL written out: run as the dynamic statement it is (variables in it are not filled in)
             "create" | "drop" | "alter" | "truncate" | "grant" | "revoke" => return self.ddl_as_execute(),
+            // SET LOCAL of a setting: run as set_config (see `statement`), for the transaction (or the function's
+            // call, under its own SET clauses). A SET or RESET of the session's settings isn't run from a function yet.
+            "set" if matches!(self.p.t.get(self.p.i + 1), Some(Tok::Word(l)) if l == "local") => {
+                return self.sql(false);
+            }
             "copy" | "set" | "reset" | "show" | "notify" | "listen" | "vacuum" | "analyze" | "lock" => {
                 return refuse(&w.to_uppercase());
             }
@@ -1853,7 +1858,9 @@ impl P<'_> {
     }
 
     fn ret(&mut self) -> Result<S> {
-        let sets = matches!(self.f.ret, Ret::SetOf(_) | Ret::Table(_) | Ret::RowsOf(_)) && !self.f.single;
+        // (OUT parameters without SETOF: one row of them)
+        let sets =
+            matches!(self.f.ret, Ret::SetOf(_) | Ret::Table(_) | Ret::RowsOf(_)) && !self.f.single && !self.f.outs;
         let record_alone = |me: &Self| match me.p.peek() {
             Some(Tok::Word(w) | Tok::Ident(w))
                 if me.kind(w) == Some(Kind::Record) && me.p.t.get(me.p.i + 1) == Some(&Tok::Sym(";")) =>
@@ -1866,13 +1873,15 @@ impl P<'_> {
             if !sets {
                 return err("42804", "cannot use RETURN NEXT in a non-SETOF function");
             }
+            // (OUT parameters: the columns RETURNS TABLE or OUT declares; SETOF record declares none)
+            let outs = self.f.outs || matches!(&self.f.ret, Ret::Table(c) if !c.is_empty());
             if self.p.sym(";") {
-                if !matches!(self.f.ret, Ret::Table(_)) {
+                if !outs {
                     return err(SYNTAX, "RETURN NEXT must have a parameter");
                 }
                 return Ok(S::ReturnNext(None));
             }
-            if matches!(self.f.ret, Ret::Table(_)) {
+            if outs {
                 return err("42804", "RETURN NEXT cannot have a parameter in function with OUT parameters");
             }
             if let Some(r) = record_alone(self) {
@@ -1908,6 +1917,8 @@ impl P<'_> {
         }
         if self.p.sym(";") {
             return match self.f.ret {
+                // (OUT parameters: the function returns their variables)
+                Ret::Value(_) if self.f.outs => Ok(S::Return(None)),
                 Ret::Value(_) | Ret::Trigger => err(SYNTAX, "missing expression at or near \";\""),
                 _ => Ok(S::Return(None)),
             };
@@ -1920,6 +1931,9 @@ impl P<'_> {
         }
         if self.f.ret == Ret::Void {
             return err("42804", "RETURN cannot have a parameter in function returning void");
+        }
+        if self.f.outs {
+            return err("42804", "RETURN cannot have a parameter in function with OUT parameters");
         }
         if let Some(r) = record_alone(self) {
             // (a function returning a table's row type or a composite type returns a row: one named so, before CREATE
@@ -2096,6 +2110,15 @@ impl P<'_> {
         if q.peek().is_some() {
             return q.fail("expected the end of the statement");
         }
+        // SET LOCAL name = value: set_config's call, as Postgres runs a utility statement there
+        if let Stmt::SetVar { name, value, local: local @ true } = &s {
+            let args = vec![
+                Expr::Lit(Value::Text(name.clone())),
+                value.clone().map_or(Expr::Lit(Value::Null), |v| Expr::Lit(Value::Text(v))),
+                Expr::Lit(Value::Bool(*local)),
+            ];
+            s = Stmt::Select(Box::new(super::select_of(Expr::Func(Func::Ctx(CtxFn::SetConfig), args))));
+        }
         if !matches!(
             s,
             Stmt::Select(_)
@@ -2121,6 +2144,8 @@ impl P<'_> {
         }
         let stmt = self.statement(toks)?;
         self.semi()?;
+        // (SET and RESET of a setting: run for their effect, as PERFORM set_config(...) is)
+        let perform = perform || set_config_of(&stmt);
         let into = match into {
             None => None,
             Some(_) if perform => return err(SYNTAX, "PERFORM runs a query for its effects: it has no INTO"),
@@ -2610,6 +2635,11 @@ fn pl_assigned(v: Value, from: Option<Type>, to: Type) -> Result<Value> {
     }
 }
 
+/// Whether `s` is the set_config call a PL/pgSQL SET LOCAL is (see `statement`).
+fn set_config_of(s: &Stmt) -> bool {
+    matches!(s, Stmt::Select(q) if matches!(&q.items[..], [Item::Expr(Expr::Func(Func::Ctx(CtxFn::SetConfig), a), None)] if a.len() == 3) && q.from.is_none())
+}
+
 /// A value as print_strict_params lists it: its text quoted (quotes in it doubled), NULL bare.
 fn quoted_param(v: &Value) -> String {
     match v {
@@ -2659,8 +2689,11 @@ impl Frame<'_> {
 
     /// Opens cursor `name` on a query's rows, in the savepoint level the statement runs at (a ROLLBACK TO an
     /// older one closes it, as Postgres closes the portals a rolled-back subtransaction opened).
-    fn open(&mut self, name: String, out: Output, scroll: Option<bool>, text: &str) {
+    fn open(&mut self, name: String, out: Output, scroll: Option<bool>, text: &str, query: Option<&Stmt>) {
         let (depth, tx) = session().map_or((0, false), |c| (c.depth, c.tx.is_some()));
+        let columns = out.columns.clone().unwrap_or_default();
+        // (what WHERE CURRENT OF needs of it, as of a cursor DECLAREd)
+        let scan = query.map(|q| Box::new(super::cursor_scan(q, &columns)));
         let c = Cursor {
             text: Arc::from(text),
             at: super::now_us(),
@@ -2672,6 +2705,7 @@ impl Frame<'_> {
             scroll,
             depth,
             tx,
+            scan,
         };
         match session() {
             Some(ctx) => {
@@ -3040,7 +3074,7 @@ impl Frame<'_> {
             return self.bound_eval(e);
         }
         if !e.query {
-            if self.calls_proc(e) {
+            if self.calls_proc(e) || self.typed_ops(e) {
                 return self.bound_eval(e);
             }
             let env = Env { cols: &self.cols, row: &self.vals, params: &self.vals, aggs: &[], sub: Some(self.x) };
@@ -3105,6 +3139,43 @@ impl Frame<'_> {
     /// Whether `e` calls a function made here that returns a regproc: it then runs bound (see `typed`). Apart from
     /// `typed`, as `query_eval` is.
     #[inline(never)]
+    /// Whether `e` has an operator what it does depends on its variables' types for, which the plain evaluation
+    /// (of values, without their types) can't tell: `||` with an array (an element or array appended, not text), and
+    /// arithmetic on a variable of a type that isn't a number (`x + 1` of a point, which has no such operator).
+    fn typed_ops(&mut self, e: &E) -> bool {
+        let key = (&e.e as *const Expr as usize, 1);
+        if let Some(&p) = self.procs.get(&key) {
+            return p;
+        }
+        let var_ty = |me: &Self, x: &Expr| match x {
+            Expr::Col(q, n) => {
+                me.find(&q.as_ref().map_or_else(|| n.clone(), |q| format!("{q}.{n}"))).map(|i| me.cols[i].ty)
+            }
+            Expr::Idx(i) => me.cols.get(*i).map(|c| c.ty),
+            Expr::Param(n) => me.cols.get(n.wrapping_sub(1)).map(|c| c.ty),
+            _ => None,
+        };
+        let number = |t: Type| {
+            matches!(
+                t,
+                Type::Int | Type::BigInt | Type::SmallInt | Type::Float | Type::Float4 | Type::Numeric | Type::Oid
+            )
+        };
+        let mut found = false;
+        walk(&e.e, &mut |x| {
+            if let Expr::Bin(a, op, b) = x {
+                let tys = [var_ty(self, a), var_ty(self, b)];
+                found |= match op {
+                    Op::Concat => tys.iter().flatten().any(|t| matches!(t, Type::Array(_))),
+                    Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod => tys.iter().flatten().any(|&t| !number(t)),
+                    _ => false,
+                };
+            }
+        });
+        self.procs.insert(key, found);
+        found
+    }
+
     fn calls_proc(&mut self, e: &E) -> bool {
         let key = (&e.e as *const Expr as usize, 0);
         if let Some(&p) = self.procs.get(&key) {
@@ -3386,6 +3457,12 @@ impl Frame<'_> {
 
     /// Runs a statement of the body, the variables its parameters.
     fn query(&mut self, s: &Stmt) -> Result<Output> {
+        if let Stmt::Update { table, filter: Some(Expr::Col(Some(q), var)), .. }
+        | Stmt::Delete { table, filter: Some(Expr::Col(Some(q), var)), .. } = s
+            && q == super::CURRENT_OF
+        {
+            return self.current_of(s, &table.clone(), &var.clone());
+        }
         if !self.whole.is_empty() {
             self.sync_whole();
         }
@@ -3408,7 +3485,47 @@ impl Frame<'_> {
                 st
             }
         };
-        self.x.with_params(&self.vals, &self.types, self.x.readonly).run_body(&st, true)
+        // (its sources are typed by its variables' types, a SQL function's by its parameters': see `sources`)
+        let declared: Vec<Type> = self.types.iter().map(|t| t.unwrap_or(Type::Text)).collect();
+        let was = super::PARAM_TYPES.replace(declared);
+        let out = self.x.with_params(&self.vals, &self.types, self.x.readonly).run_body(&st, true);
+        super::PARAM_TYPES.set(was);
+        out
+    }
+
+    /// UPDATE or DELETE ... WHERE CURRENT OF `var` (a cursor variable, whose value names the portal, or a portal's
+    /// name): of the row the portal is on, as `Session::current_of` does it for a cursor DECLAREd.
+    fn current_of(&mut self, s: &Stmt, table: &str, var: &str) -> Result<Output> {
+        let name = match self.find(var).map(|i| self.vals[i].clone()) {
+            Some(Value::Null) => return err("22004", format!("cursor variable \"{var}\" is null")),
+            Some(v) => v.to_text(),
+            None => var.to_string(),
+        };
+        let (names, at, filter) = self
+            .portal(&name, |c| super::cursor_row(c, &name, table))
+            .unwrap_or_else(|| err("34000", format!("cursor \"{name}\" does not exist")))?;
+        let (mut st, given) = super::current_of_stmt(s, &names, filter);
+        if !self.whole.is_empty() {
+            self.sync_whole();
+        }
+        self.settle();
+        if !self.records.is_empty() {
+            self.stars(&mut st)?;
+        }
+        functions::substitute(&self.x.view()?, &mut st, &mut |e, cols| self.param(e, cols))?;
+        let declared: Vec<Type> = self.types.iter().map(|t| t.unwrap_or(Type::Text)).collect();
+        let was = super::PARAM_TYPES.replace(declared);
+        let out = self.x.with_params(&self.vals, &self.types, self.x.readonly).run_body(&st, false);
+        super::PARAM_TYPES.set(was);
+        let mut out = out?;
+        if let Some(now) = super::current_of_out(&mut out, given, names.len()) {
+            self.portal(&name, |c| {
+                if let Some(scan) = c.scan.as_deref_mut() {
+                    scan.changed.insert(at, now);
+                }
+            });
+        }
+        Ok(out)
     }
 
     fn assign(&mut self, t: &Target, columns: &Option<Columns>, row: Option<Vec<Value>>) -> Result<()> {
@@ -3587,8 +3704,23 @@ impl Frame<'_> {
 
     /// A FOR loop over a query's rows (`label`: the loop's, see `body`).
     fn for_rows(&mut self, target: &Target, out: Output, body: &[S], label: &Option<String>) -> Result<Flow> {
+        self.for_rows_on(target, out, body, label, None)
+    }
+
+    /// `for_rows`, over the rows of portal `portal` when one is given: it is on each row as the loop is.
+    fn for_rows_on(
+        &mut self,
+        target: &Target,
+        out: Output,
+        body: &[S],
+        label: &Option<String>,
+        portal: Option<&str>,
+    ) -> Result<Flow> {
         let any = !out.rows.is_empty();
-        for row in out.rows {
+        for (i, row) in out.rows.into_iter().enumerate() {
+            if let Some(p) = portal {
+                self.portal(p, |c| c.pos = i + 1);
+            }
             self.assign(target, &out.columns, Some(row))?;
             if let Some(f) = self.body(body, label)? {
                 self.set("found", Value::Bool(any))?;
@@ -4017,7 +4149,7 @@ impl Frame<'_> {
                     (None, Some((q, using))) => self.dynamic(q, using)?.0,
                     (None, None) => return err(SYNTAX, "a cursor needs a query"),
                 };
-                self.open(name, out, *scroll, text);
+                self.open(name, out, *scroll, text, query.as_deref());
             }
             S::Fetch { var, go, into } => {
                 let name = match self.find(var).map(|i| self.vals[i].clone()) {
@@ -4089,10 +4221,16 @@ impl Frame<'_> {
                     return err("42P03", format!("cursor \"{name}\" already in use"));
                 }
                 let out = self.with_args(args, |me| me.query(&cur.query))?;
-                let shown = Output { typmods: vec![], tag: String::new(), columns: out.columns.clone(), rows: vec![] };
-                self.open(name.clone(), shown, cur.scroll, &cur.text);
+                // (the portal holds its rows, and is on the one the loop is at: what WHERE CURRENT OF reads)
+                let shown = Output {
+                    typmods: vec![],
+                    tag: String::new(),
+                    columns: out.columns.clone(),
+                    rows: out.rows.clone(),
+                };
+                self.open(name.clone(), shown, cur.scroll, &cur.text, Some(&cur.query));
                 let hidden = self.declare_record(rec);
-                let flow = self.for_rows(&Target::Record(rec.clone()), out, body, &label);
+                let flow = self.for_rows_on(&Target::Record(rec.clone()), out, body, &label, Some(&name));
                 self.leave(vec![(rec.clone(), hidden)]);
                 self.close(&name);
                 if named.is_none() {

@@ -28,10 +28,27 @@ fn view_text(rels: &[TableInfo], i: usize, pretty: bool, wrap: i32) -> Option<St
     let r = rels.get(i)?;
     let q = view_query(&r.name, r.definition.as_deref()?).ok()?;
     let names: Vec<String> = r.columns.iter().map(|c| c.0.clone()).collect();
+    let ctes = recursive_ctes(&q);
     let mut d = Dp::new(rels, pretty, wrap);
+    d.ctes = &ctes;
     d.query(&q, Some(&names[..]), true, 0)?;
     d.buf.push(';');
     Some(d.buf)
+}
+
+/// The WITH RECURSIVE queries the top level of `q` reads (see `Dp::ctes`), each once.
+fn recursive_ctes(q: &Select) -> Vec<(String, Vec<String>, Select)> {
+    let mut out: Vec<(String, Vec<String>, Select)> = vec![];
+    for src in q.from.iter().chain(q.joins.iter().map(|j| &j.src)) {
+        if let Some(r) = &src.rec
+            && !out.iter().any(|(n, ..)| *n == r.name)
+        {
+            let mut whole = r.base.clone();
+            whole.set.push((SetOp::Union, r.all, Box::new(r.step.clone())));
+            out.push((r.name.clone(), src.names.clone(), whole));
+        }
+    }
+    out
 }
 
 /// A trigger's WHEN condition (as stored) as pg_get_triggerdef writes it, over OLD and NEW, each a row of the table's
@@ -675,11 +692,24 @@ struct Dp<'q> {
     in_group: bool,
     /// writing a plan's expression (see `plan_expr`): constants as the planner folds them
     fold: bool,
+    /// the view's WITH RECURSIVE queries: name, its column list as written (if one is), and its query as Postgres
+    /// keeps it (its two parts put back together: `base UNION [ALL] step`)
+    ctes: &'q [(String, Vec<String>, Select)],
 }
 
 impl<'q> Dp<'q> {
     fn new(rels: &'q [TableInfo], pretty: bool, wrap: i32) -> Self {
-        Dp { rels, paren: pretty, wrap, indent: 0, buf: String::new(), levels: vec![], in_group: false, fold: false }
+        Dp {
+            rels,
+            paren: pretty,
+            wrap,
+            indent: 0,
+            buf: String::new(),
+            levels: vec![],
+            in_group: false,
+            fold: false,
+            ctes: &[],
+        }
     }
 
     /// Where constants are folded (see `fold`): a cast of a constant as the constant of the type it is cast to.
@@ -778,9 +808,48 @@ impl<'q> Dp<'q> {
         lv.desc = desc.map(<[String]>::to_vec);
         lv.visible = visible;
         self.levels.push(lv);
-        let r = self.basic(q, tail);
+        let r = self.with_clause(q).and_then(|()| self.basic(q, tail));
         self.levels.pop();
         r
+    }
+
+    /// get_with_clause: the WITH RECURSIVE queries this level reads, before its SELECT.
+    fn with_clause(&mut self, q: &'q Select) -> Option<()> {
+        let mut names: Vec<&str> = vec![];
+        for src in q.from.iter().chain(q.joins.iter().map(|j| &j.src)) {
+            if let Some(r) = &src.rec
+                && !names.contains(&r.name.as_str())
+            {
+                names.push(&r.name);
+            }
+        }
+        if names.is_empty() {
+            return Some(());
+        }
+        self.indent += STD;
+        self.buf.push(' ');
+        let mut sep = "WITH RECURSIVE ";
+        for name in names {
+            let ctes: &'q [(String, Vec<String>, Select)] = self.ctes;
+            let (_, cols, cq) = ctes.iter().find(|(n, ..)| n == name)?;
+            self.buf.push_str(sep);
+            self.buf.push_str(&quoted(name));
+            if !cols.is_empty() {
+                self.buf.push('(');
+                self.buf.push_str(&cols.iter().map(|c| quoted(c)).collect::<Vec<_>>().join(", "));
+                self.buf.push(')');
+            }
+            self.buf.push_str(" AS (");
+            self.kw("", 0, 0, 0);
+            let ind = self.indent;
+            self.query(cq, None, true, ind)?;
+            self.kw("", 0, 0, 0);
+            self.buf.push(')');
+            sep = ", ";
+        }
+        self.indent -= STD;
+        self.kw("", 0, 0, 0);
+        Some(())
     }
 
     /// get_basic_select_query, then get_select_query_def's ORDER BY, OFFSET and LIMIT.
@@ -921,8 +990,12 @@ impl<'q> Dp<'q> {
             SetTree::Leaf(q) => {
                 let q: &'q Select = q;
                 let saved = self.indent;
+                // (the first part, which holds the parts after it: a VALUES of its own row alone)
+                let own_row = !q.set.is_empty() && values_shaped(&Select { set: vec![], ..q.clone() });
                 let r = if values_shaped(q) && q.set.is_empty() {
                     self.values_query(q, desc)
+                } else if own_row {
+                    self.values_rows(q, desc, true)
                 } else {
                     self.simple_query(q, desc, visible, false)
                 };
@@ -972,8 +1045,14 @@ impl<'q> Dp<'q> {
     /// A VALUES list: bare where the view's columns keep their names (column1, ...), else as Postgres writes a view
     /// that renamed them, `SELECT column1 AS x, ... FROM (VALUES ...) "*VALUES*"`.
     fn values_query(&mut self, q: &'q Select, desc: Option<&[String]>) -> Option<()> {
-        let rows: Vec<&'q [Item]> =
-            std::iter::once(&q.items[..]).chain(q.set.iter().map(|(_, _, p)| &p.items[..])).collect();
+        self.values_rows(q, desc, false)
+    }
+
+    /// `values_query`, of `q`'s own row only with `own` (the first part of a set operation, which the parts after it
+    /// follow).
+    fn values_rows(&mut self, q: &'q Select, desc: Option<&[String]>, own: bool) -> Option<()> {
+        let rest = q.set.iter().filter(|_| !own).map(|(_, _, p)| &p.items[..]);
+        let rows: Vec<&'q [Item]> = std::iter::once(&q.items[..]).chain(rest).collect();
         let n = rows.first()?.len();
         let names: Vec<String> = (1..=n).map(|i| format!("column{i}")).collect();
         let simple = desc.is_none_or(|d| d.len() == n && d.iter().zip(&names).all(|(a, b)| a == b));
@@ -1095,6 +1174,31 @@ impl<'q> Dp<'q> {
 
     /// A FROM source: a relation, a subquery, a function, or a parenthesized join.
     fn node(&mut self, lv: &mut Level<'q>, src: &'q Source) -> Option<Node<'q>> {
+        // a WITH RECURSIVE query, by its name (in the query that reads it, and in its own step as its rows so far)
+        let named = match (&src.rec, src.working) {
+            (Some(r), _) => Some(r.name.as_str()),
+            (None, true) => Some(src.table.as_str()),
+            _ => None,
+        };
+        if let Some(name) = named
+            && src.at.is_none()
+            && let Some((_, _, q)) = self.ctes.iter().find(|(n, ..)| n == name)
+        {
+            let cols = self.out_cols(q)?;
+            let mut names: Vec<String> = cols.iter().map(|c| c.0.clone()).collect();
+            for (c, n) in names.iter_mut().zip(&src.names) {
+                *c = n.clone();
+            }
+            let types = cols.iter().map(|c| c.1).collect();
+            let rte = self.add_rte(lv, &src.alias, names, types, None);
+            return Some(Node::Rel {
+                rte,
+                name: name.to_string(),
+                only: false,
+                aliased: src.alias != name,
+                cols_given: false,
+            });
+        }
         if src.cte != 0
             || src.rec.is_some()
             || src.working

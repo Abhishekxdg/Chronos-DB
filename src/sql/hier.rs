@@ -2560,6 +2560,29 @@ impl Exec<'_> {
         from: Option<&Select>,
         checks: Option<&rls::Checks>,
     ) -> Result<Output> {
+        // SET c = t.*: a whole row, for a column that isn't of a row type
+        // (UPDATE ... FROM's values are subqueries of its join: one of `t.*` alone is that row)
+        let whole = |e: &Expr| match e {
+            Expr::Col(Some(_), s) => s == "*",
+            Expr::Sub(sq) => {
+                matches!(&sq.q.items[..], [Item::TableStar(_)])
+                    || matches!(&sq.q.items[..], [Item::Expr(Expr::Col(Some(_), s), _)] if s == "*")
+            }
+            _ => false,
+        };
+        if let Some((c, _)) = sets.iter().find(|(_, e)| whole(e))
+            && let Some(col) = need_table(&self.view()?, table)?.cols.iter().find(|x| x.name == *c)
+            && !matches!(col.ty, Type::Record(_) | Type::Enum(_))
+        {
+            return Err(SqlError {
+                code: "42804",
+                message: format!("column \"{c}\" is of type {} but expression is of type record", col.ty.pg_name()),
+                info: Some(Box::new(Violation {
+                    hint: Some("You will need to rewrite or cast the expression.".into()),
+                    ..Violation::default()
+                })),
+            });
+        }
         let Some((root, leaves)) = self.tree_of(table, only)? else {
             return self.update_in(table, sets, filter, returning, from, None, checks);
         };

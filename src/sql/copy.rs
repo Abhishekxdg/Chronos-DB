@@ -135,13 +135,72 @@ impl Parser {
         }
         let format = self.copy_options(from)?;
         let mut filter = None;
-        if self.kw("where") {
+        if self.is_kw("where") {
             if !from {
-                return Err(feature("WHERE clause not allowed with COPY TO"));
+                return self.err_at(self.i, UNSUPPORTED, "WHERE clause not allowed with COPY TO");
             }
-            filter = Some(self.expr()?);
+            self.i += 1;
+            let (places, aggs) = (self.copy_where_places(), self.agg_at.len());
+            let e = self.expr()?;
+            self.copy_where_allowed(&e, places, aggs)?;
+            filter = Some(e);
         }
         Ok(Stmt::Copy(Box::new(Copy { table, cols, query, from, file, format, filter, dml: None })))
+    }
+
+    /// Where in COPY FROM's WHERE condition (its tokens from here, before it is read) Postgres places what it refuses
+    /// there: the first function called (an aggregate, window or set-returning function), and the first subquery
+    /// (at its IN or EXISTS, as its SubLink is placed), as characters from 1.
+    fn copy_where_places(&self) -> (Option<u32>, Option<u32>) {
+        let end = (self.i..self.t.len()).find(|&k| self.t[k] == Tok::Sym(";")).unwrap_or(self.t.len());
+        let toks = &self.t[self.i..end];
+        let linking = |t: Option<&Tok>| matches!(t, Some(Tok::Word(w)) if ["in", "exists", "any", "all", "some"].contains(&w.as_str()));
+        let call = (0..toks.len()).find(|&k| {
+            matches!(&toks[k], Tok::Word(_) | Tok::Ident(_))
+                && !linking(Some(&toks[k]))
+                && !matches!(&toks[k], Tok::Word(w) if w == "array" || w == "row" || w == "not")
+                && toks.get(k + 1) == Some(&Tok::Sym("("))
+        });
+        let sub = (0..toks.len())
+            .find(|&k| toks[k] == Tok::Sym("(") && matches!(toks.get(k + 1), Some(Tok::Word(w)) if w == "select"));
+        let sub = sub.map(|k| if k > 0 && linking(toks.get(k - 1)) { k - 1 } else { k });
+        let at = |k: usize| self.starts.get(self.i + k).map(|s| *s as u32 + 1);
+        (call.and_then(at), sub.and_then(at))
+    }
+
+    /// COPY FROM's WHERE condition `e`: no subquery, aggregate, window function or set-returning function, as
+    /// Postgres's transformExpr refuses them there, each at where it is written (`places`: see `copy_where_places`;
+    /// an aggregate's where the parser read it, the first from `aggs` in `agg_at`).
+    fn copy_where_allowed(&self, e: &Expr, places: (Option<u32>, Option<u32>), aggs: usize) -> Result<()> {
+        let (mut sub, mut agg, mut win, mut srf) = (false, false, false, false);
+        walk(e, &mut |x| match x {
+            Expr::Sub(_) | Expr::Exists(..) | Expr::InSub(..) => sub = true,
+            Expr::Agg(..) => agg = true,
+            Expr::Window(_) => win = true,
+            Expr::Call(c) if one_column_srf(c) => srf = true,
+            _ => {}
+        });
+        let (call, subquery) = places;
+        let refused = if sub {
+            Some((subquery, UNSUPPORTED, "cannot use subquery in COPY FROM WHERE condition"))
+        } else if agg {
+            let at = self.agg_at.get(aggs).and_then(|a| self.starts.get(a.0)).map(|s| *s as u32 + 1).or(call);
+            Some((at, "42803", "aggregate functions are not allowed in COPY FROM WHERE conditions"))
+        } else if win {
+            Some((call, "42P20", "window functions are not allowed in COPY FROM WHERE conditions"))
+        } else if srf {
+            Some((call, UNSUPPORTED, "set-returning functions are not allowed in COPY FROM WHERE conditions"))
+        } else {
+            None
+        };
+        match refused {
+            Some((position, code, m)) => Err(SqlError {
+                code,
+                message: m.into(),
+                info: Some(Box::new(Violation { position, ..Violation::default() })),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// A one-character option's text: a string, or E'\t'.
@@ -175,6 +234,16 @@ impl Parser {
         Ok(v)
     }
 
+    /// ENCODING 'name': the data's encoding. Data here is UTF8; SQL_ASCII (bytes taken as they are) reads it as it
+    /// is too, any other encoding is refused.
+    fn copy_encoding(&mut self) -> Result<()> {
+        let e = self.copy_string("ENCODING")?;
+        if !matches!(e.to_lowercase().replace(['-', '_'], "").as_str(), "utf8" | "unicode" | "sqlascii") {
+            return Err(feature(format!("COPY encoding \"{e}\" isn't supported: data is UTF8")));
+        }
+        Ok(())
+    }
+
     fn copy_options(&mut self, from: bool) -> Result<Format> {
         let (mut csv, mut binary, mut header) = (false, false, false);
         let (mut header_match, mut freeze, mut default) = (false, false, None);
@@ -185,6 +254,7 @@ impl Parser {
         self.kw("with");
         if self.sym("(") {
             loop {
+                let at = self.i;
                 let opt = match self.next() {
                     Some(Tok::Word(w) | Tok::Ident(w)) => w,
                     t => {
@@ -192,9 +262,9 @@ impl Parser {
                         return self.fail("expected a COPY option");
                     }
                 };
-                // an option named twice
+                // an option named twice (at the second)
                 if seen.contains(&opt) {
-                    return err("42601", "conflicting or redundant options");
+                    return self.err_at(at, "42601", "conflicting or redundant options");
                 }
                 seen.push(opt.clone());
                 match opt.as_str() {
@@ -243,11 +313,10 @@ impl Parser {
                     "force_quote" => force_quote = self.copy_columns(&mut force_all)?,
                     "force_not_null" => force_not_null = self.copy_columns(&mut no_star)?,
                     "force_null" => force_null = self.copy_columns(&mut no_star)?,
-                    "encoding" => {
-                        let e = self.copy_string("ENCODING")?;
-                        if !matches!(e.to_lowercase().replace(['-', '_'], "").as_str(), "utf8" | "unicode") {
-                            return Err(feature(format!("COPY encoding \"{e}\" isn't supported: data is UTF8")));
-                        }
+                    "encoding" => self.copy_encoding()?,
+                    // (which columns a COPY FROM converts: all of them here)
+                    "convert_selectively" => {
+                        self.copy_columns(&mut no_star)?;
                     }
                     "freeze" => {
                         freeze = !(self.kw("false") || self.kw("off"));
@@ -282,6 +351,10 @@ impl Parser {
                 } else if self.kw("escape") {
                     self.kw("as");
                     escape = Some(self.copy_string("ESCAPE")?);
+                } else if self.kw("encoding") {
+                    self.copy_encoding()?;
+                } else if self.kw("freeze") {
+                    freeze = true;
                 } else if self.kw("force") {
                     if self.kw("quote") {
                         force_quote = self.copy_columns(&mut force_all)?;
@@ -334,10 +407,10 @@ impl Parser {
             return Err(invalid(format!("COPY delimiter cannot be \"{}\"", delim as char)));
         }
         if !csv && quote.is_some() {
-            return Err(feature("COPY QUOTE requires CSV mode"));
+            return Err(feature("COPY quote available only in CSV mode"));
         }
         if !csv && escape.is_some() {
-            return Err(feature("COPY ESCAPE requires CSV mode"));
+            return Err(feature("COPY escape available only in CSV mode"));
         }
         let quote = one(&quote, "quote")?.unwrap_or(b'"');
         let escape = one(&escape, "escape")?.unwrap_or(quote);
@@ -352,9 +425,9 @@ impl Parser {
         }
         if (!force_quote.is_empty() || force_all) && (!csv || from) {
             return Err(feature(if csv {
-                "COPY FORCE_QUOTE cannot be used with COPY FROM"
+                "COPY force quote only available using COPY TO"
             } else {
-                "COPY FORCE_QUOTE requires CSV mode"
+                "COPY force quote available only in CSV mode"
             }));
         }
         if let Some(d) = &default {
@@ -371,15 +444,12 @@ impl Parser {
                 return Err(feature("NULL specification and DEFAULT specification cannot be the same"));
             }
         }
-        for (f, name) in [(&force_not_null, "FORCE_NOT_NULL"), (&force_null, "FORCE_NULL")] {
+        for (f, name) in [(&force_not_null, "force not null"), (&force_null, "force null")] {
             if !f.is_empty() && !csv {
-                return Err(feature(format!("COPY {name} requires CSV mode")));
+                return Err(feature(format!("COPY {name} available only in CSV mode")));
             }
             if !f.is_empty() && !from {
-                return Err(invalid(format!(
-                    "COPY {} only available using COPY FROM",
-                    name.to_lowercase().replace('_', " ")
-                )));
+                return Err(feature(format!("COPY {name} only available using COPY FROM")));
             }
         }
         Ok(Format {
@@ -533,6 +603,10 @@ pub struct CopyIn {
     /// per column, what DEFAULT's marker gives: None, no default (an error); Some(None), one worked out per row
     /// (refused); Some(Some(v)), the constant
     defaults: Vec<Option<Option<Value>>>,
+    /// the text record being read, as written (kept for an error's CONTEXT, as Postgres's names it), and the field
+    /// of it being read as its column's value
+    rec: Vec<u8>,
+    field: Option<String>,
 }
 
 /// What COPY's DEFAULT marker gives column `c` (see `CopyIn::defaults`).
@@ -608,13 +682,16 @@ impl Session {
             .iter()
             .map(|n| match (t.schema, col_index(&t.cols, n)) {
                 (true, Ok(i)) => Ok(t.cols[i].ty),
+                (true, Err(e)) if e.code == NO_COLUMN => {
+                    err(NO_COLUMN, format!("column \"{n}\" of relation \"{}\" does not exist", rel_part(&table)))
+                }
                 (true, Err(e)) => Err(e),
                 (false, _) => Ok(Type::Text),
             })
             .collect::<Result<Vec<_>>>()?;
         let listed = |l: &[String], what: &str| -> Result<Vec<bool>> {
             if let Some(n) = l.iter().find(|n| !names.contains(n)) {
-                return err("42P10", format!("{what} column \"{n}\" is not referenced by COPY"));
+                return err("42P10", format!("{what} column \"{n}\" not referenced by COPY"));
             }
             Ok(names.iter().map(|n| l.contains(n)).collect())
         };
@@ -656,6 +733,19 @@ impl Session {
         if c.format.freeze && t.hier.part.is_some() {
             return Err(feature("cannot perform COPY FREEZE on a partitioned table"));
         }
+        // FREEZE: only into a table this transaction made or truncated, at the savepoint level it is at (its rows
+        // would otherwise show to transactions that shouldn't see them, in Postgres)
+        if c.format.freeze {
+            let made_here = self.tx.as_ref().is_some_and(|tx| {
+                tx.fresh.iter().any(|(n, depth)| *n == rel_part(&t.name) && *depth == tx.saves.len())
+            });
+            if !made_here {
+                return err(
+                    "55000",
+                    "cannot perform COPY FREEZE because the table was not created or truncated in the current subtransaction",
+                );
+            }
+        }
         // the defaults it may take, worked out before any data comes, as Postgres's are (a constant that doesn't fit
         // its column fails the COPY then): those of the columns it leaves out, and with DEFAULT those of all
         let mut defaults = vec![];
@@ -686,6 +776,31 @@ impl Session {
             let cols = t.cols.iter().filter(|x| names.contains(&x.name)).cloned().collect::<Vec<_>>();
             (f, cols)
         });
+        // (a column it reads that the table hasn't: 42703 before any data comes, at the name, as Postgres places it)
+        if let Some((f, _)) = &filter
+            && let Err(mut e) = Binder::plain(&t.cols, None).bind(f)
+        {
+            if e.code == NO_COLUMN
+                && let Some(name) = e.message.strip_prefix("column \"").and_then(|r| r.split('"').next())
+            {
+                let name = name.to_string();
+                if pg_exact()
+                    && let Some(at) = e.message.find("; did you mean")
+                {
+                    e.message.truncate(at);
+                }
+                let sql = self.sql.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                if let Ok((toks, starts)) = lex_at(&sql)
+                    && let Some(w) = toks.iter().position(|t| *t == Tok::Word("where".into()))
+                    && let Some(k) = (w..toks.len()).find(|&k| toks[k] == Tok::Word(name.to_lowercase()))
+                {
+                    let mut info = e.info.take().map(|b| *b).unwrap_or_default();
+                    info.position = starts.get(k).map(|s| *s as u32 + 1);
+                    e.info = Some(Box::new(info));
+                }
+            }
+            return Err(e);
+        }
         Ok(CopyIn {
             table,
             names,
@@ -707,6 +822,8 @@ impl Session {
             filter,
             skipped: 0,
             defaults,
+            rec: vec![],
+            field: None,
         })
     }
 
@@ -836,7 +953,7 @@ impl Session {
 fn force_quote_named(f: &Format, cols: &[(String, Type)], query: bool) -> Result<()> {
     match f.force_quote.iter().find(|n| !cols.iter().any(|(c, _)| c == *n)) {
         Some(n) if query => err(NO_COLUMN, format!("column \"{n}\" does not exist")),
-        Some(n) => err("42P10", format!("FORCE_QUOTE column \"{n}\" is not referenced by COPY")),
+        Some(n) => err("42P10", format!("FORCE_QUOTE column \"{n}\" not referenced by COPY")),
         None => Ok(()),
     }
 }
@@ -1154,13 +1271,30 @@ impl CopyIn {
         self.stop.as_ref().map_or(Ok(()), Stop::check)
     }
 
+    /// Error `e` reading line `line` (column `col` of it), with Postgres's CONTEXT: `COPY t, line 1: "the line"`, or
+    /// `COPY t, line 1, column a: "the value"` (each cut to 100 characters, as Postgres's limit_printout_length).
     fn context(&self, e: SqlError, col: Option<usize>) -> SqlError {
-        let col = col.map(|i| format!(", column {}", self.names[i])).unwrap_or_default();
-        SqlError {
-            code: e.code,
-            message: format!("{} (COPY {}, line {}{col})", e.message, self.table, self.line),
-            info: None,
-        }
+        let cut = |b: &[u8]| {
+            let t = String::from_utf8_lossy(b);
+            match t.char_indices().nth(100) {
+                Some((at, _)) => format!("{}...", &t[..at]),
+                None => t.into_owned(),
+            }
+        };
+        let table = rel_part(&self.table);
+        let context = match col {
+            Some(i) => match &self.field {
+                Some(v) => {
+                    format!("COPY {table}, line {}, column {}: \"{}\"", self.line, self.names[i], cut(v.as_bytes()))
+                }
+                None => format!("COPY {table}, line {}, column {}", self.line, self.names[i]),
+            },
+            None if self.format.binary => format!("COPY {table}, line {}", self.line),
+            None => format!("COPY {table}, line {}: \"{}\"", self.line, cut(&self.rec)),
+        };
+        let mut info = e.info.map(|b| *b).unwrap_or_default();
+        info.context = Some(context);
+        SqlError { code: e.code, message: e.message, info: Some(Box::new(info)) }
     }
 
     /// Reads the complete records at the start of `buf` (and at the end of the data, `eof`, a
@@ -1245,6 +1379,9 @@ impl CopyIn {
                         if fields.len() + 1 >= self.names.len() && !(self.header && self.format.header_match) {
                             if !self.header {
                                 self.line += 1;
+                                let to = b[rec..].iter().position(|&c| c == b'\n').map_or(b.len(), |n| rec + n);
+                                self.rec.clear();
+                                self.rec.extend_from_slice(b[rec..to].strip_suffix(b"\r").unwrap_or(&b[rec..to]));
                                 let e = SqlError {
                                     code: "22P04",
                                     message: "extra data after last expected column".into(),
@@ -1271,6 +1408,8 @@ impl CopyIn {
             fields.push((field, quoted));
             at = (end + 1).min(b.len());
             self.line += 1;
+            self.rec.clear();
+            self.rec.extend_from_slice(b[rec..end].strip_suffix(b"\r").unwrap_or(&b[rec..end]));
             if self.line.is_multiple_of(4096) {
                 self.stopped()?;
             }
@@ -1426,11 +1565,10 @@ impl CopyIn {
                 None,
             ));
         }
-        if fields.len() < self.names.len() {
-            let message = format!("missing data for column \"{}\"", self.names[fields.len()]);
-            return Err(self.context(SqlError { code: "22P04", message, info: None }, None));
-        }
-        let mut row = Vec::with_capacity(fields.len());
+        // (a record short of fields reads the ones it has first, as Postgres's NextCopyFrom does: one that fails is
+        // the error, before the missing one)
+        let given = fields.len();
+        let mut row = Vec::with_capacity(self.names.len());
         for (i, (raw, quoted)) in fields.into_iter().enumerate() {
             let is_null = raw == self.format.null.as_bytes();
             let null = if self.format.csv {
@@ -1450,7 +1588,13 @@ impl CopyIn {
             {
                 match def {
                     Some(Some(v)) => {
-                        let v = coerce(v.clone(), self.types[i]).map_err(|e| self.context(e, Some(i)))?;
+                        let v = match coerce(v.clone(), self.types[i]) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                self.field = Some(String::from_utf8_lossy(&raw).into_owned());
+                                return Err(self.context(e, Some(i)));
+                            }
+                        };
                         row.push(v);
                         continue;
                     }
@@ -1467,17 +1611,17 @@ impl CopyIn {
                             message: "unexpected default marker in COPY data".into(),
                             info: None,
                         };
-                        let mut e = self.context(e, Some(i));
-                        e.info = Some(Box::new(Violation {
-                            detail: Some(format!("Column \"{}\" has no default value.", self.names[i])),
-                            ..Violation::default()
-                        }));
+                        let mut e = self.context(e, None);
+                        if let Some(info) = e.info.as_mut() {
+                            info.detail = Some(format!("Column \"{}\" has no default value.", self.names[i]));
+                        }
                         return Err(e);
                     }
                 }
             }
             let bytes = if self.format.csv { raw } else { unescape_text(&raw) };
             let text = String::from_utf8(bytes).map_err(|_| {
+                self.field = None;
                 self.context(
                     SqlError {
                         code: "22021",
@@ -1487,8 +1631,20 @@ impl CopyIn {
                     Some(i),
                 )
             })?;
-            let v = coerce(Value::Text(text), self.types[i]).map_err(|e| self.context(e, Some(i)))?;
+            // (the field's text, for the CONTEXT of an error: kept where reading it as its type may fail)
+            let kept = (self.types[i] != Type::Text).then(|| text.clone());
+            let v = match coerce(Value::Text(text), self.types[i]) {
+                Ok(v) => v,
+                Err(e) => {
+                    self.field = kept;
+                    return Err(self.context(e, Some(i)));
+                }
+            };
             row.push(v);
+        }
+        if given < self.names.len() {
+            let message = format!("missing data for column \"{}\"", self.names[given]);
+            return Err(self.context(SqlError { code: "22P04", message, info: None }, None));
         }
         self.push(row)
     }
@@ -1599,6 +1755,8 @@ mod tests {
             filter: None,
             skipped: 0,
             defaults: vec![],
+            rec: vec![],
+            field: None,
         }
     }
 

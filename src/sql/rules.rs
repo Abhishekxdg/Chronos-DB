@@ -206,8 +206,9 @@ impl Parser {
         self.expect_kw("on")?;
         let table = self.qualified(false, Kind::Rel)?;
         self.cascade();
-        let missing =
-            (!if_exists).then(|| format!("rule \"{name}\" for relation \"{}\" does not exist", rel_part(&table)));
+        let missing = format!("rule \"{name}\" for relation \"{}\" does not exist", rel_part(&table));
+        // (IF EXISTS: a notice, see `userdefs::SKIP`)
+        let missing = Some(if if_exists { format!("{}{missing}, skipping", super::userdefs::SKIP) } else { missing });
         Ok(Stmt::UserDef { needs: None, key: key(&table, &name), json: None, tag: "DROP RULE", missing, exists: None })
     }
 }

@@ -206,12 +206,13 @@ fn a_failed_copy_leaves_nothing() {
         assert!(!ok && err.contains(code), "{bad}: {err}");
         assert_eq!(sql(&to, "select count(*) from t"), "0\n", "{bad}");
     }
+    // (where, in its CONTEXT, as Postgres says it)
     let (_, _, err) = psql(
         &to,
-        &["-v", "SHOW_CONTEXT=never", "-v", "VERBOSITY=default", "-c", "copy t from stdin csv"],
+        &["-v", "SHOW_CONTEXT=always", "-v", "VERBOSITY=default", "-c", "copy t from stdin csv"],
         &rows("45000,oops\n"),
     );
-    assert!(err.contains("line 45000, column v"), "{err}");
+    assert!(err.contains("CONTEXT:  COPY t, line 45000, column v: \"oops\""), "{err}");
     // inside a transaction: the transaction fails with it
     let script = "begin;\ninsert into t values (1, 1);\ncopy t from stdin csv;\n2,2\nx,3\n\\.\ncommit;\nselect count(*) from t;\n";
     let (_, out, _) = psql(&to, &["-A", "-t", "-f", "-"], script.as_bytes());

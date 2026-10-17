@@ -433,16 +433,13 @@ impl Parser {
         let (l, r) = self.operator_types()?;
         self.cascade();
         let key = op_key(&sym, &l, &r);
-        let missing = (!if_exists).then(|| format!("operator does not exist: {} {sym} {}", tname(&l), tname(&r)));
-        // a side's type not looked up yet has to be there (`type "x" does not exist`, before the operator is looked for)
-        let needs = [l, r].into_iter().flatten().find_map(|t| match t {
-            Type::Enum(i) if i & UNRESOLVED_BIT != 0 => {
-                let n = unresolved_name(i)?;
-                Some((type_key(&n), format!("type \"{}\" does not exist", shown_type(&n))))
-            }
-            _ => None,
+        // (IF EXISTS: Postgres's notice names the operator by its symbol alone)
+        let missing = Some(match if_exists {
+            true => format!("{SKIP}operator {sym} does not exist, skipping"),
+            false => format!("operator does not exist: {} {sym} {}", tname(&l), tname(&r)),
         });
-        let needs = needs.filter(|_| !if_exists);
+        // a side's type not looked up yet has to be there (`type "x" does not exist`, before the operator is looked for)
+        let needs = [l, r].into_iter().flatten().find_map(|t| unresolved_needs(t, if_exists));
         Ok(Stmt::UserDef { needs, key, json: None, tag: "DROP OPERATOR", missing, exists: None })
     }
 
@@ -839,12 +836,15 @@ impl Parser {
         // a type not looked up yet has to be there (`type "x" does not exist`, as Postgres looks the types up first);
         // the pseudo-types an aggregate takes (`VARIADIC "any"`, internal) always are
         let needs = sig.args.iter().find_map(|t| match *t {
-            Type::Enum(i) if i & UNRESOLVED_BIT != 0 && !if_exists => {
+            Type::Enum(i) if i & UNRESOLVED_BIT != 0 => {
                 let n = unresolved_name(i)?;
                 if ["any", "internal", "cstring", "record", "void"].contains(&rel_part(written(&n))) {
                     return None;
                 }
-                Some((type_key(&n), format!("type \"{}\" does not exist", shown_type(&n))))
+                // (IF EXISTS: a notice, and nothing dropped)
+                let skip = if if_exists { SKIP } else { "" };
+                let tail = if if_exists { ", skipping" } else { "" };
+                Some((type_key(&n), format!("{skip}type \"{}\" does not exist{tail}", shown_type(&n))))
             }
             _ => None,
         });
@@ -918,9 +918,11 @@ impl Parser {
         }
         let (from, to) = self.cast_pair()?;
         self.cascade();
-        let missing =
-            (!if_exists).then(|| format!("cast from type {} to type {} does not exist", from.name(), to.name()));
-        Ok(Stmt::UserDef { needs: None, key: cast_key(from, to), json: None, tag: "DROP CAST", missing, exists: None })
+        let missing = format!("cast from type {} to type {} does not exist", from.name(), to.name());
+        let missing = Some(if if_exists { format!("{SKIP}{missing}, skipping") } else { missing });
+        // a type not looked up yet has to be there, as Postgres looks the types up first
+        let needs = [from, to].into_iter().find_map(|t| unresolved_needs(t, if_exists));
+        Ok(Stmt::UserDef { needs, key: cast_key(from, to), json: None, tag: "DROP CAST", missing, exists: None })
     }
 
     /// `OPERATOR(schema.sym)` next, as pg_dump writes an operator that isn't in pg_catalog: the symbol, and how
@@ -1010,6 +1012,10 @@ impl Exec<'_> {
         if let Some((k, m)) = needs
             && v.get(k)?.is_none()
         {
+            if let Some(m) = m.strip_prefix(SKIP) {
+                notice("NOTICE", m.to_string());
+                return Ok(vec![]);
+            }
             return err("42704", m.clone());
         }
         if tag.ends_with(" AGGREGATE") {
@@ -1022,10 +1028,19 @@ impl Exec<'_> {
             && let Some(table) = super::rules::table_of(key)
             && relation_kind(v, table)?.is_none()
         {
-            return err(NO_TABLE, format!("relation \"{}\" does not exist", rel_part(table)));
+            let missing_table = format!("relation \"{}\" does not exist", rel_part(table));
+            if missing.as_ref().is_some_and(|m| m.starts_with(SKIP)) {
+                notice("NOTICE", format!("{missing_table}, skipping"));
+                return Ok(vec![]);
+            }
+            return err(NO_TABLE, missing_table);
         }
         if tag.starts_with("ALTER") {
             return match (there, missing, json) {
+                (false, Some(m), _) if m.starts_with(SKIP) => {
+                    notice("NOTICE", m[SKIP.len()..].to_string());
+                    Ok(vec![])
+                }
                 (false, Some(m), _) => err("42704", m.clone()),
                 // (an event trigger's change: its fields merged into the row)
                 (true, _, Some(change)) => {
@@ -1047,6 +1062,10 @@ impl Exec<'_> {
             Some(_) if there && exists.is_none() => Ok(vec![]),
             Some(_) if there => err("42710", exists.clone().unwrap_or_default()),
             None if !there => match missing {
+                Some(m) if m.starts_with(SKIP) => {
+                    notice("NOTICE", m[SKIP.len()..].to_string());
+                    Ok(vec![])
+                }
                 Some(m) => err(if tag.contains("OPERATOR") { "42883" } else { "42704" }, m.clone()),
                 None => Ok(vec![]),
             },
@@ -1201,6 +1220,10 @@ impl Parser {
         } else {
             String::new()
         };
+        // (the access method is looked up first, IF EXISTS or not)
+        if !using.is_empty() && !ACCESS_METHODS.contains(&using.as_str()) {
+            return err("42704", format!("access method \"{using}\" does not exist"));
+        }
         self.skip_rest();
         let key = format!("{PREFIX}{kind}/{name}/{using}");
         let on = if using.is_empty() { String::new() } else { format!(" for access method \"{using}\"") };
@@ -1219,10 +1242,60 @@ impl Parser {
                 key,
                 json: None,
                 tag,
-                missing: (!if_exists).then(|| format!("{what} \"{name}\" does not exist{on}")),
+                missing: Some(match if_exists {
+                    true => format!("{SKIP}{what} \"{name}\" does not exist{on}, skipping"),
+                    false => format!("{what} \"{name}\" does not exist{on}"),
+                }),
                 exists: None,
             },
         })
+    }
+
+    /// After CREATE, ALTER or DROP: `[DEFAULT] CONVERSION ...`. A conversion is kept as its name only: text here
+    /// is UTF8, which nothing converts (CREATE CONVERSION name FOR 'from' TO 'to' FROM function).
+    pub(super) fn conversion_stmt(&mut self, verb: &str) -> Result<Stmt> {
+        self.kw("default");
+        self.expect_kw("conversion")?;
+        let tag: &'static str = match verb {
+            "create" => "CREATE CONVERSION",
+            "alter" => "ALTER CONVERSION",
+            _ => "DROP CONVERSION",
+        };
+        let if_exists = verb == "drop" && self.guard(false)?;
+        let mut name = self.name()?;
+        while self.sym(".") {
+            name = self.name()?;
+        }
+        self.skip_rest();
+        let key = format!("{PREFIX}conversion/{name}");
+        let missing = format!("conversion \"{name}\" does not exist");
+        Ok(Stmt::UserDef {
+            needs: None,
+            key,
+            json: (verb == "create").then(|| "{}".to_string()),
+            tag,
+            missing: Some(if if_exists { format!("{SKIP}{missing}, skipping") } else { missing }),
+            exists: Some(format!("conversion \"{name}\" already exists")),
+        })
+    }
+
+    /// After DROP ACCESS METHOD: `[IF EXISTS] name [CASCADE | RESTRICT]`. The access methods are Postgres's own,
+    /// which none drops; there are no others.
+    pub(super) fn drop_access_method(&mut self) -> Result<Stmt> {
+        let if_exists = self.guard(false)?;
+        let name = self.name()?;
+        self.cascade();
+        if ACCESS_METHODS.contains(&name.as_str()) {
+            return err(
+                "2BP01",
+                format!("cannot drop access method {name} because it is required by the database system"),
+            );
+        }
+        let missing = format!("access method \"{name}\" does not exist");
+        match if_exists {
+            true => Ok(Stmt::NoopNotices("DROP ACCESS METHOD", vec![format!("{missing}, skipping")])),
+            false => err("42704", missing),
+        }
     }
 
     /// `[IF [NOT] EXISTS]`, as (taken, whether it was there).
@@ -1575,7 +1648,10 @@ impl Parser {
         let name = self.ts_name()?;
         let key = format!("{PREFIX}ts{kind}/{name}");
         let what = format!("text search {kind} \"{name}\"");
-        let missing = (!if_exists).then(|| format!("{what} does not exist"));
+        let missing = Some(match if_exists {
+            true => format!("{SKIP}{what} does not exist, skipping"),
+            false => format!("{what} does not exist"),
+        });
         if verb == "drop" {
             self.cascade();
             return Ok(Stmt::UserDef { needs: None, key, json: None, tag, missing, exists: None });
@@ -1681,6 +1757,9 @@ impl Parser {
         Ok(Stmt::UserDef { needs: None, key, json, tag, missing: Some(format!("{what} does not exist")), exists: None })
     }
 }
+
+/// Postgres's access methods: its index methods and `heap`.
+pub(super) const ACCESS_METHODS: [&str; 7] = ["btree", "hash", "gist", "gin", "spgist", "brin", "heap"];
 
 /// The default mappings of a built-in configuration, or of a user's, as (token class, dictionaries).
 pub(super) fn ts_maps_of(name: &str) -> Vec<(String, Vec<String>)> {
@@ -1891,7 +1970,19 @@ fn written_type(t: Option<&Tok>) -> Option<String> {
 }
 
 /// Before a message that something isn't there: the statement said IF EXISTS, so it is a notice, not an error.
-const SKIP: &str = "\u{1}skip:";
+pub(super) const SKIP: &str = "\u{1}skip:";
+
+/// For a type a statement named that wasn't looked up yet (an unresolved name): the row it needs, and Postgres's
+/// error if it isn't there, or with IF EXISTS (`skip`) its notice (see `SKIP`).
+fn unresolved_needs(t: Type, skip: bool) -> Option<(String, String)> {
+    let Type::Enum(i) = t else { return None };
+    if i & UNRESOLVED_BIT == 0 {
+        return None;
+    }
+    let n = unresolved_name(i)?;
+    let m = format!("type \"{}\" does not exist", shown_type(&n));
+    Some((type_key(&n), if skip { format!("{SKIP}{m}, skipping") } else { m }))
+}
 
 /// The row of aggregate `name` with arguments of these types.
 pub(super) fn agg_key(name: &str, args: &[Type]) -> String {

@@ -357,7 +357,7 @@ fn distance(a: &str, b: &str) -> usize {
 
 /// The name among `candidates` closest to `source`, as Postgres's getClosestMatch picks it: at most 4 edits
 /// away and at most half the source's length, the first of the closest.
-fn closest<'a>(source: &str, candidates: &[&'a str]) -> Option<&'a str> {
+pub(super) fn closest<'a>(source: &str, candidates: &[&'a str]) -> Option<&'a str> {
     let mut best: Option<(usize, &str)> = None;
     if source.is_empty() || source.len() > 255 {
         return None;

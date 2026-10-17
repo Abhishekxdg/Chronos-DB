@@ -82,6 +82,8 @@ pub(super) enum Commented {
     Type(String),
     /// a function or procedure, by name and argument types (None: the one of that name)
     Func(String, Option<Vec<Type>>, bool),
+    /// a large object, by its oid
+    LargeObject(i64),
     /// a database, extension, function, role...: nothing here to look up
     Other,
 }
@@ -354,9 +356,13 @@ impl Parser {
                     _ => return self.fail("expected one function"),
                 }
             }
+            "large" => {
+                self.expect_kw("object")?;
+                Commented::LargeObject(self.large_object_oid()?)
+            }
             "database" | "extension" | "routine" | "role" | "user" | "group" | "policy" | "trigger" | "publication"
             | "subscription" | "collation" | "conversion" | "language" | "operator" | "cast" | "transform"
-            | "tablespace" | "statistics" | "text" | "access" | "event" | "large" => {
+            | "tablespace" | "statistics" | "text" | "access" | "event" => {
                 // skip the name (a function's has a signature): up to IS outside parentheses
                 let mut depth = 0;
                 while let Some(t) = self.peek() {
@@ -840,6 +846,12 @@ pub(super) fn comment(db: &Db, branch: &str, c: &Comment) -> Result<Output> {
             }
             // (its text isn't kept: there is no row for a domain's constraint to keep it on)
             return Ok(Output::tag("COMMENT"));
+        }
+        Commented::LargeObject(oid) => {
+            if !super::largeobj::exists_in(&db.view_tx(branch)?, *oid)? {
+                return err("42704", format!("large object {oid} does not exist"));
+            }
+            Some(format!("large object/{oid}"))
         }
         Commented::Type(name) => {
             let v = db.view_tx(branch)?;

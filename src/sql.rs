@@ -2712,6 +2712,9 @@ struct SearchPath {
     /// the session's temporary tables are looked for after this many of `schemas`, where pg_temp is named after one;
     /// None: first (pg_temp unnamed or named first)
     temp_at: Option<usize>,
+    /// pg_catalog or information_schema, where it is named before every schema of `schemas`: what current_schema()
+    /// is then
+    builtin_first: Option<String>,
     core: Arc<crate::Core>,
     world: String,
 }
@@ -2820,14 +2823,16 @@ fn path_of(
         let at = p.iter().position(|s| s == "pg_catalog").unwrap_or(0);
         p[..at].iter().filter(|s| !matches!(s.as_str(), "$user" | "pg_temp" | "information_schema")).count()
     });
-    (schemas != ["public"] || info.is_some() || catalog > 0 || temp_at.is_some()).then(|| SearchPath {
-        schemas,
-        info,
-        catalog,
-        temp_at,
-        core: core.clone(),
-        world: world.into(),
-    })
+    // (pg_catalog or information_schema named first, before every schema there is: current_schema())
+    let builtin_first = list.and_then(|p| {
+        p.iter()
+            .filter(|s| !matches!(s.as_str(), "pg_temp") && (*s != "$user" || user.is_some()))
+            .find(|s| matches!(s.as_str(), "pg_catalog" | "information_schema") || schemas.contains(s) || *s == "$user")
+            .filter(|s| matches!(s.as_str(), "pg_catalog" | "information_schema"))
+            .cloned()
+    });
+    (schemas != ["public"] || info.is_some() || catalog > 0 || temp_at.is_some() || builtin_first.is_some())
+        .then(|| SearchPath { schemas, info, catalog, temp_at, builtin_first, core: core.clone(), world: world.into() })
 }
 
 /// The schemas a search_path given as one string names (`'app, "B,c", public'`): split at the commas outside double
@@ -3181,10 +3186,53 @@ fn create_in(name: &str) -> Result<String> {
     err("3F000", "no schema has been selected to create in")
 }
 
-/// The schema unqualified names are created in: current_schema().
+/// `e` without the parentheses around the whole of it, if it has them (`(a * 2)` is `a * 2`, `(a) + (b)` stays).
+pub fn without_outer_parens(e: &str) -> &str {
+    let Some(inner) = e.strip_prefix('(').and_then(|r| r.strip_suffix(')')) else { return e };
+    let (mut depth, mut quoted) = (0i32, false);
+    for c in inner.chars() {
+        depth += match c {
+            '\'' => {
+                quoted = !quoted;
+                0
+            }
+            '(' if !quoted => 1,
+            ')' if !quoted => -1,
+            _ => 0,
+        };
+        if depth < 0 {
+            return e;
+        }
+    }
+    if depth == 0 && !quoted { inner } else { e }
+}
+
+/// The schema unqualified names are created in: current_schema(); pg_catalog or information_schema where the
+/// search_path names it before any schema there is.
 fn current_schema() -> Option<String> {
+    if let Some(b) = PATH.with_borrow(|p| p.as_ref().and_then(|p| p.builtin_first.clone())) {
+        return Some(b);
+    }
     let s = create_in("x").ok()?;
     Some(schema_part(&s).to_string())
+}
+
+/// What a DROP naming `schemas` (see `Stmt::InSchemas`) does when one of them doesn't exist: 3F000, or with IF EXISTS
+/// a notice and nothing more (`tag`). None when they all exist (the built-in ones always do).
+fn schemas_named(v: &View, schemas: &[String], if_exists: bool, tag: &str) -> Result<Option<Output>> {
+    for s in schemas {
+        let builtin = ["public", "pg_catalog", "information_schema", "pg_toast"].contains(&s.as_str())
+            || s.starts_with("pg_temp");
+        if builtin || v.get(&namespace_key(s))?.is_some() {
+            continue;
+        }
+        if if_exists {
+            notice("NOTICE", format!("schema \"{s}\" does not exist, skipping"));
+            return Ok(Some(Output::tag(tag)));
+        }
+        return err("3F000", format!("schema \"{s}\" does not exist"));
+    }
+    Ok(None)
 }
 
 /// Checks the schema `name` would be made in exists (3F000 if not).
@@ -3541,7 +3589,10 @@ fn outcome_columns(by_policy: bool) -> Vec<(&'static str, Type)> {
 }
 
 fn notice(level: &'static str, message: String) {
-    if pg_exact() && ["aren't used", "isn't used", "isn't tracked"].iter().any(|w| message.contains(w)) {
+    // (Chronos's own words on what it leaves out: a function's planner attributes, LOCK TABLE's reach)
+    let own =
+        ["aren't used", "isn't used", "isn't tracked", "only tune Postgres's planner", "don't take table locks here"];
+    if pg_exact() && own.iter().any(|w| message.contains(w)) {
         return;
     }
     unkept();
@@ -6568,18 +6619,45 @@ struct OnConflict {
     update: Option<(Sets, Option<Expr>)>, // None: DO NOTHING
 }
 
-/// What ON CONFLICT is about: the primary key or a UNIQUE constraint, by its columns (in any
-/// order) or its name.
+/// What ON CONFLICT is about: the primary key or a UNIQUE constraint, by its parts (in any
+/// order, each once or more, as Postgres's infer_arbiter_indexes takes them) or its name.
 #[derive(Clone, Debug)]
 enum Target {
-    Cols(Vec<String>),
+    Cols(Vec<Infer>),
     Constraint(String),
+}
+
+/// A part of an ON CONFLICT target: a column or an expression, as CREATE INDEX writes a part, and the collation it
+/// asks for (an index whose part is in another collation isn't an arbiter). Its operator class, when written, is
+/// read and not compared: an index here keeps no operator class but its type's (see `create_index`).
+#[derive(Clone, Debug)]
+struct Infer {
+    part: IndexPart,
+    coll: Option<collation::Named>,
+}
+
+impl Infer {
+    /// The column it is, when it is one.
+    fn col(&self) -> Option<&str> {
+        match &self.part {
+            IndexPart::Col(c) => Some(c),
+            IndexPart::Expr(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Target {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Target::Cols(c) => write!(f, "({})", c.join(", ")),
+            Target::Cols(c) => {
+                let parts: Vec<&str> = c
+                    .iter()
+                    .map(|i| match &i.part {
+                        IndexPart::Col(c) | IndexPart::Expr(c) => c.as_str(),
+                    })
+                    .collect();
+                write!(f, "({})", parts.join(", "))
+            }
             Target::Constraint(n) => write!(f, "ON CONSTRAINT {n}"),
         }
     }
@@ -6626,6 +6704,8 @@ struct MergeStmt {
     whens: Vec<MergeWhen>,
     /// every expression of it, for the parameters it takes
     exprs: Vec<Expr>,
+    /// WITH ... MERGE: its WITH list (as SQL), which every statement the MERGE runs reads (see `Exec::merge_into`)
+    with: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -7174,6 +7254,9 @@ enum Stmt {
     AlterOwner(acl::Owned, roles::Spec),
     /// ALTER FUNCTION | PROCEDURE ... SECURITY DEFINER (true) | INVOKER (false)
     SetDefiner(acl::Owned, bool),
+    /// ALTER FUNCTION | PROCEDURE ... SET name = value | RESET name | RESET ALL: its settings (see
+    /// `functions::Function::config`), each change (name, value): RESET's value None, RESET ALL's name too
+    RoutineConfig(acl::Owned, Vec<(Option<String>, Option<Vec<String>>)>),
     /// DROP OWNED BY roles [CASCADE]
     DropOwned(Vec<roles::Spec>, bool),
     /// REASSIGN OWNED BY roles TO role
@@ -7434,6 +7517,15 @@ enum Stmt {
     NoopNotice(&'static str, &'static str),
     /// as `NoopNotice`, with a notice for each thing skipped (DROP EXTENSION IF EXISTS)
     NoopNotices(&'static str, Vec<String>),
+    /// A DROP of one object whose name (or an argument type's, or its table's) names schemas: each must exist, as
+    /// Postgres looks the schema up before the object (3F000, or with IF EXISTS a notice and nothing dropped). `tag`
+    /// is what the skipped statement says.
+    InSchemas {
+        schemas: Vec<String>,
+        if_exists: bool,
+        tag: String,
+        stmt: Box<Stmt>,
+    },
     /// ALTER INDEX name RENAME TO new
     RenameIndex {
         name: String,
@@ -10288,6 +10380,37 @@ impl Parser {
         }
     }
 
+    /// ON CONFLICT's `(part [COLLATE c] [opclass], ...)` after the opening parenthesis: each part a column or an
+    /// expression, as CREATE INDEX reads them (a function call, or one in parentheses).
+    fn inference(&mut self) -> Result<Vec<Infer>> {
+        let mut out = vec![];
+        loop {
+            let call = matches!(self.peek(), Some(Tok::Word(_) | Tok::Ident(_)))
+                && matches!(self.t.get(self.i + 1), Some(Tok::Sym("(")));
+            let part = if matches!(self.peek(), Some(Tok::Sym("("))) || call {
+                let (start, toks) = (self.i, self.ahead(true));
+                self.expr()?;
+                IndexPart::Expr(tokens_sql(self.since(&toks, start)?))
+            } else {
+                IndexPart::Col(self.name()?)
+            };
+            let coll = if self.kw("collate") { Some(self.collation_name()?) } else { None };
+            // an operator class, perhaps with its schema
+            if matches!(self.peek(), Some(Tok::Word(_) | Tok::Ident(_))) {
+                self.name()?;
+                if self.sym(".") {
+                    self.name()?;
+                }
+            }
+            out.push(Infer { part, coll });
+            if !self.sym(",") {
+                break;
+            }
+        }
+        self.expect_sym(")")?;
+        Ok(out)
+    }
+
     /// `a, b, c)` after the opening parenthesis.
     fn names(&mut self) -> Result<Vec<String>> {
         let mut v = vec![self.name()?];
@@ -10444,6 +10567,48 @@ impl Parser {
     }
 
     fn stmt_in(&mut self) -> Result<Stmt> {
+        if !self.is_kw("drop") {
+            return self.stmt_plain();
+        }
+        // the schemas a DROP of one object names (`s.t`, `f(s.ty)`, `TRIGGER x ON s.t`), up to its end: a comma
+        // outside parentheses lists several objects, each looked up on its own by the DROP itself
+        let (mut schemas, mut depth, mut words) = (vec![], 0, vec![]);
+        let mut k = self.i + 1;
+        let mut several = false;
+        while let Some(t) = self.t.get(k) {
+            match t {
+                Tok::Sym(";") => break,
+                Tok::Sym("(") => depth += 1,
+                Tok::Sym(")") => depth -= 1,
+                Tok::Sym(",") if depth == 0 => several = true,
+                Tok::Word(w) | Tok::Ident(w)
+                    if self.t.get(k + 1) == Some(&Tok::Sym("."))
+                        && self.t.get(k + 2).is_some_and(|n| !matches!(n, Tok::Sym("*")))
+                        && !(k > 0 && self.t.get(k - 1) == Some(&Tok::Sym(".")))
+                        && !schemas.contains(w) =>
+                {
+                    schemas.push(w.clone())
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        for t in &self.t[self.i + 1..] {
+            match t {
+                Tok::Word(w) if w != "if" && w.chars().all(|c| c.is_ascii_lowercase()) => words.push(w.to_uppercase()),
+                _ => break,
+            }
+        }
+        let if_exists = self.t[self.i..k].windows(2).any(|p| p == [Tok::Word("if".into()), Tok::Word("exists".into())]);
+        let stmt = self.stmt_plain()?;
+        if schemas.is_empty() || several {
+            return Ok(stmt);
+        }
+        let tag = format!("DROP {}", words.join(" "));
+        Ok(Stmt::InSchemas { schemas, if_exists, tag, stmt: Box::new(stmt) })
+    }
+
+    fn stmt_plain(&mut self) -> Result<Stmt> {
         let w = match self.peek() {
             Some(Tok::Word(w)) => w.clone(),
             Some(Tok::Sym("(")) => {
@@ -10549,11 +10714,13 @@ impl Parser {
                         query = Some(Box::new(q));
                     }
                 }
-                let conflict = if self.kw("on") {
+                let conflict = if self.is_kw("on") {
+                    let on_at = self.i;
+                    self.i += 1;
                     self.expect_kw("conflict")?;
                     let mut pred = None;
                     let target = if self.sym("(") {
-                        let t = self.names()?;
+                        let t = self.inference()?;
                         if self.kw("where") {
                             pred = Some(self.expr()?);
                         }
@@ -10572,6 +10739,10 @@ impl Parser {
                         self.expect_kw("set")?;
                         Some((self.sets()?, self.filter()?))
                     };
+                    // (DO UPDATE has to know which constraint: refused at the ON CONFLICT, as Postgres's parser does)
+                    if update.is_some() && target.is_none() {
+                        return Err(no_conflict_target(self.starts.get(on_at).map(|s| *s as u32 + 1)));
+                    }
                     Some(OnConflict { target, pred, update })
                 } else {
                     None
@@ -10835,7 +11006,7 @@ impl Parser {
             }
             "alter"
                 if !self.foreign_object()
-                    && !["world", "system", "agent", "merge", "role", "user", "group", "event"]
+                    && !["world", "system", "agent", "merge", "role", "user", "group", "event", "large"]
                         .iter()
                         .any(|k| self.is_kw(k)) =>
             {
@@ -11492,8 +11663,14 @@ impl Parser {
                 }
             }
             "drop" if self.kw("rule") => self.drop_rule(),
+            "drop" | "alter" if self.is_kw("conversion") => self.conversion_stmt(&w),
+            "drop" if self.is_kw("access") && matches!(self.t.get(self.i + 1), Some(Tok::Word(m)) if m == "method") => {
+                self.i += 2;
+                self.drop_access_method()
+            }
             "drop" if self.kw("event") => self.event_trigger_stmt(true),
             "alter" if self.kw("event") => self.event_trigger_stmt(false),
+            "alter" if self.is_kw("large") => self.alter_large_object(),
             "drop" if self.kw("operator") => self.drop_operator(),
             "drop" if self.kw("cast") => self.drop_cast(),
             "drop" if self.kw("aggregate") => self.drop_aggregate(),
@@ -13380,7 +13557,18 @@ impl Parser {
             return Ok(Stmt::PlannerStats("select count(*) from pg_catalog.pg_class where false".into()));
         }
         let source_alias = if members.is_empty() { src.alias } else { MERGE_JOINED.to_string() };
-        Ok(Stmt::Merge(Box::new(MergeStmt { table, only, alias, source, source_alias, members, on, whens, exprs })))
+        Ok(Stmt::Merge(Box::new(MergeStmt {
+            table,
+            only,
+            alias,
+            source,
+            source_alias,
+            members,
+            on,
+            whens,
+            exprs,
+            with: None,
+        })))
     }
 
     /// The names `toks` (the statement's from token `start` on) read unqualified, with where each is: not
@@ -13695,6 +13883,9 @@ impl Parser {
         let (at, peak) = (self.depth, self.peak);
         self.peak = at;
         let main = if self.is_kw("merge") {
+            if recursive {
+                return err(UNSUPPORTED, "WITH RECURSIVE is not supported for MERGE statement");
+            }
             // WITH ... MERGE: its USING source reads the WITH queries, as a subquery that has them
             let list = tokens_sql(self.since(&list_toks, list_at)?);
             self.i += 1;
@@ -13708,6 +13899,10 @@ impl Parser {
                 if let Some(body) = cte_body(&list, &named) {
                     m.source = format!("({body}) {}", ident(&m.source_alias));
                 }
+            }
+            // (and its clauses' subqueries, and its source's, read them too)
+            if let Stmt::Merge(m) = &mut st {
+                m.with = Some(list.clone());
             }
             st
         } else if matches!(self.peek(), Some(Tok::Word(w)) if matches!(w.as_str(), "insert" | "update" | "delete")) {
@@ -14491,6 +14686,34 @@ impl Parser {
                     self.skip_rest();
                     let (name, types) = names.pop().unwrap();
                     return Ok(Stmt::SetDefiner(acl::Owned::Routine(name, types, procedure), d));
+                }
+                // SET name = value, RESET name, RESET ALL: the settings each call runs with
+                if (self.is_kw("set") && !matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "schema"))
+                    || self.is_kw("reset")
+                {
+                    let mut changes = vec![];
+                    loop {
+                        if self.kw("set") {
+                            if let Some((n, v)) = self.config_clause()? {
+                                changes.push((Some(n), Some(v)));
+                            }
+                        } else if self.kw("reset") {
+                            if self.kw("all") {
+                                changes.push((None, None));
+                            } else {
+                                let mut n = self.name()?;
+                                while self.sym(".") {
+                                    n = format!("{n}.{}", self.name()?);
+                                }
+                                changes.push((Some(n), None));
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    self.kw("restrict");
+                    let (name, types) = names.pop().unwrap();
+                    return Ok(Stmt::RoutineConfig(acl::Owned::Routine(name, types, procedure), changes));
                 }
             }
             self.i = save;
@@ -15732,6 +15955,7 @@ impl Parser {
         self.expect_kw("on")?;
         let only = self.kw("only");
         let table = self.table_name()?;
+        self.in_schema_being_made(&table)?;
         let mut using = Using::Btree;
         let mut trgm = None;
         if self.kw("using") && !self.kw("btree") {
@@ -16014,6 +16238,11 @@ impl Parser {
         }
         if self.kw("procedure") {
             return self.create_function(replace, true);
+        }
+        if self.is_kw("conversion")
+            || (self.is_kw("default") && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "conversion"))
+        {
+            return self.conversion_stmt("create");
         }
         if self.kw("trigger") {
             return self.create_trigger(replace, false);
@@ -16320,9 +16549,11 @@ impl Parser {
             let name = if self.is_kw("authorization") { None } else { Some(self.name()?) };
             let owner = if self.kw("authorization") { Some(self.role_spec(false)?) } else { None };
             // CREATE SCHEMA's elements: the CREATEs and GRANTs it holds, made in it
+            // (AUTHORIZATION CURRENT_ROLE: the role running it, as the name below has it)
             let schema_name = name.clone().or_else(|| match &owner {
                 Some(roles::Spec::Name(n)) => Some(n.clone()),
-                _ => None,
+                Some(_) => roles::current().map(|w| w.name.clone()),
+                None => None,
             });
             let mut elements = vec![];
             // (Postgres's grammar refuses elements with IF NOT EXISTS, at the first one)
@@ -16653,6 +16884,21 @@ impl Parser {
             }
         }
         Ok(l)
+    }
+
+    /// Inside CREATE SCHEMA: an index's or trigger's table, which must be in the schema being made (42P15 otherwise,
+    /// as Postgres's transformCreateSchemaStmtElements checks each element's schema).
+    fn in_schema_being_made(&self, table: &str) -> Result<()> {
+        match &self.in_schema {
+            Some(s) if table.contains('.') && schema_part(table) != s && schema_part(table) != "pg_temp" => err(
+                "42P15",
+                format!(
+                    "CREATE specifies a schema ({}) different from the one being created ({s})",
+                    schema_part(table)
+                ),
+            ),
+            _ => Ok(()),
+        }
     }
 
     /// A table's (or view's, or sequence's) name as stored (see `NAMESPACES`): `schema.name`, or
@@ -17579,6 +17825,8 @@ impl Parser {
             } else if matches!(self.peek(), Some(Tok::Word(_) | Tok::Ident(_)))
                 && self.t.get(self.i + 1) == Some(&Tok::Sym("."))
                 && self.t.get(self.i + 2) == Some(&Tok::Sym("*"))
+                // (`t.*::text`, `t.* || x`: the row as a value, in an expression)
+                && !matches!(self.t.get(self.i + 3), Some(Tok::Sym(s)) if !matches!(*s, "," | ")" | ";"))
             {
                 let t = self.name()?;
                 self.i += 2;
@@ -18477,6 +18725,11 @@ impl Parser {
     fn filter(&mut self) -> Result<Option<Expr>> {
         if !self.kw("where") {
             return Ok(None);
+        }
+        // WHERE CURRENT OF cursor (an UPDATE's or DELETE's): the row the cursor is on (see `CURRENT_OF`)
+        if self.is_kw("current") && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "of") {
+            self.i += 2;
+            return Ok(Some(Expr::Col(Some(CURRENT_OF.into()), self.name()?)));
         }
         let e = self.expr()?;
         if has_window(&e) {
@@ -19465,7 +19718,39 @@ impl Parser {
             {
                 self.type_literal(w)?
             }
-            Some(Tok::Word(w)) if w == "current_timestamp" => Expr::Func(Func::Now, vec![]),
+            // the transaction's start, as Postgres's SQL value functions give it: CURRENT_TIMESTAMP and LOCALTIMESTAMP,
+            // CURRENT_TIME (with its zone) and LOCALTIME, each with the digits of its seconds it may be given
+            Some(Tok::Word(w))
+                if matches!(w.as_str(), "current_timestamp" | "localtimestamp" | "current_time" | "localtime") =>
+            {
+                let (t, name) = match w.as_str() {
+                    "current_timestamp" => (Type::TimestampTz, "TIMESTAMP(%) WITH TIME ZONE"),
+                    "localtimestamp" => (Type::Timestamp, "TIMESTAMP(%)"),
+                    "current_time" => (Type::TimeTz, "TIME(%) WITH TIME ZONE"),
+                    _ => (Type::Time, "TIME(%)"),
+                };
+                let mut p = None;
+                if matches!(self.peek(), Some(Tok::Sym("("))) && matches!(self.t.get(self.i + 1), Some(Tok::Num(_))) {
+                    self.i += 1;
+                    let Some(Tok::Num(n)) = self.next() else { unreachable!() };
+                    self.expect_sym(")")?;
+                    let n: u32 = n.parse().map_err(|_| SqlError {
+                        code: "22023",
+                        message: format!("{} precision must not be negative", name.replace("(%)", "")),
+                        info: None,
+                    })?;
+                    p = Some(n);
+                }
+                let now = Expr::Func(Func::Now, vec![]);
+                let e = if t == Type::TimestampTz { now } else { Expr::Cast(Box::new(now), t) };
+                // (a precision past 6 is 6, with a warning, as the statement runs: see `Binder::go`)
+                match p {
+                    Some(p) => {
+                        Expr::Func(Func::Scalar(funcs::Scalar::TimePrec), vec![e, Expr::Lit(Value::Int(i64::from(p)))])
+                    }
+                    None => e,
+                }
+            }
             // keywords that stand for a function of the session, written without parentheses
             Some(Tok::Word(w))
                 if matches!(
@@ -19481,13 +19766,6 @@ impl Parser {
                     _ => CtxFn::CurrentSchema,
                 };
                 Expr::Func(Func::Ctx(f), vec![])
-            }
-            // the time of day now, in UTC (Postgres's current_time carries a zone; ours is plain time)
-            Some(Tok::Word(w)) if w == "current_time" || w == "localtime" => {
-                Expr::Cast(Box::new(Expr::Func(Func::Now, vec![])), Type::Time)
-            }
-            Some(Tok::Word(w)) if w == "localtimestamp" => {
-                Expr::Cast(Box::new(Expr::Func(Func::Now, vec![])), Type::Timestamp)
             }
             Some(Tok::Word(w)) if w == "current_date" => Expr::Func(Func::CurrentDate, vec![]),
             Some(Tok::Word(w))
@@ -20321,11 +20599,24 @@ impl Parser {
                     return self.fail("expected SELECT");
                 }
                 let Stmt::Select(query) = self.stmt()? else { return self.fail("expected SELECT") };
-                if self.since(&toks, start)?.iter().any(|t| matches!(t, Tok::Param(_))) {
+                // (its tokens as written: a WITH query's SEARCH or CYCLE is read as the query it is rewritten to,
+                // which has more tokens, so then those written up to its WITH CHECK OPTION or WITH DATA, if any)
+                let written: Vec<Tok> = match self.since(&toks, start) {
+                    Ok(t) => t.to_vec(),
+                    Err(_) => {
+                        let tail = ["with", "check", "option", "cascaded", "local", "no", "data"];
+                        let mut end = toks.len();
+                        while end > 0 && matches!(&toks[end - 1], Tok::Word(w) if tail.contains(&w.as_str())) {
+                            end -= 1;
+                        }
+                        toks[..end].to_vec()
+                    }
+                };
+                if written.iter().any(|t| matches!(t, Tok::Param(_))) {
                     return err(NO_PARAM, "a view's query can't have parameters ($1)");
                 }
                 // (as written for a person to read: `t.id`, `count(*)`; \d+ and pg_dump show it)
-                let mut shown: Vec<Tok> = self.since(&toks, start)?.to_vec();
+                let mut shown: Vec<Tok> = written;
                 if let Some(sch) = &self.in_schema {
                     // (inside CREATE SCHEMA the query names what the schema holds by its schema's name, as it is kept)
                     let mut out = Vec::with_capacity(shown.len());
@@ -21080,7 +21371,15 @@ impl Script {
             } else if e.message.starts_with("column ")
                 && let Some(at) = e.message.find(" does not exist; did you mean")
             {
+                // (`column t.c does not exist`: the column of t it was nearest to, as Postgres's hint names it)
+                let near = e.message[at..].split('"').nth(1).map(str::to_string);
+                let table = e.message["column ".len()..at].split_once('.').map(|(t, _)| t.to_string());
                 e.message.truncate(at + " does not exist".len());
+                if let (Some(n), Some(t)) = (near, table.filter(|t| !t.starts_with('"'))) {
+                    let mut v = e.info.take().map(|b| *b).unwrap_or_default();
+                    v.hint = Some(format!("Perhaps you meant to reference the column \"{t}.{n}\"."));
+                    e.info = Some(Box::new(v));
+                }
             }
         }
         // x[lo:hi] of a jsonb: at hi, or at lo where there is no hi (none for `[:]`), as Postgres points to it
@@ -21129,6 +21428,54 @@ impl Script {
             v.position = Some(*at);
             e.info = Some(Box::new(v));
             return e;
+        }
+        // an UPDATE's value of the wrong type for its column (`column "a" is of type integer but expression is ...`): at
+        // the value, after its `a =`
+        if let Some(col) =
+            e.message.strip_prefix("column \"").and_then(|r| r.split_once("\" is of type ")).map(|(c, _)| c)
+            && e.message.contains(" but expression is of type ")
+            && matches!(self.stmts.get(i), Some(Statement(Stmt::Update { .. }, ..)))
+            && e.info.as_ref().is_none_or(|i| i.position.is_none())
+            && let Ok((toks, starts)) = lex_at(&self.sql)
+            && let Some(span) = self.spans.get(i).cloned()
+            && let Some(k) = span.clone().find(|&k| {
+                matches!(toks.get(k), Some(Tok::Word(w) | Tok::Ident(w)) if w == col)
+                    && toks.get(k + 1) == Some(&Tok::Sym("="))
+            })
+            && let Some(at) = starts.get(k + 2)
+        {
+            let mut v = e.info.take().map(|b| *b).unwrap_or_default();
+            v.position = Some(*at as u32 + 1);
+            e.info = Some(Box::new(v));
+            return e;
+        }
+        // a table's name read where it can't be (`invalid reference to FROM-clause entry for table "t"`, at its last
+        // `t.` reference) or that names two tables (`table reference "t" is ambiguous`, at its first)
+        let refs = |m: &str, p: &str| m.strip_prefix(p).and_then(|r| r.strip_suffix('"')).map(str::to_string);
+        let reference =
+            refs(&e.message, "invalid reference to FROM-clause entry for table \"").map(|t| (t, true)).or_else(|| {
+                e.message
+                    .strip_prefix("table reference \"")
+                    .and_then(|r| r.strip_suffix("\" is ambiguous"))
+                    .map(|t| (t.to_string(), false))
+            });
+        if let Some((name, last)) = reference
+            && e.info.as_ref().is_none_or(|i| i.position.is_none())
+            && let Ok((toks, starts)) = lex_at(&self.sql)
+            && let Some(span) = self.spans.get(i).cloned()
+        {
+            let named = |k: &usize| {
+                matches!(toks.get(*k), Some(Tok::Word(w) | Tok::Ident(w)) if *w == name)
+                    && toks.get(k + 1) == Some(&Tok::Sym("."))
+            };
+            let mut hits = span.filter(named);
+            let found = if last { hits.next_back() } else { hits.next() };
+            if let Some(at) = found.and_then(|k| starts.get(k)) {
+                let mut v = e.info.take().map(|b| *b).unwrap_or_default();
+                v.position = Some(*at as u32 + 1);
+                e.info = Some(Box::new(v));
+                return e;
+            }
         }
         // EXECUTE's argument its parameter can't take: at the argument
         if let Some(n) = e.message.strip_prefix("parameter $").and_then(|r| r.split(' ').next()?.parse::<usize>().ok())
@@ -21182,10 +21529,12 @@ impl Script {
                     | Stmt::Update { .. }
                     | Stmt::Delete { .. }
                     | Stmt::Prepare { .. }
+                    | Stmt::Copy(_)
                     | Stmt::CreateView { .. },
                 ..
-            ))
-        );
+            )) // (COPY's column list names a column of its table, which Postgres's message names without a place)
+        ) && !(matches!(self.stmts.get(i), Some(Statement(Stmt::Copy(_), ..)))
+            && e.message.contains(" of relation "));
         if pg_exact() && e.message.contains(" is ambiguous; say which table") {
             let at = e.message.find("; say which").unwrap_or(e.message.len());
             e.message.truncate(at);
@@ -21203,6 +21552,13 @@ impl Script {
             return e;
         }
         let named = |m: &str| -> Option<String> {
+            // (`column t.c does not exist`, unquoted: at its `t.c`)
+            if let Some(r) = m.strip_prefix("column ").filter(|r| !r.starts_with('"'))
+                && let Some(name) = r.strip_suffix(" does not exist")
+                && name.contains('.')
+            {
+                return Some(name.to_string());
+            }
             let r = m.strip_prefix("column reference \"").or_else(|| m.strip_prefix("column \""))?;
             let name = r.split('"').next()?;
             let rest = &r[name.len() + 1..];
@@ -23380,6 +23736,112 @@ fn old_holder(
 /// The unique index behind `u`, when it was made by CREATE UNIQUE INDEX with expressions or WHERE.
 fn uniq_index<'t>(t: &'t Table, u: &Unique) -> Option<&'t btree::Index> {
     t.indexes.iter().find(|x| x.name == u.name && (x.filter.is_some() || !x.exprs.is_empty()))
+}
+
+/// ON CONFLICT DO UPDATE without a target (`position`: of its ON, from 1), as Postgres refuses it.
+fn no_conflict_target(position: Option<u32>) -> SqlError {
+    SqlError {
+        code: SYNTAX,
+        message: "ON CONFLICT DO UPDATE requires inference specification or constraint name".into(),
+        info: Some(Box::new(Violation {
+            hint: Some("For example, ON CONFLICT (column_name).".into()),
+            position,
+            ..Violation::default()
+        })),
+    }
+}
+
+/// Whether condition `g` (bound) implies condition `f`, as far as Postgres's predicate_implied_by proves it for the
+/// conditions a partial index has: the same condition, or a comparison of the same expression with a constant that
+/// bounds it at least as tightly (`x > 1` implies `x > 0` and `x >= 1`).
+fn implies(g: &Expr, f: &Expr) -> bool {
+    if format!("{g:?}") == format!("{f:?}") {
+        return true;
+    }
+    let (Expr::Bin(gl, gop, gr), Expr::Bin(fl, fop, fr)) = (g, f) else { return false };
+    let (Expr::Lit(gc), Expr::Lit(fc)) = (&**gr, &**fr) else { return false };
+    if format!("{gl:?}") != format!("{fl:?}") || *gc == Value::Null || *fc == Value::Null {
+        return false;
+    }
+    let Ok(ord) = compare(gc, fc) else { return false };
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    match (gop, fop) {
+        (Op::Gt, Op::Gt) | (Op::Gt, Op::Ge) | (Op::Ge, Op::Ge) | (Op::Eq, Op::Ge) => ord != Less,
+        (Op::Ge, Op::Gt) | (Op::Eq, Op::Gt) => ord == Greater,
+        (Op::Lt, Op::Lt) | (Op::Lt, Op::Le) | (Op::Le, Op::Le) | (Op::Eq, Op::Le) => ord != Greater,
+        (Op::Le, Op::Lt) | (Op::Eq, Op::Lt) => ord == Less,
+        (Op::Eq, Op::Eq) => ord == Equal,
+        _ => false,
+    }
+}
+
+/// An ON CONFLICT target's parts as `infers` compares them: each a column (by id) or an expression (bound, as
+/// Debug text), and the collation it asks for (None: any; Some(None): one that names none, so no index's).
+type InferParts = Vec<(std::result::Result<u32, String>, Option<Option<collation::Coll>>)>;
+
+fn infer_parts(t: &Table, elems: &[Infer]) -> InferParts {
+    elems
+        .iter()
+        .map(|i| {
+            let mut coll = i.coll.as_ref().map(|n| n.resolve(None).ok());
+            // (a part that names nothing here matches no index's: `upsert_plan` says what's wrong with it)
+            let part = match &i.part {
+                IndexPart::Col(n) => t.cols.iter().find(|c| c.name == *n).map(|c| c.id).ok_or_else(|| "\0".into()),
+                IndexPart::Expr(x) => match index_expr(t, x) {
+                    // (`lower(fruit) COLLATE "C"` read as one expression: its collation is the part's)
+                    Ok(Expr::Func(Func::Collate(c), mut a)) if a.len() == 1 => {
+                        coll = Some(Some(c));
+                        Err(format!("{:?}", a.remove(0)))
+                    }
+                    Ok(e) => Err(format!("{e:?}")),
+                    Err(_) => Err("\0".into()),
+                },
+            };
+            (part, coll)
+        })
+        .collect()
+}
+
+/// Whether unique constraint `u` of `t` is one an ON CONFLICT target's `parts` infer, as Postgres's
+/// infer_arbiter_indexes has it: each of its expressions is one of the target's, and each part of the target is one
+/// of its parts, in the collation the part asks for. (Its columns are the target's: see `unique_for`.)
+fn infers(t: &Table, u: &Unique, parts: &InferParts) -> bool {
+    let mut texts = uniq_index(t, u).into_iter().flat_map(|x| x.exprs.iter());
+    let own: Vec<(std::result::Result<u32, String>, collation::Coll)> = u
+        .cols
+        .iter()
+        .enumerate()
+        .map(|(k, &c)| {
+            let mut coll = uniq_coll(t, u, k);
+            let part = match c {
+                btree::EXPR => Err(match texts.next().and_then(|x| index_expr(t, x).ok()) {
+                    // (CREATE INDEX reads `lower(fruit) COLLATE "C"` as one expression too)
+                    Some(Expr::Func(Func::Collate(cl), a)) if a.len() == 1 => {
+                        coll = cl;
+                        format!("{:?}", a[0])
+                    }
+                    Some(e) => format!("{e:?}"),
+                    None => String::new(),
+                }),
+                c => Ok(c),
+            };
+            (part, coll)
+        })
+        .collect();
+    own.iter().all(|(p, _)| p.is_ok() || parts.iter().any(|(q, _)| q == p))
+        && parts
+            .iter()
+            .all(|(q, coll)| own.iter().any(|(p, c)| p == q && coll.as_ref().is_none_or(|want| *want == Some(*c))))
+}
+
+/// The collation part `k` of unique constraint `u` compares in: its index's, else its column's.
+fn uniq_coll(t: &Table, u: &Unique, k: usize) -> collation::Coll {
+    let ix = t.indexes.iter().find(|x| x.name == u.name);
+    match (ix.and_then(|x| x.colls.get(k)), u.cols.get(k)) {
+        (Some(c), _) => *c,
+        (None, Some(&c)) if c != btree::EXPR => position(t, c).map_or(collation::Coll::DEFAULT, |i| t.cols[i].coll),
+        _ => collation::Coll::DEFAULT,
+    }
 }
 
 /// The values unique constraint `u` compares for a row of `t` (its columns', or its index's
@@ -33172,6 +33634,171 @@ struct Cursor {
     depth: usize,
     /// declared in the transaction still open: its ROLLBACK closes it even WITH HOLD, as Postgres's does
     tx: bool,
+    /// what WHERE CURRENT OF needs of it (see `Session::current_of`); None for one PL/pgSQL opened
+    scan: Option<Box<CursorScan>>,
+}
+
+/// A cursor's query as WHERE CURRENT OF sees it: the one table it is a plain scan of (None: it is a join, an
+/// aggregate, ...), and for each of its columns that table's column it is; the tables its FOR UPDATE or FOR SHARE
+/// locks (None: it locks none); and the rows an UPDATE or DELETE WHERE CURRENT OF changed since, by their place
+/// in its rows: their columns as they are now (None: deleted), as Postgres's cursor reaches the row it is on by its
+/// place in the table, whatever its values became.
+struct CursorScan {
+    table: Option<String>,
+    cols: Vec<Option<String>>,
+    locks: Option<Vec<String>>,
+    changed: HashMap<usize, Option<Vec<Value>>>,
+}
+
+/// The row cursor `c` (named `cursor`) is on, of table `table`, as Postgres's execCurrentOf finds it, with its errors
+/// (held from a committed transaction, not a plain scan or a FOR UPDATE of the table, not on a row): the cursor's
+/// columns that are the table's, the row's place in its rows, and the condition that finds the row (its values as
+/// the cursor read them, or as a statement here since left them; none once deleted).
+fn cursor_row(c: &Cursor, cursor: &str, table: &str) -> Result<(Vec<String>, usize, Expr)> {
+    let shown = rel_part(table).to_string();
+    let same = |t: &str| t == table || rel_part(t) == shown;
+    let not_plain = || err("24000", format!("cursor \"{cursor}\" is not a simply updatable scan of table \"{shown}\""));
+    if c.hold && !c.tx {
+        return err("24000", format!("cursor \"{cursor}\" is held from a previous transaction"));
+    }
+    let Some(scan) = c.scan.as_deref() else { return not_plain() };
+    if let Some(locks) = &scan.locks {
+        match locks.iter().filter(|t| same(t)).count() {
+            0 => {
+                return err(
+                    "24000",
+                    format!("cursor \"{cursor}\" does not have a FOR UPDATE/SHARE reference to table \"{shown}\""),
+                );
+            }
+            1 => {}
+            _ => {
+                return err(
+                    "24000",
+                    format!("cursor \"{cursor}\" has multiple FOR UPDATE/SHARE references to table \"{shown}\""),
+                );
+            }
+        }
+    }
+    if !scan.table.as_deref().is_some_and(same) || scan.cols.iter().all(Option::is_none) {
+        return not_plain();
+    }
+    if !(1..=c.rows.len()).contains(&c.pos) {
+        return err("24000", format!("cursor \"{cursor}\" is not positioned on a row"));
+    }
+    let at = c.pos - 1;
+    let names: Vec<String> = scan.cols.iter().flatten().cloned().collect();
+    let image = match scan.changed.get(&at) {
+        Some(now) => now.clone(),
+        None => Some(scan.cols.iter().zip(&c.rows[at]).filter(|(n, _)| n.is_some()).map(|(_, v)| v.clone()).collect()),
+    };
+    let filter = match &image {
+        None => Expr::Lit(Value::Bool(false)),
+        Some(vals) => names
+            .iter()
+            .zip(vals)
+            .map(|(n, v)| Expr::Func(Func::Distinct(true), vec![Expr::Col(None, n.clone()), Expr::Lit(v.clone())]))
+            .reduce(|a, b| bin(a, Op::And, b))
+            .unwrap_or(Expr::Lit(Value::Bool(true))),
+    };
+    Ok((names, at, filter))
+}
+
+/// UPDATE or DELETE ... WHERE CURRENT OF `s` for its row (`filter`, see `cursor_row`); an UPDATE gives back the
+/// row's columns `names` as they now are too, after what it returns (`given`: its own RETURNING; None for DELETE).
+#[allow(clippy::type_complexity)]
+fn current_of_stmt(s: &Stmt, names: &[String], filter: Expr) -> (Stmt, Option<Option<Vec<Item>>>) {
+    let mut st = s.clone();
+    let mut given = None;
+    match &mut st {
+        Stmt::Update { filter: f, returning, .. } => {
+            *f = Some(filter);
+            given = Some(returning.clone());
+            let extra = names.iter().map(|n| Item::Expr(Expr::Col(None, n.clone()), Some(n.clone())));
+            *returning = Some(returning.take().unwrap_or_default().into_iter().chain(extra).collect());
+        }
+        Stmt::Delete { filter: f, .. } => *f = Some(filter),
+        _ => {}
+    }
+    (st, given)
+}
+
+/// What `current_of_stmt`'s statement gave (`out`, its `k` columns of the row taken off again): the row as the
+/// cursor's next statement finds it (Some(None) once deleted), or None where it changed nothing.
+fn current_of_out(out: &mut Output, given: Option<Option<Vec<Item>>>, k: usize) -> Option<Option<Vec<Value>>> {
+    let Some(given) = given else { return (!out.tag.ends_with(" 0")).then_some(None) };
+    let now = out.rows.first().map(|r| r[r.len().saturating_sub(k)..].to_vec());
+    match given {
+        None => (out.columns, out.rows, out.typmods) = (None, vec![], vec![]),
+        Some(_) => {
+            for r in &mut out.rows {
+                r.truncate(r.len().saturating_sub(k));
+            }
+            if let Some(cols) = &mut out.columns {
+                cols.truncate(cols.len().saturating_sub(k));
+            }
+            let n = out.columns.as_ref().map_or(0, Vec::len);
+            out.typmods.truncate(n);
+        }
+    }
+    now.map(Some)
+}
+
+thread_local! {
+    /// The tables the running statement truncated, its functions' TRUNCATEs too: what its transaction made afresh
+    /// (see `Tx::fresh`).
+    static TRUNCATED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(vec![]) };
+}
+
+/// `Expr::Col(Some(CURRENT_OF), cursor)`: an UPDATE's or DELETE's WHERE CURRENT OF cursor, put in for the row the
+/// cursor is on as the statement runs (see `Session::current_of`).
+const CURRENT_OF: &str = "\u{1}current of";
+
+/// What WHERE CURRENT OF needs of a cursor declared for `query`, whose rows have `columns` (see `CursorScan`).
+fn cursor_scan(query: &Stmt, columns: &Columns) -> CursorScan {
+    let (q, locking) = match query {
+        Stmt::Select(q) => (q, None),
+        Stmt::Locking(q, clauses) => (q, Some(clauses)),
+        _ => return CursorScan { table: None, cols: vec![], locks: None, changed: HashMap::new() },
+    };
+    let mut plain = q.set.is_empty()
+        && q.joins.is_empty()
+        && q.group.is_empty()
+        && q.having.is_none()
+        && !q.distinct
+        && q.distinct_on.is_empty();
+    for e in select_exprs(q) {
+        walk(e, &mut |x| plain &= !matches!(x, Expr::Agg(..) | Expr::Window(_)));
+    }
+    let src =
+        q.from.as_ref().filter(|s| s.sub.is_none() && s.rec.is_none() && s.srf.is_none() && !s.working && s.cte == 0);
+    let table = src.filter(|_| plain).map(|s| s.table.clone());
+    // (a `*` is the table's columns, its output's names; a system column such as ctid no condition can read)
+    let stars = q.items.iter().filter(|it| matches!(it, Item::Star | Item::TableStar(_))).count();
+    let star_len = columns.len().saturating_sub(q.items.len().saturating_sub(1));
+    let mut cols: Vec<Option<String>> = vec![];
+    for it in &q.items {
+        match it {
+            Item::Star | Item::TableStar(_) if stars == 1 => {
+                cols.extend(columns.iter().skip(cols.len()).take(star_len).map(|(n, _)| Some(n.clone())));
+            }
+            Item::Expr(Expr::Col(_, n), _) if !system_name(n) => cols.push(Some(n.clone())),
+            _ => cols.push(None),
+        }
+    }
+    // the tables its FOR UPDATE / FOR SHARE locks: those its OF names (by alias or name), else every one it reads
+    let locks = locking.map(|clauses| {
+        let sources: Vec<&Source> = q.from.iter().chain(q.joins.iter().map(|j| &j.src)).collect();
+        let mut out = vec![];
+        for (_, of, _) in clauses.iter() {
+            for s in &sources {
+                if of.is_empty() || of.iter().any(|n| *n == s.alias || *n == s.table) {
+                    out.push(s.table.clone());
+                }
+            }
+        }
+        out
+    });
+    CursorScan { table, cols, locks, changed: HashMap::new() }
 }
 
 impl Cursor {
@@ -33184,7 +33811,9 @@ impl Cursor {
         let target = |n: i64| if n < 0 { len as i64 + 1 + n } else { n };
         let backward = match dir {
             Move::Back(_) | Move::Last => true,
-            Move::Rel(n) => n < 0,
+            // (RELATIVE 0 reads the row it is on again: a step back, then one forward, as Postgres does it)
+            Move::Rel(n) => n < 0 || (n == 0 && (1..=len).contains(&self.pos)),
+            Move::Fwd(Some(0)) => (1..=len).contains(&self.pos),
             Move::First => self.pos >= 1,
             Move::Abs(n) => target(n) <= self.pos as i64,
             Move::Fwd(_) => false,
@@ -33337,6 +33966,9 @@ struct Tx {
     read_only: bool,
     /// its isolation level: how it reads and writes what others commit meanwhile (see `Iso`)
     iso: Iso,
+    /// the tables it made or truncated, and how many savepoints were open then: what COPY FREEZE may load (see
+    /// `Session::copy_in`), as Postgres's rd_createSubid and rd_newRelfilenodeSubid say
+    fresh: Vec<(String, usize)>,
 }
 
 /// The settings a session can SET, as they were at some moment (see `Tx::snaps`).
@@ -33511,7 +34143,14 @@ impl Session {
     /// Parses `sql` as this session reads it: names without a schema found along its
     /// search_path, in its world.
     pub fn parse(&self, db: &Db, sql: &str) -> Result<Vec<Statement>> {
-        self.with_path(db, || parse(sql))
+        self.parsing(db, || parse(sql))
+    }
+
+    /// Runs `f`, a parse of the session's statements, with its search_path in reach and as the role it runs as: what
+    /// CREATE SCHEMA AUTHORIZATION CURRENT_ROLE names its schema and the objects it makes in it by.
+    fn parsing<T>(&self, db: &Db, f: impl FnOnce() -> T) -> T {
+        let who = self.who_shared(db).ok().map(|(current, _)| current);
+        self.with_path(db, || roles::acting(who, f))
     }
 
     /// Whether the session LISTENs on any channel.
@@ -34487,6 +35126,55 @@ impl Session {
     /// Merges the savepoints from `from` on into the level before each, newest first.
     /// SET CONSTRAINTS: the names are checked wherever it runs; only in a transaction does it do
     /// anything. Making constraints IMMEDIATE checks what they put off now.
+    /// UPDATE or DELETE ... WHERE CURRENT OF `cursor` (`s`): of the row the cursor is on, as Postgres's
+    /// execCurrentOf finds it, with its errors (the cursor isn't there, is held from a committed transaction, isn't a
+    /// plain scan or a FOR UPDATE of the table, isn't on a row). The cursor's rows are as its query gave them; the
+    /// row is the table's row with the values its columns had then, or, once a statement here changed it, have now.
+    fn current_of(&mut self, db: &Db, s: &Statement, cursor: &str, params: &[Value], types: &[Type]) -> Result<Output> {
+        let table = match &s.0 {
+            Stmt::Update { table, .. } | Stmt::Delete { table, .. } => table.clone(),
+            _ => return err(UNSUPPORTED, "WHERE CURRENT OF is for UPDATE and DELETE"),
+        };
+        let (names, at, filter) = self.current_row(db, cursor, &table)?;
+        let (st, given) = current_of_stmt(&s.0, &names, filter);
+        let mut out = self.execute(db, &Statement(st, PlanCache::default(), s.2), params, types)?;
+        if let Some(now) = current_of_out(&mut out, given, names.len()) {
+            let state = self.state.clone();
+            let mut st = state.lock().unwrap();
+            let c = match self.cursors.get_mut(cursor) {
+                Some(c) => Some(c),
+                None => st.portals.get_mut(cursor),
+            };
+            if let Some(scan) = c.and_then(|c| c.scan.as_deref_mut()) {
+                scan.changed.insert(at, now);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The row cursor `cursor` is on, of table `table` (see `current_of`, `cursor_row`).
+    fn current_row(&mut self, db: &Db, cursor: &str, table: &str) -> Result<(Vec<String>, usize, Expr)> {
+        // (a view: refused, as Postgres's rewriter refuses it)
+        let mut view = view_def(&db.view_tx(self.target())?, table)?.is_some();
+        if let Some(d) = &self.temp {
+            let _private = crate::acting_as(""); // its own database: see `temp_db`
+            view |= view_def(&d.view_tx(&self.temp_branch())?, table)?.is_some();
+        }
+        if view {
+            return err(UNSUPPORTED, "WHERE CURRENT OF on a view is not implemented");
+        }
+        let state = self.state.clone();
+        let mut st = state.lock().unwrap();
+        let c = match self.cursors.get_mut(cursor) {
+            Some(c) => c,
+            None => match st.portals.get_mut(cursor) {
+                Some(c) => c,
+                None => return err("34000", format!("cursor \"{cursor}\" does not exist")),
+            },
+        };
+        cursor_row(c, cursor, table)
+    }
+
     fn set_constraints(&mut self, db: &Db, names_given: &[String], deferred: bool) -> Result<Output> {
         let v = db.view_tx(self.target())?;
         let tables = schemas(&v)?;
@@ -34620,7 +35308,7 @@ impl Session {
     /// all before any runs, as in Postgres.
     pub fn script(&self, db: &Db, sql: &str) -> Result<Script> {
         self.received(Arc::from(sql));
-        let mut s = self.with_path(db, || {
+        let mut s = self.parsing(db, || {
             range::hydrate();
             userdefs::hydrate();
             Script::new(sql)
@@ -34644,7 +35332,7 @@ impl Session {
         *self.stmt_sql.lock().unwrap_or_else(|p| p.into_inner()) =
             (script.texts.len() > 1).then(|| script.texts.get(i).cloned()).flatten();
         if i > 0 && (script.resolved || self.search(db).is_some()) {
-            return self.with_path(db, || script.parse_again(i));
+            return self.parsing(db, || script.parse_again(i));
         }
         Ok(script.stmts[i].clone())
     }
@@ -34668,6 +35356,33 @@ impl Session {
     }
 
     pub fn execute(&mut self, db: &Db, s: &Statement, params: &[Value], types: &[Type]) -> Result<Output> {
+        if let Stmt::InSchemas { schemas, if_exists, tag, stmt } = &s.0 {
+            if let Some(out) = schemas_named(&db.view_tx(self.target())?, schemas, *if_exists, tag)? {
+                return Ok(out);
+            }
+            return self.execute(db, &Statement((**stmt).clone(), PlanCache::default(), s.2), params, types);
+        }
+        if let Stmt::Update { filter: Some(Expr::Col(Some(q), name)), .. }
+        | Stmt::Delete { filter: Some(Expr::Col(Some(q), name)), .. } = &s.0
+            && q == CURRENT_OF
+        {
+            return self.current_of(db, s, name, params, types);
+        }
+        // EXPLAIN of one: of the row the cursor is on now
+        if let Stmt::Explain { stmt, .. } = &s.0
+            && let Stmt::Update { table, filter: Some(Expr::Col(Some(q), name)), .. }
+            | Stmt::Delete { table, filter: Some(Expr::Col(Some(q), name)), .. } = &**stmt
+            && q == CURRENT_OF
+        {
+            let (_, _, row) = self.current_row(db, name, table)?;
+            let mut st = s.0.clone();
+            if let Stmt::Explain { stmt, .. } = &mut st
+                && let Stmt::Update { filter, .. } | Stmt::Delete { filter, .. } = &mut **stmt
+            {
+                *filter = Some(row);
+            }
+            return self.execute(db, &Statement(st, PlanCache::default(), s.2), params, types);
+        }
         let at = std::time::Instant::now();
         // the cursors DECLAREd here and the ones PL/pgSQL opens are one namespace, as Postgres's portals are: the
         // session's cursors are the statement's portals while it runs, where a function (its OPEN, FETCH, MOVE and
@@ -34715,7 +35430,18 @@ impl Session {
             Stmt::Execute { name, .. } if outer.0 => self.prepared.get(name).cloned(),
             _ => None,
         };
+        TRUNCATED.with_borrow_mut(Vec::clear);
         let out = holding(|| self.execute_held(db, s, params, types)).0;
+        let truncated = TRUNCATED.take();
+        if out.is_ok()
+            && let Some(t) = &mut self.tx
+        {
+            let depth = t.saves.len();
+            if let Stmt::Create { table, .. } = &s.0 {
+                t.fresh.push((rel_part(table).to_string(), depth));
+            }
+            t.fresh.extend(truncated.into_iter().map(|n| (n, depth)));
+        }
         let top = outer.0;
         drop(outer);
         if !lent.is_empty() {
@@ -35116,6 +35842,7 @@ impl Session {
                 c.hold
             });
             st.local.clear(); // SET LOCAL's end with the transaction
+            st.los.clear(); // and its large objects' descriptors, as Postgres closes them
             st.deferred.clear(); // and SET CONSTRAINTS's
             st.pending_events.clear();
             st.fk_modes.clear();
@@ -35538,7 +36265,21 @@ impl Session {
                 // while its query runs, as Postgres's does
                 let depth = self.tx.as_ref().map_or(0, |t| t.saves.len());
                 let text = self.sql.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                let (hold, scroll) = (*hold, *scroll);
+                let (hold, mut scroll) = (*hold, *scroll);
+                // FOR UPDATE / SHARE: a cursor that goes forward only, as Postgres's (SCROLL refused)
+                if matches!(**query, Stmt::Locking(..)) {
+                    if scroll == Some(true) {
+                        return Err(SqlError {
+                            code: UNSUPPORTED,
+                            message: "DECLARE SCROLL CURSOR ... FOR UPDATE is not supported".into(),
+                            info: Some(Box::new(Violation {
+                                detail: Some("Scrollable cursors must be READ ONLY.".into()),
+                                ..Violation::default()
+                            })),
+                        });
+                    }
+                    scroll = Some(false);
+                }
                 let cursor = Cursor {
                     text,
                     at: now_us(),
@@ -35550,6 +36291,7 @@ impl Session {
                     scroll,
                     depth,
                     tx: in_tx,
+                    scan: None,
                 };
                 self.cursors.insert(name.clone(), cursor);
                 let st = Statement((**query).clone(), PlanCache::default(), s.2);
@@ -35557,6 +36299,7 @@ impl Session {
                     Ok(out) => {
                         let c = self.cursors.get_mut(name).expect("inserted above");
                         (c.columns, c.typmods, c.rows) = (out.columns.unwrap_or_default(), out.typmods, out.rows);
+                        c.scan = Some(Box::new(cursor_scan(query, &c.columns)));
                         tag("DECLARE CURSOR")
                     }
                     Err(e) => {
@@ -35638,6 +36381,7 @@ impl Session {
                         imported: false,
                         read_only: self.default_read_only(),
                         iso: self.default_iso(),
+                        fresh: vec![],
                     });
                 } else {
                     notice("WARNING", "there is already a transaction in progress".into());
@@ -35961,6 +36705,9 @@ impl Session {
                     for c in st.portals.values_mut().filter(|c| c.depth > i) {
                         c.depth = i; // (PL/pgSQL's too)
                     }
+                    for f in t.fresh.iter_mut().filter(|f| f.1 > i) {
+                        f.1 = i;
+                    }
                     drop(st);
                     for c in self.cursors.values_mut().filter(|c| c.depth > i) {
                         c.depth = i; // still open, now the level's they were released into
@@ -35970,6 +36717,7 @@ impl Session {
                 // back to how it was when the savepoint was made, which stays open
                 let snap = t.snaps.get(i + 1).cloned();
                 t.drop_saves(db, i);
+                t.fresh.retain(|f| f.1 <= i);
                 db.core.release_intents_above(self.id, i);
                 let mut st = self.state.lock().unwrap();
                 st.notes.retain(|(depth, ..)| *depth <= i);
@@ -36596,6 +37344,9 @@ fn changing_tag(s: &Stmt) -> Option<String> {
         | Stmt::NoopNotice(..)
         | Stmt::NoopNotices(..) => return None,
         s if safe::reach(s) == Reach::Read => return None,
+        // a query that changes something only through built-in functions (nextval, lo_create, ...): each of those
+        // refuses itself as it is called, naming itself, as Postgres's PreventCommandIfReadOnly does
+        Stmt::Select(_) if !safe::calls(s) => return None,
         Stmt::Insert { .. } => "INSERT".into(),
         Stmt::Update { .. } | Stmt::PlannerStats(_) => "UPDATE".into(),
         Stmt::Delete { .. } => "DELETE".into(),
@@ -37433,6 +38184,12 @@ impl Statement {
 
     /// Runs the statement; `params` fill $1, $2, ... and are converted to `types` (see `params`).
     pub fn execute(&self, db: &Db, branch: &str, params: &[Value], types: &[Type]) -> Result<Output> {
+        if let Stmt::InSchemas { schemas, if_exists, tag, stmt } = &self.0 {
+            if let Some(out) = schemas_named(&db.view_tx(branch)?, schemas, *if_exists, tag)? {
+                return Ok(out);
+            }
+            return Statement((**stmt).clone(), PlanCache::default(), self.2).execute(db, branch, params, types);
+        }
         if rules::applies(&self.0) {
             return rules::execute(self, db, branch, params, types);
         }
@@ -37615,6 +38372,10 @@ impl Statement {
     fn run_here(&self, x: &Exec, branch: &str, params: &[Value]) -> Result<Output> {
         let db = x.db;
         match &self.0 {
+            // (`execute` has looked its schemas up and runs what it holds)
+            Stmt::InSchemas { stmt, .. } => {
+                Statement((**stmt).clone(), PlanCache::default(), self.2).execute(db, branch, params, &[])
+            }
             Stmt::Set | Stmt::SetEf(_) | Stmt::SetTimeout(_) | Stmt::SetPath(_) | Stmt::SetZone(..) => {
                 Ok(Output::tag("SET"))
             }
@@ -37658,6 +38419,7 @@ impl Statement {
                         info: None,
                         catalog: 0,
                         temp_at: None,
+                        builtin_first: None,
                         core: db.core.clone(),
                         world: branch.to_string(),
                     });
@@ -37804,6 +38566,7 @@ impl Statement {
             Stmt::Foreign(f) => foreign::run(db, branch, f),
             Stmt::AlterOwner(what, to) => acl::alter_owner(db, branch, what, to),
             Stmt::SetDefiner(what, definer) => acl::set_definer(db, branch, what, *definer),
+            Stmt::RoutineConfig(what, changes) => acl::set_config(db, branch, what, changes),
             Stmt::DropOwned(rs, cascade) => acl::drop_owned(db, branch, rs, *cascade),
             Stmt::Reassign(from, to) => acl::reassign(db, branch, from, to),
             Stmt::Policy(p) => rls::run(db, branch, p),
@@ -39465,6 +40228,63 @@ fn advisory_call(ctx: &Ctx, f: CtxFn, a: &[Value]) -> Result<Value> {
 }
 
 /// current_setting(name [, missing_ok]) and set_config(name, value, is_local) (see `setting`).
+/// A call of a function with SET clauses (other than search_path, which `with_own_path` gives it): its settings in
+/// force while it runs, as Postgres's fmgr_security_definer sets them at a new GUC nest level, and put back after.
+/// A setting the body SET LOCAL goes back too, one it SET (not LOCAL) stays, as Postgres's AtEOXact_GUC leaves
+/// them; a call that fails puts every setting back.
+pub(super) struct FunctionSettings {
+    saved: Option<SavedSettings>,
+}
+
+/// What a call with SET clauses put back when it ends: the session's local and session settings from before the
+/// call, and the names its SET clauses gave.
+struct SavedSettings {
+    ctx: Arc<Ctx>,
+    local: HashMap<String, String>,
+    settings: HashMap<String, String>,
+    names: Vec<String>,
+}
+
+impl FunctionSettings {
+    pub(super) fn enter(config: &[(String, Vec<String>)]) -> FunctionSettings {
+        let names: Vec<&(String, Vec<String>)> = config.iter().filter(|(n, _)| n != "search_path").collect();
+        if names.is_empty() {
+            return FunctionSettings { saved: None };
+        }
+        let Some(ctx) = STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.clone())) else {
+            return FunctionSettings { saved: None };
+        };
+        let mut st = ctx.state.lock().unwrap();
+        let (local, settings) = (st.local.clone(), st.settings.clone());
+        for (n, values) in &names {
+            if let Ok(Some(v)) = checked_setting(n, Some(&values.join(", "))) {
+                st.local.insert(n.clone(), v);
+            }
+        }
+        let names = names.iter().map(|(n, _)| n.clone()).collect();
+        drop(st);
+        FunctionSettings { saved: Some(SavedSettings { ctx, local, settings, names }) }
+    }
+
+    pub(super) fn leave(self, ok: bool) {
+        let Some(SavedSettings { ctx, local, settings, names }) = self.saved else { return };
+        let mut st = ctx.state.lock().unwrap();
+        if !ok {
+            (st.local, st.settings) = (local, settings);
+            return;
+        }
+        for n in names {
+            // (still in force from the function, or SET LOCAL inside it: as before the call; SET inside it removed it)
+            if let std::collections::hash_map::Entry::Occupied(mut e) = st.local.entry(n) {
+                match local.get(e.key()) {
+                    Some(v) => drop(e.insert(v.clone())),
+                    None => drop(e.remove()),
+                }
+            }
+        }
+    }
+}
+
 fn setting_call(ctx: &Ctx, f: CtxFn, a: &[Value]) -> Result<Value> {
     if a[0] == Value::Null {
         return Ok(Value::Null);
@@ -39491,12 +40311,19 @@ fn setting_call(ctx: &Ctx, f: CtxFn, a: &[Value]) -> Result<Value> {
         st.placeholders.insert(name.clone());
     }
     if !own {
-        match (local, ctx.tx.is_some(), &checked) {
-            (true, true, Some(v)) => st.local.insert(name.clone(), v.clone()),
-            (true, true, None) => st.local.remove(&name),
-            (true, false, _) => None,
-            (false, _, Some(v)) => st.settings.insert(name.clone(), v.clone()),
-            (false, _, None) => st.settings.remove(&name),
+        // (outside a transaction block, LOCAL lasts to the end of the statement, which clears it; a setting SET
+        // without LOCAL replaces one SET LOCAL gave, as in Postgres)
+        match (local, &checked) {
+            (true, Some(v)) => st.local.insert(name.clone(), v.clone()),
+            (true, None) => st.local.remove(&name),
+            (false, Some(v)) => {
+                st.local.remove(&name);
+                st.settings.insert(name.clone(), v.clone())
+            }
+            (false, None) => {
+                st.local.remove(&name);
+                st.settings.remove(&name)
+            }
         };
     }
     let value = match checked {
@@ -42620,7 +43447,9 @@ fn view_writes_in(
                 if let Some(oc) = conflict {
                     if let Some(Target::Cols(cs)) = &mut oc.target {
                         for c in cs.iter_mut() {
-                            *c = column(c, "insert into")?;
+                            if let IndexPart::Col(n) = &mut c.part {
+                                *n = column(n, "insert into")?;
+                            }
                         }
                     }
                     let map = |e: &Expr| {
@@ -43907,6 +44736,8 @@ impl Exec<'_> {
                 }
             }
         }
+        // (for COPY FREEZE: see `Tx::fresh`, a function's TRUNCATE too)
+        TRUNCATED.with_borrow_mut(|t| t.extend(tables.iter().map(|n| rel_part(n).to_string())));
         Ok(Output::tag("TRUNCATE TABLE"))
     }
 }
@@ -45809,8 +46640,13 @@ impl<'a> Exec<'a> {
             m.source,
             sys(&m.on)
         );
+        // (WITH ... MERGE: each of them reads its WITH queries)
         let one = |sql: &str| -> Result<Stmt> {
-            match parse(sql)?.pop() {
+            let sql = match &m.with {
+                Some(list) => format!("with {list} {sql}"),
+                None => sql.to_string(),
+            };
+            match parse(&sql)?.pop() {
                 Some(Statement(st, ..)) => Ok(st),
                 None => err(SYNTAX, "expected a statement"),
             }
@@ -49012,7 +49848,33 @@ impl Exec<'_> {
             }
             self.working.borrow_mut().insert(r.name.clone(), Arc::new(last));
             self.subs.borrow_mut().clear(); // subqueries may read the rows so far
-            let mut new = fit(self.select(&r.step)?.rows)?;
+            let stepped = self.select(&r.step)?;
+            // the step's columns of a wider kind of number than the base's (integer, then numeric): the rows so far
+            // are of the base's types, which the step's don't fit, as Postgres refuses it
+            if rounds == 1
+                && let Some(step_cols) = &stepped.columns
+            {
+                let int = |t: Type| matches!(t, Type::SmallInt | Type::Int | Type::BigInt);
+                for (k, (c, (_, st))) in cols.iter().zip(step_cols).enumerate() {
+                    if int(c.ty) && matches!(st, Type::Numeric | Type::Float | Type::Float4) {
+                        return Err(SqlError {
+                            code: "42804",
+                            message: format!(
+                                "recursive query \"{}\" column {} has type {} in non-recursive term but type {} overall",
+                                r.name,
+                                k + 1,
+                                c.ty.pg_name(),
+                                st.pg_name()
+                            ),
+                            info: Some(Box::new(Violation {
+                                hint: Some("Cast the output of the non-recursive term to the correct type.".into()),
+                                ..Violation::default()
+                            })),
+                        });
+                    }
+                }
+            }
+            let mut new = fit(stepped.rows)?;
             if !r.all {
                 new.retain(|x| seen.insert(key(x)));
             }
@@ -53554,6 +54416,14 @@ impl Exec<'_> {
                         checks.as_deref(),
                     )?)
                 } else {
+                    // (its ON CONFLICT target is inferred, as Postgres's planner infers its arbiters: one that
+                    // infers none fails here too)
+                    if let Some(c) = conflict {
+                        let v = self.db.view_tx(self.branch)?;
+                        if let Some(t) = load(&v, table)? {
+                            self.upsert_plan(&v, &t, alias.as_deref().unwrap_or(table), c)?;
+                        }
+                    }
                     rows.len()
                 };
                 (vec![format!("Insert on {table}")], n)
@@ -54054,28 +54924,38 @@ impl Exec<'_> {
     fn unique_for<'t>(&self, t: &'t Table, target: &Target, pred: Option<&Expr>) -> Vec<&'t Unique> {
         match target {
             Target::Constraint(n) => t.uniques.iter().filter(|u| u.name == *n).collect(),
-            Target::Cols(names) => {
-                let Some(mut ids) = names
+            Target::Cols(elems) => {
+                // the columns the target names, each once (`(key, key, key)` is `(key)`)
+                let Some(mut ids) = elems
                     .iter()
+                    .filter_map(Infer::col)
                     .map(|n| t.cols.iter().find(|c| c.name == *n).map(|c| c.id))
                     .collect::<Option<Vec<_>>>()
                 else {
                     return vec![];
                 };
                 ids.sort();
-                let given = |e: &Expr| Binder::plain(&t.cols, None).bind(e).ok().map(|e| format!("{e:?}"));
-                let pred: Option<Vec<String>> = pred.map(|p| conjuncts(p).into_iter().filter_map(given).collect());
+                ids.dedup();
+                let parts = infer_parts(t, elems);
+                let given = |e: &Expr| Binder::plain(&t.cols, None).bind(e).ok();
+                let pred: Option<Vec<Expr>> = pred.map(|p| conjuncts(p).into_iter().filter_map(given).collect());
                 let mut found: Vec<&Unique> = t
                     .uniques
                     .iter()
                     .filter(|u| {
-                        let mut c = u.cols.clone();
+                        let mut c: Vec<u32> = u.cols.iter().copied().filter(|&c| c != btree::EXPR).collect();
                         c.sort();
+                        c.dedup();
                         c == ids
+                            && infers(t, u, &parts)
                             && match (&pred, uniq_index(t, u).and_then(|x| x.filter.as_deref())) {
                                 (Some(p), Some(f)) => check_expr(f).is_ok_and(|f| {
-                                    conjuncts(&f).into_iter().all(|f| given(f).is_some_and(|f| p.contains(&f)))
+                                    conjuncts(&f)
+                                        .into_iter()
+                                        .all(|f| given(f).is_some_and(|f| p.iter().any(|g| implies(g, &f))))
                                 }),
+                                // a partial index arbitrates only for a target whose WHERE implies its own
+                                (None, Some(_)) => false,
                                 _ => true,
                             }
                     })
@@ -54093,9 +54973,17 @@ impl Exec<'_> {
     fn is_key(t: &Table, target: &Target) -> bool {
         let key = t.key_cols();
         match target {
-            // the key's columns, in any order
+            // the key's columns, in any order, each once or more, in their own collations
             Target::Cols(c) => {
-                !key.is_empty() && c.len() == key.len() && key.iter().all(|&k| c.contains(&t.cols[k].name))
+                let names: Vec<&str> = c.iter().filter_map(Infer::col).collect();
+                !key.is_empty()
+                    && names.len() == c.len()
+                    && key.iter().all(|&k| names.contains(&t.cols[k].name.as_str()))
+                    && c.iter().all(|i| {
+                        let Some(col) = i.col().and_then(|n| t.cols.iter().find(|x| x.name == n)) else { return false };
+                        key.iter().any(|&k| t.cols[k].id == col.id)
+                            && i.coll.as_ref().is_none_or(|n| n.resolve(None).is_ok_and(|x| x == col.coll))
+                    })
             }
             Target::Constraint(n) => t.has_key() && *n == t.pkey_name(),
         }
@@ -54132,9 +55020,16 @@ impl Exec<'_> {
     /// What ON CONFLICT DO UPDATE computes, over a row of the existing columns then EXCLUDED's.
     /// None for DO NOTHING.
     fn upsert_plan(&self, v: &View, t: &Table, alias: &str, c: &OnConflict) -> Result<Option<Upsert>> {
-        let key = t.key_names();
-        // `(cols) WHERE pred`: a condition on the table's columns (42703 for one it hasn't), and a boolean
-        if let Some(p) = &c.pred {
+        // `(cols) WHERE pred`: a condition on the table's columns (42703 for one it hasn't), and a boolean; a column
+        // named by the table's alias (or name) is the table's
+        let own = |q: &str| q == alias || q == rel_part(&t.name);
+        let pred = c.pred.as_ref().map(|p| {
+            rewrite(p, &|x| match x {
+                Expr::Col(Some(q), n) if own(q) && n != "*" => Some(Expr::Col(None, n.clone())),
+                _ => None,
+            })
+        });
+        if let Some(p) = &pred {
             let e = Binder::plain(&t.cols, None).bind(p)?;
             match ty_in(&e, &t.cols, &[], &[])? {
                 Type::Bool => {}
@@ -54147,27 +55042,63 @@ impl Exec<'_> {
                 }
             }
         }
-        if let Some(target) = &c.target
-            && !Self::is_key(t, target)
-            && self.unique_for(t, target, c.pred.as_ref()).is_empty()
-        {
-            return err(
-                "42P10",
-                format!("ON CONFLICT {target} needs the primary key or a UNIQUE constraint on exactly those columns"),
-            );
+        if c.update.is_some() && c.target.is_none() {
+            return Err(no_conflict_target(None));
         }
-        let Some((sets, filter)) = &c.update else { return Ok(None) };
-        if c.target.is_none() {
-            return err(
-                SYNTAX,
-                format!(
-                    "ON CONFLICT DO UPDATE needs a conflict target, e.g. ON CONFLICT ({})",
-                    key.as_deref().unwrap_or("id")
-                ),
-            );
+        // the target's columns and expressions: of the table (42703 for a column it hasn't, with the nearest one
+        // it has, of the table and of EXCLUDED, as Postgres's hint names them)
+        if let Some(Target::Cols(elems)) = &c.target {
+            for i in elems {
+                match &i.part {
+                    IndexPart::Col(n) if !t.cols.iter().any(|x| x.name == *n) => {
+                        let names: Vec<&str> = t.cols.iter().filter(|x| !x.hidden).map(|x| x.name.as_str()).collect();
+                        let rel = rel_part(alias);
+                        return Err(SqlError {
+                            code: NO_COLUMN,
+                            message: format!("column \"{n}\" does not exist"),
+                            info: foreign::closest(n, &names).map(|m| {
+                                Box::new(Violation {
+                                    hint: Some(format!(
+                                        "Perhaps you meant to reference the column \"{rel}.{m}\" or the column \"excluded.{m}\"."
+                                    )),
+                                    ..Violation::default()
+                                })
+                            }),
+                        });
+                    }
+                    IndexPart::Expr(x) => {
+                        index_expr(t, x)?;
+                    }
+                    IndexPart::Col(_) => {}
+                }
+                if let Some(n) = &i.coll {
+                    n.resolve(Some(v))?;
+                }
+            }
         }
+        // (the arbiters are inferred after the clause's expressions are read, as Postgres's planner infers them after
+        // its parser read them: a column those name that isn't there is the error first)
+        let missing = c
+            .target
+            .as_ref()
+            .is_some_and(|target| !Self::is_key(t, target) && self.unique_for(t, target, pred.as_ref()).is_empty());
+        let no_arbiter =
+            || err("42P10", "there is no unique or exclusion constraint matching the ON CONFLICT specification");
+        let Some((sets, filter)) = &c.update else {
+            return if missing { no_arbiter() } else { Ok(None) };
+        };
         if !t.schema {
             return err(UNSUPPORTED, "ON CONFLICT DO UPDATE needs a table made with CREATE TABLE");
+        }
+        // a target called `excluded` (not renamed with AS): EXCLUDED's name is then two tables'
+        if alias == "excluded" {
+            let mut named = false;
+            for e in sets.iter().map(|(_, e)| e).chain(filter) {
+                walk(e, &mut |x| named |= matches!(x, Expr::Col(Some(q), _) if q == "excluded"));
+            }
+            if named {
+                return err("42P09", "table reference \"excluded\" is ambiguous");
+            }
         }
         let mut cols: Vec<Col> = t.cols.iter().map(|c| Col { table: alias.into(), ..c.clone() }).collect();
         cols.extend(t.cols.iter().map(|c| Col { table: "excluded".into(), ..c.clone() }));
@@ -54202,6 +55133,9 @@ impl Exec<'_> {
             })
             .collect::<Result<_>>()?;
         let filter = filter.as_ref().map(own).transpose()?;
+        if missing {
+            return no_arbiter();
+        }
         Ok(Some(Upsert { cols, sets, filter }))
     }
 
@@ -54213,6 +55147,52 @@ impl Exec<'_> {
         names: Option<&[String]>,
         rows: Vec<Vec<Expr>>,   // each is dropped once it's made its row
         query: Option<&Select>, // INSERT ... SELECT: the rows come from it instead
+        conflict: Option<&OnConflict>,
+        returning: Option<&[Item]>,
+        overriding: Option<bool>,
+        checks: Option<&rls::Checks>,
+    ) -> Result<Output> {
+        let out = self.insert_rows(table, alias, names, rows, query, conflict, returning, overriding, checks);
+        // (EXCLUDED is the ON CONFLICT clause's: its RETURNING, or anything else of the statement, can't read it)
+        match out {
+            Err(e) if conflict.is_some() && e.message == "missing FROM-clause entry for table \"excluded\"" => {
+                Err(SqlError {
+                    code: e.code,
+                    message: "invalid reference to FROM-clause entry for table \"excluded\"".into(),
+                    info: Some(Box::new(Violation {
+                        detail: Some(
+                            "There is an entry for table \"excluded\", but it cannot be referenced from this part of the query."
+                                .into(),
+                        ),
+                        ..e.info.map(|b| *b).unwrap_or_default()
+                    })),
+                })
+            }
+            // (the table by its name, where AS gave it another: Postgres's hint names the alias)
+            Err(e) if alias.is_some_and(|a| a != rel_part(table))
+                && e.message == format!("missing FROM-clause entry for table \"{}\"", rel_part(table)) =>
+            {
+                Err(SqlError {
+                    code: e.code,
+                    message: format!("invalid reference to FROM-clause entry for table \"{}\"", rel_part(table)),
+                    info: Some(Box::new(Violation {
+                        hint: alias.map(|a| format!("Perhaps you meant to reference the table alias \"{a}\".")),
+                        ..e.info.map(|b| *b).unwrap_or_default()
+                    })),
+                })
+            }
+            out => out,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_rows(
+        &self,
+        table: &str,
+        alias: Option<&str>,
+        names: Option<&[String]>,
+        rows: Vec<Vec<Expr>>,
+        query: Option<&Select>,
         conflict: Option<&OnConflict>,
         returning: Option<&[Item]>,
         overriding: Option<bool>,
@@ -57029,6 +58009,14 @@ impl<'a> Binder<'a> {
     /// `select t from t`, `count(t)`, `t is null`, `t = t`. A column that has the name wins (as in Postgres), and so
     /// does the single column of a function's alias.
     fn table_row(&self, e: &Expr) -> Option<Vec<usize>> {
+        // `t.*` where a value is wanted (`i.* != excluded.*`, `excluded.*::text`) is its row too
+        if let Expr::Col(Some(t), c) = e
+            && c == "*"
+        {
+            let of: Vec<usize> =
+                (0..self.cols.len()).filter(|&i| self.cols[i].table == *t && !self.cols[i].hidden).collect();
+            return (!of.is_empty()).then_some(of);
+        }
         let Expr::Col(None, t) = e else { return None };
         if self.cols.iter().any(|c| c.name == *t) {
             return None;
@@ -58018,6 +59006,27 @@ impl<'a> Binder<'a> {
     }
 
     fn go(&mut self, e: &Expr, in_agg: bool) -> Result<Expr> {
+        // a time's precision past 6 digits, `current_time(7)`, `::timestamp(9)`: 6, with Postgres's warning
+        if let Expr::Func(Func::Scalar(funcs::Scalar::TimePrec), a) = e
+            && let [x, Expr::Lit(Value::Int(p))] = &a[..]
+            && *p > 6
+        {
+            let x = self.go(x, in_agg)?;
+            let shown = match ty_in(&x, self.cols, self.params, &self.aggs)? {
+                Type::Timestamp => Some("TIMESTAMP(%)"),
+                Type::TimestampTz => Some("TIMESTAMP(%) WITH TIME ZONE"),
+                Type::Time => Some("TIME(%)"),
+                Type::TimeTz => Some("TIME(%) WITH TIME ZONE"),
+                _ => None,
+            };
+            if let Some(t) = shown {
+                notice(
+                    "WARNING",
+                    format!("{} precision reduced to maximum allowed, 6", t.replace('%', &p.to_string())),
+                );
+            }
+            return Ok(Expr::Func(Func::Scalar(funcs::Scalar::TimePrec), vec![x, Expr::Lit(Value::Int(6))]));
+        }
         // a json function called by the name its column takes (see `spelled_call`): from here on, the call
         if let Expr::Func(Func::Scalar(funcs::Scalar::Spelled(_)), a) = e
             && let [call] = &a[..]
@@ -58207,7 +59216,7 @@ impl<'a> Binder<'a> {
             return Ok(Expr::Func(Func::Collate(c), vec![x]));
         }
         // a table's name where a value is wanted: its row, as a row value
-        if matches!(e, Expr::Col(None, _))
+        if (matches!(e, Expr::Col(None, _)) || matches!(e, Expr::Col(Some(_), c) if c == "*"))
             && let Some(of) = self.table_row(e)
         {
             let mut fields: Vec<Expr> = of.into_iter().map(Expr::Idx).collect();

@@ -10,6 +10,13 @@ const PREFIX: &str = "_sonos_lo/";
 const CHUNK: u64 = 64 << 10;
 const READ: i64 = 0x40000;
 const WRITE: i64 = 0x20000;
+/// The most a read gives at once (Postgres's MaxAllocSize, less a varlena's header).
+const MAX_READ: u64 = 0x3fff_ffff - 4;
+
+/// 54000 for a read of more than one value can hold, as Postgres refuses it.
+fn too_large() -> SqlError {
+    SqlError { code: "54000", message: "large object read request is too large".into(), info: None }
+}
 
 /// An open descriptor: the object, whether it may be written, and where it is.
 #[derive(Clone, Copy)]
@@ -237,9 +244,14 @@ fn int(v: &Value) -> Result<i64> {
     }
 }
 
+/// A bytea argument's bytes: text (an unknown literal, `E'\\xdeadbeef'`) is read as bytea's input reads it.
 fn bytes(v: &Value) -> Vec<u8> {
     match v {
         Value::Bytea(b) => b.clone(),
+        Value::Text(_) => match coerce(v.clone(), Type::Bytea) {
+            Ok(Value::Bytea(b)) => b,
+            _ => v.to_text().into_bytes(),
+        },
         v => v.to_text().into_bytes(),
     }
 }
@@ -277,6 +289,19 @@ pub(super) fn call(ctx: &Ctx, name: &str, a: &[Value]) -> Result<Value> {
     let writable = |o: &Open, n: i64| -> Result<()> {
         if o.write { Ok(()) } else { err("55000", format!("large object descriptor {n} was not opened for writing")) }
     };
+    // (a READ ONLY transaction changes none, as Postgres's PreventCommandIfReadOnly refuses each)
+    if super::read_only_in(&ctx.core) {
+        let wanted = match name {
+            "lo_open" => (int(&a[1])? & WRITE != 0).then_some("lo_open(INV_WRITE)"),
+            "lo_export" => None,
+            n if writes(n) => Some(n),
+            _ => None,
+        };
+        if let Some(what) = wanted {
+            let what = if what.ends_with(')') { what.to_string() } else { format!("{what}()") };
+            return err("25006", format!("cannot execute {what} in a read-only transaction"));
+        }
+    }
     Ok(match name {
         "lo_creat" | "lo_create" | "lo_from_bytea" => {
             let given = if name == "lo_creat" { 0 } else { int(&a[0])? };
@@ -315,6 +340,9 @@ pub(super) fn call(ctx: &Ctx, name: &str, a: &[Value]) -> Result<Value> {
         "loread" => {
             let (n, len) = (int(&a[0])?, int(&a[1])?.max(0) as u64);
             let mut o = fd(ctx, n)?;
+            if len > MAX_READ {
+                return Err(too_large());
+            }
             let v = ctx.core.view_tx(&ctx.world)?;
             let obj = stat(&v, o.oid)?.ok_or_else(|| bad(o.oid))?;
             let got = read(&v, o.oid, &obj, o.pos.max(0) as u64, len)?;
@@ -344,10 +372,21 @@ pub(super) fn call(ctx: &Ctx, name: &str, a: &[Value]) -> Result<Value> {
             if o.pos < 0 {
                 return err("22023", "invalid seek position");
             }
+            // (lo_lseek's result is an int4: a place past it is refused, as Postgres's be_lo_lseek does)
+            if name == "lo_lseek" && o.pos > i64::from(i32::MAX) {
+                return err("22003", format!("lo_lseek result out of range for large-object descriptor {n}"));
+            }
             set(ctx, n, o);
             Int(o.pos)
         }
-        "lo_tell" | "lo_tell64" => Int(fd(ctx, int(&a[0])?)?.pos),
+        "lo_tell" | "lo_tell64" => {
+            let n = int(&a[0])?;
+            let pos = fd(ctx, n)?.pos;
+            if name == "lo_tell" && pos > i64::from(i32::MAX) {
+                return err("22003", format!("lo_tell result out of range for large-object descriptor {n}"));
+            }
+            Int(pos)
+        }
         "lo_truncate" | "lo_truncate64" => {
             let (n, len) = (int(&a[0])?, int(&a[1])?.max(0) as u64);
             let o = fd(ctx, n)?;
@@ -368,7 +407,12 @@ pub(super) fn call(ctx: &Ctx, name: &str, a: &[Value]) -> Result<Value> {
                     return Err(o.not_owner());
                 }
             }
+            // (its comment goes with it)
             let mut rows: Rows = vec![(key(oid), None)];
+            let comment = super::comments::row_key(&format!("large object/{oid}"));
+            if v.get(&comment)?.is_some() {
+                rows.push((comment, None));
+            }
             if ctx.core.has_privileges() {
                 rows.push((acl::row_key(&acl::key_of(acl::Kind::LargeObject, &oid.to_string())), None));
             }
@@ -390,6 +434,9 @@ pub(super) fn call(ctx: &Ctx, name: &str, a: &[Value]) -> Result<Value> {
                 3 => (int(&a[1])?.max(0) as u64, int(&a[2])?.max(0) as u64),
                 _ => (0, obj.len()),
             };
+            if len.min(obj.len().saturating_sub(off)) > MAX_READ {
+                return Err(too_large());
+            }
             Bytea(read(&v, oid, &obj, off, len)?)
         }
         "lo_put" => {
@@ -492,6 +539,7 @@ pub(super) fn result(name: &str) -> Type {
         "lo_creat" | "lo_create" | "lo_from_bytea" | "lo_import" => Type::Oid,
         "loread" | "lo_get" => Type::Bytea,
         "lo_put" => Type::Void,
+        "lo_lseek64" | "lo_tell64" => Type::BigInt,
         _ => Type::Int,
     }
 }

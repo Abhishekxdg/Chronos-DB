@@ -1803,8 +1803,24 @@ impl Conn<'_> {
                                 let (own, typmod) = t.typmods.get(i).copied().unwrap_or((0, -1));
                                 let shown = sql::sized_type(own, typmod).unwrap_or_else(|| ty.pg_name().into_owned());
                                 let coll = t.collation_name(i).map_or(Value::Null, |c| text(&c));
-                                let mut r =
-                                    vec![text(name), text(&shown), d, bool(*not_null), coll, text(""), text("")];
+                                // (an identity column's kind, `a` or `d`, and a generated one's `s`: what psql shows
+                                // as its default)
+                                let identity = t.identity.get(i).filter(|c| **c != ' ').map(char::to_string);
+                                let generated = if t.generated.get(i).is_some_and(Option::is_some) { "s" } else { "" };
+                                // (psql writes a generated column's expression in its own parentheses)
+                                let d = match (&d, generated) {
+                                    (Value::Text(e), "s") => text(sql::without_outer_parens(e)),
+                                    _ => d,
+                                };
+                                let mut r = vec![
+                                    text(name),
+                                    text(&shown),
+                                    d,
+                                    bool(*not_null),
+                                    coll,
+                                    text(&identity.unwrap_or_default()),
+                                    text(generated),
+                                ];
                                 if fdw {
                                     r.push(text(&t.fdw_column_options(i).unwrap_or_default()));
                                 }
@@ -2123,16 +2139,28 @@ impl Conn<'_> {
             Err(e) => {
                 // what reading it warned of goes first (CREATE AGGREGATE's attributes it doesn't know)
                 self.notices()?;
+                // (a statement that can't be read fails its transaction, as one that fails as it runs does; one Chronos
+                // refuses as not supported here leaves it as it was)
+                if e.code != "0A000" {
+                    self.session.abort();
+                }
                 return self.error(&e);
             }
         };
+        // what reading it warned of, before what it does (the statements' own notices start afresh)
+        self.notices()?;
         if script.is_empty() {
             return self.send(b'I', &[]);
         }
         for i in 0..script.len() {
             let s = &match self.session.next_statement(self.db, &script, i) {
                 Ok(s) => s,
-                Err(e) => return self.error(&e),
+                Err(e) => {
+                    if e.code != "0A000" {
+                        self.session.abort();
+                    }
+                    return self.error(&e);
+                }
             };
             if s.copy_direction().is_some() {
                 match self.copy(s) {

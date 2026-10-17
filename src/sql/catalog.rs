@@ -1035,6 +1035,8 @@ impl Catalog {
             "server" => self.foreign.server(rest).is_some(),
             "type" => self.enums.iter().any(|(n, _)| n == rest),
             "function" => self.funcs.iter().any(|f| f.sig() == rest),
+            // (lo_unlink takes a large object's comment with it)
+            "large object" => true,
             _ => false,
         }
     }
@@ -1068,6 +1070,7 @@ impl Catalog {
                 "server" => self.foreign.server_oid(rest).map(|o| (o, 1417, 0)),
                 "type" => self.enums.iter().position(|(n, _)| n == rest).map(|k| (self.enum_oid(k), 1247, 0)),
                 "function" => self.funcs.iter().position(|f| f.sig() == rest).map(|k| (self.func_oid(k), 1255, 0)),
+                "large object" => rest.parse().ok().map(|o| (o, 2613, 0)),
                 _ => None,
             };
             if let Some((oid, class, sub)) = found {
@@ -1111,6 +1114,7 @@ impl Catalog {
             }
             (None, Some(Slot::Schema(k))) if sub == 0 && is("pg_namespace") => format!("schema/{}", self.schemas[*k]),
             (None, Some(Slot::Enum(k))) if sub == 0 && is("pg_type") => format!("type/{}", self.enums[*k].0),
+            _ if sub == 0 && class.as_deref() == Some("pg_largeobject") => format!("large object/{oid}"),
             (None, _) if sub == 0 && is("pg_proc") && self.func_oids.contains(&oid) => {
                 let k = self.func_oids.iter().position(|o| *o == oid)?;
                 format!("function/{}", self.funcs[k].sig())

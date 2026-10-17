@@ -1270,35 +1270,7 @@ impl Parser {
                 body = Some(self.atomic_body()?);
                 inline = true;
             } else if self.kw("set") {
-                // SET name { TO | = } value [, ...]: kept (see `Function::config`); SET name FROM CURRENT: read, not
-                // kept (ponytail: the session's value then isn't captured)
-                let mut name = self.name()?;
-                while self.sym(".") {
-                    name = format!("{name}.{}", self.name()?);
-                }
-                if self.kw("from") {
-                    self.expect_kw("current")?;
-                } else {
-                    if !self.kw("to") {
-                        self.expect_sym("=")?;
-                    }
-                    // (search_path as SET search_path reads it: a string of schemas split, DEFAULT its default)
-                    let path = name == "search_path";
-                    let mut values = vec![];
-                    if path && self.kw("default") {
-                        values = vec!["$user".to_string(), "public".to_string()];
-                    } else {
-                        loop {
-                            match self.next() {
-                                Some(Tok::Str(v)) if path => values.extend(super::path_items(&v)),
-                                Some(Tok::Str(v) | Tok::Num(v) | Tok::Word(v) | Tok::Ident(v)) => values.push(v),
-                                _ => return self.fail("expected a setting value"),
-                            }
-                            if !self.sym(",") {
-                                break;
-                            }
-                        }
-                    }
+                if let Some((name, values)) = self.config_clause()? {
                     config.retain(|(n, _)| *n != name);
                     config.push((name, values));
                 }
@@ -1317,6 +1289,10 @@ impl Parser {
             None if !outs.is_empty() => Some(Ret::Table(outs.clone())),
             // RETURNS [SETOF] record with OUT parameters: they are its columns
             Some(Ret::Table(c)) if c.is_empty() && !outs.is_empty() => Some(Ret::Table(outs.clone())),
+            // RETURNS [SETOF] t with one OUT parameter of type t: its column, named as it is
+            Some(Ret::Value(t) | Ret::SetOf(t)) if matches!(&outs[..], [(_, o)] if *o == t) => {
+                Some(Ret::Table(outs.clone()))
+            }
             r => r,
         };
         let Some(ret) = ret else { return err("42P13", "function result type must be specified") };
@@ -1514,6 +1490,40 @@ impl Parser {
         Ok(Stmt::Call(Box::new(select_of(call))))
     }
 
+    /// After a function's SET: `name { TO | = } value [, ...]`, kept (see `Function::config`); `name FROM CURRENT`
+    /// is read, not kept (None; ponytail: the session's value then isn't captured).
+    pub(super) fn config_clause(&mut self) -> Result<Option<(String, Vec<String>)>> {
+        let mut name = self.name()?;
+        while self.sym(".") {
+            name = format!("{name}.{}", self.name()?);
+        }
+        if self.kw("from") {
+            self.expect_kw("current")?;
+            return Ok(None);
+        }
+        if !self.kw("to") {
+            self.expect_sym("=")?;
+        }
+        // (search_path as SET search_path reads it: a string of schemas split, DEFAULT its default)
+        let path = name == "search_path";
+        let mut values = vec![];
+        if path && self.kw("default") {
+            values = vec!["$user".to_string(), "public".to_string()];
+        } else {
+            loop {
+                match self.next() {
+                    Some(Tok::Str(v)) if path => values.extend(super::path_items(&v)),
+                    Some(Tok::Str(v) | Tok::Num(v) | Tok::Word(v) | Tok::Ident(v)) => values.push(v),
+                    _ => return self.fail("expected a setting value"),
+                }
+                if !self.sym(",") {
+                    break;
+                }
+            }
+        }
+        Ok(Some((name, values)))
+    }
+
     /// After DROP FUNCTION.
     pub(super) fn drop_function(&mut self, procedure: bool) -> Result<Stmt> {
         let if_exists = self.kw("if");
@@ -1615,6 +1625,7 @@ impl Parser {
         events.sort();
         self.expect_kw("on")?;
         let table = self.routine_name(false, Kind::Rel)?;
+        self.in_schema_being_made(&table)?;
         // a constraint trigger's [FROM table] and [NOT] DEFERRABLE / INITIALLY {IMMEDIATE | DEFERRED], in any order
         let mut cons = None;
         if constraint {
@@ -1940,6 +1951,30 @@ pub(super) fn named(v: &View, name: &str) -> Result<Vec<Arc<Function>>> {
         }
     }
     Ok(out)
+}
+
+/// Type `t` as Postgres's TypeNameListToString writes a type a statement named: those SQL spells with keywords
+/// (`int`, `boolean`, `double precision`) by their names in pg_catalog, others by their names.
+fn written_type(t: &Type) -> String {
+    let (elem, array) = match t {
+        Type::Array(_) => (t.elem().unwrap_or(Type::Text), "[]"),
+        t => (*t, ""),
+    };
+    let internal = match elem {
+        Type::Int => "int4",
+        Type::BigInt => "int8",
+        Type::SmallInt => "int2",
+        Type::Float => "float8",
+        Type::Float4 => "float4",
+        Type::Bool => "bool",
+        Type::Numeric => "numeric",
+        Type::Timestamp => "timestamp",
+        Type::TimestampTz => "timestamptz",
+        Type::Time => "time",
+        Type::Interval => "interval",
+        _ => return format!("{}{array}", elem.name()),
+    };
+    format!("pg_catalog.{internal}{array}")
 }
 
 /// The function or procedure `name` (with these argument types, if given) means, as DROP FUNCTION
@@ -3632,10 +3667,12 @@ impl Exec<'_> {
             Some(path) => super::with_own_path(path, true, || self.run_code(f, args, trig)),
             None => self.run_code(f, args, trig),
         };
+        let scope = super::FunctionSettings::enter(&f.config);
         let out = match owner {
             Some(o) => roles::acting(Some(o), call),
             None => call(),
         };
+        scope.leave(out.is_ok());
         self.nest.depth.set(d);
         if let Some(t) = timing {
             super::pgstat::called(t, out.is_ok());
@@ -3868,7 +3905,12 @@ impl Exec<'_> {
                 if !replace {
                     return err("42723", format!("function \"{}\" already exists with same argument types", f.name));
                 }
-                if Function::from_raw(&old)?.ret != f.ret {
+                // (one OUT parameter's function returns its type, whatever the parameter is named)
+                let same = match (&Function::from_raw(&old)?.ret, &f.ret) {
+                    (Ret::Table(a), Ret::Table(b)) if a.len() == 1 && b.len() == 1 => a[0].1 == b[0].1,
+                    (a, b) => a == b,
+                };
+                if !same {
                     return err(
                         "42P13",
                         format!("cannot change return type of existing function; DROP FUNCTION {} first", f.sig()),
@@ -3905,18 +3947,42 @@ impl Exec<'_> {
                 let found = match types {
                     Some(ts) => all.iter().find(|f| f.args.iter().map(|a| type_named(&a.1)).eq(ts.iter().map(type_named))).cloned(),
                     None if all.len() > 1 => {
-                        return err("42725", format!("function name \"{}\" is not unique; give its argument types, like DROP FUNCTION {}", written(name), all[0].sig()));
+                        let kind = if procedure { "procedure" } else { "function" };
+                        return Err(SqlError {
+                            code: "42725",
+                            message: format!("{kind} name \"{}\" is not unique", written(name)),
+                            info: Some(Box::new(Violation {
+                                hint: Some(format!("Specify the argument list to select the {kind} unambiguously.")),
+                                ..Violation::default()
+                            })),
+                        });
                     }
                     None => all.first().cloned(),
                 };
                 let Some(f) = found else {
-                    let shown = match types {
-                        Some(ts) => format!("function {}({}) does not exist", written(name), ts.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")),
-                        None => format!("could not find a function named \"{}\"", written(name)),
+                    // an argument type that names nothing is what's missing, as Postgres looks the types up first
+                    let unknown = types.iter().flatten().find_map(|t| match *t {
+                        Type::Enum(i) if i & UNRESOLVED_BIT != 0 => {
+                            unresolved_name(i).filter(|n| v.get(&type_key(n)).ok().flatten().is_none())
+                        }
+                        _ => None,
+                    });
+                    let shown = match (types, &unknown) {
+                        (_, Some(n)) => format!("type \"{}\" does not exist", shown_type(n)),
+                        (Some(ts), None) => format!("function {}({}) does not exist", written(name), ts.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")),
+                        (None, None) => format!("could not find a function named \"{}\"", written(name)),
                     };
                     if if_exists {
+                        // (Postgres names the types as the statement wrote them: `int` as pg_catalog.int4)
+                        let shown = match (types, unknown) {
+                            (Some(ts), None) => format!("function {}({}) does not exist", written(name), ts.iter().map(written_type).collect::<Vec<_>>().join(",")),
+                            _ => shown,
+                        };
                         notice("NOTICE", format!("{shown}, skipping"));
                         continue;
+                    }
+                    if unknown.is_some() {
+                        return err("42704", shown);
                     }
                     return err(NO_FUNCTION, shown);
                 };

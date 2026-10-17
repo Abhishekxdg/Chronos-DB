@@ -1749,6 +1749,13 @@ fn ddl(v: &View, who: &Who, st: &Stmt) -> Result<()> {
                     return Err(func(v, &f)?.not_owner());
                 }
             }
+            // a large object's owner
+            maintain::Commented::LargeObject(oid) => {
+                let o = large_object(v, *oid)?;
+                if super::largeobj::exists_in(v, *oid)? && !owns(&o) {
+                    return Err(o.not_owner());
+                }
+            }
             // (a wrapper's or server's owner: see `foreign::comment_target`)
             maintain::Commented::Other
             | maintain::Commented::Aggregate(..)
@@ -2325,7 +2332,17 @@ impl Parser {
     }
 
     /// A large object's oid, as GRANT ... ON LARGE OBJECT names one (a number, maybe signed).
-    fn large_object_oid(&mut self) -> Result<i64> {
+    /// After ALTER: `LARGE OBJECT oid OWNER TO role`.
+    pub(super) fn alter_large_object(&mut self) -> Result<Stmt> {
+        self.expect_kw("large")?;
+        self.expect_kw("object")?;
+        let oid = self.large_object_oid()?;
+        self.expect_kw("owner")?;
+        self.expect_kw("to")?;
+        Ok(Stmt::AlterOwner(Owned::LargeObject(oid), self.role_spec(false)?))
+    }
+
+    pub(super) fn large_object_oid(&mut self) -> Result<i64> {
         let neg = self.sym("-");
         match self.next() {
             Some(Tok::Num(n)) => match n.parse::<i64>() {
@@ -3243,6 +3260,8 @@ pub(crate) enum Owned {
     Routine(String, Option<Vec<Type>>, bool),
     /// a type, or with true ALTER DOMAIN's domain: its stored name
     Type(String, bool),
+    /// a large object, by its oid
+    LargeObject(i64),
 }
 
 /// The kind `Owned::Rel` has for ALTER TABLE IF EXISTS ... OWNER TO: a table, skipped if it isn't there.
@@ -3274,6 +3293,7 @@ pub(super) fn alter_owner(db: &Db, branch: &str, what: &Owned, to: &Spec) -> Res
             }
         }
         Owned::Type(_, domain) => if *domain { "ALTER DOMAIN" } else { "ALTER TYPE" }.into(),
+        Owned::LargeObject(_) => "ALTER LARGE OBJECT".into(),
     };
     db.batch_with::<(), SqlError>(branch, |v| {
         let (obj, schema_name) = match what {
@@ -3298,6 +3318,12 @@ pub(super) fn alter_owner(db: &Db, branch: &str, what: &Owned, to: &Spec) -> Res
                     return err("42809", format!("{} is not a domain", o.name));
                 }
                 (o, schema_part(n).to_string())
+            }
+            Owned::LargeObject(oid) => {
+                if !super::largeobj::exists_in(v, *oid)? {
+                    return err("42704", format!("large object {oid} does not exist"));
+                }
+                (large_object(v, *oid)?, String::new())
             }
         };
         if obj.owner == new.oid {
@@ -3368,6 +3394,51 @@ pub(super) fn set_definer(db: &Db, branch: &str, what: &Owned, definer: bool) ->
                     m.remove("definer");
                 }
             }
+        }
+        Ok((vec![(f.key(), Some(j.to_string()))], ()))
+    })?;
+    functions::forget_parsed();
+    tag(if *procedure { "ALTER PROCEDURE" } else { "ALTER FUNCTION" })
+}
+
+/// ALTER FUNCTION | PROCEDURE ... SET | RESET: the settings its calls run with (see `Stmt::RoutineConfig`), its
+/// owner's to change.
+pub(super) fn set_config(
+    db: &Db,
+    branch: &str,
+    what: &Owned,
+    changes: &[(Option<String>, Option<Vec<String>>)],
+) -> Result<Output> {
+    let Owned::Routine(name, types, procedure) = what else { return err(UNSUPPORTED, "not a function") };
+    let who = roles::current().map_or_else(|| Who::boot("chronos"), |w| (*w).clone());
+    db.batch_with::<(), SqlError>(branch, |v| {
+        let Some(f) = functions::find_routine(v, name, types.as_deref())? else {
+            return err(NO_FUNCTION, format!("function {} does not exist", written(name)));
+        };
+        let o = func(v, &f)?;
+        if !who.has_privs_of(o.owner) {
+            return err("42501", format!("must be owner of {} {}", o.kind.noun(), shown_name(&f.name)));
+        }
+        let mut config = f.config.clone();
+        for (n, values) in changes {
+            match (n, values) {
+                (None, _) => config.clear(),
+                (Some(n), None) => config.retain(|(x, _)| x != n),
+                (Some(n), Some(vals)) => {
+                    config.retain(|(x, _)| x != n);
+                    config.push((n.clone(), vals.clone()));
+                }
+            }
+        }
+        let Some(raw) = v.get(&f.key())? else { return Ok((vec![], ())) };
+        let mut j: Json = serde_json::from_str(&raw).unwrap_or_default();
+        match config.is_empty() {
+            true => {
+                if let Some(m) = j.as_object_mut() {
+                    m.remove("config");
+                }
+            }
+            false => j["config"] = serde_json::json!(config),
         }
         Ok((vec![(f.key(), Some(j.to_string()))], ()))
     })?;
