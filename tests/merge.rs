@@ -43,7 +43,7 @@ fn dry_run_explains_and_changes_nothing() {
     let before = rows(&q(&db, MAIN, "select id, name, email, age from t order by id"));
     let plan = q(&db, MAIN, "merge world x dry run");
     let cols: Vec<String> = plan.columns.clone().unwrap().into_iter().map(|c| c.0).collect();
-    assert_eq!(cols, ["table", "id", "outcome", "detail", "base", "ours", "theirs", "result"]);
+    assert_eq!(cols, ["table", "id", "outcome", "detail", "base", "ours", "theirs", "result", "postgres"]);
     let got: Vec<String> =
         plan.rows.iter().map(|r| format!("{}: {} ({})", r[1].to_text(), r[2].to_text(), r[3].to_text())).collect();
     assert_eq!(

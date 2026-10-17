@@ -27430,6 +27430,32 @@ fn scan(
     Ok(())
 }
 
+/// What a dry run's check against Postgres found (see `crate::attach::dry_run`), in a line for its plan.
+pub fn live_summary(l: &crate::LiveCheck) -> String {
+    if let Some(e) = &l.error {
+        return format!("not checked against Postgres ({}): {e}", l.source);
+    }
+    if l.at == 0 {
+        return format!("writes nothing to Postgres ({})", l.source);
+    }
+    let changed = l.rows.iter().filter(|r| r.changed).count();
+    let at = time::format_timestamptz(l.at as i64 * 1000);
+    let mut out = format!(
+        "checked against Postgres ({}) at {at}, read with no locks (a snapshot: it can change before the merge, \
+         which compares again): {} rows would apply, {changed} changed in Postgres since main's copy; nothing was \
+         written",
+        l.source,
+        l.rows.len() - changed
+    );
+    if !l.triggers.is_empty() {
+        out.push_str(&format!(
+            "; triggers not run, so what they set isn't shown (main takes it after the merge): {}",
+            l.triggers.join(", ")
+        ));
+    }
+    out
+}
+
 /// The rows a scan's `column op constant` conditions can let through, by column name: what a
 /// world that checks its reads read when it scanned a whole table with them (see `stale`). The
 /// conditions on their own are a superset of the rows the scan returned, so a row changed outside
@@ -37027,6 +37053,7 @@ impl Statement {
                     ("ours", Type::Json),
                     ("theirs", Type::Json),
                     ("result", Type::Json),
+                    ("postgres", Type::Json),
                 ]);
             }
             Stmt::Diff(_, _, true, _) => return fixed(&[("sql", Type::Text)]),
@@ -37668,9 +37695,12 @@ impl Statement {
                 let json = |v: Option<Val>| {
                     v.map_or(Value::Null, |r| Value::Json(serde_json::from_str(&r).unwrap_or(Json::Null)))
                 };
+                // in a folder attached to Postgres, each row it would write as Postgres has it now (see `attach`)
+                let live: HashMap<&str, &crate::LiveRow> =
+                    plan.live.iter().flat_map(|l| &l.rows).map(|r| (r.key.as_str(), r)).collect();
                 let mut rows: Vec<Vec<Value>> = plan
                     .rows
-                    .into_iter()
+                    .iter()
                     .filter(|p| !p.key.starts_with("_sonos_") || p.key.starts_with(SCHEMAS) || schema_object(&p.key))
                     .map(|p| {
                         let (t, id) = p.key.split_once('/').unwrap_or((&p.key, ""));
@@ -37678,29 +37708,39 @@ impl Statement {
                             SCHEMAS | VIEWS | SEQUENCES => (id.to_string(), Value::Null), // the table itself
                             t => (t.to_string(), Value::Text(show_id(id).into())),
                         };
+                        let pg = live.get(p.key.as_str());
+                        let (outcome, detail) = match pg {
+                            Some(r) if r.changed => (
+                                "changed in postgres".to_string(),
+                                "changed in Postgres since main's copy: the merge is refused, and main takes \
+                                 Postgres's row (postgres)"
+                                    .to_string(),
+                            ),
+                            _ => (p.outcome.to_string(), p.detail.clone()),
+                        };
                         vec![
                             Value::Text(t),
                             id,
-                            Value::Text(p.outcome.into()),
-                            Value::Text(p.detail),
-                            json(p.base),
-                            json(p.ours),
-                            json(p.theirs),
-                            json(p.result),
+                            Value::Text(outcome),
+                            Value::Text(detail),
+                            json(p.base.clone()),
+                            json(p.ours.clone()),
+                            json(p.theirs.clone()),
+                            json(p.result.clone()),
+                            pg.map_or(Value::Null, |r| json(r.postgres.as_deref().map(Val::from))),
                         ]
                     })
                     .collect();
+                let line = |outcome: &str, detail: String| {
+                    let mut r = vec![Value::Null, Value::Null, Value::Text(outcome.into()), Value::Text(detail)];
+                    r.resize(9, Value::Null);
+                    r
+                };
+                if let Some(l) = &plan.live {
+                    rows.push(line("postgres", live_summary(l)));
+                }
                 if let Some(why) = plan.blocked {
-                    rows.push(vec![
-                        Value::Null,
-                        Value::Null,
-                        Value::Text("blocked".into()),
-                        Value::Text(why),
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                        Value::Null,
-                    ]);
+                    rows.push(line("blocked", why));
                 }
                 let columns = self.columns(db, branch, &[])?;
                 Ok(Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows })

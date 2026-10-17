@@ -331,8 +331,11 @@ What the merge would do with the same clauses, row by row. Changes nothing.
 | `ours` | jsonb | this world's row |
 | `theirs` | jsonb | the parent's (or `INTO` world's) row |
 | `result` | jsonb | the row after the merge; null for a conflict |
+| `postgres` | jsonb | in a folder [attached to Postgres](../guides/attach-postgres.md#dry-run-against-live-postgres), a merge into main: the row as Postgres has it now (null: no row there, or not attached) |
 
 A last row with outcome `blocked` (and null `table`) means constraints would refuse the merge; `detail` says why.
+
+In an attached folder, a merge into main is also checked against Postgres as it is now, in a read-only transaction that is rolled back (nothing is written there, and main doesn't take Postgres's rows). A row changed in Postgres since main's copy has outcome `changed in postgres`, and `blocked` says the merge would be refused. A row with outcome `postgres` says when Postgres was read (with no locks: a snapshot), lists the triggers that weren't run, or says why Postgres couldn't be checked.
 
 ### Stale reads (check_reads)
 

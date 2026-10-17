@@ -12,6 +12,11 @@
 //!     ├─ the merge published in Chronos
 //!     └─ rows Postgres changed as it wrote them (a trigger, a default): main takes them too
 //!
+//!   merge world x dry run (into main): the plan as any dry run, then, after its locks (see `dry_run`)
+//!     └─ Postgres, one read-only transaction: settings ─> source identity ─> schema unchanged? ─> compare each row
+//!        it would write with main's value (no locks: a snapshot) ─> the tables' triggers ─> ROLLBACK
+//!        (nothing written there, and main doesn't take Postgres's rows)
+//!
 //! Comparing: Postgres casts each value Chronos holds to the column's type and both sides to text, under the same
 //! session settings, so a row nobody changed always compares equal. Main only ever holds what Postgres last sent
 //! (writes to main are refused in an attached folder), so a row that differs changed in Postgres since.
@@ -578,19 +583,17 @@ pub(crate) fn writes_back(core: &Core, name: &str, tx: bool) -> bool {
     name == MAIN && !tx && core.attached.is_some() && core.me.get().is_some() && !crate::RECOVERING.get() && !SKIP.get()
 }
 
-/// The write-back of a merge into main (see the module's doc), run by `merge_locked` under the merge's locks once
-/// everything Chronos checks has passed: `apply` is what the merge changes in main (`theirs`), the world's rows
-/// as `ours` holds them. Ok: Postgres committed, and the merge goes on. Err: nothing was written to Postgres,
-/// and nothing merges; on a conflict main takes Postgres's rows after the locks (see `after_merge`).
-pub(crate) fn write_back(
+/// The rows of attached tables a merge into main changes (`apply`, from the parent's state `theirs`; the world's
+/// rows as `ours` holds them), as text, refused as the write-back would refuse them: a table's shape changed, a
+/// table that isn't attached, a sequence-fed value not reserved from Postgres, more than `MAX_ROWS`.
+fn rows_of(
     core: &Core,
     att: &Attached,
     world: &str,
-    world_id: &str,
     theirs: &State,
     ours: &State,
     apply: &[crate::Change],
-) -> Result<()> {
+) -> Result<Vec<Row>> {
     let mut rows: Vec<Row> = vec![];
     for c in apply {
         let table = c.key.split_once('/').map_or(c.key.as_str(), |(t, _)| t);
@@ -621,9 +624,6 @@ pub(crate) fn write_back(
         check_ids(att, world, t, before.as_deref(), after.as_deref())?;
         rows.push(Row { key: c.key.clone(), table: ti, before, after });
     }
-    if rows.is_empty() {
-        return Ok(());
-    }
     if rows.len() > MAX_ROWS {
         return Err(refused(format!(
             "{world} changes {} rows of attached tables, more than {MAX_ROWS} written to Postgres in one merge: \
@@ -631,10 +631,143 @@ pub(crate) fn write_back(
             rows.len()
         )));
     }
+    Ok(rows)
+}
+
+/// The write-back of a merge into main (see the module's doc), run by `merge_locked` under the merge's locks once
+/// everything Chronos checks has passed: `apply` is what the merge changes in main (`theirs`), the world's rows
+/// as `ours` holds them. Ok: Postgres committed, and the merge goes on. Err: nothing was written to Postgres,
+/// and nothing merges; on a conflict main takes Postgres's rows after the locks (see `after_merge`).
+pub(crate) fn write_back(
+    core: &Core,
+    att: &Attached,
+    world: &str,
+    world_id: &str,
+    theirs: &State,
+    ours: &State,
+    apply: &[crate::Change],
+) -> Result<()> {
+    let rows = rows_of(core, att, world, theirs, ours, apply)?;
+    if rows.is_empty() {
+        return Ok(());
+    }
     let mut pg = connect().map_err(|e| refused(format!("{e}; nothing was merged")))?;
     let out = transaction(&mut pg, att, world, world_id, &rows);
     if out.is_err() {
         rollback(&mut pg);
+    }
+    out
+}
+
+// ---------------------------------------------------------------- a dry run against Postgres
+
+/// What a dry run of a merge into main checks against Postgres (see `dry_run`), worked out by `merge_locked` under
+/// the merge's locks, so the round trips to Postgres happen after them: the rows the merge would write, or why the
+/// write-back would refuse them.
+pub(crate) struct Dry {
+    rows: Result<Vec<Row>>,
+}
+
+impl Dry {
+    pub(crate) fn new(
+        core: &Core,
+        att: &Attached,
+        world: &str,
+        theirs: &State,
+        ours: &State,
+        apply: &[crate::Change],
+    ) -> Dry {
+        Dry { rows: rows_of(core, att, world, theirs, ours, apply) }
+    }
+}
+
+/// `MERGE WORLD x DRY RUN` in an attached folder: the rows the merge would write, compared with Postgres as the
+/// write-back compares them, in one read-only transaction that is rolled back. Nothing is written to Postgres, and
+/// main doesn't take Postgres's rows (as a real merge's conflict does). Read with no locks (a plain SELECT, at
+/// REPEATABLE READ: one snapshot across the tables), so it says what a merge would meet then, not later; triggers
+/// aren't run (their names are listed), so values they'd set show only after a real merge. Never fails: what went
+/// wrong is the check's `error`.
+pub(crate) fn dry_run(att: &Attached, dry: Dry) -> crate::LiveCheck {
+    let mut live = crate::LiveCheck { source: att.source(), ..Default::default() };
+    let rows = match dry.rows {
+        Ok(rows) => rows,
+        Err(e) => {
+            live.error = Some(e.to_string());
+            return live;
+        }
+    };
+    if rows.is_empty() {
+        return live; // writes nothing to Postgres: nothing there to check
+    }
+    let mut pg = match connect() {
+        Ok(pg) => pg,
+        Err(e) => {
+            live.error = Some(e);
+            return live;
+        }
+    };
+    let out = dry_transaction(&mut pg, att, &rows, &mut live);
+    rollback(&mut pg);
+    if let Err(e) = out {
+        live.rows.clear();
+        live.error = Some(e.to_string());
+    }
+    live
+}
+
+fn dry_transaction(pg: &mut Client, att: &Attached, rows: &[Row], live: &mut crate::LiveCheck) -> Result<()> {
+    begin(pg, att, true)?;
+    live.at = crate::now_ms();
+    let by_table = by_table(rows);
+    for &ti in by_table.keys() {
+        same_shape(pg, &att.tables[ti])?;
+    }
+    for (&ti, rs) in &by_table {
+        let t = &att.tables[ti];
+        for c in compare(pg, t, rs)? {
+            live.rows.push(crate::LiveRow {
+                key: rs[c.at].key.clone(),
+                changed: c.changed,
+                postgres: c.now.as_ref().map(|r| row_json(t, r)),
+            });
+        }
+    }
+    // user triggers on the tables written: the dry run doesn't run the writes, so what they'd set isn't shown
+    let names = text_array(by_table.keys().map(|&ti| Some(att.tables[ti].pg.as_str())));
+    let sql = "select tgrelid::regclass::text, tgname from pg_trigger where tgrelid = any($1::text[]::regclass[]) \
+               and not tgisinternal and tgenabled <> 'D' order by 1, 2";
+    for r in run(pg, "reading the tables' triggers", sql, &[names])? {
+        live.triggers.push(format!("{}: {}", r[0].clone().unwrap_or_default(), r[1].clone().unwrap_or_default()));
+    }
+    Ok(())
+}
+
+/// Why a merge the dry run checked against Postgres would be refused there now (rows changed since main's copy),
+/// or None.
+pub(crate) fn dry_blocked(live: &crate::LiveCheck) -> Option<String> {
+    let changed = live.rows.iter().filter(|r| r.changed).count();
+    (changed > 0).then(|| {
+        format!(
+            "{changed} rows it would write changed in Postgres since main's copy ({}): merging now is refused, nothing \
+             is written to Postgres, and main takes Postgres's values for them; then merge again and settle them as \
+             any conflict",
+            live.source
+        )
+    })
+}
+
+/// A row of `t` as JSON: each column's text as Postgres writes it (null for NULL).
+fn row_json(t: &Table, r: &[Option<String>]) -> String {
+    let o: serde_json::Map<String, Json> =
+        t.cols.iter().zip(r).map(|(c, v)| (c.name.clone(), v.clone().map_or(Json::Null, Json::String))).collect();
+    Json::Object(o).to_string()
+}
+
+/// `rows` by table, in the tables' order (parents first).
+fn by_table(rows: &[Row]) -> BTreeMap<usize, Vec<&Row>> {
+    let mut out: BTreeMap<usize, Vec<&Row>> = BTreeMap::new();
+    for r in rows {
+        out.entry(r.table).or_default().push(r);
     }
     out
 }
@@ -697,26 +830,8 @@ fn run(pg: &mut Client, what: &str, sql: &str, params: &[String]) -> Result<pgcl
 
 /// One write-back transaction (see the module's doc). Err leaves the transaction for the caller to roll back.
 fn transaction(pg: &mut Client, att: &Attached, world: &str, world_id: &str, rows: &[Row]) -> Result<()> {
-    let start = format!(
-        "begin isolation level read committed; set local lock_timeout = '{LOCK_TIMEOUT}'; \
-         set local statement_timeout = '{STATEMENT_TIMEOUT}'; \
-         set local idle_in_transaction_session_timeout = '{IDLE_TIMEOUT}'; {SETTINGS}; \
-         select count(*) from chronos.merges where id = {}",
-        lit(&att.marker())
-    );
-    let found = pg.query(&start).map_err(|e| failed("starting the write-back", &e))?;
-    if found.last().and_then(|r| r[0].as_deref()) != Some("1") {
-        return Err(refused(format!(
-            "the Postgres CHRONOS_SOURCE_URL names isn't the one this folder was attached to ({}): its chronos.merges \
-             has no row {}; nothing was merged",
-            att.source(),
-            att.marker()
-        )));
-    }
-    let mut by_table: BTreeMap<usize, Vec<&Row>> = BTreeMap::new();
-    for r in rows {
-        by_table.entry(r.table).or_default().push(r);
-    }
+    begin(pg, att, false)?;
+    let by_table = by_table(rows);
     for &ti in by_table.keys() {
         same_shape(pg, &att.tables[ti])?;
     }
@@ -727,7 +842,6 @@ fn transaction(pg: &mut Client, att: &Attached, world: &str, world_id: &str, row
     let mut canon: HashMap<usize, Vec<Vec<Option<String>>>> = HashMap::new();
     for (&ti, rs) in &by_table {
         let t = &att.tables[ti];
-        let all: Vec<usize> = (0..t.cols.len()).collect();
         let keys = arrays(rs, t, false, &[], false);
         let tkeys: Vec<String> = t.key.iter().map(|&i| format!("t.{}", q(&t.cols[i].name))).collect();
         let kcast: Vec<String> = t.key.iter().enumerate().map(|(n, &i)| format!("k.k{n}::{}", t.cols[i].ty)).collect();
@@ -739,34 +853,11 @@ fn transaction(pg: &mut Client, att: &Attached, world: &str, world_id: &str, row
             unnest(t, false, &[], 1)
         );
         run(pg, &format!("locking rows of {}", t.pg), &lock, &keys)?;
-        let params = arrays(rs, t, true, &all, false);
-        let pg_text: Vec<String> = t.cols.iter().map(|c| format!("t.{}::text", q(&c.name))).collect();
-        let held: Vec<String> = all.iter().map(|&i| format!("k.c{i}::{}::text", t.cols[i].ty)).collect();
-        let canon_keys: Vec<String> =
-            t.key.iter().enumerate().map(|(n, &i)| format!("k.k{n}::{}::text", t.cols[i].ty)).collect();
-        let k0 = format!("t.{}", q(&t.cols[t.key[0]].name));
-        let compare = format!(
-            "select k.i, ({k0} is null) = k.p or (k.p and ({}) is distinct from ({})), {k0} is null, {}, {} \
-             from {} left join {} t on {} order by k.i",
-            pg_text.join(", "),
-            held.join(", "),
-            canon_keys.join(", "),
-            pg_text.join(", "),
-            unnest(t, true, &all, 1),
-            t.pg,
-            key_match(t, "t"),
-        );
-        let found = run(pg, &format!("comparing rows of {}", t.pg), &compare, &params)?;
-        let nk = t.key.len();
         let mut keys_here = vec![vec![]; rs.len()];
-        for r in found {
-            let i: usize = r[0].as_deref().and_then(|i| i.parse().ok()).unwrap_or(0);
-            let Some(row) = rs.get(i.wrapping_sub(1)) else { continue };
-            let key: Vec<Option<String>> = r[3..3 + nk].to_vec();
-            keys_here[i - 1] = key.clone();
-            if r[1].as_deref() == Some("t") {
-                let now = (r[2].as_deref() != Some("t")).then(|| r[3 + nk..].to_vec());
-                conflicts.push((ti, row, now, key));
+        for c in compare(pg, t, rs)? {
+            keys_here[c.at] = c.key.clone();
+            if c.changed {
+                conflicts.push((ti, rs[c.at], c.now, c.key));
             }
         }
         canon.insert(ti, keys_here);
@@ -777,18 +868,7 @@ fn transaction(pg: &mut Client, att: &Attached, world: &str, world_id: &str, row
         let mut stored = vec![];
         for (ti, row, now, key) in &conflicts {
             let t = &att.tables[*ti];
-            let show = |r: &Option<Vec<Option<String>>>| match r {
-                None => "no row".to_string(),
-                Some(r) => {
-                    let o: serde_json::Map<String, Json> = t
-                        .cols
-                        .iter()
-                        .zip(r)
-                        .map(|(c, v)| (c.name.clone(), v.clone().map_or(Json::Null, Json::String)))
-                        .collect();
-                    Json::Object(o).to_string()
-                }
-            };
+            let show = |r: &Option<Vec<Option<String>>>| r.as_ref().map_or("no row".to_string(), |r| row_json(t, r));
             if lines.len() < 10 {
                 lines.push(format!(
                     "  {}: the world's {}, main's {}, Postgres's {}",
@@ -934,6 +1014,83 @@ fn transaction(pg: &mut Client, att: &Attached, world: &str, world_id: &str, row
     }
     AFTER.set(Some(After { rows: sent_back, committed: true }));
     Ok(())
+}
+
+/// Starts a transaction on the source (see `SETTINGS`, the timeouts) and checks it is the database this folder was
+/// attached to, in the same round trip. `dry`: a dry run's (read only, one snapshot), which writes nothing.
+fn begin(pg: &mut Client, att: &Attached, dry: bool) -> Result<()> {
+    let (how, what, nothing) = match dry {
+        true => ("isolation level repeatable read, read only", "starting the dry run", "nothing was checked"),
+        false => ("isolation level read committed", "starting the write-back", "nothing was merged"),
+    };
+    let start = format!(
+        "begin {how}; set local lock_timeout = '{LOCK_TIMEOUT}'; \
+         set local statement_timeout = '{STATEMENT_TIMEOUT}'; \
+         set local idle_in_transaction_session_timeout = '{IDLE_TIMEOUT}'; {SETTINGS}; \
+         select count(*) from chronos.merges where id = {}",
+        lit(&att.marker())
+    );
+    let found = pg.query(&start).map_err(|e| failed(what, &e))?;
+    if found.last().and_then(|r| r[0].as_deref()) != Some("1") {
+        return Err(refused(format!(
+            "the Postgres CHRONOS_SOURCE_URL names isn't the one this folder was attached to ({}): its chronos.merges \
+             has no row {}; {nothing}",
+            att.source(),
+            att.marker()
+        )));
+    }
+    Ok(())
+}
+
+/// One row of a table compared with Postgres (see `compare`).
+struct Compared {
+    /// its place in the rows given
+    at: usize,
+    /// Postgres's row isn't the one main holds (or is there when main has none, or gone when main has one)
+    changed: bool,
+    /// Postgres's row now (None: no row there)
+    now: Option<Texts>,
+    /// its key as Postgres writes it
+    key: Texts,
+}
+
+/// Each of `rs` (rows of `t`) compared with Postgres's row of the same key: main's value of it cast to the column's
+/// type and both sides to text (see the module's doc), so a row nobody changed always compares equal.
+fn compare(pg: &mut Client, t: &Table, rs: &[&Row]) -> Result<Vec<Compared>> {
+    let all: Vec<usize> = (0..t.cols.len()).collect();
+    let params = arrays(rs, t, true, &all, false);
+    let pg_text: Vec<String> = t.cols.iter().map(|c| format!("t.{}::text", q(&c.name))).collect();
+    let held: Vec<String> = all.iter().map(|&i| format!("k.c{i}::{}::text", t.cols[i].ty)).collect();
+    let canon_keys: Vec<String> =
+        t.key.iter().enumerate().map(|(n, &i)| format!("k.k{n}::{}::text", t.cols[i].ty)).collect();
+    let k0 = format!("t.{}", q(&t.cols[t.key[0]].name));
+    let sql = format!(
+        "select k.i, ({k0} is null) = k.p or (k.p and ({}) is distinct from ({})), {k0} is null, {}, {} \
+         from {} left join {} t on {} order by k.i",
+        pg_text.join(", "),
+        held.join(", "),
+        canon_keys.join(", "),
+        pg_text.join(", "),
+        unnest(t, true, &all, 1),
+        t.pg,
+        key_match(t, "t"),
+    );
+    let found = run(pg, &format!("comparing rows of {}", t.pg), &sql, &params)?;
+    let nk = t.key.len();
+    let mut out = vec![];
+    for r in found {
+        let i: usize = r[0].as_deref().and_then(|i| i.parse().ok()).unwrap_or(0);
+        if i == 0 || i > rs.len() {
+            continue;
+        }
+        out.push(Compared {
+            at: i - 1,
+            changed: r[1].as_deref() == Some("t"),
+            now: (r[2].as_deref() != Some("t")).then(|| r[3 + nk..].to_vec()),
+            key: r[3..3 + nk].to_vec(),
+        });
+    }
+    Ok(out)
 }
 
 /// Refuses a statement that wrote another number of rows than it was given: a trigger skipped some (BEFORE ...

@@ -719,6 +719,36 @@ pub struct MergePlan {
     /// THEIRS, BY COLUMNS, picks) are settled against that world as it was, so a merge pinned to
     /// it too (`MergeOptions::target`) is refused if that world changed since
     pub target: u64,
+    /// in a folder attached to Postgres, a merge into main: the rows it would write checked against Postgres as it
+    /// is now (see `attach::dry_run`)
+    pub live: Option<LiveCheck>,
+}
+
+/// A dry run's check of a merge into main against the Postgres an attached folder copies (see `attach::dry_run`):
+/// read in one read-only transaction with no locks, rolled back, so a snapshot of Postgres as it was then.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LiveCheck {
+    /// the database, as said at attach (no secret)
+    pub source: String,
+    /// when Postgres was read (ms since 1970; 0: it wasn't)
+    pub at: u64,
+    /// each row the merge would write, compared with Postgres's
+    pub rows: Vec<LiveRow>,
+    /// the user triggers on the tables it would write (`orders: audit_row`): not run, so what they'd set isn't
+    /// shown
+    pub triggers: Vec<String>,
+    /// why Postgres wasn't checked (unreachable, no URL given, another database, a refusal the write-back makes)
+    pub error: Option<String>,
+}
+
+/// A row a merge would write to Postgres, as the dry run found it there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveRow {
+    pub key: String,
+    /// changed in Postgres since main's copy (or added, or gone): the merge would be refused for it
+    pub changed: bool,
+    /// Postgres's row now, as JSON of each column's text (None: no row there)
+    pub postgres: Option<String>,
 }
 
 /// A row settled inside a merge: by a pick, by columns, or (replaying the log) as it was then.
@@ -4152,7 +4182,7 @@ impl Core {
         };
         let (n, pos, notes, kept) = match merged {
             Merged::Done(n, pos, notes, kept) => (n, pos, notes, kept),
-            Merged::Plan(_) => unreachable!("only a dry run plans"),
+            Merged::Plan(..) => unreachable!("only a dry run plans"),
             Merged::Review(p, reasons, version) => {
                 self.ask_review(b, &p, &reasons, version)?;
                 return Err(agents::needs_review(b, &p, &reasons));
@@ -4180,15 +4210,23 @@ impl Core {
     /// errors. Nothing changes.
     pub fn merge_preview(&self, b: &str, o: &MergeOptions) -> Result<MergePlan> {
         let picks = settles(o);
-        let _g = self.gate();
-        let mut plan = match self.merge_locked(b, o, &picks, Mode::Dry)? {
-            Merged::Plan(p) => p,
-            Merged::Done(..) | Merged::Review(..) => unreachable!("a dry run only plans"),
+        let (mut plan, dry) = {
+            let _g = self.gate();
+            match self.merge_locked(b, o, &picks, Mode::Dry)? {
+                Merged::Plan(plan) => *plan,
+                Merged::Done(..) | Merged::Review(..) => unreachable!("a dry run only plans"),
+            }
         };
         if plan.blocked.is_none() && self.branch(b)?.flagged.load(Ordering::Relaxed) {
             plan.blocked = Some(format!(
                 "{b} was open during a crash, so its last writes may be lost: check its diff, then merge with CONFIRM"
             ));
+        }
+        // into main of a folder attached to Postgres: checked there too, now that the merge's locks are let go
+        if let (Some(dry), Some(att)) = (dry, self.attached.as_deref()) {
+            let live = attach::dry_run(att, dry);
+            plan.blocked = plan.blocked.or_else(|| attach::dry_blocked(&live));
+            plan.live = Some(live);
         }
         Ok(plan)
     }
@@ -4612,7 +4650,23 @@ impl Core {
                 (None, _) => Some(checks::broken(b, &broken)),
             };
             p.blocked = p.blocked.or(refused.map(|e| e.to_string()));
-            return Ok(Merged::Plan(p));
+            // into main of a folder attached to Postgres: the rows it would write there, to check against Postgres
+            // once the locks are let go (see `merge_preview`)
+            let dry = match self.attached.as_deref().filter(|_| attach::writes_back(self, &name, tx)) {
+                Some(att) => {
+                    let mut written: Vec<Change> = Vec::with_capacity(apply.len());
+                    for c in &apply {
+                        written.push(Change {
+                            key: c.key.clone(),
+                            before: self.val(&theirs_state, &c.key)?,
+                            after: self.val(&merged, &c.key)?,
+                        });
+                    }
+                    Some(attach::Dry::new(self, att, b, &theirs_state, &ours_state, &written))
+                }
+                None => None,
+            };
+            return Ok(Merged::Plan(Box::new((p, dry))));
         }
         if let Some(k) = schema_clash.first() {
             let t = k.strip_prefix("_sonos_tables/").unwrap_or(k);
@@ -4995,7 +5049,7 @@ impl Core {
             rows.push(Planned { key: c.key.clone(), outcome: "conflict", detail, base, ours, theirs, result: None });
         }
         rows.sort_by(|a, b| a.key.cmp(&b.key));
-        Ok((MergePlan { conflicts: conflicts.len(), rows, blocked, version: 0, target: 0 }, next))
+        Ok((MergePlan { conflicts: conflicts.len(), rows, blocked, version: 0, target: 0, live: None }, next))
     }
 
     /// Drops world `b` and what it changed; refused while it has forks of its own.
@@ -5754,7 +5808,8 @@ enum Merged {
     /// rows applied, the log position, the notifications of effects it brought into main, and
     /// the branch's version if it stays open
     Done(usize, u64, Vec<(String, String)>, Option<u64>),
-    Plan(MergePlan),
+    /// with, into main of a folder attached to Postgres, what to check there once the locks are let go
+    Plan(Box<(MergePlan, Option<attach::Dry>)>),
     /// refused by the acting agent's merge policy: its name, the rules (and merge checks) broken,
     /// and the branch's version they were checked at
     Review(String, Vec<String>, u64),

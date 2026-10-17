@@ -607,7 +607,7 @@ diff world agent_7b readers;  -- what reads each changed column (views, checks, 
 register reader nightly_export on orders (status, total);   -- a reader outside SQL, named by hand
 show readers;                 -- registered readers, and the clients seen reading which columns
 diff world a to b;            -- between any two worlds, or moments (a@-1 hour)
-merge world agent_7b dry run;  -- what the merge would do, row by row, and why rows conflict
+merge world agent_7b dry run;  -- what the merge would do, row by row, and why rows conflict (attached: checked against live Postgres too)
 merge world agent_7b by columns resolve ('orders/7' = theirs, 'orders/9' = '{"id": 9, "status": "paid"}');
 merge world agent_7b only tables (orders);           -- just these; agent_7b stays open with the rest
 merge world agent_7b only keys ('orders/7', 'orders/9');

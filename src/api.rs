@@ -916,6 +916,17 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                 let i = chronos::sql::impact(db, &target, &changes).map_err(|e| bad(e.message))?;
                 // "version": pass it back to merge only what this showed (409 if the branch changed since)
                 let mut out = json!({ "rows": rows, "conflicts": plan.conflicts, "blocked": plan.blocked, "version": plan.version, "target": plan.target });
+                // into main of a folder attached to Postgres: the rows it would write, as Postgres has them now
+                if let Some(l) = &plan.live {
+                    out["postgres"] = json!({
+                        "source": l.source, "at": l.at, "error": l.error, "triggers": l.triggers,
+                        "summary": chronos::sql::live_summary(l),
+                        "rows": l.rows.iter().map(|r| json!({
+                            "key": chronos::sql::show_key(&r.key), "changed": r.changed,
+                            "postgres": r.postgres.as_deref().map(row),
+                        })).collect::<Vec<_>>(),
+                    });
+                }
                 let i = impact_json(i);
                 out["readers"] = i["readers"].clone();
                 out["coverage"] = i["coverage"].clone();

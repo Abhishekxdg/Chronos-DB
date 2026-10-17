@@ -1045,8 +1045,11 @@ fn tools(hidden: &[&str]) -> Value {
             "merge_preview",
             "What merging a branch would do, without doing it: per row, whether it applies cleanly or \
              conflicts and why, with the parent's, the branch's and the fork point's versions, then what in \
-             the database reads the columns the branch changes. Takes the same by_columns, resolve, rows, \
-             into, only_tables and only_keys as merge, so you can try a resolution first.",
+             the database reads the columns the branch changes. In a folder attached to Postgres, a merge into \
+             main is also checked against Postgres as it is now (read only, rolled back, nothing written): each \
+             row it would write shows Postgres's current value, and rows changed there since the copy are marked. \
+             Takes the same by_columns, resolve, rows, into, only_tables and only_keys as merge, so you can try a \
+             resolution first.",
             json!({
                 "branch": branch,
                 "into": { "type": "string", "description": "Merge into this branch instead of the parent" },

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Attach: a dry run checks live Postgres.** `MERGE WORLD x DRY RUN` into main of an attached folder now compares the rows the merge would write with Postgres as it is now, in one read-only transaction (the write-back's settings, source check, shape check and compare), then rolls back: nothing is written to Postgres, and main doesn't take Postgres's rows. A new `postgres` column shows each row as Postgres has it; a row changed there since the copy has outcome `changed in postgres` and `blocked` says the merge would be refused; a `postgres` row says when it was read (no locks: a snapshot) and which triggers weren't run. In the HTTP preview as `postgres`, and in MCP's `merge_preview`. Asked for on r/AI_Agents ([issue #26](https://github.com/Abhishekxdg/chronosdb/issues/26)). See [Working beside your Postgres](docs/guides/attach-postgres.md#dry-run-against-live-postgres).
+
 ## 0.2.0 (beta), 2026-10-17
 
 **The first public beta: agents' changes to your Postgres data, reviewed and checked before they land.** Chronos is not Postgres and not yet used in production; this release is for trying it on a staging copy of your own data. It can now work beside the Postgres you already run, or take your data in.

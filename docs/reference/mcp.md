@@ -285,7 +285,7 @@ Returns `REBASE n`, n the parent's rows it took in.
 
 ### merge_preview
 
-What `merge` would do with the same parameters, without doing it: per row, whether it applies or conflicts and why, with the fork point's, the branch's and the parent's versions. Runs [`MERGE ... DRY RUN`](worlds.md#merge-dry-run); its columns are `table`, `id`, `outcome`, `detail`, `base`, `ours`, `theirs`, `result`. Then `What reads the changed columns:` and the table from [`DIFF ... READERS`](worlds.md#diff--readers) for the branch, and the branch's version: pass it as `version` with later pages (`offset`), which are refused if the branch changed since, and with `merge`, which then merges exactly what the pages showed.
+What `merge` would do with the same parameters, without doing it: per row, whether it applies or conflicts and why, with the fork point's, the branch's and the parent's versions. Runs [`MERGE ... DRY RUN`](worlds.md#merge-dry-run); its columns are `table`, `id`, `outcome`, `detail`, `base`, `ours`, `theirs`, `result`, `postgres`. In a folder attached to Postgres, a merge into main is checked against Postgres as it is now too (read only, rolled back): `postgres` is each row as Postgres has it, a row changed there since the copy has outcome `changed in postgres`, and a row with outcome `postgres` says when it was read. Then `What reads the changed columns:` and the table from [`DIFF ... READERS`](worlds.md#diff--readers) for the branch, and the branch's version: pass it as `version` with later pages (`offset`), which are refused if the branch changed since, and with `merge`, which then merges exactly what the pages showed.
 
 | Parameter | Type | Required | Default |
 |---|---|---|---|

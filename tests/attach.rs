@@ -492,3 +492,94 @@ fn merges_at_once_take_turns() {
     drop(pg);
     drop_db(&name);
 }
+
+/// `MERGE WORLD x DRY RUN` in an attached folder checks the rows it would write against Postgres as it is now, in a
+/// read-only transaction it rolls back: a row changed there since the copy is marked, with Postgres's value, and
+/// nothing is written to Postgres or taken into main (as a real merge's conflict would). Issue #26.
+#[test]
+fn a_dry_run_checks_postgres_without_writing() {
+    let Some((mut pg, name, url, _turn)) = throwaway("dry") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table t (id int primary key, v text, touched timestamptz);
+         create function touch() returns trigger language plpgsql as
+             $$ begin new.touched := clock_timestamp(); return new; end $$;
+         -- (on insert only: the test sets a row back later, which must then match the copy again)
+         create trigger t_touch before insert on t for each row execute function touch();
+         insert into t (id, v) values (1, 'a'), (2, 'b'), (3, 'c');",
+    )
+    .unwrap();
+    let dir = folder("dry");
+    let (ok, out) = attach(&dir, &["--tables", "t"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    run(&db, MAIN, "create world d", &[]).unwrap();
+    run(
+        &db,
+        "d",
+        "update t set v = 'x' where id = 1; update t set v = 'y' where id = 2; delete from t where id = 3",
+        &[],
+    )
+    .unwrap();
+    // changed in Postgres since the copy
+    pg.batch_execute("update t set v = 'pg' where id = 2").unwrap();
+    let state = |pg: &mut postgres::Client| pg_cell(pg, "select string_agg(id || '=' || v, ',' order by id) from t");
+    let before = state(&mut pg);
+
+    let out = run(&db, MAIN, "merge world d dry run", &[]).unwrap().pop().unwrap();
+    let col = |n: &str| {
+        out.columns.as_ref().unwrap().iter().position(|(c, _)| c == n).unwrap_or_else(|| panic!("no column {n}"))
+    };
+    let (id, outcome, detail, postgres) = (col("id"), col("outcome"), col("detail"), col("postgres"));
+    let row = |want: &str| {
+        out.rows.iter().find(|r| r[id].to_text() == want).unwrap_or_else(|| panic!("no row {want}: {:?}", out.rows))
+    };
+    // would apply: Postgres's row beside it
+    assert_eq!(row("1")[outcome].to_text(), "apply");
+    assert!(row("1")[postgres].to_text().contains(r#""v": "a""#), "{}", row("1")[postgres].to_text());
+    // changed there: marked, with Postgres's value
+    assert_eq!(row("2")[outcome].to_text(), "changed in postgres");
+    assert!(row("2")[postgres].to_text().contains(r#""v": "pg""#), "{}", row("2")[postgres].to_text());
+    // a delete Postgres still has: applies
+    assert_eq!(row("3")[outcome].to_text(), "apply");
+    let line = |o: &str| out.rows.iter().find(|r| r[outcome].to_text() == o).map(|r| r[detail].to_text());
+    let summary = line("postgres").expect("a line saying what Postgres was checked against");
+    assert!(summary.contains("2 rows would apply, 1 changed in Postgres"), "{summary}");
+    assert!(summary.contains("no locks") && summary.contains("t_touch"), "{summary}");
+    let blocked = line("blocked").expect("blocked: a merge now would be refused");
+    assert!(blocked.contains("changed in Postgres since main's copy"), "{blocked}");
+
+    // nothing written to Postgres, no merge recorded there, and main didn't take Postgres's row
+    assert_eq!(state(&mut pg), before);
+    assert_eq!(pg_cell(&mut pg, "select count(*) from chronos.merges where id like 'merge:%'"), "0");
+    assert_eq!(cell(&db, MAIN, "select v from t where id = 2"), "b");
+    assert!(db.world("d").is_ok(), "the world stays");
+
+    // the same through the API: each row's Postgres value, and when it was read
+    let plan = db.merge_preview("d", &Default::default()).unwrap();
+    let live = plan.live.expect("checked against Postgres");
+    assert!(live.error.is_none() && live.at > 0, "{live:?}");
+    assert_eq!(live.rows.iter().filter(|r| r.changed).count(), 1);
+    assert_eq!(live.triggers, ["t: t_touch"]);
+
+    // Postgres out of reach: the plan still comes back, saying it wasn't checked
+    unsafe { std::env::set_var("CHRONOS_SOURCE_URL", "postgres://nobody:x@127.0.0.1:1/nowhere") };
+    let plan = db.merge_preview("d", &Default::default()).unwrap();
+    unsafe { std::env::set_var("CHRONOS_SOURCE_URL", &url) };
+    assert!(plan.live.as_ref().is_some_and(|l| l.error.is_some()), "{:?}", plan.live);
+
+    // in step again: the dry run finds nothing changed, and the merge goes through as it said
+    pg.batch_execute("update t set v = 'b' where id = 2").unwrap();
+    let plan = db.merge_preview("d", &Default::default()).unwrap();
+    assert!(plan.blocked.is_none(), "{:?}", plan.blocked);
+    assert!(plan.live.unwrap().rows.iter().all(|r| !r.changed));
+    run(&db, MAIN, "merge world d", &[]).unwrap();
+    assert_eq!(state(&mut pg), "1=x,2=y");
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}

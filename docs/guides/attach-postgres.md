@@ -41,6 +41,25 @@ What happens at `merge world`:
 3. Otherwise the updates, inserts and deletes are applied with `RETURNING`, and committed. Values a Postgres trigger
    or default set come back into main.
 
+### Dry run against live Postgres
+
+`merge world fix_leads dry run` shows, row by row, what the merge would apply, conflict on or be held for. In an
+attached folder it then checks the rows it would write against Postgres as it is now:
+
+- one read-only transaction (`REPEATABLE READ`, the same settings and source check as a write-back, and the same
+  check that each table still has the shape it was attached with), compared as the write-back compares, then
+  `ROLLBACK`. Nothing is written to Postgres, and main doesn't take Postgres's rows (a real merge's conflict does);
+- each row gets a `postgres` column, Postgres's row now. A row changed there since main's copy has outcome
+  `changed in postgres`, and the plan's `blocked` row says the merge would be refused;
+- a last row, outcome `postgres`, says when Postgres was read and lists the tables' triggers;
+- the rows are read with no locks, so what it shows is a snapshot. The merge itself locks and compares again.
+  Triggers aren't run, so values they would set show up only after the real merge (main takes them then);
+- if Postgres can't be reached (or no `CHRONOS_SOURCE_URL` is set), the plan still comes back, and the `postgres`
+  row says it wasn't checked.
+
+The HTTP `merge` op with `dry_run: true` returns the same as `postgres: {source, at, error, triggers, summary,
+rows: [{key, changed, postgres}]}`, and MCP's `merge_preview` shows the column.
+
 Main's rows change only this way: writes to main, `RESTORE` and `UNDO` on main are refused, and no statement may
 change a table's shape (do that in Postgres, then attach again into a new folder).
 
