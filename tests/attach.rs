@@ -134,6 +134,7 @@ fn merges_are_written_to_postgres_first() {
              $$ begin new.updated_at := clock_timestamp(); return new; end $$;
          create trigger leads_touch before insert or update on leads for each row execute function touch();
          create table notes (id serial primary key, body text);
+         create table tickets (id bigint generated always as identity primary key, title text);
          insert into accounts values ('acme', 'Acme'), ('globex', 'Globex');
          insert into leads (id, account, who, score, seen, tags, ok, ratio, note) values
              ('00000000-0000-0000-0000-000000000001', 'acme', 'ada', 99.50, '2026-10-17 10:00:00+05:30',
@@ -153,11 +154,12 @@ fn merges_are_written_to_postgres_first() {
     ))
     .unwrap();
     let dir = folder("merge");
-    let (ok, out) = attach(&dir, &["--tables", "accounts,leads,notes"]);
+    let (ok, out) = attach(&dir, &["--tables", "accounts,leads,notes,tickets"]);
     assert!(ok, "{out}");
-    assert!(out.contains("attached 3 tables"), "{out}");
+    assert!(out.contains("attached 4 tables"), "{out}");
     assert!(out.contains("trigger leads_touch on leads: stays in Postgres"), "{out}");
-    assert!(out.contains("\"notes\": keyed by a sequence"), "{out}");
+    assert!(out.contains("\"notes\".\"id\": new values come from Postgres's sequence public.notes_id_seq"), "{out}");
+    assert!(out.contains("\"tickets\".\"id\": new values come from Postgres's sequence"), "{out}");
     // no password anywhere in the folder
     let password = url.split_once("://").and_then(|(_, r)| r.split_once('@')).and_then(|(a, _)| a.split_once(':'));
     if let Some((_, pw)) = password {
@@ -279,14 +281,42 @@ fn merges_are_written_to_postgres_first() {
         touched
     );
 
-    // inserts into a table keyed by a sequence are refused, with nothing written; updates go
-    let e = change(&db, "w9", "insert into notes (body) values ('two')").unwrap();
-    assert!(e.message.contains("takes values from a Postgres sequence"), "{}", e.message);
-    assert_eq!(pg_cell(&mut pg, "select count(*) from notes"), "1");
-    run(&db, MAIN, "drop world w9", &[]).unwrap();
-    let e = change(&db, "w10", "update notes set body = 'uno'");
+    // inserts into tables keyed by a serial or an identity: ids reserved from Postgres's own sequences, kept at merge
+    let e = change(
+        &db,
+        "w9",
+        "insert into notes (body) values ('two'), ('three'); insert into tickets (title) values ('t1')",
+    );
     assert!(e.is_none(), "{:?}", e.map(|e| e.message));
-    assert_eq!(pg_cell(&mut pg, "select body from notes"), "uno");
+    assert_eq!(pg_cell(&mut pg, "select count(*) from notes"), "3");
+    for (t, c) in [("notes", "body"), ("tickets", "title")] {
+        let pg_ids = pg_cell(&mut pg, &format!("select string_agg(id || '=' || {c}, ',' order by id) from {t}"));
+        assert_eq!(
+            cell(&db, MAIN, &format!("select string_agg(id || '=' || {c}, ',' order by id) from {t}")),
+            pg_ids,
+            "{t}"
+        );
+    }
+    // Postgres's own inserts go on past what the folder reserved: no collision
+    pg.batch_execute("insert into notes (body) values ('pg'); insert into tickets (title) values ('pg')").unwrap();
+    let reserved = cell(&db, MAIN, "select max(id) from notes");
+    assert!(pg_cell(&mut pg, "select max(id) from notes").parse::<i64>().unwrap() > reserved.parse::<i64>().unwrap());
+    assert!(dir.join("attached.ids").exists(), "the reserved ids are kept in the folder");
+    // an id given by hand isn't one Postgres reserved: refused, nothing written
+    let e = change(&db, "w9b", "insert into notes (id, body) values (500000, 'mine')").unwrap();
+    assert!(e.message.contains("isn't one this folder reserved"), "{}", e.message);
+    assert_eq!(pg_cell(&mut pg, "select count(*) from notes where id = 500000"), "0");
+    run(&db, MAIN, "drop world w9b", &[]).unwrap();
+    // ids taken before a restart still merge after it
+    run(&db, MAIN, "create world w9c", &[]).unwrap();
+    run(&db, "w9c", "insert into notes (body) values ('before restart')", &[]).unwrap();
+    drop(db);
+    let db = Db::open(&dir).unwrap();
+    run(&db, MAIN, "merge world w9c", &[]).unwrap();
+    assert_eq!(pg_cell(&mut pg, "select count(*) from notes where body = 'before restart'"), "1");
+    let e = change(&db, "w10", "update notes set body = 'uno' where body = 'one'");
+    assert!(e.is_none(), "{:?}", e.map(|e| e.message));
+    assert_eq!(pg_cell(&mut pg, "select body from notes order by id limit 1"), "uno");
 
     // a constraint Postgres refuses: its message, nothing written
     let e = change(&db, "w11", "update accounts set name = 'z' where id = 'acme'");

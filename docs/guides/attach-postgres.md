@@ -51,8 +51,9 @@ person approves by merging the queued world.
 
 - Each table needs a primary key, and no generated column or row-level security. Partitioned and inheriting tables
   aren't attached.
-- Inserts into a table with a serial or identity column are refused at merge (updates and deletes work). Tables
-  keyed by a uuid the world supplies take inserts.
+- Serial and identity columns take their new values from Postgres's own sequence, reserved 1,000 at a time, so an
+  id a world gives a row is never given to another by Postgres, and is the id written at merge. The cost is gaps in
+  the sequence. An id typed by hand into such a column is refused at merge. The role needs USAGE on the sequence.
 - At most 10,000 changed rows per merge (`MERGE WORLD w ONLY TABLES (...)` merges part of one).
 - Main is as old as the attach for rows no merge touched: a merge only compares the rows it writes. To pick up
   Postgres's other changes, attach again into a new folder (no refresh yet).

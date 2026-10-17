@@ -1456,7 +1456,8 @@ struct Source {
     refused: Vec<String>,
     cols: Vec<attach::Col>,
     key: Vec<usize>,
-    sequenced: Option<String>,
+    /// columns fed by a sequence: position in `cols`, and Postgres's sequence if the role may take values from it
+    seqs: Vec<(usize, Option<String>)>,
 }
 
 /// `chronos attach <dir>`: see `attach_help`. Prints what it did; Err when it couldn't, with nothing left behind
@@ -1579,7 +1580,20 @@ pub fn attach(dir: &str, opts: &chronos::Open, tables: &[String], schemas: &[Str
                     pg: format!("{}.{}", q(&s.schema), q(&s.name)),
                     cols: s.cols.clone(),
                     key: s.key.clone(),
-                    sequenced: s.sequenced.clone(),
+                    seqs: s
+                        .seqs
+                        .iter()
+                        .map(|(col, pg)| attach::Seq {
+                            col: *col,
+                            pg: pg.clone(),
+                            // the counter the column's default takes values from here, now that the table is
+                            counter: chronos::sql::column_counter(
+                                &db,
+                                &if s.schema == "public" { s.name.clone() } else { format!("{}.{}", s.schema, s.name) },
+                                &s.cols[*col].name,
+                            ),
+                        })
+                        .collect(),
                 }
             })
             .collect();
@@ -1602,12 +1616,22 @@ pub fn attach(dir: &str, opts: &chronos::Open, tables: &[String], schemas: &[Str
         }
     };
     println!("\nattached {} tables of {} to {dir}", att.tables.len(), att.source());
-    for t in att.tables.iter().filter(|t| t.sequenced.is_some()) {
-        println!(
-            "  {}: keyed by a sequence ({}): updates and deletes are written back; inserts are refused for now",
-            t.sql,
-            t.sequenced.as_deref().unwrap_or_default()
-        );
+    for t in &att.tables {
+        for sq in &t.seqs {
+            let col = attach::q(&t.cols[sq.col].name);
+            match (&sq.pg, &sq.counter) {
+                (Some(seq), Some(_)) => println!(
+                    "  {}.{col}: new values come from Postgres's sequence {seq}, reserved {} at a time (the gaps that \
+                     leaves in it are normal)",
+                    t.sql, 1000
+                ),
+                _ => println!(
+                    "  {}.{col}: its sequence can't be used from here (the role needs USAGE on it): rows of {} can't be \
+                     inserted here",
+                    t.sql, t.sql
+                ),
+            }
+        }
     }
     println!(
         "\nnext: chronos serve {dir} (with CHRONOS_SOURCE_URL set), fork a world, change rows there, and MERGE WORLD:\n\
@@ -1653,7 +1677,7 @@ fn read_sources(pg: &mut Client, named: &[String], schemas: &[String]) -> Result
             refused,
             cols: vec![],
             key: vec![],
-            sequenced: None,
+            seqs: vec![],
         });
     }
     if out.is_empty() {
@@ -1664,8 +1688,10 @@ fn read_sources(pg: &mut Client, named: &[String], schemas: &[String]) -> Result
         .query(&format!(
             "select a.attrelid, a.attname, format_type(a.atttypid, a.atttypmod), a.attidentity, a.attgenerated, \
              coalesce(pg_get_expr(d.adbin, d.adrelid), '') like 'nextval(%', \
-             array_position((select i.indkey::int2[] from pg_index i where i.indrelid = a.attrelid and i.indisprimary), a.attnum) \
+             array_position((select i.indkey::int2[] from pg_index i where i.indrelid = a.attrelid and i.indisprimary), a.attnum), \
+             s.seq, s.seq is not null and has_sequence_privilege(s.seq, 'usage') \
              from pg_attribute a left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum \
+             cross join lateral (select pg_get_serial_sequence(a.attrelid::regclass::text, a.attname) seq) s \
              where a.attrelid in {oids} and a.attnum > 0 and not a.attisdropped order by a.attrelid, a.attnum"
         ))
         .map_err(|e| format!("reading Postgres: {e}"))?;
@@ -1677,7 +1703,7 @@ fn read_sources(pg: &mut Client, named: &[String], schemas: &[String]) -> Result
             s.refused.push(format!("column {} is generated (Postgres works it out; it can't be written back)", v(1)));
         }
         if !v(3).is_empty() || v(5) == "t" {
-            s.sequenced.get_or_insert_with(|| v(1));
+            s.seqs.push((s.cols.len(), r[7].clone().filter(|_| v(8) == "t")));
         }
         if let Ok(p) = v(6).parse::<i64>() {
             keys.entry(v(0)).or_default().push((p, s.cols.len()));

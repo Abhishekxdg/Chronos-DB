@@ -62,9 +62,22 @@ pub struct Table {
     pub cols: Vec<Col>,
     /// the primary key's columns, by position in `cols`, in the key's order
     pub key: Vec<usize>,
-    /// a column whose values come from a sequence (serial, identity): Stage 1 refuses inserts into the table, as
-    /// a value Chronos's own sequence gave would later collide with one Postgres's gives
-    pub sequenced: Option<String>,
+    /// columns whose values come from a sequence (serial, identity, DEFAULT nextval): see `Seq`
+    pub seqs: Vec<Seq>,
+}
+
+/// A column whose default takes values from a Postgres sequence. In the folder its default takes them from that
+/// very sequence, reserved a block at a time (see `values`), so a value given here is never given by Postgres too;
+/// a merge writes back only values so reserved (see `check_ids`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Seq {
+    /// by position in the table's `cols`
+    pub col: usize,
+    /// Postgres's sequence, as regclass writes it; None: one attach can't take values from (no USAGE on it, or a
+    /// default it can't read), and the table takes no inserts
+    pub pg: Option<String>,
+    /// the counter the column's default takes values from here (see `sql::column_counter`)
+    pub counter: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -91,6 +104,59 @@ pub struct Attached {
     dir: PathBuf,
     /// held by a merge into main from its write-back until main holds what Postgres sent back: one at a time
     lock: Mutex<()>,
+    /// values reserved from Postgres's sequences (see `values`)
+    ids: Mutex<Ids>,
+}
+
+/// The file of the values reserved from Postgres's sequences: what a merge may write back to their columns.
+const IDS: &str = "attached.ids";
+/// Values reserved from a Postgres sequence at once (`nextval` in one statement), at least.
+const BLOCK: usize = 1000;
+
+/// Values reserved from Postgres's sequences: those not handed out yet, by counter (forgotten at a restart: a gap,
+/// as Postgres's own cache leaves), and every one ever reserved, by sequence, as runs (first value, step, count), kept
+/// in `IDS`.
+#[derive(Debug, Default)]
+struct Ids {
+    pool: HashMap<String, std::collections::VecDeque<i64>>,
+    runs: BTreeMap<String, Vec<(i64, i64, i64)>>,
+}
+
+impl Ids {
+    fn load(dir: &Path) -> io::Result<Ids> {
+        let text = match std::fs::read_to_string(dir.join(IDS)) {
+            Ok(t) => t,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Ids::default()),
+            Err(e) => return Err(e),
+        };
+        let runs = serde_json::from_str(&text).map_err(|e| other(format!("{}: {e}", dir.join(IDS).display())))?;
+        Ok(Ids { pool: HashMap::new(), runs })
+    }
+
+    /// Whether `v` was reserved from sequence `seq`.
+    fn reserved(&self, seq: &str, v: i64) -> bool {
+        self.runs.get(seq).is_some_and(|runs| {
+            runs.iter().any(|&(first, step, n)| {
+                let d = v.wrapping_sub(first);
+                step != 0 && d % step == 0 && (0..n).contains(&(d / step))
+            })
+        })
+    }
+
+    /// `vals` (in the order Postgres gave them) as runs of one step each.
+    fn add(&mut self, seq: &str, vals: &[i64]) {
+        let runs = self.runs.entry(seq.to_string()).or_default();
+        let mut i = 0;
+        while i < vals.len() {
+            let step = if i + 1 < vals.len() { vals[i + 1].wrapping_sub(vals[i]) } else { 1 };
+            let mut n = 1;
+            while i + n < vals.len() && vals[i + n].wrapping_sub(vals[i + n - 1]) == step {
+                n += 1;
+            }
+            runs.push((vals[i], if n == 1 { 1 } else { step }, n as i64));
+            i += n;
+        }
+    }
 }
 
 thread_local! {
@@ -142,7 +208,8 @@ fn lit(s: &str) -> String {
 impl Table {
     fn to_json(&self) -> Json {
         json!({
-            "name": self.name, "sql": self.sql, "pg": self.pg, "key": self.key, "sequenced": self.sequenced,
+            "name": self.name, "sql": self.sql, "pg": self.pg, "key": self.key,
+            "seqs": self.seqs.iter().map(|q| json!({"col": q.col, "pg": q.pg, "counter": q.counter})).collect::<Vec<_>>(),
             "cols": self.cols.iter().map(|c| json!({"name": c.name, "ty": c.ty, "always": c.always})).collect::<Vec<_>>(),
         })
     }
@@ -154,7 +221,19 @@ impl Table {
             sql: s("sql")?,
             pg: s("pg")?,
             key: j["key"].as_array()?.iter().map(|k| k.as_u64().map(|k| k as usize)).collect::<Option<_>>()?,
-            sequenced: s("sequenced"),
+            seqs: match j["seqs"].as_array() {
+                None => vec![],
+                Some(a) => a
+                    .iter()
+                    .map(|q| {
+                        Some(Seq {
+                            col: q["col"].as_u64()? as usize,
+                            pg: q["pg"].as_str().map(String::from),
+                            counter: q["counter"].as_str().map(String::from),
+                        })
+                    })
+                    .collect::<Option<_>>()?,
+            },
             cols: j["cols"]
                 .as_array()?
                 .iter()
@@ -182,6 +261,7 @@ impl Attached {
             tables,
             dir: dir.to_path_buf(),
             lock: Mutex::new(()),
+            ids: Mutex::new(Ids::default()),
         }
     }
 
@@ -207,6 +287,7 @@ impl Attached {
                 .map(Table::from_json)
                 .collect::<Option<_>>()
                 .ok_or_else(bad)?,
+            ids: Mutex::new(Ids::load(dir)?),
             dir: dir.to_path_buf(),
             lock: Mutex::new(()),
         }))
@@ -361,6 +442,98 @@ fn rollback(pg: &mut Client) {
     }
 }
 
+// ---------------------------------------------------------------- ids from Postgres's sequences
+
+/// The next `n` values of counter `counter` (a sequence's id, or a serial's `table.column`: see
+/// `sql::column_counter`), when it is an attached table's: taken from Postgres's own sequence, reserved
+/// `BLOCK` at a time and recorded in the folder before any is handed out, so a row a world inserts gets an id
+/// Postgres will never give another row, and keeps it at merge (the id a person reviewed is the one written).
+/// None for any other counter. Err: Postgres couldn't be reached, or won't give values.
+pub(crate) fn values(core: &Core, counter: &str, n: usize) -> Option<std::result::Result<Vec<i64>, String>> {
+    let att = core.attached.as_deref()?;
+    let (t, sq) = att
+        .tables
+        .iter()
+        .find_map(|t| t.seqs.iter().find(|sq| sq.counter.as_deref() == Some(counter)).map(|sq| (t, sq)))?;
+    let Some(seq) = &sq.pg else {
+        return Some(Err(format!(
+            "{}.{} takes its values from a sequence in Postgres this folder can't take values from (the role needs \
+             USAGE on it): give rows of {} no new {} here",
+            t.sql,
+            q(&t.cols[sq.col].name),
+            t.sql,
+            q(&t.cols[sq.col].name)
+        )));
+    };
+    Some(att.take(seq, counter, n))
+}
+
+impl Attached {
+    /// `n` values of Postgres's sequence `seq` for counter `counter`: from those reserved, reserving more first.
+    fn take(&self, seq: &str, counter: &str, n: usize) -> std::result::Result<Vec<i64>, String> {
+        let mut ids = self.ids.lock().unwrap_or_else(|p| p.into_inner());
+        let have = ids.pool.get(counter).map_or(0, |p| p.len());
+        if have < n {
+            let got = reserve(seq, (n - have).max(BLOCK))?;
+            ids.add(seq, &got);
+            let runs = serde_json::to_string(&ids.runs).map_err(|e| e.to_string())?;
+            // on disk before any is handed out: a merge after a restart still knows them
+            crate::disk::write_file(&self.dir.join(IDS), runs.as_bytes()).map_err(|e| format!("{IDS}: {e}"))?;
+            ids.pool.entry(counter.to_string()).or_default().extend(got);
+        }
+        let pool = ids.pool.get_mut(counter).expect("filled above");
+        Ok(pool.drain(..n).collect())
+    }
+
+    /// Whether `v` is a value this folder reserved from Postgres's sequence `seq`.
+    fn reserved(&self, seq: &str, v: i64) -> bool {
+        self.ids.lock().unwrap_or_else(|p| p.into_inner()).reserved(seq, v)
+    }
+}
+
+/// `n` values of Postgres's sequence `seq`, taken in one statement (gaps in the sequence are the cost).
+fn reserve(seq: &str, n: usize) -> std::result::Result<Vec<i64>, String> {
+    let mut pg = connect()?;
+    let rows = pg
+        .query_params(
+            "select nextval($1::regclass) from generate_series(1, $2::int)",
+            &[Some(seq), Some(&n.to_string())],
+        )
+        .map_err(|e| format!("reserving ids from Postgres's sequence {seq}: {e}"))?;
+    rows.iter()
+        .map(|r| r[0].as_deref().and_then(|v| v.parse().ok()).ok_or_else(|| format!("{seq} gave no value")))
+        .collect()
+}
+
+/// Refuses a row whose sequence-fed column gets a value (inserted, or changed) that this folder didn't reserve from
+/// Postgres's sequence: one given by hand, which Postgres could give another row later.
+fn check_ids(
+    att: &Attached,
+    world: &str,
+    t: &Table,
+    before: Option<&[Option<String>]>,
+    after: Option<&[Option<String>]>,
+) -> Result<()> {
+    let Some(after) = after else { return Ok(()) };
+    for sq in &t.seqs {
+        let new = after[sq.col].as_deref();
+        let Some(v) = new.filter(|_| before.is_none_or(|b| b[sq.col].as_deref() != new)) else { continue };
+        let ok = sq.pg.as_deref().is_some_and(|seq| v.parse::<i64>().is_ok_and(|v| att.reserved(seq, v)));
+        if !ok {
+            let col = &t.cols[sq.col].name;
+            return Err(refused(format!(
+                "{world} gives {}.{} the value {v}, which isn't one this folder reserved from Postgres's sequence{}: \
+                 Postgres could give it to another row too. Leave the column to its default (it takes values \
+                 reserved from Postgres); nothing was merged",
+                t.sql,
+                q(col),
+                sq.pg.as_deref().map_or(String::new(), |s| format!(" {s}"))
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- the merge
 
 /// A row's columns as text (None: NULL).
@@ -445,16 +618,7 @@ pub(crate) fn write_back(
         if before == after {
             continue;
         }
-        if before.is_none()
-            && let Some(col) = &t.sequenced
-        {
-            return Err(refused(format!(
-                "{world} inserts into {}, whose column {col} takes values from a Postgres sequence: an attached \
-                 folder doesn't insert into such tables yet (a value given here could later be given by Postgres too); \
-                 nothing was merged",
-                t.sql
-            )));
-        }
+        check_ids(att, world, t, before.as_deref(), after.as_deref())?;
         rows.push(Row { key: c.key.clone(), table: ti, before, after });
     }
     if rows.is_empty() {
@@ -689,11 +853,12 @@ fn transaction(pg: &mut Client, att: &Attached, world: &str, world_id: &str, row
                 .map(|&i| format!("ins.{}::text = k.c{i}::{}::text", q(&t.cols[i].name), t.cols[i].ty))
                 .collect();
             let sql = format!(
-                "with k as (select * from {}), ins as (insert into {} ({}) select {} from k order by k.i returning *) \
+                "with k as (select * from {}), ins as (insert into {} ({}){} select {} from k order by k.i returning *) \
                  select ({}) is distinct from ({}), {} from ins join k on {}",
                 unnest(t, false, &all, 1),
                 t.pg,
                 cols.join(", "),
+                if t.cols.iter().any(|c| c.always) { " overriding system value" } else { "" },
                 given.join(", "),
                 back_ins.join(", "),
                 sent.join(", "),
@@ -1103,7 +1268,7 @@ mod tests {
                 Col { name: "total".into(), ty: "numeric(10,2)".into(), always: false },
             ],
             key: vec![0],
-            sequenced: None,
+            seqs: vec![],
         };
         let a = Attached::new(&dir, &url, vec![t.clone()]);
         a.save().unwrap();
@@ -1130,7 +1295,7 @@ mod tests {
                 Col { name: "b".into(), ty: "text".into(), always: false },
             ],
             key: vec![0],
-            sequenced: None,
+            seqs: vec![],
         };
         assert_eq!(
             unnest(&t, true, &[0, 1], 1),

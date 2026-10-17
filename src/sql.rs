@@ -40188,6 +40188,10 @@ fn seq_values(core: &crate::Core, v: &View, name: &str, n: usize) -> Result<Vec<
         message: format!("relation \"{name}\" does not exist"),
         info: None,
     })?;
+    // an attached table's sequence: values Postgres's own sequence reserved (see `crate::attach::values`)
+    if let Some(vals) = crate::attach::values(core, &def.id, n) {
+        return vals.map_err(|message| SqlError { code: "55000", message, info: None });
+    }
     let (steps, (origin, called), def) = match pending_steps(&def.id, n) {
         // (its own restart: no other session's is under way)
         Some((steps, origin)) => {
@@ -40213,6 +40217,9 @@ fn seq_values(core: &crate::Core, v: &View, name: &str, n: usize) -> Result<Vec<
 /// to count from. currval and lastval say the last, as for any sequence, under Postgres's name
 /// for the column's sequence (`t_id_seq`).
 fn serial_values(core: &crate::Core, seq: &str, n: usize) -> Result<Vec<i64>> {
+    if let Some(vals) = crate::attach::values(core, seq, n) {
+        return vals.map_err(|message| SqlError { code: "55000", message, info: None });
+    }
     let pending = pending_steps(seq, n);
     let def = SeqDef {
         id: seq.into(),
@@ -40250,6 +40257,21 @@ fn serial_values(core: &crate::Core, seq: &str, n: usize) -> Result<Vec<i64>> {
         st.last_seq = None; // (a serial's own counter: no sequence row to look for)
     }
     Ok(vals)
+}
+
+/// The counter column `col` of table `table` (as rows name it) takes its default's values from in main: a sequence's
+/// id (DEFAULT nextval('name')), or `table.column` for a serial's or identity column's own counter; None when its
+/// default takes none. What `chronos attach` points at Postgres's sequence (see `crate::attach::values`).
+pub fn column_counter(db: &Db, table: &str, col: &str) -> Option<String> {
+    let v = db.view(crate::MAIN).ok()?;
+    let t = load(&v, table).ok()??;
+    let c = t.cols.iter().find(|c| c.name == col)?;
+    match &c.seq {
+        Some(s) if s.contains('.') && !named_sequence(&v, s) => Some(s.clone()),
+        Some(s) => seq_def_named(&v, s).ok()?.map(|d| d.id),
+        None if c.identity.is_some() => Some(format!("{table}.{col}")),
+        None => None,
+    }
 }
 
 /// The next `n` values for a column's default: a sequence CREATE SEQUENCE made (a plain name,
