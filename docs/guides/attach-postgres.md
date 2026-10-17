@@ -57,6 +57,11 @@ person approves by merging the queued world.
 - At most 10,000 changed rows per merge (`MERGE WORLD w ONLY TABLES (...)` merges part of one).
 - Main is as old as the attach for rows no merge touched: a merge only compares the rows it writes. To pick up
   Postgres's other changes, attach again into a new folder (no refresh yet).
+- Reads are checked against Chronos's copy, not live Postgres. With `check_reads`, a merge is held if a row
+  or range the agent read (an empty result included) changed **in Chronos** since it forked, but a row
+  changed or added directly in Postgres since the attach isn't seen by that check: only the rows a merge
+  writes are compared with Postgres. Checking reads against Postgres too is
+  [issue #28](https://github.com/Abhishekxdg/chronosdb/issues/28).
 - Triggers stay in Postgres and run as the merge is written. Rows they change in other tables show up as conflicts
   later, not in main right away.
 - Tested on Neon, both straight to the database and through its pooler (PgBouncer, transaction mode): a merge of
