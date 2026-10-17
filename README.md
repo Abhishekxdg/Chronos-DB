@@ -2,11 +2,11 @@
 
 # Chronos DB
 
-### Let AI agents write to real data. Each run gets its own branch; your rules decide what merges.
+### Let AI agents write to your Postgres. Each run works on its own branch; your rules decide what lands.
 
 The branch is the easy part; the merge is what has to be trusted.<br>
-Every agent run works in its own copy-on-write **world** (a branch of the whole database). Chronos **diffs** it row by row and checks the merge against **rules you approve once**: no deletes without a person, at most 500 rows, every lead list keeps a lead.<br>
-What keeps to the rules merges on its own; the rest waits for review, with the reasons. It speaks **Postgres** and searches filters, text and vectors inside every world.
+Chronos sits **beside the Postgres you already run** (`chronos attach`) or holds the data itself. Every agent run works in its own copy-on-write **world** (a branch of the whole database). Chronos **diffs** it row by row and checks the merge against **rules you approve once**: no deletes without a person, at most 500 rows, every lead list keeps a lead.<br>
+What keeps to the rules is written back to your Postgres in one checked transaction; the rest waits for review, with the reasons. It speaks **Postgres** and searches filters, text and vectors inside every world.
 
 <br>
 
@@ -30,7 +30,10 @@ What keeps to the rules merges on its own; the rest waits for review, with the r
 </div>
 
 > [!IMPORTANT]
-> **Public beta (0.2).** Chronos speaks the Postgres 16 protocol and much of its SQL, but it is not Postgres and not yet used in production. As measured for this release: 83.69% of the lines Postgres 16's regression suite expects (46 of its 219 files exactly), and 7 real databases moved in with identical row checksums; point reads at about half Postgres's rate, writes at a fraction of it. Read [where it stands](docs/postgres-compatibility.md#where-it-stands-beta) and [Migrating from Postgres](docs/migrating-from-postgres.md) before moving data in.
+> **Public beta (0.2): try it on a staging copy, not production.** Nobody outside the author has run a real agent on it yet, and it is built by one person.
+> - **Attach** (working beside your Postgres) is new: at most 10,000 changed rows per merge, no refresh of rows a merge doesn't touch, tables need a primary key. Tested on Neon, direct and through its pooler. See [Working beside your Postgres](docs/guides/attach-postgres.md).
+> - **On its own,** Chronos speaks the Postgres 16 protocol and much of its SQL, but it is not Postgres: 83.69% of the lines Postgres 16's regression suite expects (46 of its 219 files exactly), 7 real databases moved in with identical row checksums, point reads at about half Postgres's rate and writes at a fraction of it. Read [where it stands](docs/postgres-compatibility.md#where-it-stands-beta) before moving data in.
+> - macOS 13+ and Linux only. The benchmarks it loses are listed in [BENCHMARKS.md](BENCHMARKS.md#where-chronos-db-loses).
 
 ---
 
@@ -52,6 +55,14 @@ merge world run_42;                  -- the delete breaks a rule: held, queued i
 -- as you: look, then approve or throw it away
 show reviews;
 merge world run_42;                  -- or: drop world run_42 (main never saw it)
+```
+
+**Already on Postgres?** Keep it there. Attach the tables an agent works on, and every merge above is written to your Postgres first, in one transaction, after checking each row is still as Chronos last saw it (a row changed there meanwhile is a conflict, and nothing is written):
+
+```bash
+export CHRONOS_SOURCE_URL='postgres://agent_writer:...@staging-db:5432/crm?sslmode=verify-full'
+chronos attach ./crm --tables public.leads,public.accounts
+chronos serve ./crm
 ```
 
 
