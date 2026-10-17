@@ -65,5 +65,3 @@ person approves by merging the queued world.
 If Chronos stops during a write-back, the outcome is settled the next time `chronos serve` starts or a merge into
 main runs: Chronos asks Postgres whether that transaction committed, then makes the merge here or drops it. Until it
 knows, merges into main wait; everything else works.
-
-How it works, and why: [docs/designs/postgres-adapter.md](../designs/postgres-adapter.md).

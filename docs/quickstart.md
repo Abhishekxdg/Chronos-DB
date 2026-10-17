@@ -144,4 +144,4 @@ db.merge_at("agent-7", Resolve::Fail, Some(v))?;
 
 A database folder is opened by one process at a time: the shell, `chronos serve`, `chronos mcp` or your program. Close one before opening another, or run `chronos serve` and point everything at it.
 
-Next: the [five-minute trial](../examples/trial), an agent on a small CRM whose mistakes are caught before they land, then [concepts](concepts.md).
+Next: the [five-minute trial](https://github.com/Abhishekxdg/chronosdb/tree/main/examples/trial), an agent on a small CRM whose mistakes are caught before they land, then [concepts](concepts.md).
