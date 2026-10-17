@@ -1,18 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (beta), 2026-10-19
 
+**The first public beta: agents' changes to your Postgres data, reviewed and checked before they land.** Chronos is not Postgres and not yet used in production; this release is for trying it on a staging copy of your own data. It can now work beside the Postgres you already run, or take your data in.
+
+New since the 2026-10-16 notes below:
+
+- **Attach: work beside your existing Postgres.** `chronos attach <new folder> --tables a,b` (or `--schema s`) copies tables of a Postgres database (`CHRONOS_SOURCE_URL`) in one consistent read. Agents work in worlds as anywhere; merging a world into main writes its rows to Postgres first, in one transaction, after checking each row is still as main holds it. A row changed in Postgres meanwhile comes back as a conflict, nothing is written, and main takes Postgres's row. Values a Postgres trigger or default sets come back into main. Main takes no direct writes, no table changes shape, and an agent's merge with no merge policy of its own waits for a person. A crash on either side of COMMIT is settled at the next merge or start. Tested on Neon, straight and through its pooler ([BENCHMARKS.md §14](BENCHMARKS.md#14-attach-writing-merges-back-to-a-managed-postgres-neon)). Limits: staging copies, at most 10,000 rows per merge, no refresh yet. See [Working beside your Postgres](docs/guides/attach-postgres.md).
+- **Serial and identity ids under attach** come from Postgres's own sequence, reserved 1,000 at a time and kept in the folder, so an id a world gives a row is never given to another by Postgres and is the id written at merge. An id typed by hand into such a column is refused at merge.
+- **The engine's source is public** under the Business Source License 1.1 (free to use, including in production, except to offer Chronos as a hosted database service; each version becomes Apache 2.0 after four years), at [github.com/Abhishekxdg/chronosdb](https://github.com/Abhishekxdg/chronosdb).
 - **How merges end: `SHOW MERGE OUTCOMES [BY POLICY]`**, and the HTTP op `merge_outcomes`. Each agent's worlds within the history window, counted once by how they ended (merged on the rules alone, merged with no policy, approved, rejected, dropped, open, partly merged), with how often their merges were held, conflicted, read rows that changed, or broke a merge check, and `rules_rate`: the share of decided worlds that merged on the rules alone. A refused merge now leaves a count in its world's metadata (`_sonos_refusals`, set only by the database), so the counts come from history and survive a restart; a merge that goes through does no new work. For the database's own users only. Merges later undone still count as merged. See [SQL](docs/sql.md#agents).
-
-## Unreleased
-
 - **MCP over HTTP:** `chronos serve` answers MCP at `POST /mcp`, as the agent whose token is sent (the guest under `--safe`), so an agent in a container or on another machine connects with its token alone, never the folder. See [MCP over HTTP](docs/reference/mcp.md#over-http-chronos-serve) and [agents in containers](docs/security.md#agents-in-containers).
 - **No false deadlocks between row waits:** a statement waiting for a row could fail with 40P01 when the transaction it waited for committed, began another and waited for a row the first one held: the deadlock check followed it as if it still held the row. Seen as a rare failure of a TPC-B loop from eight clients.
 - **The TypeScript client is on npm:** `npm install @chronosdb/client` ([clients](docs/reference/clients.md)).
 
-## 0.2.0 (beta), 2026-10-16
-
-**The first public beta, for developers moving Postgres applications and their data in.** Chronos is not Postgres and not yet used in production; this release is for trying it on your own schema and workload. As measured for it:
+As measured for the 2026-10-16 notes:
 
 - **Postgres 16's regression suite:** 83.69% of its expected lines, 46 of its 219 files exactly the same.
 - **Real databases moved in during the migration trials**, with `chronos import` or a `pg_dump` replay, checked with row counts and row checksums: 7 of 7 identical (Chinook, Northwind, pgbench at 2M rows, Pagila after one manual fix since made unnecessary, a 50-construct synthetic schema, a 47-type micro schema, a Rails-style application, a multi-tenant schema with row-level security and NOTIFY).

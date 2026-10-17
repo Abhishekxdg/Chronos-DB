@@ -15,7 +15,7 @@ What keeps to the rules merges on its own; the rest waits for review, with the r
 ![postgres wire](https://img.shields.io/badge/postgres-wire%20protocol-336791?style=flat-square&logo=postgresql&logoColor=white)
 ![mcp](https://img.shields.io/badge/MCP-ready-7c3aed?style=flat-square)
 ![tests](https://img.shields.io/badge/tests-560%2B%20passing-16a34a?style=flat-square)
-![license](https://img.shields.io/badge/license-MIT%20%2B%20binary%20terms-64748b?style=flat-square)
+![license](https://img.shields.io/badge/license-BUSL--1.1%20engine%20%2B%20MIT-64748b?style=flat-square)
 
 [**Docs site**](https://abhishekxdg.github.io/chronosdb/) ·
 [**Quickstart**](docs/quickstart.md) ·
