@@ -29,6 +29,7 @@ It speaks the Postgres protocol, so `psql`, drivers and ORMs connect as they do 
 
 ## Guides
 
+- [Working beside your Postgres](guides/attach-postgres.md): `chronos attach`: agents work on a copy, merges are written to your Postgres in one checked transaction.
 - [Agent sandbox](guides/agent-sandbox.md): give several agents their own worlds, compare them, merge the best.
 - [Agent evaluation](guides/agent-evaluation.md): grade an agent by diffing its world against the expected state.
 - [Scenario planning](guides/scenario-planning.md): simulate a thousand futures, score them in SQL, merge one.
