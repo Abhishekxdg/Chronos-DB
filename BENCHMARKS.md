@@ -908,6 +908,25 @@ bench/slt/par.sh postgres out-postgres 2 $(find sqllogictest/test -name '*.test'
 
 After the run, Neon and Chronos's main held the same rows (count, sum of `score`, highest id), and main held every `updated_at` Neon's trigger set. A merge's time is mostly round trips to Neon (a new TLS connection and login, then about four statements per table), so it grows with the distance to the database, not much with the rows: it is not a measure of Chronos itself. The transaction-mode pooler works because every setting a write-back makes is `SET LOCAL` and every statement is unnamed.
 
+## 15. What checking a world's reads costs
+
+*2026-10-17. A temporary GCP c2d-standard-8 (8 vCPUs; standard persistent disk, so merges' fsyncs are slower than on the other sections' SSDs), release build. Script: [`examples/readsets.rs`](examples/readsets.rs).*
+
+A world forked `WITH (check_reads = true)` records what it reads ([src/stale.rs](src/stale.rs)); its merge is held if any of that changed in main since the fork. The same work with recording off and on, on a table of 100,000 rows: the agent reads through a SQL session, main then changes 1,000 rows the world didn't read, the world writes one row and merges. Medians aren't taken: one run, repeated once with the same result to within 10%.
+
+| reads | check_reads | per read | merge | held |
+|---|---|---:|---:|---|
+| 9,000 point lookups by key | off | 40.8 µs | 0.7 ms | no |
+| 9,000 point lookups by key | on | 38.3 µs | 3.5 ms | no |
+| 100,000 point lookups by key | off | 40.5 µs | 0.8 ms | no |
+| 100,000 point lookups by key | on | 42.0 µs | 0.2 ms | **yes** |
+| 1,000 filtered scans (`where region = ...`, 25 distinct conditions) | off | 641 µs | 1.8 ms | no |
+| 1,000 filtered scans | on | 622 µs | **1,825 ms** | no |
+
+- **Reading costs nothing measurable:** per-statement time with recording on is within noise of off, for lookups and scans alike.
+- **Past 10,000 keys of one table, the read counts as the whole table** (by design: the read set stays small), so *any* change to that table holds the merge, as in the third row. An agent that reads that many rows of a table main is busy with will be held often; a filter (`where ...`) keeps the check precise.
+- **The merge-time check for filters grows with filters × changed rows**, about 1.7 µs per pair here: 1,000 filters × 1,000 changed rows took 1.8 s, and 100 × 1,000 or 1,000 × 100 about 0.18 s. Two causes, both fixable ([issue #29](https://github.com/Abhishekxdg/chronosdb/issues/29)): identical filters aren't kept once (25 conditions were kept as 1,000 filters), and each changed row is decoded again for each filter. Both fixed in 0.3.0: the 1,000-scan merge takes 2.7 ms there (same script, from the 0.3.0 release notes).
+
 ## Rerun everything
 
 ```bash

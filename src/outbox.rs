@@ -275,6 +275,10 @@ impl Core {
 /// The file the ledger is kept in, beside the log (as `reads` is): not rows of main, which replaying the log must
 /// rebuild exactly, while who merged or dropped a world isn't in what replay applies.
 const LEDGER: &str = "outbox.ledger";
+/// The file beside it holding the key discarded payloads are hashed under (32 random bytes, made when first needed):
+/// it never leaves the folder, through SQL, a dump or the journal, so only who holds the database can tell whether a
+/// discarded payload was a given text.
+const KEY: &str = "outbox.key";
 /// Entries the ledger keeps at most of each kind, past the history window's own limit: the oldest go first.
 const LEDGER_MOST: usize = 100_000;
 /// The channel a NOTIFY goes out on when an effect in main turns ambiguous (see the module docs).
@@ -303,8 +307,13 @@ pub struct Landed {
 pub struct Discarded {
     pub id: String,
     pub channel: String,
-    /// SHA-256 of the payload, as hex: whether two were the same, without keeping what they said
-    pub payload_sha256: String,
+    /// HMAC-SHA256 of the payload under the database's own key (see `KEY`), as hex: whether two were the same, and
+    /// whether one was a given text for whoever holds the database, without keeping what they said, and without
+    /// letting a reader of this record confirm a short, guessable payload by hashing candidates
+    pub payload_hmac: String,
+    /// the domains of the email addresses in the payload, sorted, comma-separated (empty: none): where it was going,
+    /// kept without the addresses themselves, which stay in the payload
+    pub recipient_domains: String,
     /// the payload itself, only while `outbox_keep_payloads` is on (a payload can hold personal data)
     pub payload: Option<String>,
     pub world: String,
@@ -326,6 +335,8 @@ pub struct Discarded {
 pub(crate) struct Ledger {
     landed: Vec<Landed>,
     discarded: Vec<Discarded>,
+    /// the key payloads are hashed under (see `KEY`), once loaded or made
+    key: Option<[u8; 32]>,
     /// (id, attempt) of effects whose turning ambiguous was announced (in memory: after a restart one may be
     /// announced again, which a listener takes as the same news)
     told: std::collections::HashSet<(String, u64)>,
@@ -352,7 +363,8 @@ impl Landed {
 
 impl Discarded {
     fn to_json(&self) -> Json {
-        json!({"id": self.id, "channel": self.channel, "payload_sha256": self.payload_sha256, "payload": self.payload,
+        json!({"id": self.id, "channel": self.channel, "payload_hmac": self.payload_hmac,
+               "recipient_domains": self.recipient_domains, "payload": self.payload,
                "world": self.world, "world_id": self.world_id, "queued_by": self.queued_by,
                "queued_at": self.queued_at, "owner": self.owner, "policy": self.policy, "at": self.at, "by": self.by,
                "why": self.why})
@@ -362,7 +374,8 @@ impl Discarded {
         Some(Discarded {
             id: s("id")?,
             channel: s("channel")?,
-            payload_sha256: s("payload_sha256").unwrap_or_default(),
+            payload_hmac: s("payload_hmac").unwrap_or_default(), // empty for one recorded before 0.3.2: unkeyed
+            recipient_domains: s("recipient_domains").unwrap_or_default(),
             payload: s("payload"),
             world: s("world").unwrap_or_default(),
             world_id: s("world_id").unwrap_or_default(),
@@ -383,7 +396,9 @@ pub(crate) fn load_ledger(dir: &std::path::Path, crypt: Option<&crate::crypt::Cr
     let path = dir.join(LEDGER);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ledger::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ledger { key: load_key(dir, crypt), ..Ledger::default() };
+        }
         Err(e) => {
             eprintln!("chronos: could not read {}: {e}; the outbox ledger starts empty", path.display());
             return Ledger::default();
@@ -395,11 +410,12 @@ pub(crate) fn load_ledger(dir: &std::path::Path, crypt: Option<&crate::crypt::Cr
         Ok(j) => Ledger {
             landed: j["landed"].as_array().into_iter().flatten().filter_map(Landed::from_json).collect(),
             discarded: j["discarded"].as_array().into_iter().flatten().filter_map(Discarded::from_json).collect(),
+            key: load_key(dir, crypt),
             told: Default::default(),
         },
         Err(e) => {
             eprintln!("chronos: {} is damaged ({e}); the outbox ledger starts empty", path.display());
-            Ledger::default()
+            Ledger { key: load_key(dir, crypt), ..Ledger::default() }
         }
     }
 }
@@ -410,9 +426,47 @@ thread_local! {
     pub(crate) static LANDED: std::cell::RefCell<Vec<Landed>> = const { std::cell::RefCell::new(vec![]) };
 }
 
-/// SHA-256 of `s`, as hex.
-fn sha256_hex(s: &str) -> String {
-    ring::digest::digest(&ring::digest::SHA256, s.as_bytes()).as_ref().iter().map(|b| format!("{b:02x}")).collect()
+/// The folder's payload key (see `KEY`), if it has one. One that can't be read is said on stderr, and a new one is
+/// made when next needed: records hashed under the old key can't be compared with new ones, and nothing else is lost.
+fn load_key(dir: &std::path::Path, crypt: Option<&crate::crypt::Crypt>) -> Option<[u8; 32]> {
+    let path = dir.join(KEY);
+    let bytes = std::fs::read(&path).ok()?;
+    match crate::crypt::open_file(crypt, bytes, &path.display().to_string()) {
+        Ok(k) if k.len() == 32 => Some(k.try_into().unwrap()),
+        Ok(_) => {
+            eprintln!("chronos: {} is damaged; discarded payloads are hashed under a new key", path.display());
+            None
+        }
+        Err(e) => {
+            eprintln!(
+                "chronos: could not read {} ({e}); discarded payloads are hashed under a new key",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// HMAC-SHA256 of `s` under `key`, as hex.
+fn hmac_hex(key: &[u8; 32], s: &str) -> String {
+    let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    ring::hmac::sign(&k, s.as_bytes()).as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The domains of the email addresses in `payload` (`ada@Example.com` gives `example.com`), sorted and without
+/// repeats, comma-separated. Found in any text, JSON or not: an address is a run of the characters one may hold, with
+/// one `@`, something before it, and a dot in what follows.
+pub(crate) fn recipient_domains(payload: &str) -> String {
+    let address = |c: char| c.is_ascii_alphanumeric() || "._%+-@".contains(c);
+    let mut out = std::collections::BTreeSet::new();
+    for word in payload.split(|c: char| !address(c)) {
+        let Some((local, domain)) = word.split_once('@') else { continue };
+        let domain = domain.trim_matches(|c: char| c == '.' || c == '-').to_ascii_lowercase();
+        if !local.trim_matches('.').is_empty() && !domain.contains('@') && domain.contains('.') {
+            out.insert(domain);
+        }
+    }
+    out.into_iter().collect::<Vec<_>>().join(",")
 }
 
 impl Core {
@@ -525,9 +579,11 @@ impl Core {
         let keep = self.setting(crate::Setting::OutboxKeepPayloads) != 0;
         let at = disk::now_ms();
         let mut l = self.ledger.lock().unwrap_or_else(|p| p.into_inner());
+        let key = self.payload_key(&mut l);
         for e in effects {
             l.discarded.push(Discarded {
-                payload_sha256: sha256_hex(&e.payload),
+                payload_hmac: hmac_hex(&key, &e.payload),
+                recipient_domains: recipient_domains(&e.payload),
                 payload: keep.then_some(e.payload),
                 id: e.id,
                 channel: e.channel,
@@ -543,6 +599,34 @@ impl Core {
             });
         }
         self.save_ledger(&mut l);
+    }
+
+    /// The key discarded payloads are hashed under (see `KEY`): the folder's, or a new one, saved there (sealed when
+    /// the folder is encrypted). A database without a folder keeps one for as long as it's open.
+    fn payload_key(&self, l: &mut Ledger) -> [u8; 32] {
+        if let Some(k) = l.key {
+            return k;
+        }
+        use ring::rand::SecureRandom;
+        let mut k = [0u8; 32];
+        ring::rand::SystemRandom::new().fill(&mut k).expect("the system's random numbers");
+        if let Some(log) = &self.log {
+            let path = log.dir.join(KEY);
+            let bytes = match &log.crypt {
+                Some(c) => c.seal_file(&k),
+                None => k.to_vec(),
+            };
+            if let Err(e) = disk::write_file(&path, &bytes) {
+                eprintln!("chronos: could not save {}: {e}", path.display());
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+        l.key = Some(k);
+        k
     }
 
     /// Writes the ledger to the folder, after dropping what's older than the history window (and past

@@ -76,7 +76,11 @@ fn effects_are_traced_to_their_merge_and_kept_when_vetoed() {
         ("webhook".into(), "w2".into(), "careful".into())
     );
     assert_eq!(d.rows[0][col(&d, "payload")], chronos::sql::Value::Null, "no payload unless asked");
-    assert_eq!(cell(&d, 0, "payload_sha256"), "7a150bcffbb22503cadfd9e774a903658d111910e2e004ab125b3fd419645fb1");
+    // keyed: not the plain SHA-256 of 'charge 5', which anyone could confirm by hashing guesses
+    let hmac = cell(&d, 0, "payload_hmac");
+    assert!(hmac.len() == 64 && hmac.bytes().all(|b| b.is_ascii_hexdigit()), "{hmac}");
+    assert_ne!(hmac, "7a150bcffbb22503cadfd9e774a903658d111910e2e004ab125b3fd419645fb1");
+    assert_eq!(d.rows[0][col(&d, "recipient_domains")], chronos::sql::Value::Null, "no addresses in it");
     let why = cell(&d, 0, "why");
     assert!(why.contains("rejected") && why.contains("strict"), "{why}");
     assert!(db.outbox(MAIN).unwrap().is_empty(), "never sent");
@@ -106,6 +110,22 @@ fn effects_are_traced_to_their_merge_and_kept_when_vetoed() {
     assert_eq!(cell(&d, 1, "payload"), "kept");
     assert!(cell(&d, 1, "why").contains("dropped by a person"), "{}", cell(&d, 1, "why"));
 
+    // where a vetoed email was going: its domains, not its addresses
+    q(&db, MAIN, "alter system set outbox_keep_payloads = off");
+    q(&db, MAIN, "create world w5");
+    q(
+        &db,
+        "w5",
+        r#"notify on merge email, '{"to": "Ada@Example.com", "cc": ["bob@x.org", "eve@example.com."], "body": "charge 5"}'"#,
+    );
+    q(&db, MAIN, "drop world w5");
+    let d = q(&db, MAIN, "show outbox discarded");
+    assert_eq!(d.rows.len(), 3);
+    assert_eq!(cell(&d, 2, "recipient_domains"), "example.com,x.org");
+    assert_eq!(d.rows[2][col(&d, "payload")], chronos::sql::Value::Null);
+    let hmac5 = cell(&d, 2, "payload_hmac");
+    assert_ne!(hmac5, hmac);
+
     // the merge outcomes count what each agent had vetoed
     let m = q(&db, MAIN, "show merge outcomes");
     let row = m.rows.iter().position(|r| r[col(&m, "agent")].to_text() == "careful").expect("a row for careful");
@@ -114,7 +134,15 @@ fn effects_are_traced_to_their_merge_and_kept_when_vetoed() {
     // kept across a restart
     drop(db);
     let db = Db::open(&dir).unwrap();
-    assert_eq!(q(&db, MAIN, "show outbox discarded").rows.len(), 2);
+    let d = q(&db, MAIN, "show outbox discarded");
+    assert_eq!(d.rows.len(), 3);
+    assert_eq!(cell(&d, 0, "payload_hmac"), hmac, "the same key after a restart");
+    // the same payload, discarded after the restart, hashes the same: comparable across records
+    q(&db, MAIN, "create world w6");
+    q(&db, "w6", "notify on merge webhook, 'charge 5'");
+    q(&db, MAIN, "drop world w6");
+    assert_eq!(cell(&q(&db, MAIN, "show outbox discarded"), 3, "payload_hmac"), hmac);
+    assert!(dir.join("outbox.key").exists());
     assert_eq!(cell(&q(&db, MAIN, "show merge w1 effects"), 0, "state"), "done");
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();
