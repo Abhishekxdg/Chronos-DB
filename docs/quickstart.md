@@ -12,13 +12,6 @@ chronos --version
 
 The script picks the build for your OS and CPU, checks its SHA-256 against the release's `SHA256SUMS`, and installs it for your user; it never runs anything as root. `CHRONOS_INSTALL_DIR=<folder>` installs into another folder you can write (for `/usr/local/bin`, download the script and run it with `sudo` yourself), `CHRONOS_VERSION=v0.2.0` picks a release, and `CHRONOS_VERIFY=1` also checks the build's signature with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/): proof Chronos DB's release workflow built it. The Linux builds are static (musl), so they run on any distribution.
 
-<!-- TODO(owner): no container image is published yet. The engine repository's Dockerfile builds one
-(non-root, volume /data, Postgres on 5432, HTTP on 7070, CHRONOS_TOKEN required). If an image is published
-(e.g. ghcr.io/<org>/chronos), add here:
-  export CHRONOS_TOKEN=$(openssl rand -hex 24)
-  docker run -d --name chronos -e CHRONOS_TOKEN -p 127.0.0.1:5432:5432 -v chronos-data:/data <image>
-  psql "postgres://app:$CHRONOS_TOKEN@127.0.0.1:5432/main" -->
-
 ## Start a server and connect with psql
 
 ```bash

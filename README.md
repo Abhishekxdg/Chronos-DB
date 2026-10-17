@@ -275,6 +275,8 @@ chronos --version
 
 `CHRONOS_VERIFY=1` also checks the release's signature with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/).
 
+No telemetry: Chronos never connects anywhere on its own, only to what you give it (a `--remote` to store in, a Postgres you import from or attach to).
+
 ### Postgres: psql, drivers, ORMs
 
 ```bash
