@@ -54,6 +54,12 @@ const PROBE_NOISE: f32 = 0.35;
 /// steer by, and it walks on the vectors themselves.
 const CODE_WALK_DIM: usize = 512;
 
+/// Whether a candidate set whose scan reads `cost` words walks the graph, given whether the graph measured `good`
+/// and the scan limit (see `VecIndex::graph_first`).
+fn worth_walking(cost: u64, good: bool, limit: u64) -> bool {
+    cost > limit || (cost > SMALL_SCAN && good)
+}
+
 /// Whether HNSW graphs are used (`CHRONOS_VECTOR=flat` turns them off, to compare).
 fn graphs_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -421,9 +427,7 @@ impl VecIndex {
             return Ok(vec![]);
         }
         let n = self.len() as u64;
-        let cost = bm.len() * self.scan_cost();
-        let good = self.graph_recall().is_some_and(|r| r >= GOOD);
-        if graphs_on() && bm.len() >= n / 2 && (cost > scan_limit() || (cost > SMALL_SCAN && good)) {
+        if self.graph_first(bm) {
             let ef = match (ef, self.ef.load(Ordering::Relaxed)) {
                 (0, 0) => (4 * k).max(self.tuned_ef().unwrap_or(EF_MIN)).min(EF_MAX),
                 (0, e) | (e, _) => e.min(n as usize).max(k),
@@ -479,10 +483,22 @@ impl VecIndex {
         Some(ix)
     }
 
-    /// The top `k` of `bm` by inner product through the graph alone, as `search_in_ef_checked` would walk it: when
-    /// the graph is built, measured good (see `calibrate`), and `bm` keeps at least half the vectors. None
-    /// otherwise, and when the walk comes up short: the caller then compares exactly. For a graph of
-    /// `for_metric`'s, whose 1-bit scan would rank by the wrong thing.
+    /// Whether a search of `bm` walks the graph rather than scanning: graphs on, `bm` at least half the vectors (a
+    /// narrower filter scans what it keeps), and either the scan would cost more than `scan_limit` (then even a
+    /// graph `calibrate` measured below `GOOD` is used: it still finds nearly all, and a scan of that size is slow)
+    /// or more than `SMALL_SCAN` with a graph measured good.
+    fn graph_first(&self, bm: &RoaringBitmap) -> bool {
+        let cost = bm.len() * self.scan_cost();
+        let good = self.graph_recall().is_some_and(|r| r >= GOOD);
+        graphs_on() && bm.len() >= self.len() as u64 / 2 && worth_walking(cost, good, scan_limit())
+    }
+
+    /// The top `k` of `bm` by inner product through the graph alone, as `search_in_ef_checked` would walk it, by the
+    /// same rule (see `graph_first`). None otherwise, and when the walk comes up short: the caller then compares
+    /// exactly. For a graph of `for_metric`'s, whose 1-bit scan would rank by the wrong thing. (It once also wanted a
+    /// graph measured `GOOD` past the scan limit: 1M mixed-length vectors of 768 dimensions, whose cosine copies'
+    /// graph measured just under it, were then compared one by one, 24 ms a search where the same vectors at unit
+    /// length walk their graph in 0.9 ms for 99.8% recall.)
     pub fn graph_only(
         &self,
         q: &[f32],
@@ -496,7 +512,7 @@ impl VecIndex {
             return Some(vec![]);
         }
         let n = self.len() as u64;
-        if !graphs_on() || bm.len() < n / 2 || !self.graph_recall().is_some_and(|r| r >= GOOD) {
+        if !self.graph_first(bm) {
             return None;
         }
         let ef = match (ef, self.ef.load(Ordering::Relaxed)) {
@@ -1291,6 +1307,17 @@ fn dot_any(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A big search walks the graph even when `calibrate` measured it under `GOOD` (a scan that size is slow, and
+    /// the graph still finds nearly all); a middling one only when it measured good; a small one always scans.
+    #[test]
+    fn a_graph_is_walked_by_the_size_of_the_scan_and_its_measure() {
+        let limit = 1 << 23;
+        assert!(worth_walking(limit + 1, false, limit));
+        assert!(worth_walking(SMALL_SCAN + 1, true, limit));
+        assert!(!worth_walking(SMALL_SCAN + 1, false, limit));
+        assert!(!worth_walking(SMALL_SCAN, true, limit));
+    }
 
     /// Exact scores of huge vectors (numbers whose squares overflow f32) are their true scores,
     /// not 0 or NaN, and a vector of tiny numbers isn't taken for a zero vector.

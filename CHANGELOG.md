@@ -3,6 +3,7 @@
 ## Unreleased
 
 - **The row API's `get` is checked as a read.** In a world that checks its reads, a row read with `get` (HTTP, MCP or the shell) wasn't recorded at all, so a merge decided on it went through after the row changed, and `CHECK READS` didn't list it. And a table made without SQL (rows `put` as JSON) counted as read whole whenever it was named, so a change to any of its rows held the merge. Now `get` records its row, as a SQL lookup does, and telling that such a table exists reads none of its rows.
+- **Cosine and L2 search on vectors of mixed lengths walk their graph at any size.** The graph each of those distances gets (0.3.2) was used only when it measured 99% recall on its own vectors, where the inner-product graph is used past the scan limit whatever it measures. On 1M vectors of 768 dimensions of mixed lengths it measured just under, so every search compared all of them: 24 ms (cosine) and 22 ms (L2), against 0.9 ms for the same vectors at unit length. Both now follow the same rule.
 
 ## 0.3.2 (beta), 2026-10-17
 
