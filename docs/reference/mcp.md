@@ -14,9 +14,9 @@ claude mcp add chronos -- chronos mcp /path/to/mydb
 
 | Command | Acts as | Tools listed | Changes |
 |---|---|---|---|
-| `chronos mcp mydb` | [safe mode](#safe-mode) (the default) | 22: all but `merge`, `restore`, `undo_merge` | only worlds forked in this session |
+| `chronos mcp mydb` | [safe mode](#safe-mode) (the default) | 26: all but `merge`, `restore`, `undo_merge` | only worlds forked in this session |
 | `chronos mcp mydb --agent bot` | the agent `bot` | those `bot` has the rights for ([below](#as-an-agent)) | what `bot` may change; its forks stay its own across sessions |
-| `chronos mcp mydb --allow-merge` | the database's own user | all 25 | everything |
+| `chronos mcp mydb --allow-merge` | the database's own user | all 29 | everything |
 
 - **`--agent` wins:** with both `--agent` and `--allow-merge`, the session acts as the agent.
 - **`--agent` takes a name, not a token:** an unknown or disabled agent is refused at start (`chronos: ...`, exit 1). Anyone who can run `chronos mcp` on the folder can name any agent; see [security](../security.md).

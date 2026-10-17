@@ -7,8 +7,11 @@
 ```bash
 # a prebuilt binary for macOS or Linux (x86_64 or arm64), into ~/.local/bin
 curl -fsSL https://github.com/Abhishekxdg/chronosdb/releases/latest/download/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"   # if ~/.local/bin isn't on your PATH yet (a fresh Ubuntu's isn't)
 chronos --version
 ```
+
+The examples below use `psql`; on a machine without it: `sudo apt-get install postgresql-client` (Debian, Ubuntu) or `brew install libpq` (macOS).
 
 The script picks the build for your OS and CPU, checks its SHA-256 against the release's `SHA256SUMS`, and installs it for your user; it never runs anything as root. `CHRONOS_INSTALL_DIR=<folder>` installs into another folder you can write (for `/usr/local/bin`, download the script and run it with `sudo` yourself), `CHRONOS_VERSION=v0.2.0` picks a release, and `CHRONOS_VERIFY=1` also checks the build's signature with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/): proof Chronos DB's release workflow built it. The Linux builds are static (musl), so they run on any distribution.
 
