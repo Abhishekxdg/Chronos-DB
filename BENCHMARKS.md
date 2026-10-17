@@ -21,6 +21,8 @@
 | **its own target** | vector search inside a fork, against main, 1M rows | 1.55× main (no filter), 1.12× (text) | target: within 1.1× | [3](#3-hybrid-search-inside-branches-phase-3-targets-p99--5-ms-at-1m-fork-within-10-of-main) |
 | **its own gate** | filtered vector search at 10%, 500k × 384, against tuned pgvector | 0.93 ms | 1.17–1.22 ms: only 1.3×, under the 5× gate | [2](#2-vector-search-vs-postgres--pgvector-phase-1-kill-gate-5-pgvector) |
 | **Redis 8.10** | vector search median, all rows, 76k and 1M real embeddings | 0.72–0.74 ms, 1.36 ms | **0.46 ms, 0.50 ms**, at 75.0% and 74.2% recall (Chronos: 99.98%, 98.6%) | [6](#6-vector-search-vs-other-vector-databases-on-real-embeddings) |
+| **Postgres 17 + pgvector 0.8.7** | filtered vector search (50% of rows), 8 clients, 1M × 768 | 902 q/s at 99.96% recall | **1,289 q/s** at 98.3% (`ef_search` 1,000) | [2](#side-by-side-at-1m-768-and-1536-dimensions-every-distance-2026-10-17-issue-34) |
+| **its own scaling** | filtered vector search (10%, 50%), 1 to 8 clients, 1M × 768 | 2.3× and 1.8× the throughput; p99 14.8 and 20.4 ms | | [2](#side-by-side-at-1m-768-and-1536-dimensions-every-distance-2026-10-17-issue-34) |
 | **LanceDB 0.39** | loading 76k × 1,536 vectors | 4.7 s | **1.0 s** (in its own process, from an Arrow table) | [6](#6-vector-search-vs-other-vector-databases-on-real-embeddings) |
 | **Weaviate, Redis** | one-user (1%) vector search p99, 76k | 2.1–2.3 ms | **1.46 ms, 1.23 ms** | [6](#6-vector-search-vs-other-vector-databases-on-real-embeddings) |
 | **Postgres 17** | one order joined to its row by key, over the protocol | 52 µs | **50 µs** | [4](#4-sql-over-the-postgres-protocol) |
@@ -131,6 +133,58 @@ On `8db2f701` (before query threads were kept between queries) Chronos's unfilte
 **Losses and caveats:**
 - **The 10% filter** is where pgvector comes closest: 1.3× at 500k, 1.3–1.4× at 1M.
 - **Untuned Postgres** (128 MB `shared_buffers`) is slower still; the tuning pass above is the fair comparison.
+
+### Side by side at 1M, 768 and 1,536 dimensions, every distance (2026-10-17, issue #34)
+
+`bash bench/pgvector_vs.sh setup` then `bash bench/pgvector_vs.sh run` ([`bench/pgvector_vs.py`](bench/pgvector_vs.py)), on one otherwise idle GCP `c2d-standard-16` (16 vCPUs, AMD EPYC 7B13, 62 GB, Ubuntu 24.04). Postgres 17.11 with pgvector 0.8.7. Chronos `141013f` (`main` with #32's graph per distance and the 8-bit store), plus #191 where marked. One system at a time, the other's server stopped. Raw output: [`bench/results/2026-10-17-pgvector-vs/`](bench/results/2026-10-17-pgvector-vs).
+
+**Setup.** Both get the same 1M rows and the same SQL from the same Python client (psycopg 3, vectors in binary through pgvector's `register_vector`, prepared statements): `ORDER BY embedding <op> $1 LIMIT 10`, optionally `WHERE tN = $2`. There are 1,000 held-out queries, run from 1 and from 8 connections at once. Recall@10 is against exact search by the same distance.
+
+- **pgvector:** HNSW at its defaults (`m = 16`, `ef_construction = 64`), built with 15 parallel workers and 16 GB of `maintenance_work_mem`; `shared_buffers` is a quarter of memory. It's measured twice: at its default `hnsw.ef_search` (40), and at the smallest `ef_search` that reaches Chronos's recall (the sweep is in the output; 1,000 is the most pgvector allows).
+  - Filtered searches use `hnsw.iterative_scan = relaxed_order`.
+  - Every session has `enable_seqscan = off`: at a high `ef_search`, Postgres's planner otherwise reads the whole table instead of the index (1.76 s a query at 1M × 1,536).
+- **Chronos:** at its defaults.
+
+**Data:**
+- **DBpedia:** 999,000 real OpenAI `text-embedding-ada-002` vectors (1,536 dimensions, unit length).
+- **Synthetic 768:** 1M vectors of 768 dimensions, clustered in a 64-dimensional space and projected up, as real embeddings vary along far fewer directions than they have. Once at unit length, once scaled to lengths between 0.25 and 4, where cosine, L2 and inner product rank differently.
+
+**Unfiltered, at the same recall** (p50 with 1 client; queries a second with 8):
+
+| data | distance | Chronos | pgvector, matched `ef_search` | pgvector, default (40) |
+|---|---|---|---|---|
+| DBpedia 1,536 | cosine | **1.29 ms**, 3,675 q/s, 98.5% | 7.44 ms, 724 q/s, 98.7% (`ef` 400) | 1.59 ms, 2,332 q/s, 91.6% |
+| synthetic 768, unit | cosine | **0.87 ms**, 4,700 q/s, 99.8% | 3.76 ms, 1,211 q/s, 98.2% (`ef` 1,000: never reached 99.8%) | 0.97 ms, 3,394 q/s, 87.9% |
+| synthetic 768, unit | inner product | **0.87 ms**, 4,173 q/s, 99.8% | 3.60 ms, 1,302 q/s, 98.2% (`ef` 1,000) | 0.97 ms, 3,248 q/s, 89.6% |
+| synthetic 768, mixed lengths | cosine | **0.89 ms**, 4,594 q/s, 99.8% (#191; 24.3 ms before) | 3.68 ms, 1,253 q/s, 97.9% (`ef` 1,000) | 0.98 ms, 3,389 q/s, 87.5% |
+| synthetic 768, mixed lengths | L2 | **1.03 ms**, 4,092 q/s, 95.8% (#191; 22.2 ms before) | 5.87 ms, 970 q/s, 95.9% (`ef` 1,000) | 0.76 ms, 4,286 q/s, 80.8% |
+
+**Filtered** (synthetic 768, unit, cosine; `WHERE` a tag that keeps 1%, 10% or 50% of the rows; inner product measured the same within 3%):
+
+| filter | Chronos | pgvector, matched `ef_search` | pgvector, default (40) |
+|---|---|---|---|
+| 1% | **1.33 ms**, 3,248 q/s, 100% | 40.3 ms, 168 q/s, 100% (`ef` 300) | 4.83 ms, 1,004 q/s, 92.2% |
+| 10% | **2.16 ms**, 1,003 q/s, 100% | 211 ms, 19 q/s, 100% (`ef` 600) | 1.54 ms, 2,445 q/s, 90.9% |
+| 50% | **2.02 ms**, 902 q/s, 99.96% | 3.90 ms, **1,289 q/s**, 98.3% (`ef` 1,000) | 1.00 ms, 3,316 q/s, 87.6% |
+
+**Building the index** (after the rows are loaded):
+
+| data | Chronos | pgvector | pgvector's index on disk |
+|---|---|---|---|
+| DBpedia 1,536 | **94 s** | 349 s | 7.8 GB |
+| synthetic 768, cosine | **37 s** | 127 s | 3.9 GB |
+| synthetic 768, mixed, cosine | **74 s** (two graphs) | 128 s | 3.9 GB |
+
+Loading 1M rows through 100-row `INSERT`s took about the same in both (Chronos 57–87 s, Postgres 49–95 s). Chronos's server peaked at 7.6 GB with DBpedia, while the graph was built, and held 3.2 GB after. Postgres's table and index on disk came to 15.8 GB.
+
+**Verdict:** at the same recall, Chronos is 4.1–5.8× faster than pgvector unfiltered (p50, one client) and 3.2–5.1× in throughput with 8 clients. Under a 1% or 10% filter it's 30–100× faster: to fill k at Chronos's recall there, pgvector's iterative scan walks a much wider beam. pgvector at its default `ef_search` is about as fast as Chronos, or faster under a 10% or 50% filter, at 81–92% recall.
+
+**Losses and caveats:**
+- **Filtered searches from 8 clients scale poorly.** Under a 10% filter, 1 to 8 clients gives only 2.3× the throughput (444 to 1,003 q/s, p99 14.8 ms); under 50%, 1.8× (510 to 902 q/s, p99 20.4 ms). At 50% with 8 clients, pgvector at `ef_search` 1,000 serves more: 1,289 q/s at 98.3% recall, against Chronos's 902 at 99.96%.
+- **L2 recall is lower:** 95.8% at Chronos's default beam, against 98–99.8% for cosine and inner product. `SET hnsw.ef_search` buys more.
+- **Found and fixed during this run:** cosine and L2 on vectors of mixed lengths compared every row (24.3 ms and 22.2 ms) because their graph measured just under the bar for use. #191 gives them the inner-product graph's rule. The mixed-length Chronos rows above are from #191's branch, rerun on the same machine.
+- **Synthetic data is not real data.** The first synthetic set, with independent noise in all 768 dimensions, held both systems to 70–78% recall at their defaults; real embeddings don't look like that, so it was discarded. The DBpedia rows are the real-data result.
+- One client machine and one server: no network between them (both on localhost).
 
 ## 3. Hybrid search inside branches (Phase 3 targets: p99 < 5 ms at 1M, fork within 10% of main)
 
