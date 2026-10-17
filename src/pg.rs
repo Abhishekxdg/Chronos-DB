@@ -2514,7 +2514,7 @@ impl Conn<'_> {
                 Type::Int | Type::Oid => 4,
                 Type::BigInt | Type::Float => 8,
                 Type::Float4 => 4,
-                Type::Bool => 1,
+                Type::Bool | Type::Letter => 1,
                 Type::Date => 4,
                 Type::Timestamp | Type::TimestampTz | Type::Time => 8,
                 Type::Interval | Type::Uuid => 16,
@@ -2742,6 +2742,7 @@ fn decode(b: &[u8], format: i16, ty: Type) -> Result<Value, Fail> {
         | Type::VarBit
         | Type::TimeTz
         | Type::Name
+        | Type::Letter
         | Type::Xid8
         | Type::PgSnapshot
         | Type::Enum(_)

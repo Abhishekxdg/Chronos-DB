@@ -897,6 +897,8 @@ pub(super) fn result_type(f: Scalar, first: Option<Type>) -> Type {
         FloatAccum(_) => Type::Array(Type::Float.oid()),
         Float4Numeric => Type::Numeric,
         Float4Text => Type::Text,
+        // x::"char"
+        Char => Type::Letter,
         Float4Digits | Float4Round | Float4Acc => Type::Float4,
         PointNew => Type::Point,
         MoneyOp(0) | MoneyFn(0 | 1) => Type::Money,
@@ -1651,7 +1653,7 @@ pub(super) const ENCODINGS: [&str; 42] = [
 ];
 
 /// Text read as a "char" and written back (see `Scalar::Char`).
-fn one_byte(s: &str) -> String {
+pub(super) fn one_byte(s: &str) -> String {
     let b = s.as_bytes();
     let octal = |c: u8| (b'0'..=b'7').contains(&c);
     let byte = if b.len() == 4 && b[0] == b'\\' && b[1..].iter().all(|c| octal(*c)) {

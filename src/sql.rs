@@ -392,6 +392,10 @@ pub enum Type {
     Float4,
     /// name: text cut to 63 bytes
     Name,
+    /// "char" (OID 18), the catalog's one-byte type (`pg_constraint.contype`, `x::"char"`): values are text of one
+    /// byte or none, as charin reads them. Its own type on the wire, as clients that read the catalog expect it
+    /// (Prisma's schema engine takes `contype` only as one)
+    Letter,
     /// time with time zone (see `timetz`): its text, `15:36:39-05`
     TimeTz,
     /// hstore (see `hstore`): values are its text, `"a"=>"1", "b"=>NULL`
@@ -1343,6 +1347,7 @@ impl Type {
             Type::JsonPath => 4072,
             Type::Float4 => 700,
             Type::Name => 19,
+            Type::Letter => 18,
             Type::TimeTz => 1266,
             Type::Hstore => hstore::OID,
             Type::Ltree => ltree::OID,
@@ -1437,6 +1442,7 @@ impl Type {
             700 => Type::Float4,
             142 => Type::Xml,
             19 => Type::Name,
+            18 => Type::Letter,
             1266 => Type::TimeTz,
             hstore::OID => Type::Hstore,
             ltree::OID => Type::Ltree,
@@ -1522,6 +1528,7 @@ impl Type {
             Type::JsonPath => "jsonpath",
             Type::Float4 => "real",
             Type::Name => "name",
+            Type::Letter => "\"char\"",
             Type::TimeTz => "time with time zone",
             Type::Hstore => "hstore",
             Type::Ltree => "ltree",
@@ -4010,6 +4017,7 @@ pub fn coerce(v: Value, ty: Type) -> Result<Value> {
         (JsonText(s), Type::Text) => Text(s),
         (JsonText(s), Type::Json) => Json(json_in(&s)?),
         (JsonText(s), Type::Name) => coerce(Text(s), Type::Name)?,
+        (JsonText(s), Type::Letter) => coerce(Text(s), Type::Letter)?,
         (Json(j), Type::JsonText) => JsonText(jsonb::text(&j)),
         (
             v @ (Int(_) | Float(_) | Bool(_) | Date(_) | Timestamp(_) | TimestampTz(_) | Interval(_) | Time(_)
@@ -4050,6 +4058,8 @@ pub fn coerce(v: Value, ty: Type) -> Result<Value> {
         }
         (Int(n), Type::Float4) => Float(f4(n as f64, None)?),
         (Float(f), Type::Float4) => Float(f4(f, None)?),
+        // (its first byte, as charin keeps it; see `funcs::one_byte`)
+        (Text(s), Type::Letter) => Text(funcs::one_byte(&s)),
         (Text(s), Type::Name) => {
             // (at most 63 bytes, cut at a character)
             let mut end = s.len().min(63);
@@ -4271,6 +4281,7 @@ pub fn coerce(v: Value, ty: Type) -> Result<Value> {
         (Reg(o, _), Type::Int | Type::BigInt | Type::Oid) => coerce(Int(o), ty)?,
         (v @ Reg(..), Type::Text) => Text(v.to_text()),
         (v @ Reg(..), Type::Name) => coerce(Text(v.to_text()), Type::Name)?,
+        (v @ Reg(..), Type::Letter) => coerce(Text(v.to_text()), Type::Letter)?,
         (v @ Reg(..), t) => return err("42846", format!("cannot cast type {} to {}", v.kind(), t.pg_name())),
         (Text(s), Type::Inet | Type::Cidr | Type::MacAddr | Type::MacAddr8) => {
             Net(net::parse(net::kind_of(ty).unwrap_or(net::Kind::Inet), &s)?)
@@ -8213,6 +8224,7 @@ fn col_storage(c: &Col) -> &'static str {
         Type::Interval | Type::Point => "d16",
         Type::Uuid => "c16",
         Type::Name => "c64",
+        Type::Letter => "c1",
         Type::Tid => "s6",
         Type::MacAddr => "i6",
         Type::MacAddr8 => "i8",
@@ -28570,7 +28582,7 @@ fn plain_key_type(ty: Type) -> bool {
     // (an enum's rows are named by its labels: they are found by `=`, and sorted by the labels' places, not read in
     // key order; a name is text cut to 63 bytes, named by its text as text is)
     ty.whole()
-        || matches!(ty, Type::Text | Type::Name | Type::Bytea | Type::Uuid | Type::Enum(_))
+        || matches!(ty, Type::Text | Type::Name | Type::Letter | Type::Bytea | Type::Uuid | Type::Enum(_))
         || net::kind_of(ty).is_some()
 }
 

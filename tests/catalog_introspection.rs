@@ -319,3 +319,43 @@ fn built_in_function_lookups_read_their_rows_alone() {
     let took = t.elapsed();
     assert!(took < std::time::Duration::from_secs(4), "{took:?}");
 }
+
+/// `pg_constraint`'s one-letter columns are of Postgres's `"char"` type (OID 18), not text, and so is `x::"char"`:
+/// Prisma's schema engine reads `contype` only as one, and failed `prisma db push` on any database with a CHECK
+/// constraint (its constraints query, as Prisma 6.2 sends it, is below).
+#[test]
+fn the_catalogs_one_letter_columns_are_char() {
+    let (db, mut s) = (Db::new(), Session::new(MAIN));
+    rows(
+        &mut s,
+        &db,
+        "create table parent (id int primary key); create table child (id int primary key, p int references parent on delete cascade, n int check (n > 0))",
+    );
+    let q = "SELECT schemainfo.nspname AS namespace, tableinfo.relname AS table_name, constr.conname AS constraint_name, \
+             constr.contype AS constraint_type, pg_get_constraintdef(constr.oid) AS constraint_definition, \
+             constr.condeferrable AS is_deferrable, constr.condeferred AS is_deferred \
+             FROM pg_constraint constr JOIN pg_class AS tableinfo ON tableinfo.oid = constr.conrelid \
+             JOIN pg_namespace AS schemainfo ON schemainfo.oid = tableinfo.relnamespace \
+             WHERE schemainfo.nspname = ANY ($1) AND contype NOT IN ('p', 'u', 'f') \
+             ORDER BY namespace, table_name, constr.contype, constraint_name";
+    let out = s.run(&db, q, &[Value::Text("{public}".into())]).unwrap().pop().unwrap();
+    let ty = |name: &str| out.columns.as_ref().unwrap().iter().find(|(n, _)| n == name).unwrap().1;
+    assert_eq!(ty("constraint_type").oid(), 18);
+    assert_eq!(out.rows.len(), 1);
+    assert_eq!(out.rows[0][3], Value::Text("c".into()));
+    let out = s
+        .run(&db, "select contype, confdeltype, confupdtype, confmatchtype from pg_constraint where contype = 'f'", &[])
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(out.columns.as_ref().unwrap().iter().all(|(_, t)| t.oid() == 18));
+    assert_eq!(out.rows[0][..2], [Value::Text("f".into()), Value::Text("c".into())]);
+    assert_eq!(
+        rows(
+            &mut s,
+            &db,
+            r#"select 'abc'::"char", pg_typeof('x'::"char"), pg_typeof(contype) from pg_constraint limit 1"#
+        ),
+        [r#"a|"char"|"char""#]
+    );
+}
