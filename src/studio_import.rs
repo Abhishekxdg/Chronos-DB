@@ -220,7 +220,7 @@ fn start(db: &Arc<Db>, a: &Value) -> Result<Value, Fail> {
             json!({
                 "imported": r.imported, "total": r.total, "rows": r.rows,
                 "done": r.done, "carried": r.carried, "partial": r.partial, "skipped": r.skipped,
-                "unenforced": r.unenforced, "error": error,
+                "unenforced": r.unenforced, "hidden": r.hidden, "error": error,
             })
         });
         *job.end.lock().unwrap_or_else(|p| p.into_inner()) = Some(End { at: now_ms(), result });

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.1 (beta), 2026-10-17
+
+**Fixes for importing from Supabase (and any Postgres with row-level security, or extensions in a schema of their own).** Found importing Supabase projects in tests the day 0.3.0 came out: a shop schema with Supabase's `auth` and `storage`, then pgvector embeddings, PostGIS points, a million partitioned rows and two dozen awkward column types. Everything that came over matched Supabase value for value; these are what didn't.
+
+- **`chronos import` never brings over part of a table in silence.** For a role without `BYPASSRLS` that doesn't own the table, Postgres hands over only the rows a table's row-level security policies show it, often none, with no error. Supabase turns row-level security on for every table its dashboard makes, so an import as a read-only role came over with empty tables and exited 0. Now the importer asks Postgres to refuse instead (`row_security = off`, as `pg_dump` does) and checks each table first. A table whose rows the role can't all read is made, left empty and named (`"customers": not copied`), and the import (and `--dry-run`) exits with status 1, telling you to import as the tables' owner, a superuser, or a role with `BYPASSRLS` (on Supabase, `postgres`). The Studio's import shows the same.
+- **Extensions in their own schema (Supabase's `extensions`) come over.** Supabase installs pgvector, PostGIS, citext and the rest into a schema named `extensions`, so its definitions say `extensions.vector(64)`, `extensions.citext` or `extensions.vector_cosine_ops`, which Chronos refused (its built-in extensions have no schema): a table of embeddings, a geography column or a citext domain didn't come over. The importer now writes the types, functions and operator classes of extensions Chronos has built in without that schema.
+- **A table that doesn't come over fails the import.** It exited 0 when a table was refused ("imported 47 of 50 tables"); now it exits with status 1, naming the tables, as it already did for a unique index that didn't come over.
+- **The report says what Chronos has:** an extension built into Chronos (`pgcrypto`, `uuid-ossp`, `citext`, ...) is made as Postgres had it and listed under "also brought over", where it was listed as "not in Chronos". Row-level security and policies are listed as not carried over (Chronos has row-level security: make them again with `CREATE POLICY`), not as missing from Chronos.
+- **Docs:** importing from Supabase, through its pooler in session mode ([Migrating from Postgres](docs/migrating-from-postgres.md#route-1-chronos-import)).
+
+The macOS builds need **macOS 13 or later**, as for 0.2.0.
+
 ## 0.3.0 (beta), 2026-10-17
 
 **Reviews you can trust with production data, from the first week of feedback on 0.2.0.** Every change here was asked for in the 0.2.0 release threads on r/AI_Agents and r/LLMDevs: a dry run against your live Postgres, reads checked against it too, destructive changes shown first with a typed count to approve big deletes, and effects (`NOTIFY ON MERGE`) shown in the review, traced to the merge that sent them, and recorded when they're vetoed. Still a beta for staging copies of your data.

@@ -35,7 +35,8 @@ It reads the catalog, makes the schema, copies every table's rows (COPY, text fo
 
 imported 4 of 4 tables (62500 rows) into main, and 6 foreign keys, indexes and views
 
-also brought over (4):
+also brought over (5):
+  - extension uuid-ossp (built into Chronos)
   - type public.status
   - function public.touch()
   - trigger orders_touch on orders
@@ -45,16 +46,17 @@ brought over in part (2):
   - database name: Postgres's shop is the world main here (current_database() says main)
   - index orders_status: a hash index came over as a btree (it finds the same rows)
 
-not imported (4):
-  - extension isn: not in Chronos (pgvector and PostGIS points are built in)
-  - extension uuid-ossp: not in Chronos (pgvector and PostGIS points are built in)
-  - row-level security on "customers": not in Chronos (give programs agents with rights, and merge policies)
-  - policy own on public.customers: row-level security isn't in Chronos
+not imported (3):
+  - extension isn: not in Chronos (the ones it has are built in: pgvector, PostGIS points, pgcrypto, uuid-ossp, citext, hstore, ltree, pg_trgm and others)
+  - row-level security on "customers": not carried over (Chronos has it: make the policies again with CREATE POLICY, and ALTER TABLE ... ENABLE ROW LEVEL SECURITY)
+  - policy own on public.customers: not carried over (make it again with CREATE POLICY: Chronos has row-level security)
 
 roles, grants and passwords aren't imported: give each program an agent (CREATE AGENT) with the rights it needs
 ```
 
-Read the whole report. Two of its lines say less than they could: `uuid-ossp`'s `uuid_generate_v4()` is built into Chronos (its other functions aren't), so defaults that call it keep working though the extension is listed; and Chronos does have row-level security, which the importer doesn't carry yet (make the policies again with `CREATE POLICY` and `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`). The command exits with status 1 if a unique index or constraint did not come over, since the table would then accept rows Postgres refused.
+Read the whole report. An extension Chronos has built in is made as Postgres had it (`uuid-ossp`'s `uuid_generate_v4()`, `pgcrypto`'s functions); one it doesn't have is listed. Chronos has row-level security, but the importer doesn't carry the policies yet: make them again with `CREATE POLICY` and `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`. The command exits with status 1 if a unique index or constraint did not come over (the table would then accept rows Postgres refused), if a table didn't come over at all (a type Chronos doesn't have, say), or if row-level security kept rows from the role you import as (below).
+
+**Import as a role that reads past row-level security.** For a role without it, Postgres hands over only the rows a table's policies show that role, often none, and says nothing. Supabase turns row-level security on for every table its dashboard makes, so a read-only role sees empty tables. The importer never brings over part of a table that way: it asks Postgres to refuse instead (`row_security = off`, as `pg_dump` does) and checks each table first. A table whose rows the role can't all read is made, left empty, named in the report (`"customers": not copied`), and the import exits with status 1, saying so. Import as the tables' owner (it reads past their policies unless the table `FORCE`s them), a superuser, or a role with `BYPASSRLS`. On Supabase that's the `postgres` role. Through Supabase's pooler, use session mode (port 5432) with the user `postgres.<project ref>`, as `chronos import ./mydb "postgres://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require"`; the direct host `db.<ref>.supabase.co` is reachable over IPv6 only. Supabase's own schemas (`auth`, `storage`) come over with the rest: `auth.users` and the tables that reference it keep working. Extensions Supabase keeps in its `extensions` schema (pgvector, PostGIS, citext, pg_trgm, hstore, ltree, btree_gist, pgcrypto, uuid-ossp) are built into Chronos: their types, functions and operator classes come over without that schema (`extensions.vector(64)` is `vector(64)` here).
 
 **What comes over:** schemas; enum, composite, range and domain types (with defaults, `NOT NULL` and checks); sequences (with `CACHE`, set to where they were, so `serial` and identity columns go on from there); tables with their columns, defaults, `GENERATED ... AS IDENTITY`, primary keys, `UNIQUE`, `CHECK`, `NOT NULL`, exclusion constraints, partitions and inheritance; every row; foreign keys; indexes; views and materialized views; SQL and PL/pgSQL functions and procedures; plain aggregates; triggers; rules; comments. The full list is in [SQL: Moving from Postgres](sql.md#moving-from-postgres).
 

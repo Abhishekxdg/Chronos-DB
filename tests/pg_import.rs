@@ -521,3 +521,114 @@ fn columnless_tables_keep_their_rows_and_functions_may_read_views() {
     std::fs::remove_dir_all(&dir).unwrap();
     admin.batch_execute(&format!("drop database {name}")).unwrap();
 }
+
+/// Row-level security that would hide rows from the role importing (Supabase turns it on for every table it makes,
+/// and a role without BYPASSRLS then reads only what its policies show, often nothing, with no error): those tables'
+/// rows aren't copied, the import says why and exits with an error, instead of bringing over only some rows in
+/// silence. The tables' owner reads past them unless the table FORCEs them. An extension Chronos has built in comes
+/// over as made.
+#[test]
+fn row_level_security_never_hides_rows_in_silence() {
+    let Some((mut admin, name, url)) = throwaway("rls") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    let reader = format!("chronos_reader_{}", std::process::id());
+    admin.batch_execute(&format!("drop role if exists {reader}")).unwrap();
+    admin.batch_execute(&format!("create role {reader} login password 'reader-pw'")).unwrap();
+    let mut pg = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    pg.batch_execute(&format!(
+        "create extension if not exists pgcrypto;
+         create schema extensions;
+         create extension if not exists citext with schema extensions;
+         create table tagged (id int primary key, tag extensions.citext);
+         insert into tagged values (1, 'MiXeD');
+         create table items (id int primary key);
+         insert into items values (1), (2);
+         create table private_items (id int primary key, owner text);
+         insert into private_items values (1, 'a'), (2, 'b'), (3, 'c');
+         alter table private_items enable row level security;
+         create policy mine on private_items for select using (owner = current_user);
+         create table forced_items (id int primary key);
+         insert into forced_items values (1);
+         alter table forced_items enable row level security;
+         alter table forced_items force row level security;
+         grant select on all tables in schema public to {reader};"
+    ))
+    .unwrap();
+    drop(pg);
+    let (base, db_name) = url.rsplit_once('/').unwrap();
+    let host = base.rsplit_once('@').unwrap().1;
+    let reader_url = format!("postgres://{reader}:reader-pw@{host}/{db_name}");
+    let dir = std::env::temp_dir().join(format!("chronos-pg-import-rls-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // as a role that doesn't bypass it: the table is made, empty, and the import fails saying why
+    let dry = Command::new(env!("CARGO_BIN_EXE_chronos"))
+        .args(["import", dir.to_str().unwrap(), &reader_url, "--dry-run"])
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&dry.stdout).into_owned() + &String::from_utf8_lossy(&dry.stderr);
+    assert!(!dry.status.success(), "a dry run says so too: {said}");
+    assert!(said.contains("\"private_items\": not copied"), "{said}");
+    let (ok, out) = import(&reader_url, &dir);
+    assert!(!ok, "{out}");
+    assert!(out.contains("\"private_items\": not copied") && out.contains("\"forced_items\": not copied"), "{out}");
+    assert!(out.contains("BYPASSRLS") && out.contains("2 table(s) have row-level security"), "{out}");
+    assert!(out.contains("\"items\": 2 rows"), "{out}");
+    assert!(out.contains("extension pgcrypto (built into Chronos)"), "{out}");
+    // an extension's type named with the schema Postgres keeps it in (Supabase's `extensions`): made all the same
+    assert!(out.contains("\"tagged\": 1 rows"), "{out}");
+    assert!(!out.contains("extension pgcrypto: not in Chronos"), "{out}");
+    let db = Db::open(&dir).unwrap();
+    assert_eq!(cell(&db, "select count(*) from private_items"), "0", "none, rather than the policy's");
+    assert_eq!(cell(&db, "select count(*) from tagged where tag = 'mixed'"), "1", "citext compares as citext");
+    assert_eq!(cell(&db, "select count(*) from items"), "2");
+    assert_eq!(cell(&db, "select encode(digest('a', 'sha1'), 'hex')"), "86f7e437faa5a7fce15d1ddcb9eaeaea377667b8");
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // as the owner: its tables come over whole, but one that FORCEs its policies hides rows from its owner too,
+    // unless the owner is a superuser (CI's), who reads past every policy
+    let superuser = admin.query_one("select rolsuper from pg_roles where rolname = current_user", &[]).unwrap().get(0);
+    let (ok, out) = import(&url, &dir);
+    assert!(out.contains("\"private_items\": 3 rows"), "{out}");
+    match superuser {
+        true => assert!(ok && out.contains("\"forced_items\": 1 rows"), "{out}"),
+        false => {
+            assert!(!ok && out.contains("\"forced_items\": not copied"), "{out}");
+            assert!(out.contains("1 table(s) have row-level security"), "{out}");
+        }
+    }
+    let db = Db::open(&dir).unwrap();
+    assert_eq!(cell(&db, "select count(*) from private_items"), "3");
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    admin.batch_execute(&format!("drop database {name} with (force)")).unwrap();
+    admin.batch_execute(&format!("drop role {reader}")).unwrap();
+}
+
+/// A table Chronos refuses to make doesn't leave an import that says it succeeded: it exits with an error naming it.
+#[test]
+fn a_table_that_did_not_come_over_fails_the_import() {
+    let Some((mut admin, name, url)) = throwaway("missing") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    let mut pg = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    // a type Chronos doesn't have (aclitem), next to a table it takes
+    pg.batch_execute(
+        "create table fine (id int primary key); insert into fine values (1);
+         create table odd (id int primary key, a aclitem); insert into odd values (1, 'postgres=r/postgres');",
+    )
+    .unwrap();
+    drop(pg);
+    let dir = std::env::temp_dir().join(format!("chronos-pg-import-missing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (ok, out) = import(&url, &dir);
+    assert!(!ok, "{out}");
+    assert!(out.contains("1 table(s) did not come over") && out.contains("\"odd\""), "{out}");
+    assert!(out.contains("\"fine\": 1 rows"), "{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+    admin.batch_execute(&format!("drop database {name} with (force)")).unwrap();
+}

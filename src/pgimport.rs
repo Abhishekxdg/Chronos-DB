@@ -85,6 +85,10 @@ struct Table {
     flat: Option<String>,
     /// other tables inherit from it, so its own rows are `FROM ONLY` it
     only: bool,
+    /// row-level security is on and the role imported as doesn't bypass it (not a superuser, BYPASSRLS, or the owner
+    /// of a table that doesn't FORCE it): Postgres would hand over only the rows its policies show that role, so none
+    /// are copied (see `Report::hidden`)
+    hidden: bool,
 }
 
 /// What an import did, or would do.
@@ -99,6 +103,11 @@ pub struct Report {
     pub partial: Vec<String>,
     /// unique indexes that didn't come over: the table now accepts rows Postgres refused
     pub unenforced: Vec<String>,
+    /// tables whose rows weren't copied: row-level security would have shown the role only some of them (see
+    /// `Table::hidden`)
+    pub hidden: Vec<String>,
+    /// tables Chronos refused to make (a type it doesn't have, say): they and their rows aren't here
+    pub missing: Vec<String>,
     /// how many tables came over, of how many were read, and their rows
     pub imported: usize,
     pub total: usize,
@@ -181,6 +190,11 @@ struct Import<'a> {
     seqs_refused: BTreeSet<(String, String)>,
     /// for `chronos attach`: triggers and rules stay in Postgres (they run there when a merge is written)
     attach: bool,
+    /// the schemas Postgres keeps extensions Chronos has built in (Supabase: `extensions`), and the names of those
+    /// extensions' types, functions and operator classes: written there as `extensions.vector(64)`, made here as
+    /// `vector(64)` (see `unqualify`)
+    ext_schemas: Vec<String>,
+    ext_names: std::collections::HashSet<String>,
 }
 
 impl Report {
@@ -313,7 +327,8 @@ impl Import<'_> {
 
     /// Runs `sql` in Chronos: why not, if it refuses.
     fn attempt(&mut self, sql: &str) -> Result<(), String> {
-        self.s.run(self.db, sql, &[]).map(|_| ()).map_err(|e| e.message)
+        let sql = unqualify(sql, &self.ext_schemas, &self.ext_names);
+        self.s.run(self.db, &sql, &[]).map(|_| ()).map_err(|e| e.message)
     }
 
     /// SQL keeping the function `p` (in the namespace `n`) to those of an included schema, or used by an included
@@ -560,14 +575,58 @@ impl Import<'_> {
     fn catalog(&mut self) -> Result<Vec<Table>, String> {
         let user = self.user.clone();
         let oid = |c: &str| OWN.replace("{oid}", c);
+        let mut built_in: Vec<String> = vec![];
         for r in self.pg("select extname from pg_extension where extname <> 'plpgsql' order by 1")? {
             let e = r[0].clone().unwrap_or_default();
-            if !["vector", "postgis"].contains(&e.as_str()) {
-                self.report
-                    .skipped
-                    .push(format!("extension {e}: not in Chronos (pgvector and PostGIS points are built in)"));
+            // one Chronos has built in (pgcrypto, uuid-ossp, citext, ...): made here as Postgres had it
+            if ["vector", "postgis"].contains(&e.as_str())
+                || self.attempt(&format!("create extension if not exists {}", q(&e))).is_ok()
+            {
+                self.report.carried.push(format!("extension {e} (built into Chronos)"));
+                built_in.push(e);
+            } else {
+                self.report.skipped.push(format!(
+                    "extension {e}: not in Chronos (the ones it has are built in: pgvector, PostGIS points, pgcrypto, \
+                     uuid-ossp, citext, hstore, ltree, pg_trgm and others)"
+                ));
             }
         }
+        // where Postgres keeps them, and what of theirs a definition may name with that schema (Supabase puts every
+        // extension in `extensions`): here they have no schema, so the name goes without it
+        if !built_in.is_empty() {
+            let names = built_in.iter().map(|e| lit(e)).collect::<Vec<_>>().join(", ");
+            let ext = format!("(select oid from pg_extension where extname in ({names}))");
+            self.ext_schemas = self
+                .pg_or_none(&format!(
+                    "select distinct n.nspname from pg_extension e join pg_namespace n on n.oid = e.extnamespace \
+                     where e.oid in {ext}"
+                ))
+                .into_iter()
+                .filter_map(|r| r[0].clone())
+                .filter(|n| n != "public" && n != "pg_catalog")
+                .collect();
+            let owned = |catalog: &str, name: &str| {
+                format!(
+                    "select x.{name} from pg_depend d join {catalog} x on x.oid = d.objid \
+                     where d.classid = '{catalog}'::regclass and d.deptype = 'e' and d.refobjid in {ext}"
+                )
+            };
+            let sql = [
+                owned("pg_type", "typname"),
+                owned("pg_proc", "proname"),
+                owned("pg_opclass", "opcname"),
+                owned("pg_opfamily", "opfname"),
+            ]
+            .join(" union ");
+            self.ext_names = self.pg_or_none(&sql).into_iter().filter_map(|r| r[0].clone()).collect();
+        }
+        // whether the role imported as reads past row-level security: else a table with it on would come over with
+        // only the rows its policies show that role (see `Table::hidden`)
+        let bypass = self
+            .pg_or_none("select rolsuper or rolbypassrls from pg_roles where rolname = current_user")
+            .first()
+            .and_then(|r| r[0].clone())
+            .is_some_and(|b| b == "t");
         for r in
             self.pg(&format!("select n.nspname from pg_namespace n where {user} and n.nspname <> 'public' order by 1"))?
         {
@@ -627,7 +686,8 @@ impl Import<'_> {
         let tables = self.pg(&format!(
             "select c.oid, n.nspname, c.relname, c.relrowsecurity, greatest(c.reltuples, 0)::bigint, c.relkind, \
              case when c.relkind = 'p' then pg_get_partkeydef(c.oid) end, \
-             exists (select 1 from pg_inherits h where h.inhparent = c.oid) from pg_class c \
+             exists (select 1 from pg_inherits h where h.inhparent = c.oid), \
+             c.relforcerowsecurity, pg_get_userbyid(c.relowner) = current_user from pg_class c \
              join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r', 'p') and not c.relispartition \
              and {user}{} and {} order by 2, 3",
             self.rel,
@@ -762,9 +822,12 @@ impl Import<'_> {
             let (rel, name) = (v(0), qualified(&v(1), &v(2)));
             if v(3) == "t" {
                 self.report.skipped.push(format!(
-                    "row-level security on {name}: not in Chronos (give programs agents with rights, and merge policies)"
+                    "row-level security on {name}: not carried over (Chronos has it: make the policies again with \
+                     CREATE POLICY, and ALTER TABLE ... ENABLE ROW LEVEL SECURITY)"
                 ));
             }
+            // its owner reads past its own policies unless the table FORCEs them
+            let hidden = v(3) == "t" && !bypass && !(v(9) == "t" && v(8) != "t");
             for (c, e) in dropped.remove(&rel).unwrap_or_default() {
                 self.report.skipped.push(format!(
                     "default {e} of {name}.{}: Postgres works it out afresh for each row and Chronos keeps a default \
@@ -825,6 +888,7 @@ impl Import<'_> {
                 parts: parts_of,
                 flat,
                 only: v(7) == "t" && key.is_none(),
+                hidden,
             });
         }
         // a table after the tables it inherits from (`parents` has their names, as `Table::name` is written)
@@ -1037,7 +1101,11 @@ impl Import<'_> {
         ))?;
         for r in policies {
             let v = |i: usize| r[i].clone().unwrap_or_default();
-            self.report.skipped.push(format!("policy {} on {}: row-level security isn't in Chronos", v(1), v(0)));
+            self.report.skipped.push(format!(
+                "policy {} on {}: not carried over (make it again with CREATE POLICY: Chronos has row-level security)",
+                v(1),
+                v(0)
+            ));
         }
         // what Chronos has in a form Postgres's definitions don't carry over to: said, not guessed at
         for (kind, sql) in [
@@ -1253,6 +1321,52 @@ impl Import<'_> {
     }
 }
 
+/// `sql` with `schema.name` (either part quoted or not) written as `name` wherever `schema` is one of `schemas` and
+/// `name` one of `names`: the extensions Chronos has built in have no schema here, while Postgres may keep them in one
+/// (Supabase's `extensions`), and its definitions then name their types, functions and operator classes with it.
+fn unqualify<'s>(
+    sql: &'s str,
+    schemas: &[String],
+    names: &std::collections::HashSet<String>,
+) -> std::borrow::Cow<'s, str> {
+    if schemas.is_empty() || names.is_empty() {
+        return std::borrow::Cow::Borrowed(sql);
+    }
+    let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    // the identifier at the start of `s` (quoted or not), and how many bytes it takes
+    let word = |s: &str| -> Option<(String, usize)> {
+        if let Some(rest) = s.strip_prefix('"') {
+            let end = rest.find('"')?;
+            return Some((rest[..end].to_string(), end + 2));
+        }
+        let end = s.find(|c: char| !ident(c)).unwrap_or(s.len());
+        (end > 0).then(|| (s[..end].to_lowercase(), end))
+    };
+    let (mut out, mut i, mut changed) = (String::with_capacity(sql.len()), 0, false);
+    while i < sql.len() {
+        let prev = sql[..i].chars().next_back();
+        let at_start = prev.is_none_or(|p| !ident(p) && p != '.' && p != '"');
+        if at_start
+            && let Some((schema, n)) = word(&sql[i..])
+            && schemas.contains(&schema)
+            && sql[i + n..].starts_with('.')
+            && let Some((name, _)) = word(&sql[i + n + 1..])
+            && names.contains(&name)
+        {
+            i += n + 1; // the name stays; its schema goes
+            changed = true;
+            continue;
+        }
+        let c = sql[i..].chars().next().expect("within the string");
+        out.push(c);
+        i += c.len_utf8();
+    }
+    match changed {
+        true => std::borrow::Cow::Owned(out),
+        false => std::borrow::Cow::Borrowed(sql),
+    }
+}
+
 pub fn help() -> &'static str {
     "usage: chronos import <folder> postgres://user:password@host:port/database [--dry-run] [-b <world>]\n\
      \x20                                   [--allow-plaintext-password]\n\n\
@@ -1308,16 +1422,34 @@ pub fn run(db: Option<&Db>, url: &str, branch: &str, dry: bool, plain_password: 
     }
 }
 
-/// Why an import that lost a unique index isn't a success: the tables now accept rows Postgres refused.
+/// Why an import isn't a success: a table that didn't come over, a unique index that didn't (the tables now accept
+/// rows Postgres refused), or tables whose rows row-level security kept from the role imported as (empty here).
 pub fn unenforced(report: &Report) -> Option<String> {
-    if report.unenforced.is_empty() {
-        return None;
+    let mut why = vec![];
+    if !report.missing.is_empty() {
+        why.push(format!(
+            "{} table(s) did not come over, nor their rows: {} (see \"not imported\" above for why)",
+            report.missing.len(),
+            report.missing.join(", ")
+        ));
     }
-    Some(format!(
-        "{} unique index(es) did not come over, so those tables now accept rows Postgres refused: {} (see \"not imported\" above)",
-        report.unenforced.len(),
-        report.unenforced.join(", ")
-    ))
+    if !report.hidden.is_empty() {
+        why.push(format!(
+            "{} table(s) have row-level security the role imported as doesn't bypass, so their rows weren't copied: {}. \
+             Import again as a role that reads past it: the tables' owner, a superuser, or one with BYPASSRLS (on \
+             Supabase, the postgres role)",
+            report.hidden.len(),
+            report.hidden.join(", ")
+        ));
+    }
+    if !report.unenforced.is_empty() {
+        why.push(format!(
+            "{} unique index(es) did not come over, so those tables now accept rows Postgres refused: {} (see \"not imported\" above)",
+            report.unenforced.len(),
+            report.unenforced.join(", ")
+        ));
+    }
+    (!why.is_empty()).then(|| why.join("; "))
 }
 
 /// `run`'s import, told as it goes to `progress` (and printed, with `echo`), with only the schemas and
@@ -1374,8 +1506,15 @@ fn import_with(
         part_oids: vec![],
         seqs_refused: BTreeSet::new(),
         attach,
+        ext_schemas: vec![],
+        ext_names: Default::default(),
     };
     im.report.database_name(source, branch);
+    // as pg_dump does: a COPY that row-level security would filter is an error, never fewer rows in silence (a
+    // pooler in transaction mode may drop the setting between statements: `Table::hidden` checks beforehand too)
+    if !attach {
+        let _ = im.pg("set row_security = off");
+    }
     im.source_collation();
     progress.now("reading the catalog: schemas, types, sequences, functions and tables");
     let tables = im.catalog()?;
@@ -1386,7 +1525,23 @@ fn import_with(
         progress.stopped()?;
         progress.now(format!("table {}", t.name));
         let made = im.make(t);
-        if made {
+        if !made {
+            im.report.missing.push(t.name.clone());
+        }
+        if made && t.hidden {
+            // its rows aren't all the role's to read: none copied, rather than only those its policies show
+            n += 1;
+            im.report.hidden.push(t.name.clone());
+            im.report.skipped.push(format!(
+                "rows of {}: row-level security is on, and the role imported as doesn't bypass it, so Postgres would \
+                 hand over only the rows its policies show that role (often none): none were copied (the table is \
+                 there, empty)",
+                t.name
+            ));
+            if echo {
+                println!("{}: not copied (row-level security hides its rows from this role)", t.name);
+            }
+        } else if made {
             n += 1;
             let k = match im.dry {
                 true => Some(t.rows.max(0) as u64),
@@ -1770,7 +1925,34 @@ fn wipe(password: &mut Option<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::collation_warning;
+    use super::{collation_warning, unqualify};
+
+    #[test]
+    fn extension_names_lose_the_schema_postgres_kept_them_in() {
+        let schemas = vec!["extensions".to_string()];
+        let names: std::collections::HashSet<String> =
+            ["vector", "vector_cosine_ops", "citext", "uuid_generate_v4"].iter().map(|s| s.to_string()).collect();
+        let cases = [
+            (
+                "create table d (e extensions.vector(64), m \"extensions\".citext)",
+                "create table d (e vector(64), m citext)",
+            ),
+            (
+                "CREATE INDEX i ON lab.d USING hnsw (e extensions.vector_cosine_ops)",
+                "CREATE INDEX i ON lab.d USING hnsw (e vector_cosine_ops)",
+            ),
+            ("id uuid default extensions.uuid_generate_v4()", "id uuid default uuid_generate_v4()"),
+            ("e extensions.vector(3)[]", "e vector(3)[]"),
+            // not an extension's: kept as written
+            ("select * from extensions.my_table", "select * from extensions.my_table"),
+            ("select my_extensions.vector from t", "select my_extensions.vector from t"),
+            ("select a.extensions.vector", "select a.extensions.vector"),
+        ];
+        for (sql, want) in cases {
+            assert_eq!(unqualify(sql, &schemas, &names), want, "{sql}");
+        }
+        assert!(matches!(unqualify("select 1", &schemas, &names), std::borrow::Cow::Borrowed(_)));
+    }
 
     #[test]
     fn a_source_collation_other_than_bytes_is_said() {
