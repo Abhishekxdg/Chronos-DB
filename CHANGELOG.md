@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (beta), 2026-10-19
+## 0.2.0 (beta), 2026-10-17
 
 **The first public beta: agents' changes to your Postgres data, reviewed and checked before they land.** Chronos is not Postgres and not yet used in production; this release is for trying it on a staging copy of your own data. It can now work beside the Postgres you already run, or take your data in.
 
