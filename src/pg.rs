@@ -165,6 +165,8 @@ struct Tokens {
     permits: usize,
     /// how many times token verifiers were made (for the tests)
     makes: std::sync::atomic::AtomicUsize,
+    /// the most made at once so far (for the tests)
+    most: std::sync::atomic::AtomicUsize,
 }
 
 impl Tokens {
@@ -181,6 +183,7 @@ impl Tokens {
             made: std::sync::Condvar::new(),
             permits: (cores / 2).clamp(1, 8),
             makes: Default::default(),
+            most: Default::default(),
         };
         if t.server.is_some() {
             let began = Instant::now();
@@ -205,6 +208,7 @@ impl Tokens {
             making = self.made.wait(making).unwrap_or_else(|p| p.into_inner());
         }
         *making += 1;
+        self.most.fetch_max(*making, Ordering::Relaxed);
         drop(making);
         let _permit = Permit(self);
         self.makes.fetch_add(1, Ordering::Relaxed);
@@ -3016,17 +3020,6 @@ mod tests {
     #[test]
     fn few_token_verifiers_are_made_at_once() {
         let t = std::sync::Arc::new(tokens(Some("s3cret"), Some("ADMIN")));
-        let done = std::sync::Arc::new(AtomicBool::new(false));
-        let watch = {
-            let (t, done) = (t.clone(), done.clone());
-            std::thread::spawn(move || {
-                let mut most = 0;
-                while !done.load(Ordering::Relaxed) {
-                    most = most.max(*t.making.lock().unwrap());
-                }
-                most
-            })
-        };
         let clients: Vec<_> = (0..t.permits * 3 + 2)
             .map(|i| {
                 let t = t.clone();
@@ -3036,8 +3029,8 @@ mod tests {
         for c in clients {
             assert_eq!(c.join().unwrap(), 2);
         }
-        done.store(true, Ordering::Relaxed);
-        let most = watch.join().unwrap();
+        // counted where they start, not watched from a thread: on a busy machine a watcher missed them all
+        let most = t.most.load(Ordering::Relaxed);
         assert!((1..=t.permits).contains(&most), "{most} at once, {} allowed", t.permits);
     }
 }
