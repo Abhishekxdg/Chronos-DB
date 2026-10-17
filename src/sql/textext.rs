@@ -260,21 +260,67 @@ fn trgm_set(s: &str) -> Vec<Trgm> {
     v
 }
 
+/// A trigram as `show_trgm` prints it, which is also how a trigram index keeps it (see `btree::entries`): the
+/// three characters when they are letters, digits and blanks, else `0x` and six hex digits.
+fn trgm_text(t: &Trgm) -> String {
+    if t.iter().all(|&b| b.is_ascii_alphanumeric() || b == b' ') {
+        t.iter().map(|&b| b as char).collect()
+    } else {
+        format!("0x{:06x}", u32::from(t[0]) << 16 | u32::from(t[1]) << 8 | u32::from(t[2]))
+    }
+}
+
+/// A text's trigrams as a trigram index keeps them (`gin_trgm_ops`, `gist_trgm_ops`): its trigram set, as
+/// `show_trgm` gives it.
+pub(super) fn index_trigrams(s: &str) -> Vec<String> {
+    trgm_set(s).iter().map(trgm_text).collect()
+}
+
+/// The trigrams every text a `LIKE` (or `ILIKE`) pattern matches has, as a trigram index keeps them: each run of
+/// three letters or digits inside one of the pattern's literal pieces, lower-cased (a trigram index's are), with
+/// `\` escaping the next character. Only runs inside a piece, never a word's padded edges: where the piece meets a
+/// wildcard the text's word may go on. Empty when no piece has three such characters in a row: then the pattern
+/// can't be looked up, and every row is read.
+pub(super) fn like_trigrams(pattern: &str) -> Vec<String> {
+    let mut out: Vec<Trgm> = vec![];
+    let mut run: Vec<char> = vec![];
+    let mut take = |run: &mut Vec<char>| {
+        if run.len() >= 3 {
+            out.extend(run.windows(3).map(compact_trigram));
+        }
+        run.clear();
+    };
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        let c = match c {
+            '%' | '_' => {
+                take(&mut run);
+                continue;
+            }
+            '\\' => match chars.next() {
+                Some(e) => e,
+                None => break,
+            },
+            c => c,
+        };
+        if is_word_char(c) {
+            run.push(lower_char(c));
+        } else {
+            take(&mut run);
+        }
+    }
+    take(&mut run);
+    out.sort_by(trgm_cmp);
+    out.dedup();
+    out.iter().map(trgm_text).collect()
+}
+
 /// `show_trgm(text)`: the trigram set as Postgres prints its elements. A trigram made of letters,
 /// digits and blanks is shown as itself, any other (one that was hashed) as `0x` and six hex digits.
 /// A text of 238,609,292 bytes or more is refused (see `generate_trgm_alloc`).
 pub(super) fn show_trgm(s: &str) -> Result<Vec<String>, Fail> {
     generate_trgm_alloc(s.len())?;
-    Ok(trgm_set(s)
-        .iter()
-        .map(|t| {
-            if t.iter().all(|&b| b.is_ascii_alphanumeric() || b == b' ') {
-                t.iter().map(|&b| b as char).collect()
-            } else {
-                format!("0x{:06x}", u32::from(t[0]) << 16 | u32::from(t[1]) << 8 | u32::from(t[2]))
-            }
-        })
-        .collect())
+    Ok(trgm_set(s).iter().map(trgm_text).collect())
 }
 
 /// count / (len1 + len2 - count), in `float4` like Postgres (`CALCSML`).

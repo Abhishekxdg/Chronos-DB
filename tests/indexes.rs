@@ -604,6 +604,111 @@ fn gin_indexes_find_what_a_scan_finds() {
 }
 
 #[test]
+fn trigram_indexes_find_what_a_scan_finds() {
+    let db = Db::new();
+    let words = [
+        "Hotel",
+        "hotel",
+        "Motel",
+        "hostel",
+        "Hôtel",
+        "Paris",
+        "Berlin",
+        "grand",
+        "one",
+        "Paris-Hilton",
+        "café",
+        "ot%el",
+        "abc_d",
+        "x",
+        "12345",
+        "Straße",
+    ];
+    let mut values = vec![];
+    for i in 0..3000 {
+        let name: Vec<&str> = (0..1 + i % 3).map(|j| words[(i * 7 + j * 11 + i / 13) % words.len()]).collect();
+        values.push(format!("({i}, '{}')", name.join(" ")));
+    }
+    values.push("(3000, null)".into());
+    values.push("(3001, '')".into());
+    for t in ["d", "e"] {
+        sql(&db, &format!("create table {t} (id int primary key, name text)"));
+        sql(&db, &format!("insert into {t} values {}", values.join(", ")));
+    }
+    sql(&db, "create index d_name_trgm on d using gin (name gin_trgm_ops)");
+    sql(&db, "create index d_lower_trgm on d using gist (lower(name) gist_trgm_ops)");
+    let conds = [
+        "name % 'hotel'",
+        "'hotel' % name",
+        "name % 'motel paris'",
+        "name % 'hôtel'",
+        "name % 'x'",
+        "name % ''",
+        "name like '%otel%'",
+        "name like '%Hotel%'",
+        "name like '%otel Par%'",
+        "name like 'grand%'",
+        "name like '%c_d%'",
+        "name like '%ot\\%el%'",
+        "name like '%ab%'",
+        "name like '%hôt%'",
+        "name like '%straße%'",
+        "name not like '%otel%'",
+        "name ilike '%HOTEL%'",
+        "name ilike '%HÔT%'",
+        "name ilike '%paris-hil%'",
+        "lower(name) like '%hôtel%'",
+        "lower(name) like '%345%' and id > 100",
+    ];
+    let same = |db: &Db| {
+        for c in conds {
+            let q = |t: &str| format!("select id from {t} where {c} order by id");
+            assert_eq!(rows(&sql(db, &q("d"))), rows(&sql(db, &q("e"))), "{c}");
+        }
+    };
+    same(&db);
+    for (c, ix) in [
+        ("name % 'hotel'", "d_name_trgm"),
+        ("name like '%otel%'", "d_name_trgm"),
+        ("name ilike '%paris%'", "d_name_trgm"),
+        ("lower(name) like '%paris%'", "d_lower_trgm"),
+    ] {
+        let p = plan(&db, &format!("explain select id from d where {c}"), &[]);
+        assert!(p[0].starts_with(&format!("Bitmap Index Scan using {ix}")), "{c}: {p:?}");
+    }
+    // a pattern with no three letters in a row reads every row
+    let p = plan(&db, "explain select id from d where name like '%ab%'", &[]);
+    assert!(!p[0].starts_with("Bitmap Index Scan"), "{p:?}");
+    assert_eq!(
+        rows(&sql(
+            &db,
+            "select indexdef from pg_indexes where indexname in ('d_name_trgm', 'd_lower_trgm') order by 1"
+        )),
+        [
+            "CREATE INDEX d_lower_trgm ON public.d USING gist (lower(name) gist_trgm_ops)",
+            "CREATE INDEX d_name_trgm ON public.d USING gin (name gin_trgm_ops)",
+        ]
+    );
+    // kept up by writes, and by a merge
+    for t in ["d", "e"] {
+        sql(&db, &format!("update {t} set name = 'Grand Hotel Paris' where id % 10 = 3"));
+        sql(&db, &format!("delete from {t} where id % 10 = 4"));
+    }
+    same(&db);
+    db.fork(MAIN, "w").unwrap();
+    for t in ["d", "e"] {
+        on(&db, "w", &format!("update {t} set name = 'motel one' where id < 50"));
+        on(&db, "w", &format!("insert into {t} values (5000, 'Hotel Berlin')"));
+    }
+    db.merge("w", Resolve::Fail).unwrap();
+    same(&db);
+    assert_eq!(fails(&db, "create index on d using gin (id gin_trgm_ops)").0, "42804");
+    assert_eq!(fails(&db, "create unique index on d using gin (name gin_trgm_ops)").0, "0A000");
+    sql(&db, "drop index d_name_trgm");
+    same(&db);
+}
+
+#[test]
 fn text_key_ranges_read_a_slice_of_the_table() {
     let dir = std::env::temp_dir().join(format!("chronos-textkey-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

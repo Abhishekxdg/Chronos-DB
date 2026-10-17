@@ -271,10 +271,13 @@ fn index_losses(def: &str) -> Vec<String> {
     if def.contains(") INCLUDE (") {
         out.push("INCLUDE columns aren't kept".into());
     }
-    // (pgvector's are kept: they pick the distance an hnsw index's graph is for)
-    let vector =
-        |w: &str| ["vector_cosine_ops", "vector_l2_ops", "vector_ip_ops"].contains(&w.rsplit('.').next().unwrap_or(w));
-    if let Some(c) = words.iter().find(|w| w.ends_with("_ops") && !w.starts_with('"') && !vector(w)) {
+    // (pgvector's are kept: they pick the distance an hnsw index's graph is for; pg_trgm's too: the index is one
+    // of trigrams)
+    let kept = |w: &str| {
+        let w = w.rsplit('.').next().unwrap_or(w);
+        ["vector_cosine_ops", "vector_l2_ops", "vector_ip_ops", "gin_trgm_ops", "gist_trgm_ops"].contains(&w)
+    };
+    if let Some(c) = words.iter().find(|w| w.ends_with("_ops") && !w.starts_with('"') && !kept(w)) {
         out.push(format!("operator class {c} isn't kept (the index finds the same rows without it)"));
     }
     if def.contains(" WITH (") {
@@ -1928,14 +1931,12 @@ fn wipe(password: &mut Option<String>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{collation_warning, unqualify};
+    use super::{collation_warning, index_losses, unqualify};
 
     #[test]
     fn a_vector_operator_class_is_kept() {
-        let losses = super::index_losses("CREATE INDEX d_e ON lab.d USING hnsw (e extensions.vector_cosine_ops)");
+        let losses = index_losses("CREATE INDEX d_e ON lab.d USING hnsw (e extensions.vector_cosine_ops)");
         assert!(losses.is_empty(), "{losses:?}");
-        let losses = super::index_losses("CREATE INDEX t_trgm ON public.t USING gin (title gin_trgm_ops)");
-        assert_eq!(losses, ["operator class gin_trgm_ops isn't kept (the index finds the same rows without it)"]);
     }
 
     #[test]
@@ -1963,6 +1964,14 @@ mod tests {
             assert_eq!(unqualify(sql, &schemas, &names), want, "{sql}");
         }
         assert!(matches!(unqualify("select 1", &schemas, &names), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn a_trigram_operator_class_is_kept() {
+        assert!(index_losses("CREATE INDEX i ON public.d USING gin (name gin_trgm_ops)").is_empty());
+        assert!(index_losses("CREATE INDEX i ON public.d USING gist (name gist_trgm_ops)").is_empty());
+        let l = index_losses("CREATE INDEX i ON public.d USING btree (name text_pattern_ops)");
+        assert!(l.iter().any(|l| l.contains("text_pattern_ops")), "{l:?}");
     }
 
     #[test]

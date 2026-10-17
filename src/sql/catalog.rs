@@ -270,7 +270,11 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
         let pred = x.filter.as_deref().map(|f| expr_def(f, &t.cols, true));
         let unique = t.uniques.iter().any(|u| u.name == x.name);
         let nnd = t.uniques.iter().any(|u| u.name == x.name && u.nnd);
-        let method = if x.gin { "gin" } else { "btree" };
+        let method = match &x.trgm {
+            Some(class) if class.starts_with("gist") => "gist",
+            _ if x.gin => "gin",
+            _ => "btree",
+        };
         let from = up.as_ref().filter(|_| given(&x.name)).and_then(|p| {
             if unique {
                 p.uniques.iter().find(|pu| same_cols(&pu.cols, &x.cols)).map(|pu| pu.name.clone())
@@ -284,7 +288,7 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
         let pred_pretty = x.filter.as_deref().map(|f| pretty_def(f, &t.cols));
         // (an expression that isn't a function call is in parentheses of its own, around its pretty form)
         let mut texts = x.exprs.iter();
-        let parts_pretty = x
+        let parts_pretty: Vec<String> = x
             .cols
             .iter()
             .zip(&parts)
@@ -300,6 +304,11 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
                 }
             })
             .collect();
+        // (a trigram index's one part has its operator class after it, as Postgres shows one that isn't the default)
+        let (mut parts, mut parts_pretty) = (parts, parts_pretty);
+        if let Some(class) = &x.trgm {
+            parts.iter_mut().chain(parts_pretty.iter_mut()).for_each(|p| *p = format!("{p} {class}"));
+        }
         idx.push(Idx {
             name: x.name.clone(),
             unique,

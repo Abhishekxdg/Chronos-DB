@@ -3170,6 +3170,7 @@ pub(super) fn clone_constraints(
                 exprs: x.exprs.clone(),
                 filter: x.filter.clone(),
                 gin: x.gin,
+                trgm: x.trgm.clone(),
                 colls: x.colls.clone(),
             });
         }
@@ -3208,6 +3209,7 @@ pub(super) fn clone_constraints(
             exprs: x.exprs.clone(),
             filter: x.filter.clone(),
             gin: x.gin,
+            trgm: x.trgm.clone(),
             colls: x.colls.clone(),
         });
         child.hier.inherited.push(name);
@@ -3655,6 +3657,7 @@ pub(super) fn spread_index(
                     exprs: ix.exprs.clone(),
                     filter: ix.filter.clone(),
                     gin: ix.gin,
+                    trgm: ix.trgm.clone(),
                     colls: ix.colls.clone(),
                 });
                 if let Some(u) = u {

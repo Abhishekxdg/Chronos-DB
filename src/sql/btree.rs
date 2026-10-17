@@ -22,6 +22,10 @@ pub(super) struct Index {
     pub filter: Option<String>, // a partial index's WHERE: only rows it holds for have entries
     /// GIN on a tsvector: one entry per lexeme of its one part, `...<lexeme>\u{1}<row id>`
     pub gin: bool,
+    /// pg_trgm's operator class (`gin_trgm_ops`, `gist_trgm_ops`) on a text: with `gin`, one entry per trigram of
+    /// its one part (as `show_trgm` writes it) instead of per lexeme, for `%` and `LIKE '%...%'` (see
+    /// `sql::trgm_access`)
+    pub trgm: Option<String>,
     /// each part's collation, in order (none: every part's is the default); a part of text in an ICU collation
     /// holds its key in that collation (see `collation::key`), so entries are in the collation's order
     pub colls: Vec<Coll>,
@@ -179,6 +183,19 @@ pub(super) fn entries(t: &Table, ix: &Index, vals: &[Value], id: &str) -> Vec<St
         && !index_holds(t, f, vals)
     {
         return vec![];
+    }
+    // a trigram index: its text's trigrams
+    if ix.trgm.is_some() {
+        let v = match (ix.cols.first(), ix.exprs.first()) {
+            (Some(&EXPR), Some(e)) => index_value(t, e, vals),
+            (Some(&c), _) => position(t, c).map(|i| vals[i].clone()),
+            _ => None,
+        };
+        let Some(Value::Text(s)) = v else { return vec![] };
+        return super::textext::index_trigrams(&s)
+            .iter()
+            .filter_map(|g| lexeme_key(t, ix, g).map(|k| format!("{k}\u{1}{id}")))
+            .collect();
     }
     let v = match (ix.cols.first(), ix.exprs.first()) {
         (Some(&EXPR), Some(e)) => index_value(t, e, vals),

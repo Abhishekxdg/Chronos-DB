@@ -7351,6 +7351,8 @@ enum Stmt {
         if_not_exists: bool,
         filter: Option<String>, // WHERE, as SQL: a partial index
         using: Using,
+        /// pg_trgm's operator class (`gin_trgm_ops`, `gist_trgm_ops`), with `Using::Gin`: a trigram index
+        trgm: Option<String>,
         /// ON ONLY a partitioned table: its partitions get no index of this (see `hier`)
         only: bool,
         /// CONCURRENTLY (a partitioned table can't have one made so)
@@ -15718,6 +15720,7 @@ impl Parser {
         let only = self.kw("only");
         let table = self.table_name()?;
         let mut using = Using::Btree;
+        let mut trgm = None;
         if self.kw("using") && !self.kw("btree") {
             if ["hnsw", "ivfflat"].into_iter().any(|m| self.kw(m)) {
                 self.expect_sym("(")?;
@@ -15748,15 +15751,20 @@ impl Parser {
             let text = |p: &Self| {
                 p.t.get(p.i + 1) == Some(&Tok::Sym("(")) && p.t.get(p.i + 2) == Some(&Tok::Word("to_tsvector".into()))
             };
-            let trgm = self.t[self.i..]
-                .iter()
-                .any(|t| matches!(t, Tok::Word(w) if w == "gin_trgm_ops" || w == "gist_trgm_ops"));
+            let class = self.t[self.i..].iter().find_map(|t| match t {
+                Tok::Word(w) if w == "gin_trgm_ops" || w == "gist_trgm_ops" => Some(w.clone()),
+                _ => None,
+            });
             using = if self.is_kw("gist") && text(self) {
                 self.i += 1;
                 Using::Gin
-            // a hash or block-range index finds no more than a btree does: it's a btree here; so is gin or
-            // gist with pg_trgm's operator class (a btree finds the same rows: % and LIKE scan)
-            } else if self.kw("hash") || self.kw("brin") || (trgm && (self.kw("gin") || self.kw("gist"))) {
+            // gin or gist with pg_trgm's operator class: an inverted index of the text's trigrams, for % and
+            // LIKE '%...%' (gist's signature tree finds the same rows)
+            } else if class.is_some() && (self.kw("gin") || self.kw("gist")) {
+                trgm = class;
+                Using::Gin
+            // a hash or block-range index finds no more than a btree does: it's a btree here
+            } else if self.kw("hash") || self.kw("brin") {
                 Using::Btree
             } else if self.kw("gin") {
                 Using::Gin
@@ -15935,6 +15943,7 @@ impl Parser {
             if_not_exists,
             filter,
             using,
+            trgm,
             only,
             concurrently,
         })
@@ -22301,7 +22310,15 @@ fn index_sql(x: &btree::Index, t: &str, col_name: &dyn Fn(u32) -> String, unique
         })
         .collect();
     let filter = x.filter.as_ref().map_or(String::new(), |f| format!(" where {f}"));
-    let t = if x.gin { format!("{t} using gin") } else { t.to_string() };
+    // (a trigram index: gist when it was made as one, its one part with its operator class)
+    let (t, parts) = match &x.trgm {
+        Some(class) if class.starts_with("gist") => {
+            (format!("{t} using gist"), vec![format!("{} {class}", parts.join(", "))])
+        }
+        Some(class) => (format!("{t} using gin"), vec![format!("{} {class}", parts.join(", "))]),
+        None if x.gin => (format!("{t} using gin"), parts),
+        None => (t.to_string(), parts),
+    };
     let unique = if unique { "unique " } else { "" };
     format!("create {unique}index {} on {t} ({}){filter};", ident(&x.name), parts.join(", "))
 }
@@ -22888,6 +22905,7 @@ fn parse_schema(name: &str, s: &str) -> Result<Table> {
                     .collect(),
                 filter: x["where"].as_str().map(String::from),
                 gin: x["gin"] == true,
+                trgm: x["trgm"].as_str().map(String::from),
                 colls: x["colls"].as_array().into_iter().flatten().map(collation::Coll::from_json).collect(),
             })
             .collect();
@@ -25674,6 +25692,9 @@ fn schema_json(t: &Table) -> String {
             }
             if x.gin {
                 j["gin"] = Json::Bool(true);
+            }
+            if let Some(o) = &x.trgm {
+                j["trgm"] = Json::String(o.clone());
             }
             if let Some(f) = &x.filter {
                 j["where"] = Json::String(f.clone());
@@ -38935,6 +38956,7 @@ impl Statement {
                 if_not_exists,
                 filter,
                 using,
+                trgm,
                 only,
                 concurrently,
             } => x.create_index(
@@ -38946,7 +38968,7 @@ impl Statement {
                 *nnd,
                 *if_not_exists,
                 filter.as_deref(),
-                *using,
+                (*using, trgm.as_deref()),
                 *only,
                 *concurrently,
             ),
@@ -46537,6 +46559,9 @@ impl Exec<'_> {
         if let Some(a) = self.gin_access(v, t, conds, at)? {
             return Ok(a);
         }
+        if let Some(a) = self.trgm_access(v, t, conds, at)? {
+            return Ok(a);
+        }
         // a world that checks its reads keeps the rows these conditions can match, not the table
         let all = match v.recording() {
             true => {
@@ -46974,7 +46999,8 @@ impl Exec<'_> {
     /// entries allow (& intersects, | unites, a prefix reads a range of lexemes), each rechecked.
     /// None: no such condition, or the query needs every row (a NOT at the top).
     fn gin_access(&self, v: &View, t: &Table, conds: &[&Expr], at: usize) -> Result<Option<Access>> {
-        let gins: Vec<&btree::Index> = t.indexes.iter().filter(|x| x.gin && x.filter.is_none()).collect();
+        let gins: Vec<&btree::Index> =
+            t.indexes.iter().filter(|x| x.gin && x.trgm.is_none() && x.filter.is_none()).collect();
         if gins.is_empty() {
             return Ok(None);
         }
@@ -47012,6 +47038,93 @@ impl Exec<'_> {
                 }
                 self.reads(t, pgstat::Read::Index(ix.name.clone()));
                 return Ok(Some(Access::Rows(rows)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `text % constant` (pg_trgm's similarity test) or `text LIKE constant` (ILIKE too) where a trigram index
+    /// holds that text: the rows its trigrams' entries allow, each rechecked. A row `%` can match has at least
+    /// the threshold's share of the constant's trigrams (its similarity is at most that share); a row LIKE can
+    /// match has every trigram of the pattern's literal runs (see `textext::like_trigrams`). None: no such
+    /// condition, or one the index can't narrow (a constant with no trigrams, a pattern with no three letters in
+    /// a row), and every row is read.
+    fn trgm_access(&self, v: &View, t: &Table, conds: &[&Expr], at: usize) -> Result<Option<Access>> {
+        let ixs: Vec<&btree::Index> =
+            t.indexes.iter().filter(|x| x.gin && x.trgm.is_some() && x.filter.is_none()).collect();
+        if ixs.is_empty() {
+            return Ok(None);
+        }
+        for c in conds {
+            // (the side the index may hold, the constant, and whether it's a similarity test)
+            let (sides, similar): (Vec<(&Expr, &Expr)>, bool) = match c {
+                Expr::Func(Func::Scalar(funcs::Scalar::TrgmTest), args) => match &args[..] {
+                    [Expr::Lit(Value::Text(k)), a, b] if k == "%" => (vec![(a, b), (b, a)], true),
+                    _ => continue,
+                },
+                Expr::Like(a, p, ci, false) => {
+                    // (ILIKE lower-cases as Rust does, the index as pg_trgm does: they agree on ASCII)
+                    let Ok(q) = self.constant(p) else { continue };
+                    if *ci && !q.to_text().is_ascii() {
+                        continue;
+                    }
+                    (vec![(&**a, &**p)], false)
+                }
+                _ => continue,
+            };
+            for (held_side, other) in sides {
+                if !self.fixed(other) {
+                    continue;
+                }
+                let Ok(q) = self.constant(other) else { continue };
+                if q == Value::Null {
+                    continue;
+                }
+                let q = q.to_text();
+                let grams = if similar { textext::index_trigrams(&q) } else { textext::like_trigrams(&q) };
+                if grams.is_empty() {
+                    continue;
+                }
+                let shape = format!("{held_side:?}");
+                for ix in &ixs {
+                    let held = match (ix.cols.first(), ix.exprs.first()) {
+                        (Some(&btree::EXPR), Some(e)) => shift_up(&index_expr(t, e)?, at),
+                        (Some(&c), _) => match position(t, c) {
+                            Some(i) => Expr::Idx(at + i),
+                            None => continue,
+                        },
+                        _ => continue,
+                    };
+                    if format!("{held:?}") != shape {
+                        continue;
+                    }
+                    // how many of the constant's trigrams each row has
+                    let mut have: HashMap<String, usize> = HashMap::new();
+                    for g in &grams {
+                        let Some(k) = btree::lexeme_key(t, ix, g) else { continue };
+                        v.each(&k, None, None, |_, id| {
+                            *have.entry(id.to_string()).or_default() += 1;
+                            Ok::<_, SqlError>(true)
+                        })?;
+                    }
+                    let n = grams.len();
+                    // (a hair under the threshold: similarity is figured in float4, the rows are rechecked)
+                    let enough = |k: usize| {
+                        if similar { k as f64 / n as f64 >= textext::SIMILARITY_THRESHOLD - 1e-6 } else { k == n }
+                    };
+                    let ids: std::collections::BTreeSet<String> =
+                        have.into_iter().filter(|(_, k)| enough(*k)).map(|(id, _)| id).collect();
+                    self.traced(t, &format!("Bitmap Index Scan using {}", ix.name), vec![], Some(ids.len()));
+                    let mut rows = Vec::with_capacity(ids.len());
+                    for id in ids {
+                        let k = row_key(&t.name, &id);
+                        if let Some(raw) = v.get(&k)? {
+                            rows.push((k, raw));
+                        }
+                    }
+                    self.reads(t, pgstat::Read::Index(ix.name.clone()));
+                    return Ok(Some(Access::Rows(rows)));
+                }
             }
         }
         Ok(None)
@@ -50602,6 +50715,7 @@ impl Exec<'_> {
                 exprs: x.exprs.clone(),
                 filter: x.filter.clone(),
                 gin: x.gin,
+                trgm: x.trgm.clone(),
                 colls: x.colls.clone(),
             });
         }
@@ -53566,7 +53680,7 @@ impl Exec<'_> {
         nnd: bool,
         if_not_exists: bool,
         filter: Option<&str>,
-        using: Using,
+        (using, trgm): (Using, Option<&str>),
         only: bool,
         concurrently: bool,
     ) -> Result<Output> {
@@ -53795,7 +53909,15 @@ impl Exec<'_> {
                 // `@>`, `?` and `&&` read the rows, as they do without it; so is one on several of them
                 let kept = |p: &Type| matches!(p, Type::Json | Type::Hstore | Type::Array(_));
                 let lexemes = parts.len() == 1 && parts[0] == Type::TsVector;
-                if parts.is_empty() || !(lexemes || parts.iter().all(kept)) || unique {
+                // a trigram index is on one text (its trigrams are its entries: see `btree::entries`)
+                if let Some(class) = trgm {
+                    if let Some(p) = parts.iter().find(|p| !matches!(p, Type::Text | Type::Name)) {
+                        return err("42804", format!("operator class \"{class}\" does not accept data type {}", p.pg_name()));
+                    }
+                    if parts.len() != 1 || unique {
+                        return err(UNSUPPORTED, "a trigram index here is on one text (a column or an expression), and not unique");
+                    }
+                } else if parts.is_empty() || !(lexemes || parts.iter().all(kept)) || unique {
                     return err(
                         UNSUPPORTED,
                         "a gin index here is on one tsvector (a column or to_tsvector(...)), jsonb, hstore or array, and not unique",
@@ -53812,6 +53934,7 @@ impl Exec<'_> {
                 exprs: exprs.iter().map(|e| collation::bind(v, e)).collect(),
                 filter: filter.map(|f| collation::bind(v, f)),
                 gin,
+                trgm: trgm.filter(|_| gin).map(String::from), // (not where it became a btree: on an ltree)
                 colls,
             };
             if unique && t.hier.part.is_some() {
