@@ -10,7 +10,7 @@
 //! Vectors: an HNSW graph (built in the background) for searches over most of a large table, an
 //! exact binary-quantized scan otherwise. ponytail: equality filters only.
 
-use crate::search::{Metric, VecIndex, VecRows, similarity};
+use crate::search::{Metric, VecIndex, VecRows, for_query, similarity};
 use crate::{Change, Val};
 use roaring::RoaringBitmap;
 use serde_json::Value;
@@ -125,7 +125,12 @@ pub struct TableIndex {
     lens: Vec<u32>,                               // tokens per doc
     avg_len: f32,
     vectors: HashMap<String, (VecIndex, RoaringBitmap)>, // field -> vectors, docs that have one
-    fuzzy: HashMap<String, Vec<String>>,                 // a word and its one-letter deletions -> words (SymSpell)
+    /// a field's vectors rewritten for a distance its pgvector index is for (cosine, L2), when they aren't of unit
+    /// length: a graph by that distance (see `VecIndex::for_metric`)
+    by_metric: HashMap<(String, Metric), VecIndex>,
+    /// the distances it was built for (see `build_for`): a cached index built for others isn't reused
+    metrics: HashMap<String, Vec<Metric>>,
+    fuzzy: HashMap<String, Vec<String>>, // a word and its one-letter deletions -> words (SymSpell)
 }
 
 /// A word and every way of deleting one letter from it.
@@ -186,7 +191,12 @@ impl TableIndex {
     /// Indexes rows given in key order. Rows that aren't JSON objects are kept but match nothing
     /// except an unfiltered listing.
     /// `vectors` are fields given as floats rather than in the row's JSON (SQL's vector columns).
-    pub fn build(rows: impl IntoIterator<Item = (String, Val, Vec<(String, Arc<[f32]>)>)>) -> TableIndex {
+    /// `metrics`, the distances a vector field's pgvector indexes are for (see `sql::ann_metrics`): a graph by each,
+    /// for a field whose vectors need one (see `VecIndex::for_metric`).
+    pub fn build_for(
+        rows: impl IntoIterator<Item = (String, Val, Vec<(String, Arc<[f32]>)>)>,
+        metrics: &HashMap<String, Vec<Metric>>,
+    ) -> TableIndex {
         let mut ix = TableIndex {
             keys: vec![],
             doc: HashMap::new(),
@@ -196,6 +206,8 @@ impl TableIndex {
             lens: vec![],
             avg_len: 0.0,
             vectors: HashMap::new(),
+            by_metric: HashMap::new(),
+            metrics: metrics.clone(),
             fuzzy: HashMap::new(),
         };
         // each field's vectors, indexed once all are seen: its dimension is the most common length,
@@ -241,6 +253,14 @@ impl TableIndex {
             // rows without this field (or with another length): zero vectors, never candidates
             let present = rows.ids().iter().copied().collect();
             ix.vectors.insert(f, (VecIndex::from_rows(rows), present));
+        }
+        for (f, ms) in metrics {
+            let Some((vi, _)) = ix.vectors.get(f) else { continue };
+            for &m in ms {
+                if let Some(d) = vi.for_metric(m) {
+                    ix.by_metric.insert((f.clone(), m), d);
+                }
+            }
         }
         ix.avg_len = ix.lens.iter().sum::<u32>() as f32 / ix.lens.len().max(1) as f32;
         for t in ix.terms.keys().filter(|t| (FUZZY_MIN_LEN..=FUZZY_MAX_LEN).contains(&t.chars().count())) {
@@ -293,7 +313,7 @@ impl TableIndex {
     // while another runs; a queue if many large tables are searched at once.
     pub fn start_graphs(self: &Arc<Self>) {
         static BUSY: AtomicBool = AtomicBool::new(false);
-        if !self.vectors.values().any(|(vi, _)| vi.wants_graph() && !vi.has_graph()) {
+        if !self.graphs().any(|vi| vi.wants_graph() && !vi.has_graph()) {
             return;
         }
         if BUSY.swap(true, Ordering::AcqRel) {
@@ -301,7 +321,7 @@ impl TableIndex {
         }
         let ix = self.clone();
         std::thread::spawn(move || {
-            for (vi, _) in ix.vectors.values().filter(|(vi, _)| vi.wants_graph()) {
+            for vi in ix.graphs().filter(|vi| vi.wants_graph()) {
                 vi.build_graph();
             }
             BUSY.store(false, Ordering::Release);
@@ -310,7 +330,17 @@ impl TableIndex {
 
     /// Whether every vector field that gets a graph has it (for tests and benchmarks).
     pub fn graphs_ready(&self) -> bool {
-        self.vectors.values().all(|(vi, _)| !vi.wants_graph() || vi.has_graph())
+        self.graphs().all(|vi| !vi.wants_graph() || vi.has_graph())
+    }
+
+    /// Whether it was built for these distances (see `build_for`).
+    pub fn built_for(&self, metrics: &HashMap<String, Vec<Metric>>) -> bool {
+        self.metrics == *metrics
+    }
+
+    /// Every vector index that may have a graph: each field's, and its copies for other distances.
+    fn graphs(&self) -> impl Iterator<Item = &VecIndex> {
+        self.vectors.values().map(|(vi, _)| vi).chain(self.by_metric.values())
     }
 
     pub fn delta(&self, changes: Vec<Change>) -> Delta {
@@ -398,7 +428,24 @@ impl TableIndex {
                             f.extend((&c & zeros).iter().take(want).map(|id| (id, 0.0)));
                             f
                         }
-                        false => vi.exact_by_checked(qv, &c, want, m).map_err(stopped)?,
+                        // a graph by this distance, when its pgvector index gave it one and it's ready; else exact.
+                        // (A zero vector has no angle: never a cosine candidate, it joins last, as above)
+                        false => {
+                            let cand = if m == Metric::Cosine { &c - zeros } else { c.clone() };
+                            let walked = self
+                                .by_metric
+                                .get(&(field.clone(), m))
+                                .and_then(|d| d.graph_only(&for_query(m, qv), &cand, want, q.ef, m == Metric::Cosine));
+                            match walked {
+                                Some(mut f) => {
+                                    if m == Metric::Cosine {
+                                        f.extend((&c & zeros).iter().take(want).map(|id| (id, 0.0)));
+                                    }
+                                    f
+                                }
+                                None => vi.exact_by_checked(qv, &c, want, m).map_err(stopped)?,
+                            }
+                        }
                     };
                     // a row that can't be read fails the search rather than keep its rough score
                     let scored = |part: &[(u32, f32)]| -> Vec<crate::Result<(String, f32)>> {

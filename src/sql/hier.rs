@@ -2953,7 +2953,7 @@ pub(super) fn index_names(v: &View) -> Result<HashSet<String>> {
     for t in schemas(v)? {
         out.extend(t.indexes.iter().map(|x| x.name.clone()));
         out.extend(t.uniques.iter().map(|x| x.name.clone()));
-        out.extend(t.ann.iter().map(|(n, _)| n.clone()));
+        out.extend(t.ann.iter().map(|(n, _, _)| n.clone()));
     }
     Ok(out)
 }

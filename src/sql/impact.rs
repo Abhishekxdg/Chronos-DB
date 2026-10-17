@@ -382,7 +382,7 @@ pub(crate) fn readers(
             let kind = if t.uniques.iter().any(|u| u.name == x.name) { "unique" } else { "index" };
             add(kind, &x.name, hit(&cols), String::new());
         }
-        for (name, id) in &t.ann {
+        for (name, id, _) in &t.ann {
             add("vector index", name, hit(&names_of(&[*id])), String::new());
         }
         for tr in &t.triggers {

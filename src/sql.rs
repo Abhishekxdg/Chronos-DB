@@ -7369,6 +7369,8 @@ enum Stmt {
         name: Option<String>,
         table: String,
         col: String,
+        /// its operator class, when one other than pgvector's default (`vector_l2_ops`) is named
+        ops: Option<String>,
         if_not_exists: bool,
     },
     /// ALTER [MATERIALIZED] VIEW [IF EXISTS] name RENAME TO new (`kind`: what it must be)
@@ -15720,8 +15722,27 @@ impl Parser {
             if ["hnsw", "ivfflat"].into_iter().any(|m| self.kw(m)) {
                 self.expect_sym("(")?;
                 let col = self.name()?;
-                self.skip_rest(); // vector_cosine_ops ... ) [WITH (m = 16, ...)]: the search index has its own settings
-                return Ok(Stmt::VectorIndex { name, table, col, if_not_exists });
+                // its operator class, which decides the distance its graph is for (pgvector's default: L2)
+                let ops = match self.peek().cloned() {
+                    Some(Tok::Word(w) | Tok::Ident(w)) if w.ends_with("_ops") => {
+                        self.i += 1;
+                        Some(w)
+                    }
+                    _ => None,
+                };
+                let ops = match ops.as_deref() {
+                    None | Some("vector_l2_ops") => None,
+                    Some(o @ ("vector_cosine_ops" | "vector_ip_ops")) => Some(o.to_string()),
+                    Some(o) => {
+                        return Err(SqlError {
+                            code: "42704",
+                            message: format!("operator class \"{o}\" does not exist for access method \"hnsw\""),
+                            info: None,
+                        });
+                    }
+                };
+                self.skip_rest(); // ) [WITH (m = 16, ...)]: the search index has its own settings
+                return Ok(Stmt::VectorIndex { name, table, col, ops, if_not_exists });
             }
             // gin, or gist, on a tsvector: an inverted index for @@ (checked once the type's known)
             let text = |p: &Self| {
@@ -21472,9 +21493,11 @@ struct Table {
     uniques: Vec<Unique>,
     fks: Vec<Fk>,
     indexes: Vec<btree::Index>,
-    /// pgvector indexes (`USING hnsw`, `ivfflat`): name, column id. Nothing is stored for them;
-    /// they let ORDER BY a distance on that column use the search index's graph (see `nearest`)
-    ann: Vec<(String, u32)>,
+    /// pgvector indexes (`USING hnsw`, `ivfflat`): name, column id, and the operator class when it isn't
+    /// pgvector's default (`vector_cosine_ops`, `vector_ip_ops`; L2's is the default). Nothing is stored for them:
+    /// they let ORDER BY a distance on that column use the search index's graph (see `nearest`), and a cosine or
+    /// L2 one gives that distance a graph of its own on vectors that aren't of unit length (see `ann_metrics`)
+    ann: Vec<(String, u32, Option<String>)>,
     checks: Vec<Check>,
     excludes: Vec<Exclusion>,
     /// CREATE TRIGGER's, in name order (see `functions`)
@@ -22899,7 +22922,10 @@ fn parse_schema(name: &str, s: &str) -> Result<Table> {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|x| Some((x.get(0)?.as_str()?.to_string(), x.get(1)?.as_u64()? as u32)))
+                .filter_map(|x| {
+                    let ops = x.get(2).and_then(|o| o.as_str()).map(String::from);
+                    Some((x.get(0)?.as_str()?.to_string(), x.get(1)?.as_u64()? as u32, ops))
+                })
                 .collect(),
             checks,
             excludes: (j["exclude"].as_array().into_iter().flatten())
@@ -26127,7 +26153,30 @@ pub(crate) fn packed_json(schema: Option<&Val>, raw: &str) -> String {
     }
 }
 
-/// Rows of one table for the search index (see `index::TableIndex::build`): each as JSON without
+/// The distances the pgvector indexes of the table whose schema row is `schema` are for, by vector column: cosine
+/// for `vector_cosine_ops`, L2 for pgvector's default, inner product for `vector_ip_ops`. The search index ranks
+/// every column by inner product; a cosine or L2 index also gets a graph of its own when the column's vectors
+/// aren't of unit length (see `index::TableIndex::build_for`).
+pub(crate) fn ann_metrics(schema: Option<&Val>) -> HashMap<String, Vec<crate::search::Metric>> {
+    use crate::search::Metric;
+    let mut out: HashMap<String, Vec<Metric>> = HashMap::new();
+    let Some(t) = schema.and_then(|s| schema_of(s).ok()) else { return out };
+    for (_, id, ops) in &t.ann {
+        let Some(c) = t.cols.iter().find(|c| c.id == *id) else { continue };
+        let m = match ops.as_deref() {
+            Some("vector_cosine_ops") => Metric::Cosine,
+            Some("vector_ip_ops") => Metric::Dot,
+            _ => Metric::L2,
+        };
+        let ms = out.entry(c.name.clone()).or_default();
+        if !ms.contains(&m) {
+            ms.push(m);
+        }
+    }
+    out
+}
+
+/// Rows of one table for the search index (see `index::TableIndex::build_for`): each as JSON without
 /// its vector columns, and those vectors as floats, so the index needn't print and reparse every
 /// number. The schema is read once. Rows that aren't packed pass through as they are.
 /// A row for the search index: its key, its JSON, and its vector columns by name.
@@ -38909,8 +38958,8 @@ impl Statement {
                 }
                 Ok(out)
             }
-            Stmt::VectorIndex { name, table, col, if_not_exists } => {
-                x.vector_index(name.as_deref(), table, col, *if_not_exists)
+            Stmt::VectorIndex { name, table, col, ops, if_not_exists } => {
+                x.vector_index(name.as_deref(), table, col, ops.as_deref(), *if_not_exists)
             }
             Stmt::Explain { analyze, pg_plan, stmt, original } => {
                 x.explain(stmt, *analyze, *pg_plan, original.as_deref())
@@ -40977,7 +41026,7 @@ fn new_pkey_name(v: &View, t: &Table) -> Result<Option<String>> {
         taken.extend(o.pkey.clone().filter(|_| other && o.has_key()));
         taken.extend(o.indexes.iter().map(|x| x.name.clone()));
         taken.extend(o.uniques.iter().map(|x| x.name.clone()));
-        taken.extend(o.ann.iter().map(|(n, _)| n.clone()));
+        taken.extend(o.ann.iter().map(|(n, _, _)| n.clone()));
         taken.extend(o.checks.iter().map(|x| x.name.clone()));
         taken.extend(o.fks.iter().map(|x| x.name.clone()));
     };
@@ -49672,7 +49721,7 @@ impl Exec<'_> {
         let (Some(c), Some(pk)) = (t.cols.iter().find(|c| c.name == *col), t.key.map(|k| &t.cols[k])) else {
             return Ok(None);
         };
-        if c.ty != Type::Vector || !t.ann.iter().any(|(_, id)| *id == c.id) {
+        if c.ty != Type::Vector || !t.ann.iter().any(|(_, id, _)| *id == c.id) {
             return Ok(None);
         }
         let mut qv: Vec<f32> = as_vector(target.clone())?.to_vec();
@@ -51815,7 +51864,7 @@ impl Exec<'_> {
                     t.uniques.retain(|u| !u.cols.contains(&id));
                     t.fks.retain(|f| !f.cols.contains(&id));
                     t.indexes.retain(|x| !x.cols.contains(&id));
-                    t.ann.retain(|(_, c)| *c != id);
+                    t.ann.retain(|(_, c, _)| *c != id);
                     // a sequence the column owns (an identity column's, or OWNED BY) goes with it
                     for r in v.prefix(&format!("{SEQUENCES}/"))? {
                         let (k, raw) = r?;
@@ -51955,7 +52004,7 @@ impl Exec<'_> {
                             schema_part(&o.name) == schema
                                 && (o.indexes.iter().any(|x| x.name == *b)
                                     || o.uniques.iter().any(|u| u.name == *b)
-                                    || o.ann.iter().any(|(n, _)| n == b)
+                                    || o.ann.iter().any(|(n, _, _)| n == b)
                                     || (o.has_key() && o.pkey_name() == *b))
                         };
                         if named(&t)
@@ -53005,7 +53054,7 @@ impl Exec<'_> {
                         Some((cols, unique, x.filter.is_some()))
                     } else if let Some(u) = t.uniques.iter().find(|u| u.name == *ix) {
                         Some((u.cols.clone(), true, false))
-                    } else if t.ann.iter().any(|(n, _)| n == ix) {
+                    } else if t.ann.iter().any(|(n, _, _)| n == ix) {
                         Some((vec![], false, false))
                     } else {
                         None
@@ -53016,7 +53065,7 @@ impl Exec<'_> {
                             schema_part(&o.name) == schema
                                 && (o.indexes.iter().any(|x| x.name == *ix)
                                     || o.uniques.iter().any(|u| u.name == *ix)
-                                    || o.ann.iter().any(|(n, _)| n == ix)
+                                    || o.ann.iter().any(|(n, _, _)| n == ix)
                                     || (o.has_key() && o.pkey_name() == *ix))
                         });
                         if elsewhere {
@@ -53467,7 +53516,14 @@ impl Exec<'_> {
     // ponytail: the build holds the branch's writer for its length; build in chunks behind a
     // "building" flag if big tables make that pause matter.
     /// A pgvector index: recorded, nothing built (the search index is built on first use).
-    fn vector_index(&self, name: Option<&str>, table: &str, col: &str, if_not_exists: bool) -> Result<Output> {
+    fn vector_index(
+        &self,
+        name: Option<&str>,
+        table: &str,
+        col: &str,
+        ops: Option<&str>,
+        if_not_exists: bool,
+    ) -> Result<Output> {
         self.db.batch_with(self.branch, |v| {
             let mut t = need_table(v, table)?;
             let Some(c) = t.cols.iter().find(|c| c.name == col) else {
@@ -53484,7 +53540,7 @@ impl Exec<'_> {
             let taken = |o: &Table| {
                 o.indexes.iter().any(|x| x.name == name)
                     || o.uniques.iter().any(|u| u.name == name)
-                    || o.ann.iter().any(|(n, _)| *n == name)
+                    || o.ann.iter().any(|(n, _, _)| *n == name)
             };
             if schemas(v)?.iter().any(taken) {
                 if if_not_exists {
@@ -53493,7 +53549,7 @@ impl Exec<'_> {
                 }
                 return err("42P07", format!("relation \"{name}\" already exists"));
             }
-            t.ann.push((name, id));
+            t.ann.push((name, id, ops.map(String::from)));
             Ok((vec![(schema_key(table), Some(schema_json(&t)))], ()))
         })?;
         Ok(Output::tag("CREATE INDEX"))
@@ -53712,7 +53768,7 @@ impl Exec<'_> {
             let taken = |o: &Table| {
                 o.indexes.iter().any(|x| x.name == name)
                     || o.uniques.iter().any(|u| u.name == name)
-                    || o.ann.iter().any(|(n, _)| *n == name)
+                    || o.ann.iter().any(|(n, _, _)| *n == name)
             };
             if schemas(v)?.iter().any(taken) {
                 if if_not_exists {
@@ -53786,7 +53842,7 @@ impl Exec<'_> {
         };
         self.db.batch_with(self.branch, |v| {
             let has = |t: &Table| {
-                visible(t) && (t.indexes.iter().any(|x| x.name == name) || t.ann.iter().any(|(n, _)| n == name))
+                visible(t) && (t.indexes.iter().any(|x| x.name == name) || t.ann.iter().any(|(n, _, _)| n == name))
             };
             let Some(mut t) = schemas(v)?.into_iter().find(has) else {
                 if if_exists {
@@ -53820,7 +53876,7 @@ impl Exec<'_> {
                 t.hier.clustered = None; // (the mark goes with the index)
             }
             t.indexes.retain(|x| x.name != name);
-            t.ann.retain(|(n, _)| n != name);
+            t.ann.retain(|(n, _, _)| n != name);
             let mut gone = vec![btree::prefix(&t.name, name)];
             if t.uniques.iter().any(|u| u.name == name) {
                 t.uniques.retain(|u| u.name != name); // made by CREATE UNIQUE INDEX

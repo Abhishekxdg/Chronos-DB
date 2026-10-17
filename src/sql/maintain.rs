@@ -537,7 +537,7 @@ fn has_index(t: &Table, ix: &str) -> bool {
     (t.has_key() && t.pkey_name() == ix)
         || t.uniques.iter().any(|u| u.name == ix)
         || t.indexes.iter().any(|x| x.name == ix)
-        || t.ann.iter().any(|(n, _)| n == ix)
+        || t.ann.iter().any(|(n, _, _)| n == ix)
 }
 
 /// Whether table `t` may be clustered on its index `ix`, as Postgres's `check_index_is_clusterable` asks (and,
@@ -553,7 +553,7 @@ pub(super) fn clusterable(v: &View, t: &Table, ix: &str) -> Result<()> {
         return err("42704", format!("index \"{ix}\" for table \"{table}\" does not exist"));
     }
     let x = t.indexes.iter().find(|x| x.name == ix);
-    if t.ann.iter().any(|(n, _)| n == ix) || x.is_some_and(|x| x.gin) {
+    if t.ann.iter().any(|(n, _, _)| n == ix) || x.is_some_and(|x| x.gin) {
         return err(
             UNSUPPORTED,
             format!("cannot cluster on index \"{ix}\" because access method does not support clustering"),

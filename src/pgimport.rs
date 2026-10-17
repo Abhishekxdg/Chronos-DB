@@ -271,7 +271,10 @@ fn index_losses(def: &str) -> Vec<String> {
     if def.contains(") INCLUDE (") {
         out.push("INCLUDE columns aren't kept".into());
     }
-    if let Some(c) = words.iter().find(|w| w.ends_with("_ops") && !w.starts_with('"')) {
+    // (pgvector's are kept: they pick the distance an hnsw index's graph is for)
+    let vector =
+        |w: &str| ["vector_cosine_ops", "vector_l2_ops", "vector_ip_ops"].contains(&w.rsplit('.').next().unwrap_or(w));
+    if let Some(c) = words.iter().find(|w| w.ends_with("_ops") && !w.starts_with('"') && !vector(w)) {
         out.push(format!("operator class {c} isn't kept (the index finds the same rows without it)"));
     }
     if def.contains(" WITH (") {
@@ -1926,6 +1929,14 @@ fn wipe(password: &mut Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::{collation_warning, unqualify};
+
+    #[test]
+    fn a_vector_operator_class_is_kept() {
+        let losses = super::index_losses("CREATE INDEX d_e ON lab.d USING hnsw (e extensions.vector_cosine_ops)");
+        assert!(losses.is_empty(), "{losses:?}");
+        let losses = super::index_losses("CREATE INDEX t_trgm ON public.t USING gin (title gin_trgm_ops)");
+        assert_eq!(losses, ["operator class gin_trgm_ops isn't kept (the index finds the same rows without it)"]);
+    }
 
     #[test]
     fn extension_names_lose_the_schema_postgres_kept_them_in() {

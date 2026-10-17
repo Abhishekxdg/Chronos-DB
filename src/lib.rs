@@ -3804,8 +3804,11 @@ impl Core {
         budget: usize,
     ) -> Result<Option<(Arc<index::TableIndex>, Vec<Change>)>> {
         let prefix = format!("{table}/");
+        // the distances its pgvector indexes are for: an index built for others (made before CREATE INDEX ...
+        // vector_cosine_ops, say) is built again
+        let metrics = sql::ann_metrics(self.val(s, &format!("{}/{table}", sql::SCHEMAS))?.as_ref());
         let cached = self.indexes.lock().unwrap().get(table).cloned().unwrap_or_default();
-        for (anchor, ix) in cached.iter().rev() {
+        for (anchor, ix) in cached.iter().rev().filter(|(_, ix)| ix.built_for(&metrics)) {
             let delta: Vec<Change> =
                 self.state_diff(anchor, s)?.into_iter().filter(|c| c.key.starts_with(&prefix)).collect();
             if delta.len() <= 256.max(ix.len() / 20) {
@@ -3827,7 +3830,7 @@ impl Core {
         }
         let schema = self.val(s, &format!("{}/{table}", sql::SCHEMAS))?;
         let rows = sql::search_rows(schema, rows);
-        let ix = Arc::new(index::TableIndex::build(rows));
+        let ix = Arc::new(index::TableIndex::build_for(rows, &metrics));
         let mut c = self.indexes.lock().unwrap();
         let anchors = c.entry(table.to_string()).or_default();
         anchors.push((s.clone(), ix.clone()));

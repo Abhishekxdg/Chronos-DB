@@ -319,14 +319,19 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
             collate,
         });
     }
-    for (name, c) in &t.ann {
+    for (name, c, ops) in &t.ann {
+        // the operator class, as Postgres writes it: only when it isn't the type's default
+        let part = match ops {
+            Some(o) => format!("{} {o}", named(*c)),
+            None => named(*c),
+        };
         idx.push(Idx {
             name: name.clone(),
             unique: false,
             primary: false,
             cols: vec![num(*c)],
-            parts: vec![named(*c)],
-            parts_pretty: vec![named(*c)],
+            parts: vec![part.clone()],
+            parts_pretty: vec![part],
             pred: None,
             pred_pretty: None,
             valid: true,

@@ -69,11 +69,52 @@ const PARALLEL_MIN: u64 = 50_000;
 
 /// What a search ranks by. The index ranks by dot product; for vectors of unit length that's the
 /// same order as by cosine or Euclidean (L2) distance, and for others `exact_by` compares them all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Metric {
     Dot,
     Cosine,
     L2,
+}
+
+/// `v` as a copy for distance `m` keeps it (see `VecIndex::for_metric`): of unit length for cosine, whose order
+/// inner product then gives; as it is for the others (L2's copy has a graph by Euclidean distance itself).
+pub fn for_index(m: Metric, v: &[f32]) -> Vec<f32> {
+    match m {
+        Metric::Cosine => {
+            let n = dot(v, v).sqrt();
+            if n > 0.0 && n.is_finite() { v.iter().map(|x| x / n).collect() } else { v.to_vec() }
+        }
+        _ => v.to_vec(),
+    }
+}
+
+/// A query `q` for a copy made by `for_index`, rewritten as it rewrites vectors.
+pub fn for_query(m: Metric, q: &[f32]) -> Vec<f32> {
+    for_index(m, q)
+}
+
+/// A store ranked by Euclidean distance, for the graph of an L2 copy (see `VecIndex::for_metric`): between two
+/// stored vectors `-|a - b|²`, from their inner product and the squared lengths kept; from a query `2 q·v - |v|²`,
+/// which ranks by distance to `q` leaving out `|q|²`, the same for every `v`. A graph walks well by a true distance,
+/// where one by inner product on rewritten vectors found only 90% of the true neighbours.
+struct L2Space<'a> {
+    store: &'a Store,
+    norms: &'a [f32],
+}
+
+impl Space for L2Space<'_> {
+    fn len(&self) -> usize {
+        self.store.len()
+    }
+    fn between(&self, a: u32, b: u32) -> f32 {
+        2.0 * self.store.between(a, b) - self.norms[a as usize] - self.norms[b as usize]
+    }
+    fn to(&self, q: &[f32], id: u32) -> f32 {
+        2.0 * self.store.to(q, id) - self.norms[id as usize]
+    }
+    fn fetch(&self, id: u32) {
+        self.store.fetch(id)
+    }
 }
 
 /// How near `v` is to `q` by `m`, higher nearer: the dot product, cosine similarity (with `q` of
@@ -132,6 +173,8 @@ pub struct VecIndex {
     ef: AtomicUsize,
     /// the default beam `calibrate` chose for this graph
     tuned_ef: OnceLock<usize>,
+    /// a copy for L2 (see `for_metric`): its graph is by Euclidean distance, with each vector's squared length here
+    l2: Option<Vec<f32>>,
 }
 
 impl VecIndex {
@@ -151,6 +194,7 @@ impl VecIndex {
             building: AtomicBool::new(false),
             ef: AtomicUsize::new(0),
             tuned_ef: OnceLock::new(),
+            l2: None,
         }
     }
 
@@ -238,7 +282,10 @@ impl VecIndex {
         if self.graph.get().is_some() || self.building.swap(true, Ordering::AcqRel) {
             return false;
         }
-        let g = Hnsw::build(&self.store);
+        let g = match &self.l2 {
+            Some(norms) => Hnsw::build(&L2Space { store: &self.store, norms }),
+            None => Hnsw::build(&self.store),
+        };
         let _ = self.graph.set(g);
         let _ = self.graph_recall.set(self.calibrate());
         true
@@ -280,7 +327,7 @@ impl VecIndex {
                 // ponytail: one full pass over the vectors per probe (128 passes); batch the probes
                 // into one pass if that shows up in build time at tens of millions of vectors
                 let want = self
-                    .exact_in(&q, &self.all, 11, Metric::Dot)
+                    .exact_in(&q, &self.all, 11, if self.l2.is_some() { Metric::L2 } else { Metric::Dot })
                     .expect(UNSTOPPED)
                     .into_iter()
                     .map(|(x, _)| x)
@@ -402,11 +449,62 @@ impl VecIndex {
         codes: bool,
     ) -> Option<Vec<(u32, f32)>> {
         let g = self.graph.get()?;
+        if let Some(norms) = &self.l2 {
+            return Some(g.search(&L2Space { store: &self.store, norms }, q, k, ef, allow));
+        }
         if !codes {
             return Some(g.search(&self.store, q, k, ef, allow));
         }
         let qb = signs(q, self.words);
         Some(self.rescore(q, g.candidates(&self.bits, self.words, &qb, ef.max(k), allow).into_iter(), k))
+    }
+
+    /// A copy of these vectors for distance `m`, to give `m` a graph of its own (see `for_index`): for cosine, of unit
+    /// length, which inner product ranks as cosine does; for L2, as they are, with a graph by Euclidean distance (see
+    /// `L2Space`). None when this index already ranks by `m` (inner product, or vectors of unit length), or is too
+    /// small for a graph.
+    pub fn for_metric(&self, m: Metric) -> Option<VecIndex> {
+        if m == Metric::Dot || self.unit || !self.wants_graph() {
+            return None;
+        }
+        let mut rows = VecRows::new(self.dim, self.all.len() as usize);
+        for id in &self.all {
+            rows.push(id, &for_index(m, &self.store.get(id)));
+        }
+        let mut ix = VecIndex::from_rows(rows);
+        ix.pad_to(self.len());
+        if m == Metric::L2 {
+            ix.l2 = Some((0..ix.len() as u32).map(|id| ix.store.between(id, id)).collect());
+        }
+        Some(ix)
+    }
+
+    /// The top `k` of `bm` by inner product through the graph alone, as `search_in_ef_checked` would walk it: when
+    /// the graph is built, measured good (see `calibrate`), and `bm` keeps at least half the vectors. None
+    /// otherwise, and when the walk comes up short: the caller then compares exactly. For a graph of
+    /// `for_metric`'s, whose 1-bit scan would rank by the wrong thing.
+    pub fn graph_only(
+        &self,
+        q: &[f32],
+        bm: &RoaringBitmap,
+        k: usize,
+        ef: usize,
+        codes: bool,
+    ) -> Option<Vec<(u32, f32)>> {
+        let k = k.min(bm.len() as usize);
+        if k == 0 {
+            return Some(vec![]);
+        }
+        let n = self.len() as u64;
+        if !graphs_on() || bm.len() < n / 2 || !self.graph_recall().is_some_and(|r| r >= GOOD) {
+            return None;
+        }
+        let ef = match (ef, self.ef.load(Ordering::Relaxed)) {
+            (0, 0) => (4 * k).max(self.tuned_ef().unwrap_or(EF_MIN)).min(EF_MAX),
+            (0, e) | (e, _) => e.min(n as usize).max(k),
+        };
+        let allow = (bm.len() < n).then_some(bm);
+        self.walk(q, k, ef, allow, codes && self.dim >= CODE_WALK_DIM).filter(|f| f.len() >= k)
     }
 
     /// Whether this many vectors are worth a graph: more than a quick scan (see `SMALL_SCAN`).

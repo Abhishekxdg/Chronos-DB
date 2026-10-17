@@ -288,3 +288,55 @@ fn eight_bit_l2_over_huge_numbers_drops_nothing() {
     let got: Vec<u32> = ix.exact_by(&vecs[2], &all, 1, Metric::L2).into_iter().map(|(i, _)| i).collect();
     assert!(got.contains(&2), "the vector equal to the query: {got:?}");
 }
+
+/// A cosine or L2 index on vectors that aren't of unit length gets a graph of its own, over copies rewritten so
+/// inner product ranks them as that distance does (`for_metric`): its walk finds the true nearest by the distance,
+/// where the inner-product graph would rank by the wrong thing. Issue #32.
+#[test]
+fn a_graph_per_distance_finds_the_true_neighbours() {
+    // 80,000 x 32: past SMALL_SCAN, so the index wants a graph
+    let (n, dim) = (80_000, 32);
+    let mut s = 19u64;
+    let mut r = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (s >> 11) as f32 / (1u64 << 53) as f32 - 0.5
+    };
+    // points near a low-dimensional patch, as embeddings are (uniform noise in every dimension is a case no graph
+    // walks well), with lengths from 0.2 to 3.2: inner product ranks these unlike cosine or L2
+    let sub = 8;
+    let basis: Vec<Vec<f32>> = (0..sub).map(|_| (0..dim).map(|_| r()).collect()).collect();
+    let mut ix = VecIndex::new(dim);
+    for _ in 0..n {
+        let z: Vec<f32> = (0..sub).map(|_| r()).collect();
+        let scale = 0.2 + 3.0 * (r() + 0.5);
+        let v: Vec<f32> =
+            (0..dim).map(|i| scale * ((0..sub).map(|j| z[j] * basis[j][i]).sum::<f32>() + 0.02 * r())).collect();
+        ix.add(&v, &[]);
+    }
+    assert!(!ix.unit());
+    assert!(ix.for_metric(Metric::Dot).is_none(), "inner product is the index's own order");
+    let all: roaring::RoaringBitmap = (0..n as u32).collect();
+    for m in [Metric::Cosine, Metric::L2] {
+        let d = ix.for_metric(m).expect("a copy for a distance the index doesn't rank by");
+        d.build_graph();
+        let self_test = d.graph_recall().unwrap();
+        assert!(self_test >= 0.99, "{m:?}: self-test recall {self_test}");
+        let (mut hit, mut total) = (0, 0);
+        for _ in 0..50 {
+            let z: Vec<f32> = (0..sub).map(|_| r()).collect();
+            let q: Vec<f32> = (0..dim).map(|i| 2.0 * (0..sub).map(|j| z[j] * basis[j][i]).sum::<f32>()).collect();
+            let qn = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let unit_q: Vec<f32> = q.iter().map(|x| x / qn).collect();
+            let truth = ids(ix.exact_by(if m == Metric::Cosine { &unit_q } else { &q }, &all, 10, m));
+            let got = d
+                .graph_only(&chronos::search::for_query(m, &q), &all, 10, 0, false)
+                .expect("the graph is built and good");
+            let got = ids(got);
+            hit += truth.iter().filter(|x| got.contains(x)).count();
+            total += truth.len();
+        }
+        assert!(hit as f32 / total as f32 >= 0.95, "{m:?}: held-out recall {hit}/{total}");
+    }
+}

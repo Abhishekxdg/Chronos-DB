@@ -2422,6 +2422,40 @@ fn pgvector_index_route() {
     assert_eq!(fails(&db, "create index on m using hnsw (kind)").0, "0A000");
 }
 
+/// A pgvector index keeps its operator class (issue #32): pg_get_indexdef shows it as Postgres does (L2's, the
+/// default, left out), the distance queries use is still any of the three, and an unknown class is refused as
+/// Postgres refuses it.
+#[test]
+fn hnsw_keeps_its_operator_class() {
+    let db = Db::new();
+    let mut s = chronos::sql::Session::new(MAIN);
+    let mut q = |x: &str| rows(&s.run(&db, x, &[]).unwrap_or_else(|e| panic!("{x}: {e}")).pop().unwrap());
+    q("create table v (id int primary key, e vector(2))");
+    q("insert into v values (1, '[1,0]'), (2, '[0,3]'), (3, '[2,2]')");
+    q("create index v_cos on v using hnsw (e vector_cosine_ops)");
+    q("create index v_l2 on v using hnsw (e vector_l2_ops) with (m = 16)");
+    q("create index v_ip on v using hnsw (e vector_ip_ops)");
+    q("create index v_plain on v using hnsw (e)");
+    assert_eq!(
+        q(
+            "select indexname || ': ' || indexdef from pg_indexes where tablename = 'v' and indexname <> 'v_pkey' order by 1"
+        ),
+        [
+            "v_cos: CREATE INDEX v_cos ON public.v USING hnsw (e vector_cosine_ops)",
+            "v_ip: CREATE INDEX v_ip ON public.v USING hnsw (e vector_ip_ops)",
+            "v_l2: CREATE INDEX v_l2 ON public.v USING hnsw (e)",
+            "v_plain: CREATE INDEX v_plain ON public.v USING hnsw (e)",
+        ]
+    );
+    // each distance still ranks as it should, whichever indexes the column has
+    assert_eq!(q("select id from v order by e <=> '[1,0.1]' limit 1"), ["1"]);
+    assert_eq!(q("select id from v order by e <-> '[0,2.5]' limit 1"), ["2"]);
+    assert_eq!(q("select id from v order by e <#> '[1,1]' limit 1"), ["3"]);
+    let (code, message) = fails(&db, "create index on v using hnsw (e vector_hamming_ops)");
+    assert_eq!(code, "42704", "{message}");
+    assert_eq!(message, "operator class \"vector_hamming_ops\" does not exist for access method \"hnsw\"");
+}
+
 #[test]
 fn hnsw_ef_search_is_a_session_setting() {
     let db = Db::new();

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **pgvector indexes keep their operator class, and cosine and L2 get a graph of their own.** `USING hnsw (e vector_cosine_ops)` (or `vector_ip_ops`) is kept and shown by `pg_get_indexdef` and `pg_indexes` as Postgres shows it, so `pg_dump` carries it; an unknown class is 42704, as in Postgres. The search index ranks every vector column by inner product, the cosine and L2 order only for vectors of unit length; for vectors that aren't, a cosine or L2 index now gets a graph of its own (over unit-length copies for cosine, by Euclidean distance for L2), so `ORDER BY e <=> q LIMIT k` walks a graph instead of comparing every row: on 200,000 vectors of 384 dimensions and mixed lengths, cosine went from 15.6 ms to 0.57 ms (97.7% recall@10) and L2 from 15.1 ms to 1.24 ms (98.5%) (`examples/metric_graphs.rs`). `chronos import` no longer reports pgvector's operator classes as dropped. Trigram indexes are still kept as btrees (documented). [Issue #32](https://github.com/Abhishekxdg/chronosdb/issues/32).
+
 ## 0.3.1 (beta), 2026-10-17
 
 **Fixes for importing from Supabase (and any Postgres with row-level security, or extensions in a schema of their own).** Found importing Supabase projects in tests the day 0.3.0 came out: a shop schema with Supabase's `auth` and `storage`, then pgvector embeddings, PostGIS points, a million partitioned rows and two dozen awkward column types. Everything that came over matched Supabase value for value; these are what didn't.
