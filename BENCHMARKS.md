@@ -892,6 +892,22 @@ bench/slt/par.sh chronos out-chronos 3 $(find sqllogictest/test -name '*.test')
 bench/slt/par.sh postgres out-postgres 2 $(find sqllogictest/test -name '*.test')   # Postgres at host=/tmp
 ```
 
+## 14. Attach: writing merges back to a managed Postgres (Neon)
+
+*2026-10-17. Chronos on the chronos-test VM (GCP, Mumbai); Postgres 16.15 on Neon (AWS Singapore, 0.25 compute units, the smallest), about 60 ms apart. One run, so read these as orders of magnitude.*
+
+`chronos attach` of two tables (200 accounts, 20,000 leads with a `serial` id and a trigger that sets `updated_at`), then merges of worlds into main, each written to Neon first (see [the guide](docs/guides/attach-postgres.md)). The same run twice: straight to the database, and through Neon's pooler (PgBouncer, transaction mode).
+
+| | direct | through the pooler |
+|---|---:|---:|
+| attach: copy 20,200 rows in one consistent read | 7.7 s | 7.9 s |
+| merge 1,000 updated rows | 1.19 s | 1.20 s |
+| merge 1,000 inserted rows (ids reserved from Neon's sequence) | 1.19 s | 1.19 s |
+| merge 500 deleted rows | 1.13 s | 1.07 s |
+| a row changed in Neon meanwhile | conflict, nothing written | conflict, nothing written |
+
+After the run, Neon and Chronos's main held the same rows (count, sum of `score`, highest id), and main held every `updated_at` Neon's trigger set. A merge's time is mostly round trips to Neon (a new TLS connection and login, then about four statements per table), so it grows with the distance to the database, not much with the rows: it is not a measure of Chronos itself. The transaction-mode pooler works because every setting a write-back makes is `SET LOCAL` and every statement is unnamed.
+
 ## Rerun everything
 
 ```bash

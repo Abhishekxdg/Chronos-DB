@@ -58,7 +58,8 @@ person approves by merging the queued world.
   Postgres's other changes, attach again into a new folder (no refresh yet).
 - Triggers stay in Postgres and run as the merge is written. Rows they change in other tables show up as conflicts
   later, not in main right away.
-- A transaction-mode pooler (PgBouncer, Supavisor) is untested.
+- Tested on Neon, both straight to the database and through its pooler (PgBouncer, transaction mode): a merge of
+  1,000 rows took about 1.2 s from a machine 60 ms away, mostly round trips ([BENCHMARKS.md §14](https://github.com/Abhishekxdg/chronosdb/blob/main/BENCHMARKS.md#14-attach-writing-merges-back-to-a-managed-postgres-neon)).
 
 ## After a crash
 
