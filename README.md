@@ -29,6 +29,8 @@ What keeps to the rules is written back to your Postgres in one checked transact
 
 </div>
 
+<p align="center"><img src="docs/assets/attach-demo.gif" alt="An agent cleans up a CRM in its own world beside a real Postgres: the diff, a merge policy holding back its deletes, Postgres unchanged until a person approves, then the change written to Postgres" width="820"></p>
+
 > [!IMPORTANT]
 > **Public beta (0.2): try it on a staging copy, not production.** Nobody outside the author has run a real agent on it yet, and it is built by one person.
 > - **Attach** (working beside your Postgres) is new: at most 10,000 changed rows per merge, no refresh of rows a merge doesn't touch, tables need a primary key. Tested on Neon, direct and through its pooler. See [Working beside your Postgres](docs/guides/attach-postgres.md).
