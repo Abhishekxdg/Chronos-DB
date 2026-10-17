@@ -3670,10 +3670,12 @@ impl Core {
         Ok(self.branch(b)?.stamp.load(Ordering::Relaxed))
     }
 
+    /// Row `k` of world `b`, as the world outside SQL sees it (see `show`): the row API's and the shell's read, which
+    /// goes in the world's read set when it checks its reads (see `stale`), as a SQL read of the row does.
     pub fn get(&self, b: &str, k: &str) -> Result<Option<Val>> {
-        let s = self.view_tx(b)?.s;
-        let k = self.typed(&s, k)?;
-        self.val(&s, &k)?.map(|v| self.show(&s, &k, v, &mut HashMap::new())).transpose()
+        let v = self.view_tx(b)?;
+        let k = self.typed(&v.s, k)?;
+        v.get(&k)?.map(|x| self.show(&v.s, &k, x, &mut HashMap::new())).transpose()
     }
 
     /// A row key as people type it (`orders/5`) as its table stores it (see `sql::typed_key`).
@@ -6500,6 +6502,13 @@ impl View<'_> {
             traced::spoil();
         }
         self.core.find_within(self.born, &self.s, q, budget)
+    }
+
+    /// Whether any row's key starts with `prefix`, without counting as a read of them (see `stale`): for telling
+    /// that a table without a SQL schema exists, which decides nothing about its rows. What then reads them (a
+    /// scan, a key) records what it reads.
+    pub(crate) fn any_under(&self, prefix: &str) -> Result<bool> {
+        Ok(self.core.rows(&self.s, prefix)?.next().transpose()?.is_some_and(|(k, _)| k.starts_with(prefix)))
     }
 
     /// Rows whose key starts with `prefix`, in key order, read lazily.

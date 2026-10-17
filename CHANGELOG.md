@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **The row API's `get` is checked as a read.** In a world that checks its reads, a row read with `get` (HTTP, MCP or the shell) wasn't recorded at all, so a merge decided on it went through after the row changed, and `CHECK READS` didn't list it. And a table made without SQL (rows `put` as JSON) counted as read whole whenever it was named, so a change to any of its rows held the merge. Now `get` records its row, as a SQL lookup does, and telling that such a table exists reads none of its rows.
+
 ## 0.3.2 (beta), 2026-10-17
 
 **Agents can check their reads between steps, and a vetoed effect's record is safer to keep.** Most of this came from the 0.2.0 release threads on r/AI_Agents: `CHECK READS` (Abhishekxdg/chronosdb#35) and the keyed hash for discarded effects (Abhishekxdg/chronosdb#36). Also trigram indexes and per-metric pgvector graphs.

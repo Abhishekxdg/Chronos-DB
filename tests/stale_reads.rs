@@ -334,3 +334,30 @@ fn reads_survive_a_server_closing_and_exiting() {
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The row API's `get` (HTTP, MCP, the shell) is a read of its row like SQL's: recorded, and only the row, also for a
+/// table without a SQL schema (telling that one exists reads none of its rows).
+#[test]
+fn the_row_apis_get_records_its_row_and_only_it() {
+    let db = Db::new();
+    db.put(MAIN, "notes/1", r#"{"v":1}"#).unwrap();
+    db.put(MAIN, "notes/2", r#"{"v":2}"#).unwrap();
+    run(&db, MAIN, "create world w with (check_reads = true)", &[]).unwrap();
+    assert!(db.get("w", "notes/1").unwrap().is_some());
+    // other rows of the table may change, and rows be added
+    db.put(MAIN, "notes/2", r#"{"v":20}"#).unwrap();
+    db.put(MAIN, "notes/3", r#"{"v":3}"#).unwrap();
+    assert_eq!(db.reads_changed("w").unwrap(), vec![]);
+    // the row it read may not
+    db.put(MAIN, "notes/1", r#"{"v":10}"#).unwrap();
+    let why = db.reads_changed("w").unwrap();
+    assert!(why.len() == 1 && why[0].1.contains("notes/1"), "{why:?}");
+    let e = run(&db, MAIN, "merge world w", &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    // a row looked for and not found counts once it's added
+    run(&db, MAIN, "create world gap with (check_reads = true)", &[]).unwrap();
+    assert!(db.get("gap", "notes/9").unwrap().is_none());
+    db.put(MAIN, "notes/9", r#"{"v":9}"#).unwrap();
+    let why = db.reads_changed("gap").unwrap();
+    assert!(why.iter().any(|(_, w)| w.contains("notes/9")), "{why:?}");
+}

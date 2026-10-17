@@ -22695,8 +22695,9 @@ fn load_world(v: &View, name: &str) -> Result<Option<Table>> {
         }
         return Ok(Some(t));
     }
-    let prefix = format!("{name}/");
-    if v.prefix(&prefix)?.next().is_none() {
+    // (a table without a schema exists while it has a row: telling so reads none of them, for a world that checks
+    // its reads; see `View::any_under`)
+    if !v.any_under(&format!("{name}/"))? {
         return Ok(None);
     }
     let id = Col { not_null: true, ..Col::new(name, "id", Type::Text) };
