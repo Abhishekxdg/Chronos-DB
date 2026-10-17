@@ -219,3 +219,29 @@ fn a_checked_merge_survives_a_restart() {
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A scan run again and again with the same conditions (an agent's loop) is kept once: past `MOST_FILTERS` (1,000)
+/// filtered scans of one table it would otherwise count as reading the whole table, and any change to it would hold
+/// the merge. Issue #29.
+#[test]
+fn the_same_filtered_scan_is_kept_once() {
+    let db = Db::new();
+    run(&db, MAIN, "create table leads (id int primary key, owner text, region text)", &[]).unwrap();
+    run(&db, MAIN, "insert into leads select g, 'o' || (g % 25), 'r' || (g % 7) from generate_series(1, 2000) g", &[])
+        .unwrap();
+    run(&db, MAIN, "create world loop with (check_reads = true)", &[]).unwrap();
+    let mut s = Session::new("loop");
+    // 1,500 scans over 10 distinct conditions (owner isn't indexed: each is a filtered scan of the table)
+    for i in 0..1500 {
+        s.run(&db, &format!("select count(*) from leads where owner = 'o{}'", i % 10), &[]).unwrap();
+    }
+    s.run(&db, "update leads set region = 'done' where id = 25", &[]).unwrap(); // owner o0
+    // rows it never read (another owner) change in main: still merges
+    run(&db, MAIN, "update leads set region = 'x' where owner = 'o13'", &[]).unwrap();
+    let plan = db.merge_preview("loop", &Default::default()).unwrap();
+    assert!(plan.blocked.is_none(), "{:?}", plan.blocked);
+    // one it read (owner o7) holds it, as before
+    run(&db, MAIN, "update leads set region = 'y' where id = 7", &[]).unwrap();
+    let e = run(&db, MAIN, "merge world loop", &[]).unwrap_err();
+    assert!(e.code == "40001" && e.message.contains("leads/7"), "{}", e.message);
+}

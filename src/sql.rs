@@ -27686,20 +27686,44 @@ impl RowFilter {
             .collect::<Option<_>>()?;
         Some(RowFilter { table: j["table"].as_str()?.to_string(), conds })
     }
+}
 
-    /// Whether the row stored at `key` as `raw`, in state `v`, may pass: true when unsure (the
-    /// table or a column gone, a value that won't compare).
-    pub(crate) fn matches(&self, v: &View, key: &str, raw: &str) -> bool {
-        let Ok(Some(t)) = load_world(v, &self.table) else { return true };
+/// Filters of one table (see `RowFilter`), tested together against rows of one state: the table's schema read
+/// once, each filter's columns found once, and each row decoded once for all of them. A world that checks its
+/// reads may keep hundreds of filters of a table, and its merge tests every row changed since the fork.
+pub(crate) struct Filters<'a> {
+    /// None: the table is gone, so every row may pass
+    table: Option<Table>,
+    /// each filter's conditions, by the column's place in the table (None: a column gone)
+    filters: Vec<Vec<(Option<usize>, &'a Bounds)>>,
+}
+
+impl<'a> Filters<'a> {
+    /// `filters` (all of one table) as `v` holds the table.
+    pub(crate) fn new(v: &View, filters: &[&'a RowFilter]) -> Filters<'a> {
+        let table = filters.first().and_then(|f| load_world(v, &f.table).ok().flatten());
+        let filters = filters
+            .iter()
+            .map(|f| {
+                f.conds
+                    .iter()
+                    .map(|(c, b)| (table.as_ref().and_then(|t| t.cols.iter().position(|x| x.name == *c)), b))
+                    .collect()
+            })
+            .collect();
+        Filters { table, filters }
+    }
+
+    /// Whether any of the filters may let through the row stored at `key` as `raw`: true when unsure (the table or
+    /// a column gone, a value that won't compare or decode).
+    pub(crate) fn any(&self, key: &str, raw: &str) -> bool {
+        let Some(t) = &self.table else { return true };
         let id = key.strip_prefix(&format!("{}/", t.name)).unwrap_or(key);
         let mut row = vec![Value::Null; t.cols.len()];
-        if decode_into(&t, id, raw, None, &mut row).is_err() {
+        if decode_into(t, id, raw, None, &mut row).is_err() {
             return true;
         }
-        self.conds.iter().all(|(c, b)| match t.cols.iter().position(|x| x.name == *c) {
-            Some(i) => b.may_hold(&row[i]),
-            None => true,
-        })
+        self.filters.iter().any(|f| f.iter().all(|(i, b)| i.is_none_or(|i| b.may_hold(&row[i]))))
     }
 }
 

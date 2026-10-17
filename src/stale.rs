@@ -49,6 +49,9 @@ pub(crate) struct ReadSet {
     groups: BTreeSet<String>,
     /// a table's rows (its group) that these filters match: the rows a scan could have returned
     filters: Vec<(String, crate::sql::RowFilter)>,
+    /// the filters kept, as `RowFilter::to_json` writes them with their group: a scan run again with the same
+    /// conditions (an agent's loop) adds nothing, and doesn't bring its table nearer `MOST_FILTERS`
+    seen: HashSet<String>,
 }
 
 /// The group a key's read falls in: a table's rows (`orders/`) or, for the rows SQL keeps behind
@@ -103,6 +106,12 @@ impl ReadSet {
         if self.groups.contains(&g) {
             return;
         }
+        // (a filter that can't be written out, a value kept only in memory, is kept each time: rare)
+        if let Some(j) = f.to_json()
+            && !self.seen.insert(format!("{g}\u{0}{j}"))
+        {
+            return; // the same conditions on the same table: already kept
+        }
         if self.filters.len() >= MOST_FILTERS {
             return self.whole(g);
         }
@@ -144,6 +153,7 @@ impl ReadSet {
         self.keys.retain(|k| !k.starts_with(&g));
         self.ranges.retain(|(p, ..)| !p.starts_with(&g));
         self.filters.retain(|(f, _)| *f != g);
+        self.seen.retain(|s| !s.starts_with(&format!("{g}\u{0}")));
         self.groups.insert(g);
     }
 
@@ -192,7 +202,9 @@ impl ReadSet {
             .iter()
             .map(|f| Some((f[0].as_str()?.to_string(), crate::sql::RowFilter::from_json(&f[1])?)))
             .collect::<Option<_>>()?;
-        Some(ReadSet { complete: true, keys: strs(&j["keys"])?, ranges, groups: strs(&j["groups"])?, filters })
+        let filters: Vec<(String, crate::sql::RowFilter)> = filters;
+        let seen = filters.iter().filter_map(|(g, f)| Some(format!("{g}\u{0}{}", f.to_json()?))).collect();
+        Some(ReadSet { complete: true, keys: strs(&j["keys"])?, ranges, groups: strs(&j["groups"])?, filters, seen })
     }
 }
 
@@ -357,6 +369,8 @@ impl Core {
             for g in tables {
                 let fs: Vec<&crate::sql::RowFilter> =
                     set.filters.iter().filter(|(f, _)| f == g).map(|(_, f)| f).collect();
+                // the table as each state has it, read once; each changed row decoded once per state
+                let sides = [crate::sql::Filters::new(&views[0], &fs), crate::sql::Filters::new(&views[1], &fs)];
                 for c in self.state_diff_iter(base, now, Some(g))? {
                     let c = c?;
                     if !c.key.starts_with(g) {
@@ -365,9 +379,7 @@ impl Core {
                     if wrote.contains(c.key.as_str()) {
                         continue;
                     }
-                    let hit = |i: usize, v: &Option<crate::Val>| {
-                        v.as_ref().is_some_and(|v| fs.iter().any(|f| f.matches(&views[i], &c.key, v)))
-                    };
+                    let hit = |i: usize, v: &Option<crate::Val>| v.as_ref().is_some_and(|v| sides[i].any(&c.key, v));
                     if hit(0, &c.before) || hit(1, &c.after) {
                         changed.push(c.key);
                     }
