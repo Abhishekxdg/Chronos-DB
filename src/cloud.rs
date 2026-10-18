@@ -22,7 +22,10 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const DEFAULT_API: &str = "https://api.chronos.cloud";
+/// The dashboard's address: Vercel serves the dashboard there and forwards `/v1` and `/auth` to the backend, so the
+/// backend's own name (a Google-given one) can change without a release. Everything else the API says (the MCP
+/// endpoint, the database's address) comes back in its answers.
+const DEFAULT_API: &str = "https://chronos.2090.tech";
 const BEGIN: &str = "<!-- chronos:begin -->";
 const END: &str = "<!-- chronos:end -->";
 /// The longest answer read from the API: its answers are small JSON objects.
@@ -36,7 +39,7 @@ pub(crate) fn help() -> &'static str {
        chronos cloud list                your org's projects and their databases
        chronos cloud usage               this folder's project: disk, worlds, egress, awake time, against the plan
        chronos cloud production on|off   agents' merges into main of this folder's project wait for a person (off: they merge)
-CHRONOS_CLOUD_API overrides the API's address (https://api.chronos.cloud)."
+CHRONOS_CLOUD_API overrides the API's address (https://chronos.2090.tech)."
 }
 
 /// `chronos init ...` or `chronos cloud ...` (`args` from the command's name on); the process's exit code.
@@ -93,7 +96,7 @@ impl Config {
         self.text.lines().find_map(|l| toml_line(l).filter(|(k, _)| k == key).map(|(_, v)| v)).filter(|v| !v.is_empty())
     }
 
-    /// The API's base: CHRONOS_CLOUD_API, else the one the key came from, else api.chronos.cloud.
+    /// The API's base: CHRONOS_CLOUD_API, else the one the key came from, else chronos.2090.tech.
     fn api(&self) -> String {
         let env = std::env::var("CHRONOS_CLOUD_API").ok().filter(|v| !v.is_empty());
         env.or_else(|| self.get("api")).unwrap_or_else(|| DEFAULT_API.into()).trim_end_matches('/').to_string()
@@ -895,13 +898,19 @@ mod tests {
     #[test]
     fn mcp_json_keeps_other_servers() {
         let old = r#"{"mcpServers":{"github":{"command":"gh-mcp","args":["--x"]},"chronos":{"type":"http","url":"old"}},"other":1}"#;
-        let new = merge_mcp_json(Some(old), "https://mcp.chronos.cloud/?project=prj_1").unwrap();
+        let new = merge_mcp_json(Some(old), "https://chronos.endpoints.my-project.cloud.goog/?project=prj_1").unwrap();
         let v: Value = serde_json::from_str(&new).unwrap();
         assert_eq!(v["mcpServers"]["github"], json!({"command":"gh-mcp","args":["--x"]}));
-        assert_eq!(v["mcpServers"]["chronos"], json!({"type":"http","url":"https://mcp.chronos.cloud/?project=prj_1"}));
+        assert_eq!(
+            v["mcpServers"]["chronos"],
+            json!({"type":"http","url":"https://chronos.endpoints.my-project.cloud.goog/?project=prj_1"})
+        );
         assert_eq!(v["other"], json!(1));
         // again: the same text
-        assert_eq!(merge_mcp_json(Some(&new), "https://mcp.chronos.cloud/?project=prj_1").unwrap(), new);
+        assert_eq!(
+            merge_mcp_json(Some(&new), "https://chronos.endpoints.my-project.cloud.goog/?project=prj_1").unwrap(),
+            new
+        );
         // none yet, an empty file, and one that isn't JSON (left alone)
         let fresh = merge_mcp_json(None, "u").unwrap();
         assert_eq!(
@@ -915,13 +924,19 @@ mod tests {
 
     #[test]
     fn mcp_url_names_the_project() {
-        assert_eq!(mcp_project_url("https://mcp.chronos.cloud", "prj_a"), "https://mcp.chronos.cloud/?project=prj_a");
-        assert_eq!(mcp_project_url("https://mcp.chronos.cloud/", "prj_a"), "https://mcp.chronos.cloud/?project=prj_a");
+        assert_eq!(
+            mcp_project_url("https://chronos.endpoints.my-project.cloud.goog", "prj_a"),
+            "https://chronos.endpoints.my-project.cloud.goog/?project=prj_a"
+        );
+        assert_eq!(
+            mcp_project_url("https://chronos.endpoints.my-project.cloud.goog/", "prj_a"),
+            "https://chronos.endpoints.my-project.cloud.goog/?project=prj_a"
+        );
     }
 
     #[test]
     fn env_line_replaced_or_appended() {
-        let url = "postgres://app:pw@db_x.pg.chronos.cloud/main?sslmode=require";
+        let url = "postgres://app:pw@chronos.endpoints.my-project.cloud.goog:5432/main?sslmode=require&options=endpoint%3Ddb_x";
         let old = "# keys\nSTRIPE_KEY=sk_test\nDATABASE_URL=postgres://old\nPORT=3000";
         let new = merge_env(Some(old), url);
         assert_eq!(new, format!("# keys\nSTRIPE_KEY=sk_test\nDATABASE_URL={url}\nPORT=3000\n"));
@@ -1007,8 +1022,10 @@ mod tests {
     #[test]
     fn password_masked() {
         assert_eq!(
-            mask("postgres://app:s3cr3t@db_a.pg.chronos.cloud/main?sslmode=require"),
-            "postgres://app:****@db_a.pg.chronos.cloud/main?sslmode=require"
+            mask(
+                "postgres://app:s3cr3t@chronos.endpoints.my-project.cloud.goog:5432/main?sslmode=require&options=endpoint%3Ddb_a"
+            ),
+            "postgres://app:****@chronos.endpoints.my-project.cloud.goog:5432/main?sslmode=require&options=endpoint%3Ddb_a"
         );
         assert_eq!(mask("postgres://app@h/main"), "postgres://app@h/main");
         assert_eq!(mask("postgres://h/main?x=a:b@c"), "postgres://h/main?x=a:b@c");

@@ -1,6 +1,6 @@
 # Chronos Cloud
 
-> **Private alpha.** Chronos Cloud is invite only while it is built; the commands below are in the `chronos` binary now. Design: [docs/designs/cloud.md](designs/cloud.md).
+> **Private alpha.** Chronos Cloud, at `chronos.2090.tech` (the dashboard) with its backend on a name Google gives, and built by [2090.tech](https://2090.tech), is invite only while it is built; the commands below are in the `chronos` binary now. The hosted platform itself is developed in a separate, private repository.
 
 Chronos Cloud hosts a project's database, so an agent in Claude Code, Codex or Cursor (or in CI, or on a teammate's laptop) can use it without anyone running `chronos serve`. One command in the project folder connects it:
 
@@ -13,8 +13,8 @@ chronos init
 chronos: to sign in to Chronos Cloud, open https://github.com/login/device and enter the code WDJB-MJHT
 chronos: signed in as ada (key saved in /home/ada/.config/chronos/cloud.toml)
 chronos: project myapp (prj_...), database db_... (running, asia-south1)
-chronos: DATABASE_URL=postgres://app:****@db_....pg.chronos.cloud/main?sslmode=require (in .env)
-chronos: MCP https://mcp.chronos.cloud/?project=prj_...
+chronos: DATABASE_URL=postgres://app:****@chronos.endpoints.<project>.cloud.goog:5432/main?sslmode=require&options=endpoint%3Ddb_... (in .env)
+chronos: MCP https://chronos.endpoints.<project>.cloud.goog/?project=prj_...
 chronos: wrote .chronos/project.json, .mcp.json, .env, .gitignore, CLAUDE.md
 Open Claude Code here and ask it to build.
 ```
@@ -30,7 +30,7 @@ Then open Claude Code in the folder and ask for what you want ("add user account
 | File | What is written |
 |---|---|
 | `.chronos/project.json` | `{"project_id", "name"}`: the link, no secrets. Commit it, so teammates and CI reach the same database |
-| `.mcp.json` | the `chronos` server in `mcpServers` (`{"type": "http", "url": "https://mcp.chronos.cloud/?project=prj_..."}`); other servers are kept |
+| `.mcp.json` | the `chronos` server in `mcpServers` (`{"type": "http", "url": "https://chronos.endpoints.<project>.cloud.goog/?project=prj_..."}`); other servers are kept |
 | `.env` | `DATABASE_URL=...` for the app, pointing at `main`: the line is replaced if there is one, else added; other lines are kept. A new `.env` is readable only by you |
 | `.gitignore` | `.env`, unless it is ignored already |
 | `CLAUDE.md`, and `AGENTS.md` if there is one | a short block between `<!-- chronos:begin -->` and `<!-- chronos:end -->`: the database is Chronos Cloud; change the schema or data in a world, run the app's tests against the world, show the diff, then merge. The rest of the file is kept; a second run replaces only the block |
@@ -55,7 +55,7 @@ chronos cloud production on      # agents' worlds wait for a person to merge the
 
 | Setting | |
 |---|---|
-| `CHRONOS_CLOUD_API` | the API's address instead of `https://api.chronos.cloud` (a local control plane in tests) |
+| `CHRONOS_CLOUD_API` | the API's address instead of `https://chronos.2090.tech` (the dashboard's address, which forwards `/v1` and `/auth` to the backend) (a local control plane in tests) |
 | `~/.config/chronos/cloud.toml` | `api_key` and the `api` address it came from (`$XDG_CONFIG_HOME/chronos/cloud.toml` where that is set) |
 | `SSL_CERT_FILE` | CA certificates for the API's TLS, where the system's bundle isn't in `/etc/ssl` |
 
