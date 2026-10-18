@@ -258,3 +258,77 @@ fn rows_main_laid_out_anew_are_read_as_main_has_them() {
     let got = run(&db, MAIN, "select status || ' ' || owner || ' ' || prio from tickets", &[]).unwrap();
     assert_eq!(got[0].rows[0][0].to_text(), "done cy 2");
 }
+
+#[test]
+fn a_run_declares_how_many_rows_it_changes_and_deletes() {
+    let db = Db::new();
+    crm(&db);
+    // within its counts: merged
+    assert_eq!(
+        attempt(&db, "few", "max_rows = 2, max_deletes = 0", "update leads set status = 'won' where id <= 2"),
+        None
+    );
+    // more rows than it declared, across tables
+    let e = attempt(
+        &db,
+        "many",
+        "may_change = 'leads, lists', max_rows = '2'",
+        "update leads set owner = 'x' where org = 1; update lists set name = 'y'",
+    )
+    .unwrap();
+    assert!(e.contains("merging many changes 3 rows (it declared at most 2)"), "{e}");
+    assert!(e.contains("may change leads, lists; at most 2 rows"), "{e}");
+    // a whole table, but no deletes
+    let e = attempt(&db, "del", "may_change = 'leads', max_deletes = 0", "delete from leads where id = 3").unwrap();
+    assert!(e.contains("deletes 1 rows (it declared at most 0)"), "{e}");
+    assert!(e.contains("no deletes"), "{e}");
+    assert_eq!(
+        attempt(&db, "ins", "may_change = 'leads', max_deletes = 0", "insert into leads values (9, 1, 'open', 'dee')"),
+        None
+    );
+    // a dry run says so
+    run(&db, MAIN, "create world zero with (max_rows = 0)", &[]).unwrap();
+    run(&db, "zero", "update leads set owner = 'z' where id = 1", &[]).unwrap();
+    let blocked = db.merge_preview("zero", &Default::default()).unwrap().blocked.unwrap_or_default();
+    assert!(blocked.contains("changes 1 rows (it declared at most 0)"), "{blocked}");
+    // shown, and an admin can raise it
+    let s = db.world("zero").unwrap().scope.unwrap();
+    assert_eq!(s["max_rows"], 0);
+    run(&db, MAIN, "alter world zero set (max_rows = 5)", &[]).unwrap();
+    run(&db, MAIN, "merge world zero", &[]).unwrap();
+    // a row left in conflict writes nothing: the conflict is what it gets, not the count
+    run(&db, MAIN, "create world clash with (max_rows = 0)", &[]).unwrap();
+    run(&db, "clash", "update leads set owner = 'w' where id = 2", &[]).unwrap();
+    run(&db, MAIN, "create world first; ", &[]).unwrap();
+    run(&db, "first", "update leads set owner = 'm' where id = 2", &[]).unwrap();
+    run(&db, MAIN, "merge world first", &[]).unwrap();
+    let e = run(&db, MAIN, "merge world clash", &[]).unwrap_err();
+    assert!(!e.message.contains("declared at most"), "{}", e.message);
+    // not a count
+    for bad in ["max_rows = -1", "max_rows = 'lots'", "max_deletes = 1.5"] {
+        let e = run(&db, MAIN, &format!("create world x with ({bad})"), &[]).unwrap_err();
+        assert!(e.message.contains("must be a whole number of rows"), "{bad}: {}", e.message);
+    }
+}
+
+#[test]
+fn an_agent_declares_less_than_its_policy_never_more() {
+    let db = Db::new();
+    crm(&db);
+    run(&db, MAIN, "create merge policy p with (max_rows = 10, max_deletes = 1)", &[]).unwrap();
+    let can = "read,fork,write_own,write_main,merge_own";
+    run(&db, MAIN, &format!("create agent bot with (can = '{can}', policy = 'p')"), &[]).unwrap();
+    let mut bot = Session::new(MAIN);
+    bot.agent = Some("bot".into());
+    let e = bot.run(&db, "create world big with (max_rows = 11)", &[]).unwrap_err();
+    assert_eq!(e.code, "42501", "{}", e.message);
+    assert!(e.message.contains("max_rows = 11 is more than merge policy p allows (max_rows 10)"), "{}", e.message);
+    assert!(bot.run(&db, "create world big with (max_deletes = 2)", &[]).is_err());
+
+    // tighter: its own count holds the merge for a person, under the policy's
+    bot.run(&db, "create world w with (max_rows = 1); use world w", &[]).unwrap();
+    bot.run(&db, "update leads set status = 'won' where org = 1; use world main", &[]).unwrap();
+    let e = bot.run(&db, "merge world w", &[]).unwrap_err();
+    assert!(e.message.contains("changes 2 rows (it declared at most 1), outside its declared scope"), "{}", e.message);
+    assert_eq!(db.reviews().len(), 1);
+}

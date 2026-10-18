@@ -379,6 +379,8 @@ An agent allowed to write a table can still overwrite the wrong rows of it. A wo
 create world close_stale with (
   may_change = 'leads.status, lists',  -- whole tables, or single columns
   tenant     = 'org_id = 42',          -- every row changed has org_id = 42, before and after
+  max_rows   = 250,                    -- rows this run changes, across every table
+  max_deletes = 0,                     -- and how many of them it may delete
   intent     = 'close leads idle 90 days',
   run        = 'planner/3'             -- your own id for the run (a subagent's, a job's)
 );
@@ -390,12 +392,13 @@ merge world close_stale;
 
 - **`may_change`:** a table named whole may be inserted into, deleted from, updated and altered. A column (`leads.status`) may only be updated. Names are read as SQL reads them (`"Leads"."Status"`), and each must be a table or column of the world it's forked from (42P01 otherwise). Leave it out to allow every table.
 - **`tenant`:** `'column = value'`, where the value is a number, `true`/`false`, or text in single quotes (`'region = ''eu'''`); or `{"org_id": 42}` in `META`. A row counts when the column holds the value before the change (updates, deletes) and after it (inserts, updates), so moving a row out of the tenant is outside too. A table without the column is outside; one named in `may_change` without it is refused at the fork.
+- **`max_rows`, `max_deletes`:** how many rows this run declares it changes (inserted, updated and deleted, across every table), and how many of those it may delete; `max_deletes = 0` lets a run that names a whole table in `may_change` insert into and update it but not delete from it. A whole number, or one as text. Broken: `changes 1204 rows (it declared at most 250)`. A merge policy's own `max_rows`/`max_deletes` still apply; an agent under one may declare less than its policy allows, never more (the fork is refused, 42501). Either may be declared alone, without `may_change` or `tenant`.
 - **Everything else is outside:** views, functions, sequences, schemas, and a table's own changes when only its columns are listed or a tenant is set. `intent` and `run` are only shown.
 - **Checked on what the world changed:** its own rows, as the merge applies them (after `ONLY TABLES` / `ONLY KEYS`). Columns the parent changed and a `BY COLUMNS` merge combines in don't count against it.
 - **Refused or queued:** SQLSTATE `42501`; for an agent keeping to a merge policy, a broken rule (`..., outside its declared scope`), and the world waits in `SHOW REVIEWS`. `MERGE ... DRY RUN` shows it in its `blocked` row.
 - **Changing it:** `ALTER WORLD w SET (may_change = 'leads')` widens it, `= null` drops a part. Only the database's own users and admins may; the agent that forked the world can't (42501).
-- **Shown:** `SHOW WORLDS` and `SHOW REVIEWS` have a `scope` column (JSON: `may_change` as `[{"table": ..., "column": ...}]`, `tenant` as `{"column": ..., "value": ...}`, `intent`, `run`); the world's owner is the agent that forked it. Over HTTP and MCP a world has a `scope` field.
-- **Required:** a merge policy with `require_scope = true` refuses its agents' forks that declare neither `may_change` nor `tenant`.
+- **Shown:** `SHOW WORLDS` and `SHOW REVIEWS` have a `scope` column (JSON: `may_change` as `[{"table": ..., "column": ...}]`, `tenant` as `{"column": ..., "value": ...}`, `max_rows`, `max_deletes`, `intent`, `run`); the world's owner is the agent that forked it. Over HTTP and MCP a world has a `scope` field.
+- **Required:** a merge policy with `require_scope = true` refuses its agents' forks that declare neither `may_change` nor `tenant` (counts alone don't do).
 
 ## REBASE WORLD
 

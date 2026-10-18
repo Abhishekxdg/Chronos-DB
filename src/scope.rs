@@ -3,6 +3,7 @@
 //! 5,000 rows; a scope says which ones it meant to touch, so a merge that strays is caught.
 //!
 //!   CREATE WORLD w WITH (may_change = 'leads.status, lists', tenant = 'org_id = 42',
+//!                        max_rows = 250, max_deletes = 0,
 //!                        intent = 'close stale leads', run = 'planner/3')
 //!     ─> `_sonos_scope` in its metadata (only the database sets it; an admin may change it)
 //!   merge ─> each row it applies, as JSON ─> outside the tables or columns, or the tenant:
@@ -13,7 +14,10 @@
 //! single columns (which may only be updated). `tenant` names a column and a value that every
 //! row changed has, before and after, so a table without that column is out of scope. Anything
 //! else a merge changes (views, functions, sequences, schemas) is out of any declared scope.
-//! `intent` and `run` (a caller's own id for the run, such as a subagent's) are only shown.
+//! `max_rows` and `max_deletes` say how many rows this run means to change (across every table),
+//! and how many of those it may delete (0: none), on top of any merge policy's limits: a run may
+//! declare tighter than its agent's policy, never looser. `intent` and `run` (a caller's own id for
+//! the run, such as a subagent's) are only shown.
 
 use crate::sql::{self, Described};
 use crate::{Core, Error, Result, View};
@@ -23,7 +27,7 @@ use std::collections::BTreeMap;
 /// Metadata key holding a world's declared scope.
 pub(crate) const SCOPE: &str = "_sonos_scope";
 /// The metadata keys a scope is declared with.
-const KEYS: [&str; 4] = ["may_change", "tenant", "intent", "run"];
+pub(crate) const KEYS: [&str; 6] = ["may_change", "tenant", "max_rows", "max_deletes", "intent", "run"];
 /// Rows a reason names before it says how many more.
 const SHOWN: usize = 5;
 
@@ -64,6 +68,10 @@ pub(crate) fn resolve(v: &View, old: &Map<String, Json>, patch: Map<String, Json
             }
             ("tenant", val) => {
                 s.insert(k, tenant(&val)?);
+            }
+            ("max_rows" | "max_deletes", val) => {
+                let n = count(&val).ok_or_else(|| bad(format!("{k} must be a whole number of rows, 0 or more")))?;
+                s.insert(k, json!(n));
             }
             ("intent" | "run", Json::String(t)) => {
                 s.insert(k, Json::String(t));
@@ -128,6 +136,20 @@ fn may_change(v: &View, val: &Json, w: &str) -> Result<Vec<Json>> {
         return Err(bad("may_change names nothing: list tables or columns, or leave it out".into()));
     }
     Ok(out)
+}
+
+/// A declared count: a number, or a number as text (`'250'`).
+fn count(val: &Json) -> Option<u64> {
+    match val {
+        Json::Number(n) => n.as_u64(),
+        Json::String(t) => t.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// What `scope` declares a run will change at most, rows and then deletes (None: no limit).
+pub(crate) fn limits(scope: &Json) -> (Option<u64>, Option<u64>) {
+    (scope["max_rows"].as_u64(), scope["max_deletes"].as_u64())
 }
 
 /// A tenant as `{"column": c, "value": v}`: text `column = value` (a number, true or false, or
@@ -204,6 +226,15 @@ pub fn summary(scope: &Json) -> String {
     if let Some(c) = scope["tenant"]["column"].as_str() {
         parts.push(format!("tenant {c} = {}", lit(&scope["tenant"]["value"])));
     }
+    let (rows, deletes) = limits(scope);
+    if let Some(n) = rows {
+        parts.push(format!("at most {n} rows"));
+    }
+    match deletes {
+        Some(0) => parts.push("no deletes".into()),
+        Some(n) => parts.push(format!("at most {n} deletes")),
+        None => {}
+    }
     if parts.is_empty() {
         parts.push("no limits on what it changes".into());
     }
@@ -211,12 +242,26 @@ pub fn summary(scope: &Json) -> String {
 }
 
 /// What `changes` (a merge's rows, as JSON: see `sql::describe`) does outside `scope`, in words
-/// (none: all within it).
-pub(crate) fn outside(scope: &Json, changes: &[Described]) -> Vec<String> {
+/// (none: all within it). Only rows in `applied` (those the merge writes, not those left in
+/// conflict) count toward `max_rows` and `max_deletes`.
+pub(crate) fn outside(scope: &Json, changes: &[Described], applied: &std::collections::HashSet<&str>) -> Vec<String> {
     let targets = scope["may_change"].as_array();
     let tenant = scope["tenant"]["column"].as_str().map(|c| (c, &scope["tenant"]["value"]));
+    let (max_rows, max_deletes) = limits(scope);
+    let mut counted = vec![];
+    if max_rows.is_some() || max_deletes.is_some() {
+        let rows = changes.iter().filter(|d| d.id.is_some() && applied.contains(d.key.as_str()));
+        let deletes = rows.clone().filter(|d| d.change == "delete").count() as u64;
+        let rows = rows.count() as u64;
+        if let Some(n) = max_rows.filter(|n| rows > *n) {
+            counted.push(format!("changes {rows} rows (it declared at most {n})"));
+        }
+        if let Some(n) = max_deletes.filter(|n| deletes > *n) {
+            counted.push(format!("deletes {deletes} rows (it declared at most {n})"));
+        }
+    }
     if targets.is_none() && tenant.is_none() {
-        return vec![]; // only an intent or a run's id: nothing to hold it to
+        return counted; // no tables or tenant: only the counts (or just an intent) to hold it to
     }
     let whole = |t: &str| targets.is_none_or(|ts| ts.iter().any(|x| x["table"] == t && x.get("column").is_none()));
     let column =
@@ -254,12 +299,12 @@ pub(crate) fn outside(scope: &Json, changes: &[Described]) -> Vec<String> {
             }
         }
     }
-    strayed
+    counted
         .into_iter()
-        .map(|(what, ids)| match ids.is_empty() {
+        .chain(strayed.into_iter().map(|(what, ids)| match ids.is_empty() {
             true => what,
             false => format!("{what}: {}", shown(&ids)),
-        })
+        }))
         .collect()
 }
 

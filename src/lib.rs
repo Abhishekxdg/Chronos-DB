@@ -2267,10 +2267,8 @@ impl Core {
                 ),
             });
         }
-        let given: serde_json::Map<String, serde_json::Value> = ["may_change", "tenant", "intent", "run"]
-            .iter()
-            .filter_map(|k| Some((k.to_string(), patch.remove(*k)?)))
-            .collect();
+        let given: serde_json::Map<String, serde_json::Value> =
+            scope::KEYS.iter().filter_map(|k| Some((k.to_string(), patch.remove(*k)?))).collect();
         let was = self.world(b)?.scope;
         let old = was.as_ref().and_then(|s| s.as_object().cloned()).unwrap_or_default();
         let new = scope::resolve(&self.view(b)?, &old, given, b)?;
@@ -4851,7 +4849,11 @@ impl Core {
             }
             false => vec![],
         };
-        let strayed = declared.as_ref().map_or(vec![], |s| scope::outside(s, &merge_rows));
+        // (rows left in conflict apply nothing: they count against what it may change, not how many rows)
+        let strayed = declared.as_ref().map_or(vec![], |s| {
+            let applied: std::collections::HashSet<&str> = apply.iter().map(|c| c.key.as_str()).collect();
+            scope::outside(s, &merge_rows, &applied)
+        });
         // outside its scope, merged by anyone keeping to no merge policy: refused as it is
         if let (Some(s), None, false) = (&declared, &policy, strayed.is_empty() || dry) {
             return Err(scope::refused(b, s, &strayed));

@@ -1826,6 +1826,20 @@ impl Acting<'_> {
         if policy.as_ref().is_some_and(|p| p.check_reads) {
             meta.insert(crate::stale::CHECK_READS.into(), Json::Bool(true)); // its policy checks what it reads
         }
+        // a run may declare tighter limits than its policy, never looser
+        if let (Some(p), Some(s)) = (&policy, meta.get(crate::scope::SCOPE)) {
+            let (rows, deletes) = crate::scope::limits(s);
+            for (what, mine, theirs) in [("max_rows", rows, p.max_rows), ("max_deletes", deletes, p.max_deletes)] {
+                if let (Some(m), Some(t)) = (mine, theirs)
+                    && m > t
+                {
+                    return Err(refused(format!(
+                        "{what} = {m} is more than merge policy {} allows ({what} {t}): a run may declare less than its policy, not more",
+                        p.name
+                    )));
+                }
+            }
+        }
         if let Some(p) = policy.filter(|p| p.require_scope)
             && !meta
                 .get(crate::scope::SCOPE)
