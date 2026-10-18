@@ -11,6 +11,9 @@
 //!   chronos mydb backup /backups/mydb-1   copy the database into a new folder (while it runs: BACKUP
 //!                                DATABASE TO '...' over SQL, or the `backup` HTTP op, on the server)
 //!   chronos restore /backups/mydb-1 mydb2   start a database from a backup, and verify it
+//!   chronos init                   in a project folder: its Chronos Cloud database, and .mcp.json, .env and
+//!                                the CLAUDE.md block written (chronos cloud login|logout|list|usage|production:
+//!                                see src/cloud.rs, docs/cloud.md)
 //!   chronos keygen                 a new encryption key; CHRONOS_KEY=<key> (or CHRONOS_KEY_FILE=<file>)
 //!                                encrypts a new database, and is then needed to open it
 //!   chronos serve mydb [--listen 127.0.0.1:7070] [--pg 127.0.0.1:5433|off] [--token T]
@@ -31,6 +34,7 @@
 
 mod api;
 mod backoff;
+mod cloud;
 mod http;
 mod import;
 mod local;
@@ -181,6 +185,10 @@ fn main() {
     if let Some(a) = args.iter().find(|a| a.starts_with("--")) {
         eprintln!("chronos: unknown option {a}; see chronos --help");
         std::process::exit(2);
+    }
+    // chronos init, chronos cloud ...: Chronos Cloud (src/cloud.rs); no folder is opened
+    if args[0] == "init" || args[0] == "cloud" {
+        std::process::exit(cloud::run(&args, no_open));
     }
     if args[0] == "keygen" {
         println!("{}", chronos::crypt::new_key());
@@ -714,7 +722,7 @@ fn db_key() -> std::io::Result<Option<[u8; 32]>> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: chronos [-b branch] [--remote s3://bucket/prefix [--takeover]] [--anchor FILE [--anchor-reset]] <folder> [command]\n       chronos mcp <folder> [--allow-merge | --agent NAME]   (MCP server for AI agents, over stdio; without --allow-merge, agents can't merge; --agent acts as that agent)\n       chronos import <folder> <table> <data.csv> --schema <schema.csv>   (a copy of one Postgres table)\n       chronos attach <new folder> --tables a,b | --schema s [--yes]   (work beside a Postgres: merges into main are written there; CHRONOS_SOURCE_URL)\n       chronos restore <backup> <new folder>   (start a database from a backup, and verify it)\n       chronos keygen   (a new encryption key: CHRONOS_KEY=<key> chronos <new folder> makes an encrypted database)\n       chronos studio <folder> [--port N] [--no-open]   (a web UI for the database, on 127.0.0.1; works beside a running serve)\n       chronos studio <folder> --login [--port N | --listen ADDR:PORT] [--host NAME[:PORT]]... [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--no-open]\n                                  (the web UI, signed in with a database role and its password, acting with its privileges;\n                                   make one with: create role admin login superuser password '...'; any address but loopback needs TLS)\n       chronos serve <folder> [--listen 127.0.0.1:7070] [--pg 127.0.0.1:5433|off] [--token T] [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--safe [--admin-token A]]
+        "usage: chronos [-b branch] [--remote s3://bucket/prefix [--takeover]] [--anchor FILE [--anchor-reset]] <folder> [command]\n       chronos mcp <folder> [--allow-merge | --agent NAME]   (MCP server for AI agents, over stdio; without --allow-merge, agents can't merge; --agent acts as that agent)\n       chronos import <folder> <table> <data.csv> --schema <schema.csv>   (a copy of one Postgres table)\n       chronos attach <new folder> --tables a,b | --schema s [--yes]   (work beside a Postgres: merges into main are written there; CHRONOS_SOURCE_URL)\n       chronos restore <backup> <new folder>   (start a database from a backup, and verify it)\n       chronos init [--no-open]   (in a project folder: its Chronos Cloud database, wired up for agents; chronos cloud help)\n       chronos keygen   (a new encryption key: CHRONOS_KEY=<key> chronos <new folder> makes an encrypted database)\n       chronos studio <folder> [--port N] [--no-open]   (a web UI for the database, on 127.0.0.1; works beside a running serve)\n       chronos studio <folder> --login [--port N | --listen ADDR:PORT] [--host NAME[:PORT]]... [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--no-open]\n                                  (the web UI, signed in with a database role and its password, acting with its privileges;\n                                   make one with: create role admin login superuser password '...'; any address but loopback needs TLS)\n       chronos serve <folder> [--listen 127.0.0.1:7070] [--pg 127.0.0.1:5433|off] [--token T] [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--safe [--admin-token A]]
                                   (HTTP JSON API, and Postgres protocol: psql postgres://127.0.0.1:5433/main; with --safe,
                                    clients that aren't agents only fork and change their own worlds, unless they give the admin token;
                                    a token is 24 characters or more (openssl rand -hex 24; pass it as CHRONOS_TOKEN, not on the

@@ -23,6 +23,8 @@ chronos mcp mydb                              # MCP server for AI agents, over s
 | `chronos import <folder> postgres://user:password@host:port/database [--dry-run]` | a whole Postgres database, moved in one command (see [SQL](../sql.md#moving-from-postgres)) |
 | `chronos import <folder> <table> <data.csv> --schema <schema.csv>` | a copy of one Postgres table (see [SQL](../sql.md)) |
 | `chronos restore <backup> <new folder>` | starts a database from a backup folder, and verifies it |
+| `chronos init [--no-open]` | in a project folder: signs in to [Chronos Cloud](../cloud.md), finds or makes the project's database, and writes `.chronos/project.json`, `.mcp.json`, `.env` and the `CLAUDE.md` block |
+| `chronos cloud login\|logout\|list\|usage\|production on\|off` | Chronos Cloud's account and the folder's project (see [Chronos Cloud](../cloud.md)) |
 | `chronos keygen` | prints a new encryption key (see [encryption](../operations.md#encryption-at-rest)) |
 | `chronos -V`, `chronos --version` | prints `chronos <version>` |
 | `chronos`, `chronos -h`, `chronos --help` | usage and the shell's help, exit code 2 |

@@ -296,7 +296,7 @@ impl rustls::client::danger::ServerCertVerifier for ChainOnly {
 }
 
 /// CA certificates: `sslrootcert`, else the system's bundle.
-fn roots(file: Option<&str>) -> io::Result<rustls::RootCertStore> {
+pub fn roots(file: Option<&str>) -> io::Result<rustls::RootCertStore> {
     let system = ["/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"];
     let path = match file {
         Some(f) => f.to_string(),
@@ -485,7 +485,7 @@ fn data_row(body: &[u8]) -> io::Result<Vec<Option<String>>> {
 
 /// A TCP connection to `addr`, trying each address it resolves to for at most `secs` seconds each
 /// (0: as long as the system takes; under 2, 2, as libpq's connect_timeout).
-fn connect_tcp(addr: &str, secs: u64) -> io::Result<TcpStream> {
+pub fn connect_tcp(addr: &str, secs: u64) -> io::Result<TcpStream> {
     use std::net::ToSocketAddrs;
     if secs == 0 {
         return TcpStream::connect(addr);

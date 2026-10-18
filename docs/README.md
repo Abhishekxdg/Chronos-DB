@@ -26,6 +26,7 @@ It speaks the Postgres protocol, so `psql`, drivers and ORMs connect as they do 
 - [Quickstart](quickstart.md): install, start a server, connect with psql and from an application, then the shell, TypeScript, Python, Claude Code, Rust.
 - [Migrating from Postgres](migrating-from-postgres.md): `chronos import` or a `pg_dump` replay, checking row counts and checksums, pointing an ORM at it, the differences to plan for.
 - [Concepts](concepts.md): worlds, merging and conflicts, time travel, durability.
+- [Chronos Cloud](cloud.md): `chronos init` in a project folder: a hosted database, wired up for your agent (private alpha).
 
 ## Guides
 
