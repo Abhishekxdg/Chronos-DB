@@ -1749,12 +1749,15 @@ impl Conn<'_> {
                         ]);
                         // (pg_class.relreplident: what REPLICA IDENTITY set, `d` unless it said otherwise)
                         let ident = if t.hier.replident == '\0' { 'd' } else { t.hier.replident };
+                        // (its reloptions, `a=b, c=d`: a view's options)
+                        let opts = t.reloptions.iter().map(|(o, v)| format!("{o}={v}")).collect::<Vec<_>>().join(", ");
                         r.extend([
                             bool(t.hier.of.is_some()),
-                            text(""),
+                            text(&opts),
                             text("0"),
-                            text(""),
-                            text("p"),
+                            // (a typed table's composite type, as regtype names it)
+                            text(&t.hier.of_type.as_deref().map(sql::shown_type).unwrap_or_default()),
+                            text(if t.unlogged { "u" } else { "p" }),
                             text(&ident.to_string()),
                         ]);
                         // (a partitioned table and a foreign table have no access method)
@@ -1798,7 +1801,8 @@ impl Conn<'_> {
                             .iter()
                             .enumerate()
                             .map(|(i, (name, ty, not_null, default))| {
-                                let d = default.as_deref().map_or(Value::Null, text);
+                                // (as pg_get_expr(adbin, adrelid, true) writes it: pretty)
+                                let d = default.as_deref().map_or(Value::Null, |d| text(&sql::pretty_default(t, d)));
                                 // (varchar(n), numeric(p, s) and smallint keep what they were made with)
                                 let (own, typmod) = t.typmods.get(i).copied().unwrap_or((0, -1));
                                 let shown = sql::sized_type(own, typmod).unwrap_or_else(|| ty.pg_name().into_owned());
@@ -1828,10 +1832,10 @@ impl Conn<'_> {
                                     let fixed = ty.whole()
                                         || matches!(ty, Type::Float | Type::Float4 | Type::Bool | Type::Date);
                                     let comment = comments.get(&format!("column/{}/{name}", t.name));
-                                    // (a mac address is plain, like the fixed-size types; an inet and a cidr are main)
+                                    // (a mac address is plain, like the fixed-size types; an inet, a cidr and a numeric are main)
                                     let storage = match ty {
                                         Type::MacAddr | Type::MacAddr8 => "p",
-                                        Type::Inet | Type::Cidr => "m",
+                                        Type::Inet | Type::Cidr | Type::Numeric => "m",
                                         _ if fixed => "p",
                                         _ => "x",
                                     };
@@ -1893,7 +1897,13 @@ impl Conn<'_> {
                             sql::schema_part(&t.name),
                             sql::rel_part(&t.name),
                             x.method,
-                            x.parts.join(", ")
+                            // (pg_get_indexdef(oid, 0, true): pretty)
+                            x.parts_pretty
+                                .iter()
+                                .zip(x.collate.iter().map(String::as_str).chain(std::iter::repeat("")))
+                                .map(|(p, c)| format!("{p}{c}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
                         );
                         if x.nnd {
                             def.push_str(" NULLS NOT DISTINCT");
@@ -2396,8 +2406,10 @@ impl Conn<'_> {
             let copy = self.session.copy_in(self.db, s)?;
             let data = std::fs::read(path).map_err(|e| fail(e, "reading"))?;
             let mut once = Some(data);
-            let out = copy.run(&mut self.session, self.db, Box::new(move || Ok(once.take())))?;
-            cstr(&mut b, &out.tag);
+            let out = copy.run(&mut self.session, self.db, Box::new(move || Ok(once.take())));
+            // (what its triggers said, before its tag or its error)
+            self.notices()?;
+            cstr(&mut b, &out?.tag);
             return Ok(self.send(b'C', &b)?);
         }
         if s.copy_direction() == Some(false) {
@@ -2489,6 +2501,8 @@ impl Conn<'_> {
         if let Some(e) = lost.take() {
             return Err(Fail::Io(e));
         }
+        // (what its triggers said, before its tag or its error)
+        self.notices()?;
         let mut b = vec![];
         cstr(&mut b, &out?.tag);
         Ok(self.send(b'C', &b)?)

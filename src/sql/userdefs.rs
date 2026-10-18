@@ -434,8 +434,39 @@ impl Parser {
         self.expect_sym("(")?;
         let (mut left, mut right, mut func) = (None, None, None);
         loop {
-            let key = self.name()?.to_lowercase();
+            // (an attribute's name may be a keyword: JOIN)
+            // (a quoted one is its name as written: "Leftarg" is no attribute)
+            let key = match self.next() {
+                Some(Tok::Word(w)) => w.to_lowercase(),
+                Some(Tok::Ident(w)) => w,
+                t => {
+                    self.put_back(t);
+                    return self.fail("expected an operator attribute");
+                }
+            };
+            const KNOWN: &[&str] = &[
+                "leftarg",
+                "rightarg",
+                "function",
+                "procedure",
+                "commutator",
+                "negator",
+                "restrict",
+                "join",
+                "hashes",
+                "merges",
+                "sort1",
+                "sort2",
+                "ltcmp",
+                "gtcmp",
+            ];
+            if !KNOWN.contains(&key.as_str()) {
+                notice("WARNING", format!("operator attribute \"{key}\" not recognized"));
+            }
             if self.sym("=") {
+                if matches!(key.as_str(), "leftarg" | "rightarg") && self.kw("setof") {
+                    return err("42P13", "SETOF type not allowed for operator argument");
+                }
                 match key.as_str() {
                     "leftarg" => left = Some(self.ty()?),
                     "rightarg" => right = Some(self.ty()?),
@@ -465,10 +496,29 @@ impl Parser {
         if left.is_none() && right.is_none() {
             return err("42P13", "operator argument types must be specified");
         }
+        // (a shell type, CREATE TYPE name, stays one here, its input and output being C functions: an operator over
+        // it would compare values no type gives)
+        for t in [left, right].into_iter().flatten() {
+            let n = match t {
+                Type::Enum(i) if i & UNRESOLVED_BIT != 0 => unresolved_name(i).unwrap_or_default(),
+                t => t.name().to_string(),
+            };
+            if is_shell(&n) {
+                return err(UNSUPPORTED, format!("type {n} is only a shell: an operator over it isn't supported"));
+            }
+        }
         let key = op_key(&sym, &left, &right);
+        // (a side's type not looked up yet has to be there: `type "x" does not exist`)
+        let needs = [left, right].into_iter().flatten().find_map(|t| match t {
+            Type::Enum(i) if i & UNRESOLVED_BIT != 0 => {
+                let n = unresolved_name(i)?;
+                Some((type_key(&n), format!("type \"{}\" does not exist", shown_type(&n))))
+            }
+            _ => None,
+        });
         let json = serde_json::json!({ "sym": sym, "left": left.map(|t| t.name()), "right": right.map(|t| t.name()), "func": func });
         Ok(Stmt::UserDef {
-            needs: None,
+            needs,
             key,
             json: Some(json.to_string()),
             tag: "CREATE OPERATOR",
@@ -685,17 +735,24 @@ impl Parser {
     pub(super) fn alter_aggregate(&mut self) -> Result<Stmt> {
         let name = self.aggregate_name()?;
         let sig = self.aggregate_sig()?;
-        let rename = if self.kw("rename") {
+        // RENAME TO, OWNER TO role, SET SCHEMA s (anything else is read and changes nothing here)
+        let mut change = serde_json::json!({});
+        if self.kw("rename") {
             self.expect_kw("to")?;
-            Some(self.name()?)
+            change["rename"] = Json::from(self.name()?);
+        } else if self.kw("owner") {
+            self.expect_kw("to")?;
+            change["owner_to"] = Json::from(self.name()?);
+        } else if self.is_kw("set") && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "schema") {
+            self.i += 2;
+            change["schema"] = Json::from(self.name()?);
         } else {
             self.skip_rest();
-            None
-        };
+        }
         Ok(Stmt::UserDef {
             needs: None,
             key: agg_key(&name, &sig.args),
-            json: Some(serde_json::json!({ "rename": rename }).to_string()),
+            json: Some(change.to_string()),
             tag: "ALTER AGGREGATE",
             missing: Some(format!("aggregate {name}({}) does not exist", sig.shown())),
             exists: None,
@@ -2347,8 +2404,13 @@ fn agg_stmt(
     let mut j: Json = json.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
     let (name, types) = key_parts(key);
     // (only its owner, or its schema's, may drop it, change it or replace it, as Postgres's ownership checks)
-    if there && (tag != "CREATE AGGREGATE" || j["replace"] == true) && !owns_agg(v, key, &name)? {
-        return err("42501", format!("must be owner of aggregate {}", rel_part(&name)));
+    if there
+        && (tag != "CREATE AGGREGATE" || j["replace"] == true)
+        && !owns_agg(v, key, &name, tag == "ALTER AGGREGATE")?
+    {
+        // (ALTER's generic ownership check names it a function, as Postgres's does)
+        let noun = if tag == "ALTER AGGREGATE" { "function" } else { "aggregate" };
+        return err("42501", format!("must be owner of {noun} {}", rel_part(&name)));
     }
     match tag {
         "CREATE AGGREGATE" => {
@@ -2386,17 +2448,54 @@ fn agg_stmt(
             Ok(out)
         }
         _ => {
+            // ALTER AGGREGATE ... OWNER TO: a role its owner may become (a superuser any)
+            if let Some(role) = j["owner_to"].as_str() {
+                let reg = roles::registry(v.core)?;
+                let Some(new) = reg.named(role) else {
+                    return err("42704", format!("role \"{role}\" does not exist"));
+                };
+                if let Some(who) = roles::current().filter(|w| !w.superuser)
+                    && !reg.can_set(who.oid, new.oid)
+                {
+                    return err("42501", format!("must be able to SET ROLE \"{role}\""));
+                }
+                let mut row = agg_row(v, key)?;
+                row["owner"] = Json::from(new.oid);
+                forget(key);
+                return Ok(vec![(key.to_string(), Some(row.to_string()))]);
+            }
+            // ... SET SCHEMA s: the row under the name in that schema
+            let moved;
+            let (to, schema) = match (j["rename"].as_str(), j["schema"].as_str()) {
+                (Some(to), _) => {
+                    // (in the schema it would be made in: the search_path's first)
+                    let schema = path_schemas()
+                        .and_then(|s| s.into_iter().find(|x| !matches!(x.as_str(), "pg_catalog" | "pg_temp" | "$user")))
+                        .unwrap_or_else(|| "public".into());
+                    (to, schema)
+                }
+                (None, Some(s)) => {
+                    if !namespaces(v)?.iter().any(|n| n == s) {
+                        return err("3F000", format!("schema \"{s}\" does not exist"));
+                    }
+                    moved = qualify(s, rel_part(&name));
+                    if moved == name {
+                        return Ok(vec![]);
+                    }
+                    (moved.as_str(), s.to_string())
+                }
+                _ => return Ok(vec![]),
+            };
             // ALTER AGGREGATE ... RENAME TO: the row under its new name
-            let Some(to) = j["rename"].as_str() else { return Ok(vec![]) };
             let new = format!("{PREFIX}agg/{to}({})", types.join(","));
             if v.get(&new)?.is_some() || plain_function(v, to, &types)?.is_some() {
-                // (in the schema it would be made in: the search_path's first)
-                let schema = path_schemas()
-                    .and_then(|s| s.into_iter().find(|x| !matches!(x.as_str(), "pg_catalog" | "pg_temp" | "$user")))
-                    .unwrap_or_else(|| "public".into());
                 return err(
                     "42723",
-                    format!("function {to}({}) already exists in schema \"{schema}\"", pg_types(&types, ", ")),
+                    format!(
+                        "function {}({}) already exists in schema \"{schema}\"",
+                        rel_part(to),
+                        pg_types(&types, ", ")
+                    ),
                 );
             }
             let mut row: Json = serde_json::from_str(&v.get(key)?.unwrap_or_default()).unwrap_or_default();
@@ -2420,12 +2519,13 @@ pub(super) fn agg_owner(v: &View, key: &str) -> Result<i64> {
 
 /// Whether the running role may drop or change aggregate `key` (named `name`): it has its owner's privileges, or
 /// its schema's owner's (a superuser always).
-fn owns_agg(v: &View, key: &str, name: &str) -> Result<bool> {
+fn owns_agg(v: &View, key: &str, name: &str, alter: bool) -> Result<bool> {
     let Some(who) = roles::current().filter(|w| !w.superuser) else { return Ok(true) };
     if !v.core.has_privileges() {
         return Ok(true);
     }
-    Ok(who.has_privs_of(agg_owner(v, key)?) || who.has_privs_of(acl::schema(v, schema_part(name))?.owner))
+    // (ALTER is its owner's alone; DROP its schema's owner's too)
+    Ok(who.has_privs_of(agg_owner(v, key)?) || (!alter && who.has_privs_of(acl::schema(v, schema_part(name))?.owner)))
 }
 
 /// What a support function is given: the state's type, then these.

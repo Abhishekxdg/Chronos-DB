@@ -83,7 +83,7 @@ pub(super) enum Volatility {
 }
 
 impl Volatility {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Volatility::Volatile => "volatile",
             Volatility::Stable => "stable",
@@ -124,6 +124,67 @@ impl Ret {
 
     pub(super) fn sets(&self) -> bool {
         matches!(self, Ret::SetOf(_) | Ret::Table(_) | Ret::RowsOf(_))
+    }
+}
+
+/// What ALTER FUNCTION, PROCEDURE or ROUTINE names: a routine of that kind (ROUTINE: either).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum RoutineKind {
+    Function,
+    Procedure,
+    Routine,
+}
+
+impl RoutineKind {
+    /// The word Postgres's messages name one by.
+    pub(super) fn noun(self) -> &'static str {
+        match self {
+            RoutineKind::Function => "function",
+            RoutineKind::Procedure => "procedure",
+            RoutineKind::Routine => "routine",
+        }
+    }
+
+    pub(super) fn tag(self) -> &'static str {
+        match self {
+            RoutineKind::Function => "ALTER FUNCTION",
+            RoutineKind::Procedure => "ALTER PROCEDURE",
+            RoutineKind::Routine => "ALTER ROUTINE",
+        }
+    }
+}
+
+/// What ALTER FUNCTION, PROCEDURE or ROUTINE does (besides OWNER TO).
+#[derive(Clone, Debug)]
+pub(super) enum RoutineAlter {
+    /// its attributes, each with where in the text it is written (from 1)
+    Attrs(Vec<(RoutineAttr, u32)>),
+    Rename(String),
+    Schema(String),
+}
+
+/// One attribute ALTER FUNCTION changes.
+#[derive(Clone, Debug)]
+pub(super) enum RoutineAttr {
+    Volatility(Volatility),
+    Strict(bool),
+    Definer(bool),
+    Leakproof(bool),
+    Cost(f64),
+    Rows(f64),
+    Parallel(char),
+    /// SUPPORT f: the planner's helper, not kept
+    Support,
+    /// SET name TO values (None: FROM CURRENT)
+    Set(String, Option<Vec<String>>),
+    /// RESET name (None: RESET ALL)
+    Reset(Option<String>),
+}
+
+impl RoutineAttr {
+    /// Whether a procedure has it too (SECURITY and the settings); the others only tune a function's calls.
+    pub(super) fn procedures_have(&self) -> bool {
+        matches!(self, RoutineAttr::Definer(_) | RoutineAttr::Set(..) | RoutineAttr::Reset(_))
     }
 }
 
@@ -171,8 +232,25 @@ pub(super) struct Function {
     /// its `SET name = value` clauses, in order: `search_path` holds for the length of each call (see
     /// `super::with_own_path`); the others are kept, and shown, but not applied
     pub(super) config: Vec<(String, Vec<String>)>,
+    /// LEAKPROOF, ROWS and PARALLEL: what Postgres's planner reads, kept and shown as pg_proc keeps them
+    pub(super) tuning: Tuning,
+    /// a SQL-standard body's form (see `StdForm`)
+    pub(super) std_form: StdForm,
     code: Code,
 }
+
+/// A function's planner facts that change nothing here but are kept, and shown in pg_proc, as made or altered:
+/// proleakproof, prorows (None: the default, 1000 for a set and 0 otherwise) and proparallel (None: `u`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct Tuning {
+    pub(super) leakproof: bool,
+    pub(super) rows: Option<f64>,
+    pub(super) parallel: Option<char>,
+}
+
+/// How a function's SQL-standard body was written, for pg_get_functiondef: `RETURN expr` (None), or BEGIN ATOMIC
+/// with, for each statement, whether it was a RETURN (kept as the SELECT of its value).
+pub(super) type StdForm = Option<Vec<bool>>;
 
 enum Code {
     Sql(Vec<Stmt>),
@@ -294,6 +372,18 @@ impl Function {
         if !self.config.is_empty() {
             j["config"] = serde_json::json!(self.config);
         }
+        if self.tuning.leakproof {
+            j["leakproof"] = Json::Bool(true);
+        }
+        if let Some(r) = self.tuning.rows {
+            j["rows"] = Json::from(r);
+        }
+        if let Some(p) = self.tuning.parallel {
+            j["parallel"] = Json::String(p.to_string());
+        }
+        if let Some(a) = &self.std_form {
+            j["atomic"] = serde_json::json!(a);
+        }
         j
     }
 
@@ -339,6 +429,12 @@ impl Function {
             cost: j["cost"].as_f64(),
             std_body: j["std_body"] == true,
             config: serde_json::from_value(j["config"].clone()).unwrap_or_default(),
+            tuning: Tuning {
+                leakproof: j["leakproof"] == true,
+                rows: j["rows"].as_f64(),
+                parallel: j["parallel"].as_str().and_then(|p| p.chars().next()),
+            },
+            std_form: serde_json::from_value(j["atomic"].clone()).ok().flatten(),
             code: Code::Sql(vec![]),
         };
         f.compile()?;
@@ -539,6 +635,10 @@ fn sql_body(f: &Function) -> Result<Vec<Stmt>> {
             | Stmt::Insert { .. }
             | Stmt::Update { .. }
             | Stmt::Delete { .. }) => out.push(s),
+            // (the standard's body is parsed as it is made, as Postgres's, which takes no utility statement there)
+            s if f.std_body && !matches!(s, Stmt::Call(_)) => {
+                return err(UNSUPPORTED, format!("{} is not yet supported in unquoted SQL function body", what(&s)));
+            }
             s => {
                 return err(
                     UNSUPPORTED,
@@ -918,12 +1018,16 @@ fn is_a(code: &'static str, rel: &str, what: &str, detail: &str) -> SqlError {
 fn trigger_function(v: &View, x: &Trigger) -> Result<()> {
     match named(v, &x.func)?.into_iter().find(|f| f.args.is_empty()) {
         // (pg_catalog's own trigger functions, which take their arguments from the trigger: see `tsvector_trigger`)
-        None if builtin_trigger(&x.func).is_some() => Ok(()),
+        None if builtin_trigger(&x.func).is_some() || x.func == SUPPRESS_REDUNDANT => Ok(()),
         None => err(NO_FUNCTION, format!("function {}() does not exist", x.func)),
         Some(f) if f.ret != Ret::Trigger => err("42P17", format!("function {} must return type trigger", x.func)),
         Some(_) => Ok(()),
     }
 }
+
+/// pg_catalog's trigger function that skips an UPDATE of a row that changes nothing in it (when none of that name was
+/// made).
+const SUPPRESS_REDUNDANT: &str = "suppress_redundant_updates_trigger";
 
 /// The trigger functions of pg_catalog that are built in, when none of that name was made: whether the function
 /// reads its configuration from a column (`tsvector_update_trigger_column`) rather than naming it.
@@ -1166,9 +1270,39 @@ impl Parser {
         // when not given)
         let (mut c_lang, mut c_symbol) = (false, None);
         let mut cost: Option<f64> = None;
+        let mut tuning = Tuning::default();
+        let mut std_form: StdForm = None;
         loop {
             if procedure && self.is_kw("returns") {
                 return self.fail("a procedure returns nothing, so it has no RETURNS");
+            }
+            // (what only tunes a function's calls a procedure doesn't have, as Postgres's compute_common_attribute
+            // says, where it is written)
+            let only_functions = [
+                "immutable",
+                "stable",
+                "volatile",
+                "strict",
+                "called",
+                "leakproof",
+                "cost",
+                "rows",
+                "support",
+                "parallel",
+                "window",
+            ];
+            if procedure
+                && (matches!(self.peek(), Some(Tok::Word(w)) if only_functions.contains(&w.as_str()))
+                    || (self.is_kw("not") && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "leakproof")))
+            {
+                return Err(SqlError {
+                    code: "42P13",
+                    message: "invalid attribute in procedure definition".into(),
+                    info: Some(Box::new(Violation {
+                        position: self.starts.get(self.i).map(|s| *s as u32 + 1),
+                        ..Violation::default()
+                    })),
+                });
             }
             if self.kw("returns") {
                 if self.kw("null") {
@@ -1218,7 +1352,9 @@ impl Parser {
                 strict = false;
             } else if self.kw("not") {
                 self.expect_kw("leakproof")?;
+                tuning.leakproof = false;
             } else if self.kw("leakproof") {
+                tuning.leakproof = true;
             } else if self.kw("external") || self.is_kw("security") {
                 self.expect_kw("security")?;
                 if self.kw("definer") {
@@ -1229,9 +1365,15 @@ impl Parser {
                     return self.fail("expected DEFINER or INVOKER");
                 }
             } else if self.kw("parallel") {
-                if !(self.kw("safe") || self.kw("unsafe") || self.kw("restricted")) {
+                tuning.parallel = Some(if self.kw("safe") {
+                    's'
+                } else if self.kw("restricted") {
+                    'r'
+                } else if self.kw("unsafe") {
+                    'u'
+                } else {
                     return self.fail("expected SAFE, UNSAFE or RESTRICTED");
-                }
+                });
             } else if self.is_kw("cost") || self.is_kw("rows") {
                 let is_cost = self.kw("cost");
                 if !is_cost {
@@ -1241,14 +1383,22 @@ impl Parser {
                     Some(Tok::Num(n)) => n,
                     _ => return self.fail("expected a number"),
                 };
+                let x: f64 = n.parse().unwrap_or(0.0);
                 if is_cost {
-                    let c: f64 = n.parse().unwrap_or(100.0);
-                    if c <= 0.0 {
+                    if x <= 0.0 {
                         return err("22023", "COST must be positive");
                     }
-                    cost = Some(c);
+                    cost = Some(x);
+                } else {
+                    if x <= 0.0 {
+                        return err("22023", "ROWS must be positive");
+                    }
+                    tuning.rows = Some(x);
                 }
             } else if self.kw("as") {
+                if inline {
+                    return err("42P13", "duplicate function body specified");
+                }
                 match self.next() {
                     Some(Tok::Str(s)) => body = Some(s),
                     _ => return self.fail("expected the function's body as a string, like $$ ... $$"),
@@ -1259,18 +1409,25 @@ impl Parser {
                         _ => return self.fail("expected the function's link symbol as a string"),
                     }
                 }
-            } else if self.kw("return") {
-                // RETURN expression: the SQL standard's body
+            } else if self.is_kw("return") || self.is_kw("begin") && body.is_some() {
+                // RETURN expression: the SQL standard's body (where AS gave one too, two bodies)
+                if body.is_some() {
+                    return err("42P13", "duplicate function body specified");
+                }
+                self.i += 1;
                 let (start, toks) = (self.i, self.t[self.i..].to_vec());
                 self.expr()?;
                 body = Some(format!("select {}", tokens_sql(&toks[..self.i - start])));
                 inline = true;
             } else if self.is_kw("begin") && self.t.get(self.i + 1) == Some(&Tok::Word("atomic".into())) {
                 self.i += 2;
-                body = Some(self.atomic_body()?);
+                let (text, returns) = self.atomic_body()?;
+                body = Some(text);
+                std_form = Some(returns);
                 inline = true;
             } else if self.kw("set") {
-                if let Some((name, values)) = self.config_clause()? {
+                // (FROM CURRENT is read, not kept: the session's value then isn't captured)
+                if let (name, Some(values)) = self.routine_setting()? {
                     config.retain(|(n, _)| *n != name);
                     config.push((name, values));
                 }
@@ -1331,6 +1488,10 @@ impl Parser {
             }
             false => body,
         };
+        // (the standard's body is parsed as it is made, for argument types it can't know if polymorphic)
+        if inline && args.iter().any(|a| matches!(a.1, Type::Poly(_))) {
+            return err("42P13", "SQL function with unquoted function body cannot have polymorphic arguments");
+        }
         let lang = match (lang, inline) {
             (None, true) | (Some(Lang::Sql), _) => Lang::Sql,
             (Some(Lang::PlPgSql), true) => return err("42P13", "inline SQL function body only valid for language SQL"),
@@ -1390,26 +1551,37 @@ impl Parser {
             cost,
             std_body: inline,
             config,
+            tuning,
+            std_form,
             code: Code::Sql(vec![]),
         };
         f.compile()?;
         Ok(Stmt::CreateFunction(Arc::new(f), replace, procedure))
     }
 
-    /// After BEGIN ATOMIC: statements up to END, as SQL.
-    fn atomic_body(&mut self) -> Result<String> {
-        let mut parts = vec![];
+    /// After BEGIN ATOMIC: statements up to END, as SQL, and for each whether it was a RETURN.
+    fn atomic_body(&mut self) -> Result<(String, Vec<bool>)> {
+        let (mut parts, mut returns) = (vec![], vec![]);
         loop {
             while self.sym(";") {}
             if self.kw("end") {
-                return Ok(parts.join("; "));
+                return Ok((parts.join("; "), returns));
             }
-            let (start, toks) = (self.i, self.t[self.i..].to_vec());
-            self.stmt()?;
-            parts.push(tokens_sql(&toks[..self.i - start]));
+            // RETURN expression: a statement of the standard's body, the value the function gives
+            if self.kw("return") {
+                let (start, toks) = (self.i, self.t[self.i..].to_vec());
+                self.expr()?;
+                parts.push(format!("select {}", tokens_sql(&toks[..self.i - start])));
+                returns.push(true);
+            } else {
+                let (start, toks) = (self.i, self.t[self.i..].to_vec());
+                self.stmt()?;
+                parts.push(tokens_sql(&toks[..self.i - start]));
+                returns.push(false);
+            }
             if !self.sym(";") {
                 self.expect_kw("end")?;
-                return Ok(parts.join("; "));
+                return Ok((parts.join("; "), returns));
             }
         }
     }
@@ -1456,6 +1628,8 @@ impl Parser {
             cost: None,
             std_body: false,
             config: vec![],
+            tuning: Tuning::default(),
+            std_form: None,
             code: Code::Sql(vec![]),
         };
         f.compile()?;
@@ -1490,21 +1664,180 @@ impl Parser {
         Ok(Stmt::Call(Box::new(select_of(call))))
     }
 
-    /// After a function's SET: `name { TO | = } value [, ...]`, kept (see `Function::config`); `name FROM CURRENT`
-    /// is read, not kept (None; ponytail: the session's value then isn't captured).
-    pub(super) fn config_clause(&mut self) -> Result<Option<(String, Vec<String>)>> {
+    /// After DROP FUNCTION.
+    pub(super) fn drop_function(&mut self, procedure: bool) -> Result<Stmt> {
+        let if_exists = self.kw("if");
+        if if_exists {
+            self.expect_kw("exists")?;
+        }
+        let mut names = vec![];
+        loop {
+            names.push(self.routine_ref()?);
+            if !self.sym(",") {
+                break;
+            }
+        }
+        let cascade = self.kw("cascade");
+        if !cascade {
+            self.kw("restrict");
+        }
+        Ok(Stmt::DropFunction { names, if_exists, cascade, procedure, routine: false })
+    }
+
+    /// A routine as DROP and ALTER name it: its name (a plain one: the routines of that name in every schema on the
+    /// search_path) and, if written, its argument types (an OUT parameter's not among them).
+    fn routine_ref(&mut self) -> Result<(String, Option<Vec<Type>>)> {
+        let name = match self.t.get(self.i + 1) {
+            Some(Tok::Sym(".")) => self.routine_name(false, Kind::Func)?,
+            _ => func_named(&self.name()?),
+        };
+        let types = if self.sym("(") {
+            let mut ts = vec![];
+            if !self.sym(")") {
+                loop {
+                    let (_, t, _, mode) = self.fn_arg()?;
+                    if mode != ArgMode::Out {
+                        ts.push(t);
+                    }
+                    if !self.sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+            }
+            Some(ts)
+        } else {
+            None
+        };
+        Ok((name, types))
+    }
+
+    /// After ALTER FUNCTION, PROCEDURE or ROUTINE (`kind`): `name [(argument types)]` and what is done to it: OWNER
+    /// TO, RENAME TO, SET SCHEMA, [NO] DEPENDS ON EXTENSION, or attributes (each with where it is written, for the
+    /// error a procedure's that only a function has gives).
+    pub(super) fn alter_routine(&mut self, kind: RoutineKind) -> Result<Stmt> {
+        let (name, types) = self.routine_ref()?;
+        if self.kw("owner") {
+            self.expect_kw("to")?;
+            let procedure = kind == RoutineKind::Procedure;
+            return Ok(Stmt::AlterOwner(acl::Owned::Routine(name, types, procedure), self.role_spec(false)?));
+        }
+        let action = if self.kw("rename") {
+            self.expect_kw("to")?;
+            RoutineAlter::Rename(self.name()?)
+        } else if self.is_kw("set") && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "schema") {
+            self.i += 2;
+            RoutineAlter::Schema(self.name()?)
+        } else if self.is_kw("depends")
+            || (self.is_kw("no") && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "depends"))
+        {
+            // (an extension's own objects aren't dropped with it here: nothing to record)
+            self.skip_rest();
+            return Ok(Stmt::NoopNotice(kind.tag(), "extensions don't own functions here: nothing to record"));
+        } else {
+            let mut attrs = vec![];
+            loop {
+                let at = self.starts.get(self.i).map_or(0, |s| *s as u32 + 1);
+                let attr = if self.kw("immutable") {
+                    RoutineAttr::Volatility(Volatility::Immutable)
+                } else if self.kw("stable") {
+                    RoutineAttr::Volatility(Volatility::Stable)
+                } else if self.kw("volatile") {
+                    RoutineAttr::Volatility(Volatility::Volatile)
+                } else if self.kw("strict") {
+                    RoutineAttr::Strict(true)
+                } else if self.kw("called") {
+                    self.expect_kw("on")?;
+                    self.expect_kw("null")?;
+                    self.expect_kw("input")?;
+                    RoutineAttr::Strict(false)
+                } else if self.kw("returns") {
+                    self.expect_kw("null")?;
+                    self.expect_kw("on")?;
+                    self.expect_kw("null")?;
+                    self.expect_kw("input")?;
+                    RoutineAttr::Strict(true)
+                } else if self.kw("leakproof") {
+                    RoutineAttr::Leakproof(true)
+                } else if self.is_kw("not") && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "leakproof")
+                {
+                    self.i += 2;
+                    RoutineAttr::Leakproof(false)
+                } else if self.kw("external") || self.is_kw("security") {
+                    self.expect_kw("security")?;
+                    if self.kw("definer") {
+                        RoutineAttr::Definer(true)
+                    } else {
+                        self.expect_kw("invoker")?;
+                        RoutineAttr::Definer(false)
+                    }
+                } else if self.kw("parallel") {
+                    let p = match self.next() {
+                        Some(Tok::Word(w) | Tok::Ident(w) | Tok::Str(w)) => w.to_lowercase(),
+                        _ => return self.fail("expected SAFE, UNSAFE or RESTRICTED"),
+                    };
+                    match p.as_str() {
+                        "safe" => RoutineAttr::Parallel('s'),
+                        "restricted" => RoutineAttr::Parallel('r'),
+                        "unsafe" => RoutineAttr::Parallel('u'),
+                        _ => {
+                            return err("22023", "parameter \"parallel\" must be SAFE, RESTRICTED, or UNSAFE");
+                        }
+                    }
+                } else if self.is_kw("cost") || self.is_kw("rows") {
+                    let cost = self.kw("cost");
+                    if !cost {
+                        self.kw("rows");
+                    }
+                    let n: f64 = match self.next() {
+                        Some(Tok::Num(n)) => n.parse().unwrap_or(0.0),
+                        _ => return self.fail("expected a number"),
+                    };
+                    if cost { RoutineAttr::Cost(n) } else { RoutineAttr::Rows(n) }
+                } else if self.kw("support") {
+                    self.routine_name(false, Kind::Func)?;
+                    RoutineAttr::Support
+                } else if self.kw("reset") {
+                    if self.kw("all") {
+                        RoutineAttr::Reset(None)
+                    } else {
+                        let mut n = self.name()?;
+                        while self.sym(".") {
+                            n = format!("{n}.{}", self.name()?);
+                        }
+                        RoutineAttr::Reset(Some(n))
+                    }
+                } else if self.kw("set") {
+                    let (n, values) = self.routine_setting()?;
+                    RoutineAttr::Set(n, values)
+                } else {
+                    break;
+                };
+                attrs.push((attr, at));
+            }
+            if attrs.is_empty() {
+                return self.fail("expected RENAME TO, OWNER TO, SET SCHEMA or an attribute");
+            }
+            self.kw("restrict");
+            RoutineAlter::Attrs(attrs)
+        };
+        Ok(Stmt::AlterRoutine { name, types, kind, action })
+    }
+
+    /// After a routine's SET: `name { TO | = } value [, ...]`, its values (search_path's string split into its
+    /// schemas, DEFAULT its default), or `name FROM CURRENT` (None: the session's value then, not captured here).
+    fn routine_setting(&mut self) -> Result<(String, Option<Vec<String>>)> {
         let mut name = self.name()?;
         while self.sym(".") {
             name = format!("{name}.{}", self.name()?);
         }
         if self.kw("from") {
             self.expect_kw("current")?;
-            return Ok(None);
+            return Ok((name, None));
         }
         if !self.kw("to") {
             self.expect_sym("=")?;
         }
-        // (search_path as SET search_path reads it: a string of schemas split, DEFAULT its default)
         let path = name == "search_path";
         let mut values = vec![];
         if path && self.kw("default") {
@@ -1521,50 +1854,7 @@ impl Parser {
                 }
             }
         }
-        Ok(Some((name, values)))
-    }
-
-    /// After DROP FUNCTION.
-    pub(super) fn drop_function(&mut self, procedure: bool) -> Result<Stmt> {
-        let if_exists = self.kw("if");
-        if if_exists {
-            self.expect_kw("exists")?;
-        }
-        let mut names = vec![];
-        loop {
-            // (a plain name: the functions of that name in every schema on the search_path)
-            let name = match self.t.get(self.i + 1) {
-                Some(Tok::Sym(".")) => self.routine_name(false, Kind::Func)?,
-                _ => func_named(&self.name()?),
-            };
-            let types = if self.sym("(") {
-                let mut ts = vec![];
-                if !self.sym(")") {
-                    loop {
-                        let (_, t, _, mode) = self.fn_arg()?;
-                        if mode != ArgMode::Out {
-                            ts.push(t);
-                        }
-                        if !self.sym(",") {
-                            break;
-                        }
-                    }
-                    self.expect_sym(")")?;
-                }
-                Some(ts)
-            } else {
-                None
-            };
-            names.push((name, types));
-            if !self.sym(",") {
-                break;
-            }
-        }
-        let cascade = self.kw("cascade");
-        if !cascade {
-            self.kw("restrict");
-        }
-        Ok(Stmt::DropFunction { names, if_exists, cascade, procedure })
+        Ok((name, Some(values)))
     }
 
     /// After CREATE [OR REPLACE] TRIGGER, or CREATE CONSTRAINT TRIGGER (`constraint`): AFTER only, FROM and the
@@ -1997,6 +2287,53 @@ pub(super) fn find_routine(v: &View, name: &str, types: Option<&[Type]>) -> Resu
         ),
         None => Ok(all.into_iter().next()),
     }
+}
+
+/// The routine ALTER FUNCTION, PROCEDURE or ROUTINE (`kind`) names, as Postgres's LookupFuncWithArgs finds it: by
+/// its argument types where they are written, else the one of its name (42725 for several, 42883 for none), and
+/// then of that kind (a FUNCTION isn't a procedure, a PROCEDURE is one; 42809).
+pub(super) fn lookup_routine(v: &View, name: &str, types: Option<&[Type]>, kind: RoutineKind) -> Result<Arc<Function>> {
+    let all = visible(name, named(v, name)?);
+    let noun = kind.noun();
+    let shown_types = |ts: &[Type]| ts.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ");
+    let f = match types {
+        Some(ts) => all.into_iter().find(|f| f.args.iter().map(|a| type_named(&a.1)).eq(ts.iter().map(type_named))),
+        None if all.len() > 1 => {
+            return Err(SqlError {
+                code: "42725",
+                message: format!("{noun} name \"{}\" is not unique", written(name)),
+                info: Some(Box::new(Violation {
+                    hint: Some(format!("Specify the argument list to select the {noun} unambiguously.")),
+                    ..Violation::default()
+                })),
+            });
+        }
+        None => all.into_iter().next(),
+    };
+    let Some(f) = f else {
+        // (a FUNCTION or ROUTINE that isn't there is named a function)
+        let noun = if kind == RoutineKind::Procedure { "procedure" } else { "function" };
+        return err(
+            NO_FUNCTION,
+            match types {
+                Some(ts) => format!("{noun} {}({}) does not exist", written(name), shown_types(ts)),
+                None => format!("could not find a {noun} named \"{}\"", written(name)),
+            },
+        );
+    };
+    let sig = format!("{}({})", written(name), f.args.iter().map(|a| a.1.name()).collect::<Vec<_>>().join(", "));
+    match kind {
+        RoutineKind::Function if f.procedure => err("42809", format!("{sig} is not a function")),
+        RoutineKind::Procedure if !f.procedure => err("42809", format!("{sig} is not a procedure")),
+        _ => Ok(f),
+    }
+}
+
+/// The JSON a routine is stored as, with `edit` made to it (see `Function::to_json`).
+pub(super) fn edited(f: &Function, edit: impl FnOnce(&mut Json)) -> String {
+    let mut j = f.to_json();
+    edit(&mut j);
+    j.to_string()
 }
 
 /// `named`'s functions less each with the argument types of one in a schema before it on the search_path, which
@@ -2707,6 +3044,8 @@ impl Binder<'_> {
             }
             None => c,
         };
+        // (the types the call gives, as its errors name them)
+        let given_types = tys(&args);
         let def = match (&c.def, self.v) {
             // (a VARIADIC one takes the arguments from its last parameter on as its array's elements)
             (Some(d), _) if d.variadic && c.names.is_empty() && d.name != "inline_code_block" => {
@@ -2751,6 +3090,34 @@ impl Binder<'_> {
                 let given = tys(&args);
                 let (f, packed) = match pick_call(&c.name, &fs, &given) {
                     Ok(found) => found,
+                    // CALL of what no procedure is: a built-in function (or aggregate) is one that isn't a procedure,
+                    // else there is no such procedure
+                    Err(e) if c.via_call && e.code == NO_FUNCTION && fs.iter().all(|f| !f.procedure) => {
+                        let sig = format!("{}({})", written(&c.name), shown(&given));
+                        let builtin = !catalog_schema::builtin_procs(rel_part(written(&c.name))).is_empty();
+                        return Err(match builtin || !fs.is_empty() {
+                            true => SqlError {
+                                code: "42809",
+                                message: format!("{sig} is not a procedure"),
+                                info: Some(Box::new(Violation {
+                                    hint: Some("To call a function, use SELECT.".into()),
+                                    ..Violation::default()
+                                })),
+                            },
+                            false => SqlError {
+                                code: NO_FUNCTION,
+                                message: format!("procedure {sig} does not exist"),
+                                info: Some(Box::new(Violation {
+                                    hint: Some(
+                                        "No procedure matches the given name and argument types. You might need to \
+                                         add explicit type casts."
+                                            .into(),
+                                    ),
+                                    ..Violation::default()
+                                })),
+                            },
+                        });
+                    }
                     // one of Postgres's own functions called by its name, which is its C symbol too
                     // (`int4smaller(a, b)`): what it does, as SQL (see `userdefs::internal_sql`)
                     Err(e) if fs.is_empty() && e.code == NO_FUNCTION => {
@@ -2803,7 +3170,11 @@ impl Binder<'_> {
             } else {
                 ("is a procedure", "To call a procedure, use CALL.")
             };
-            return err("42809", format!("{} {what}; {hint}", d.sig()));
+            return Err(SqlError {
+                code: "42809",
+                message: format!("{}({}) {what}", written(&c.name), shown(&given_types)),
+                info: Some(Box::new(Violation { hint: Some(hint.into()), ..Violation::default() })),
+            });
         }
         // EXECUTE on it (an inlined function is checked here, as Postgres checks before inlining)
         if let (Some(d), Some(v), Some(who)) = (&def, self.v, roles::checked()) {
@@ -3857,6 +4228,10 @@ impl Exec<'_> {
         if let Code::Pl(b) = &f.code {
             plpgsql::created(b)?;
         }
+        // (LEAKPROOF says it reveals nothing of its arguments, which only a superuser may vouch for)
+        if f.tuning.leakproof && roles::current().is_some_and(|w| !w.superuser) {
+            return err("42501", "only superuser can define a leakproof function");
+        }
         // a shell type (`CREATE TYPE name` alone) in its signature: Postgres's notices, the type to be filled in by
         // the CREATE TYPE these functions are for
         let shell = |t: &Type| {
@@ -3953,8 +4328,15 @@ impl Exec<'_> {
         names: &[(String, Option<Vec<Type>>)],
         if_exists: bool,
         cascade: bool,
-        procedure: bool,
+        (procedure, routine): (bool, bool),
     ) -> Result<Output> {
+        // (DROP ROUTINE: either kind; its messages name a function, as Postgres's do)
+        let noun = match (procedure, routine) {
+            (_, true) => "routine",
+            (true, _) => "procedure",
+            _ => "function",
+        };
+        let missing = if procedure && !routine { "procedure" } else { "function" };
         self.db.batch_with(self.branch, |v| {
             let mut writes = vec![];
             let mut tables: Vec<Table> = schemas(v)?;
@@ -3962,18 +4344,17 @@ impl Exec<'_> {
                 // as in Postgres, a routine of the other kind still hides a later one of its argument types; without
                 // them, only those of the kind dropped count
                 let mut all = visible(name, named(v, name)?);
-                if types.is_none() {
+                if types.is_none() && !routine {
                     all.retain(|f| f.procedure == procedure);
                 }
                 let found = match types {
                     Some(ts) => all.iter().find(|f| f.args.iter().map(|a| type_named(&a.1)).eq(ts.iter().map(type_named))).cloned(),
                     None if all.len() > 1 => {
-                        let kind = if procedure { "procedure" } else { "function" };
                         return Err(SqlError {
                             code: "42725",
-                            message: format!("{kind} name \"{}\" is not unique", written(name)),
+                            message: format!("{noun} name \"{}\" is not unique", written(name)),
                             info: Some(Box::new(Violation {
-                                hint: Some(format!("Specify the argument list to select the {kind} unambiguously.")),
+                                hint: Some(format!("Specify the argument list to select the {noun} unambiguously.")),
                                 ..Violation::default()
                             })),
                         });
@@ -3990,8 +4371,8 @@ impl Exec<'_> {
                     });
                     let shown = match (types, &unknown) {
                         (_, Some(n)) => format!("type \"{}\" does not exist", shown_type(n)),
-                        (Some(ts), None) => format!("function {}({}) does not exist", written(name), ts.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")),
-                        (None, None) => format!("could not find a function named \"{}\"", written(name)),
+                        (Some(ts), None) => format!("{missing} {}({}) does not exist", written(name), ts.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")),
+                        (None, None) => format!("could not find a {missing} named \"{}\"", written(name)),
                     };
                     if if_exists {
                         // (Postgres names the types as the statement wrote them: `int` as pg_catalog.int4)
@@ -4007,7 +4388,7 @@ impl Exec<'_> {
                     }
                     return err(NO_FUNCTION, shown);
                 };
-                if f.procedure != procedure {
+                if f.procedure != procedure && !routine {
                     let what = if procedure { "a procedure" } else { "a function" };
                     return err("42809", format!("{} is not {what}", f.sig()));
                 }
@@ -4069,7 +4450,11 @@ impl Exec<'_> {
             Ok((writes, ()))
         })?;
         forget_parsed(); // (as CREATE FUNCTION does)
-        Ok(Output::tag(if procedure { "DROP PROCEDURE" } else { "DROP FUNCTION" }))
+        Ok(Output::tag(match (procedure, routine) {
+            (_, true) => "DROP ROUTINE",
+            (true, _) => "DROP PROCEDURE",
+            _ => "DROP FUNCTION",
+        }))
     }
 
     /// CREATE TRIGGER on a view: INSTEAD OF row triggers and BEFORE or AFTER statement triggers, each kept as a
@@ -4433,6 +4818,13 @@ impl Exec<'_> {
             if !self.when(t, x, old, new.as_deref())? {
                 continue;
             }
+            // (an UPDATE whose new row is the old one, skipped; any other row written as it is)
+            if x.func == SUPPRESS_REDUNDANT && ev == Event::Update && !self.has_trigger_function(&x.func) {
+                if old.is_some() && new.as_deref() == old {
+                    return Ok(None);
+                }
+                continue;
+            }
             let fired = match builtin_trigger(&x.func).filter(|_| !self.has_trigger_function(&x.func)) {
                 Some(by_column) => self.tsvector_trigger(t, x, ev, new.as_deref(), set, by_column)?,
                 None => self.fire(t, x, ev, old, new.as_deref())?,
@@ -4687,6 +5079,15 @@ impl Exec<'_> {
     ) -> Result<Option<Vec<Value>>> {
         let f = self.functions(&x.func)?.iter().find(|f| f.args.is_empty() && f.ret == Ret::Trigger).cloned();
         // (a built-in trigger function fired as a statement's or after the row: Postgres's own refusals)
+        if f.is_none() && x.func == SUPPRESS_REDUNDANT {
+            let m = match (ev, x.before, x.row) {
+                (Event::Update, true, true) => return Ok(new.map(<[Value]>::to_vec)),
+                (Event::Update, true, false) => "must be called for each row",
+                (Event::Update, false, _) => "must be called before update",
+                _ => "must be called on update",
+            };
+            return err("39P01", format!("suppress_redundant_updates_trigger: {m}"));
+        }
         if f.is_none() && builtin_trigger(&x.func).is_some() {
             let internal =
                 |m: &str| SqlError { code: "XX000", message: format!("tsvector_update_trigger: {m}"), info: None };
@@ -4795,6 +5196,8 @@ pub(super) fn instance(f: &Arc<Function>, given: &[Option<Type>], sure: bool) ->
         cost: f.cost,
         std_body: f.std_body,
         config: f.config.clone(),
+        tuning: f.tuning,
+        std_form: f.std_form.clone(),
         code: Code::Sql(vec![]),
     };
     g.compile()?;

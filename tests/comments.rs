@@ -94,10 +94,10 @@ fn a_view_another_view_reads_keeps_its_name() {
     ] {
         run(&db, &mut s, q);
     }
-    // views name what they read and aren't rewritten (Postgres follows the rename): refused, and nothing moves
-    let e = s.run(&db, "alter view v rename to v2", &[]).err().unwrap();
-    assert_eq!(e.code, "0A000", "{e}");
-    assert_eq!(one(&db, &mut s, "select count(*) from v"), Value::Int(0));
+    // a view reading the renamed one follows the rename, as Postgres's does, and keeps its comment
+    run(&db, &mut s, "alter view v rename to v2");
+    assert_eq!(one(&db, &mut s, "select count(*) from w"), Value::Int(0));
+    assert_eq!(one(&db, &mut s, "select obj_description('w'::regclass, 'pg_class')"), Value::Text("w".into()));
     // one nothing reads goes, with its comment
     run(&db, &mut s, "alter view w rename to w2");
     assert_eq!(one(&db, &mut s, "select obj_description('w2'::regclass, 'pg_class')"), Value::Text("w".into()));

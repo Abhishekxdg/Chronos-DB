@@ -17,6 +17,8 @@ rm -f "$OUT/summary.tsv"
 
 # as pg_regress sets them for the expected files
 export PGTZ=America/Los_Angeles PGDATESTYLE="Postgres, MDY" PGOPTIONS="${PGOPTIONS:-} -c intervalstyle=postgres_verbose"
+# and the paths the files read with \getenv, as pg_regress exports them (the C library's for the functions of it here)
+export PG_ABS_SRCDIR="$R" PG_ABS_BUILDDIR="$OUT" PG_LIBDIR="$R" PG_DLSUFFIX=.so
 PSQL_VARS=(-v "abs_srcdir=$R" -v "abs_builddir=$OUT" -v "libdir=$R" -v "regresslib=$R/regress" -v HIDE_TABLEAM=on -v HIDE_TOAST_COMPRESSION=on)
 
 prep() { cat "$1"; }

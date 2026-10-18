@@ -18,7 +18,7 @@ mod btree;
 mod bulk;
 mod bytes;
 mod catalog;
-pub use catalog::{Con, Idx};
+pub use catalog::{Con, Idx, pretty_default};
 mod catalog_objects;
 mod catalog_schema;
 mod collation;
@@ -258,6 +258,37 @@ fn no_op<T>(message: impl Into<String>) -> Result<T> {
 
 fn err<T>(code: &'static str, message: impl Into<String>) -> Result<T> {
     Err(SqlError { code, message: message.into(), info: None })
+}
+
+/// A column's definition's error that Postgres says of the column `of table "t"`: CREATE TABLE's, once it knows
+/// the table (the column's own parser doesn't).
+fn of_table(mut e: SqlError, table: &str) -> SqlError {
+    let says = ["multiple identity specifications", "both default and", "both identity and", "multiple generation"];
+    if e.code == SYNTAX && says.iter().any(|s| e.message.starts_with(s)) && !e.message.contains(" of table ") {
+        e.message = format!("{} of table \"{}\"", e.message, rel_part(table));
+    }
+    e
+}
+
+/// An enum type's labels' sort orders (pg_enum.enumsortorder) from its stored definition: 1, 2, 3, ... unless ALTER
+/// TYPE ... ADD VALUE kept others (`orders`).
+fn enum_orders(def: &Json, n: usize) -> Vec<f64> {
+    match def["orders"].as_array() {
+        Some(o) if o.len() == n => o.iter().map(|x| x.as_f64().unwrap_or(0.0)).collect(),
+        _ => (1..=n).map(|k| k as f64).collect(),
+    }
+}
+
+/// The words a table constraint of CREATE TABLE's list starts with, where a typed table's column's name can't be.
+const TABLE_CONSTRAINT_WORDS: &[&str] = &["constraint", "primary", "unique", "check", "foreign", "exclude", "like"];
+
+/// `err` with a DETAIL line.
+fn err_detail<T>(code: &'static str, message: impl Into<String>, detail: impl Into<String>) -> Result<T> {
+    Err(SqlError {
+        code,
+        message: message.into(),
+        info: Some(Box::new(Violation { detail: Some(detail.into()), ..Violation::default() })),
+    })
 }
 
 /// A constraint violation naming what it broke: the table (`schema.table` as stored, or plain),
@@ -3079,7 +3110,9 @@ pub(crate) fn own_path_key(list: &[String], as_role: bool) -> String {
 fn definer_refused(db: &Db, agent: &str, st: &Stmt) -> Result<()> {
     let definer = match st {
         Stmt::CreateFunction(f, ..) => f.definer,
-        Stmt::SetDefiner(_, on) => *on,
+        Stmt::AlterRoutine { action: functions::RoutineAlter::Attrs(attrs), .. } => {
+            attrs.iter().any(|(a, _)| matches!(a, functions::RoutineAttr::Definer(true)))
+        }
         // (CREATE SCHEMA's elements run as statements of their own)
         Stmt::CreateSchema { elements, .. } => {
             return elements.iter().try_for_each(|el| definer_refused(db, agent, el));
@@ -3539,10 +3572,22 @@ fn drop_schemas(db: &Db, branch: &str, names: &[String], if_exists: bool, cascad
             drops.push(Stmt::Drop { tables: typed_out, if_exists: true, cascade: true });
         }
         if !funcs.is_empty() {
-            drops.push(Stmt::DropFunction { names: funcs, if_exists: true, cascade: true, procedure: false });
+            drops.push(Stmt::DropFunction {
+                names: funcs,
+                if_exists: true,
+                cascade: true,
+                procedure: false,
+                routine: false,
+            });
         }
         if !procs.is_empty() {
-            drops.push(Stmt::DropFunction { names: procs, if_exists: true, cascade: true, procedure: true });
+            drops.push(Stmt::DropFunction {
+                names: procs,
+                if_exists: true,
+                cascade: true,
+                procedure: true,
+                routine: false,
+            });
         }
         if !types.is_empty() {
             drops.push(Stmt::DropType { names: types, if_exists: true, cascade: false });
@@ -6961,6 +7006,10 @@ enum DomainChange {
     NotNull(bool),
     /// SET DEFAULT expression (as SQL) or DROP DEFAULT: for the columns made from now on
     Default(Option<String>),
+    /// RENAME TO name (stored, in the domain's schema)
+    Rename(String),
+    /// RENAME CONSTRAINT old TO new
+    RenameConstraint(String, String),
 }
 
 /// The VALUES text of a MERGE's INSERT DEFAULT VALUES.
@@ -7049,6 +7098,9 @@ enum Alter {
     Trigger(Option<String>, char),
     /// SET (merge_by_columns = true | false), RESET (merge_by_columns)
     MergeByColumns(bool),
+    /// SET UNLOGGED (true) | LOGGED: whether Postgres would keep it out of its write-ahead log (pg_class's
+    /// relpersistence); everything here is kept alike
+    Unlogged(bool),
     /// SET (storage parameters) or RESET (theirs), `true`: RESET (see `reloptions`)
     RelOptions(Vec<reloptions::Given>, bool),
     /// SET SCHEMA name: the table, moved
@@ -7437,6 +7489,8 @@ enum Stmt {
         on_commit: Option<bool>,
         /// PARTITION BY, PARTITION OF, INHERITS (see `hier`)
         hier: hier::CreateHier,
+        /// CREATE UNLOGGED TABLE (see `Alter::Unlogged`)
+        unlogged: bool,
     },
     /// CREATE [TEMP] TABLE name [(column names)] AS query [WITH [NO] DATA], and SELECT ... INTO name:
     /// a table with the query's columns, and its rows
@@ -7478,11 +7532,6 @@ enum Stmt {
     SetAuth(Option<String>, bool),
     /// ALTER TABLE | VIEW | SEQUENCE | SCHEMA | FUNCTION ... OWNER TO role
     AlterOwner(acl::Owned, roles::Spec),
-    /// ALTER FUNCTION | PROCEDURE ... SECURITY DEFINER (true) | INVOKER (false)
-    SetDefiner(acl::Owned, bool),
-    /// ALTER FUNCTION | PROCEDURE ... SET name = value | RESET name | RESET ALL: its settings (see
-    /// `functions::Function::config`), each change (name, value): RESET's value None, RESET ALL's name too
-    RoutineConfig(acl::Owned, Vec<(Option<String>, Option<Vec<String>>)>),
     /// DROP OWNED BY roles [CASCADE]
     DropOwned(Vec<roles::Spec>, bool),
     /// REASSIGN OWNED BY roles TO role
@@ -7582,6 +7631,8 @@ enum Stmt {
         invoker: bool,
         /// WITH (security_barrier): conditions on its rows that could show what they read run after its own
         barrier: bool,
+        /// its options as pg_class.reloptions keeps them, in the order written (`security_barrier=true`)
+        reloptions: Vec<(String, String)>,
     },
     /// ALTER VIEW name SET (option = value, ...) or RESET (option, ...): of the options a view keeps
     /// (security_invoker, security_barrier, check_option), each set to its value as kept (see `view_def`) or, None,
@@ -7610,6 +7661,8 @@ enum Stmt {
     Refresh {
         name: String,
         data: bool,
+        /// CONCURRENTLY: the view has to have a unique index of plain columns, and rows already
+        concurrently: bool,
     },
     CreateSequence {
         name: String,
@@ -8067,12 +8120,21 @@ enum Stmt {
     Foreign(Box<foreign::ForeignStmt>),
     /// CREATE [OR REPLACE] FUNCTION or PROCEDURE (see `functions`); OR REPLACE, and PROCEDURE
     CreateFunction(Arc<functions::Function>, bool, bool),
-    /// DROP FUNCTION or PROCEDURE [IF EXISTS] name [(argument types)], ... [CASCADE]
+    /// DROP FUNCTION or PROCEDURE [IF EXISTS] name [(argument types)], ... [CASCADE]; DROP ROUTINE (`routine`):
+    /// either
     DropFunction {
         names: Vec<(String, Option<Vec<Type>>)>,
         if_exists: bool,
         cascade: bool,
         procedure: bool,
+        routine: bool,
+    },
+    /// ALTER FUNCTION | PROCEDURE | ROUTINE name [(argument types)] RENAME TO, SET SCHEMA or attributes
+    AlterRoutine {
+        name: String,
+        types: Option<Vec<Type>>,
+        kind: functions::RoutineKind,
+        action: functions::RoutineAlter,
     },
     /// DO 'block': the anonymous function it is, called; CALL name(args): the same, for a
     /// procedure. Each is a SELECT of the call, whose rows say nothing.
@@ -11985,6 +12047,12 @@ impl Parser {
             "drop" if self.kw("aggregate") => self.drop_aggregate(),
             "drop" if self.kw("function") => self.drop_function(false),
             "drop" if self.kw("procedure") => self.drop_function(true),
+            "drop" if self.kw("routine") => match self.drop_function(false)? {
+                Stmt::DropFunction { names, if_exists, cascade, .. } => {
+                    Ok(Stmt::DropFunction { names, if_exists, cascade, procedure: false, routine: true })
+                }
+                s => Ok(s),
+            },
             "do" => self.do_block(),
             "call" => self.call_statement(),
             "drop" if self.kw("trigger") => self.drop_trigger(),
@@ -14971,9 +15039,9 @@ impl Parser {
         Ok(())
     }
 
-    /// `ALTER <kind> name [(arguments)] OWNER TO role`, after the kind: what pg_dump writes after every object it
-    /// makes. A schema's, function's or procedure's owner changes (see `acl`); a database's isn't kept (its
-    /// world's owner is the bootstrap superuser), which the notice says.
+    /// `ALTER SCHEMA | DATABASE name OWNER TO role`, after the kind: what pg_dump writes after every object it
+    /// makes. A schema's owner changes (see `acl`); a database's isn't kept (its world's owner is the bootstrap
+    /// superuser), which the notice says.
     fn alter_owner(&mut self, tag: &'static str) -> Result<Stmt> {
         self.if_exists()?;
         if tag == "ALTER SCHEMA" {
@@ -14985,89 +15053,8 @@ impl Parser {
             self.expect_kw("to")?;
             return Ok(Stmt::AlterOwner(acl::Owned::Schema(name), self.role_spec(false)?));
         }
-        if matches!(tag, "ALTER FUNCTION" | "ALTER PROCEDURE") {
-            let save = self.i;
-            let procedure = tag == "ALTER PROCEDURE";
-            if let Ok(Stmt::DropFunction { mut names, .. }) = self.drop_function(procedure)
-                && names.len() == 1
-            {
-                if self.kw("owner") {
-                    self.expect_kw("to")?;
-                    let (name, types) = names.pop().unwrap();
-                    return Ok(Stmt::AlterOwner(acl::Owned::Routine(name, types, procedure), self.role_spec(false)?));
-                }
-                // SECURITY DEFINER | INVOKER among its attributes: who it runs as (the rest only tune
-                // Postgres's planner)
-                let mut definer = None;
-                let mut k = self.i;
-                while let Some(t) = self.t.get(k) {
-                    match t {
-                        Tok::Sym(";") => break,
-                        Tok::Word(w) if w == "security" => match self.t.get(k + 1) {
-                            Some(Tok::Word(x)) if x == "definer" => definer = Some(true),
-                            Some(Tok::Word(x)) if x == "invoker" => definer = Some(false),
-                            _ => {}
-                        },
-                        _ => {}
-                    }
-                    k += 1;
-                }
-                if let Some(d) = definer {
-                    self.skip_rest();
-                    let (name, types) = names.pop().unwrap();
-                    return Ok(Stmt::SetDefiner(acl::Owned::Routine(name, types, procedure), d));
-                }
-                // SET name = value, RESET name, RESET ALL: the settings each call runs with
-                if (self.is_kw("set") && !matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "schema"))
-                    || self.is_kw("reset")
-                {
-                    let mut changes = vec![];
-                    loop {
-                        if self.kw("set") {
-                            if let Some((n, v)) = self.config_clause()? {
-                                changes.push((Some(n), Some(v)));
-                            }
-                        } else if self.kw("reset") {
-                            if self.kw("all") {
-                                changes.push((None, None));
-                            } else {
-                                let mut n = self.name()?;
-                                while self.sym(".") {
-                                    n = format!("{n}.{}", self.name()?);
-                                }
-                                changes.push((Some(n), None));
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    self.kw("restrict");
-                    let (name, types) = names.pop().unwrap();
-                    return Ok(Stmt::RoutineConfig(acl::Owned::Routine(name, types, procedure), changes));
-                }
-            }
-            self.i = save;
-        }
-        // the name, and a function's argument types: everything up to OWNER
-        let mut closed = false;
+        // the name: everything up to OWNER
         while !self.is_kw("owner") {
-            // a function's attributes (IMMUTABLE, SECURITY DEFINER, COST n, SET search_path ...): what
-            // the planner and the privilege checks use, none of which is here
-            if closed
-                && matches!(self.peek(), Some(Tok::Word(w)) if [
-                    "immutable", "stable", "volatile", "strict", "called", "returns", "security", "external",
-                    "cost", "rows", "parallel", "leakproof", "not", "set", "reset", "support", "depends", "no",
-                ]
-                .contains(&w.as_str()))
-            {
-                // (SET SCHEMA would move it: not done here, so not said to be done)
-                if self.is_kw("set") && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "schema") {
-                    return err(UNSUPPORTED, format!("{tag} ... SET SCHEMA isn't supported yet"));
-                }
-                self.skip_rest();
-                return Ok(Stmt::NoopNotice(tag, "function attributes only tune Postgres's planner and privileges"));
-            }
-            closed = matches!(self.peek(), Some(Tok::Sym(")")));
             if self.next().is_none() {
                 return err(UNSUPPORTED, format!("{tag} does OWNER TO only here"));
             }
@@ -15169,6 +15156,15 @@ impl Parser {
             };
             return Ok(Stmt::ViewDefault { name, col, default, if_exists });
         }
+        // SET SCHEMA s: a materialized view is a table holding its query's rows, moved as one
+        if kind == "materialized view"
+            && self.is_kw("set")
+            && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "schema")
+        {
+            self.i += 2;
+            let changes = vec![Alter::SetSchema(self.name()?)];
+            return Ok(Stmt::Alter { table: name, changes, if_exists, only: false });
+        }
         if !self.kw("owner") {
             return err(UNSUPPORTED, format!("{tag} does RENAME TO, OWNER TO and SET (options) only here"));
         }
@@ -15177,12 +15173,16 @@ impl Parser {
     }
 
     fn alter(&mut self) -> Result<Stmt> {
-        for (word, tag) in [
-            ("schema", "ALTER SCHEMA"),
-            ("function", "ALTER FUNCTION"),
-            ("procedure", "ALTER PROCEDURE"),
-            ("database", "ALTER DATABASE"),
+        for (word, kind) in [
+            ("function", functions::RoutineKind::Function),
+            ("procedure", functions::RoutineKind::Procedure),
+            ("routine", functions::RoutineKind::Routine),
         ] {
+            if self.kw(word) {
+                return self.alter_routine(kind);
+            }
+        }
+        for (word, tag) in [("schema", "ALTER SCHEMA"), ("database", "ALTER DATABASE")] {
             if self.kw(word) {
                 return self.alter_owner(tag);
             }
@@ -15246,6 +15246,15 @@ impl Parser {
             } else if self.kw("validate") {
                 self.expect_kw("constraint")?;
                 DomainChange::Validate(self.name()?)
+            } else if self.kw("rename") {
+                if self.kw("constraint") {
+                    let from = self.name()?;
+                    self.expect_kw("to")?;
+                    DomainChange::RenameConstraint(from, self.name()?)
+                } else {
+                    self.expect_kw("to")?;
+                    DomainChange::Rename(qualify(schema_part(&name), &self.name()?))
+                }
             } else {
                 return err(
                     UNSUPPORTED,
@@ -15639,8 +15648,10 @@ impl Parser {
                     Alter::Noop("tablespaces aren't used: every table is in the one store")
                 } else if set && self.kw("schema") {
                     Alter::SetSchema(self.name()?)
-                } else if set && (self.kw("logged") || self.kw("unlogged")) {
-                    Alter::Noop("every table is logged")
+                } else if set && self.kw("logged") {
+                    Alter::Unlogged(false)
+                } else if set && self.kw("unlogged") {
+                    Alter::Unlogged(true)
                 } else {
                     // SET (merge_by_columns = true), RESET (merge_by_columns): Chronos's own table setting; the
                     // storage parameters Postgres has (fillfactor, autovacuum_*, ...) are checked and kept, though
@@ -16964,8 +16975,25 @@ impl Parser {
         // TEMP / TEMPORARY: the session's own, in memory (see `Session::temp`)
         let temp = self.kw("temp") || self.kw("temporary");
         if !temp && (self.is_kw("unlogged") || self.is_kw("global") || self.is_kw("local")) {
+            let unlogged = self.is_kw("unlogged");
             self.i += 1;
-            return self.create_more(false);
+            let at = self.i + 1; // (the table's name, after TABLE)
+            let mut st = self.create_more(false)?;
+            if let (true, Stmt::Create { unlogged: u, table, .. }) = (unlogged, &mut st) {
+                // (the session's temporary schema holds temporary relations alone)
+                if schema_part(table) == "pg_temp" {
+                    return Err(SqlError {
+                        code: "42P16",
+                        message: "only temporary relations may be created in temporary schemas".into(),
+                        info: Some(Box::new(Violation {
+                            position: self.starts.get(at).map(|s| *s as u32 + 1),
+                            ..Violation::default()
+                        })),
+                    });
+                }
+                *u = true;
+            }
+            return Ok(st);
         }
         if temp && self.is_kw("unlogged") {
             return err(SYNTAX, "a table can't be both TEMPORARY and UNLOGGED");
@@ -17011,7 +17039,13 @@ impl Parser {
             // (a type that isn't composite is named as format_type names it; one the catalog has no row of doesn't
             // exist, `int` among them: Postgres looks the name up as written)
             let plain = written.strip_prefix("pg_catalog.").unwrap_or(&written);
-            let made_here = || with_path_view(|v| v.get(&type_key(&name)).ok().flatten().is_some()).unwrap_or(false);
+            // (a table's row type is no type made with CREATE TYPE ... AS either)
+            let made_here = || {
+                with_path_view(|v| {
+                    v.get(&type_key(&name)).ok().flatten().is_some() || relation_kind(v, &name).ok().flatten().is_some()
+                })
+                .unwrap_or(false)
+            };
             let fields = match userdefs::composite(&name).and_then(|t| t.fields()) {
                 Some(f) => f,
                 None if made_here() => {
@@ -17029,17 +17063,45 @@ impl Parser {
             if !(partition || typed) {
                 self.expect_sym("(")?;
             }
-            if typed
-                && matches!(self.peek(), Some(Tok::Word(_) | Tok::Ident(_)))
-                && self.t.get(self.i + 1).is_some_and(|t| *t == Tok::Word("with".into()))
-            {
-                return err(
-                    UNSUPPORTED,
-                    "a typed table's column WITH OPTIONS isn't supported yet: give the table constraints after its columns' list",
-                );
-            }
+            // (a typed table's columns given options, by name)
+            let mut optioned: Vec<String> = vec![];
             // (an empty list is for a table made of what it inherits)
             while !self.sym(")") {
+                // `col WITH OPTIONS [constraints, DEFAULT]`: a typed table's column (its type is the type's field's)
+                let with_options = matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "with")
+                    && matches!(self.t.get(self.i + 2), Some(Tok::Word(w)) if w == "options");
+                // (WITH OPTIONS may be left out: a typed table's column has no type of its own written)
+                let field = |t: Option<&Tok>| match t {
+                    Some(Tok::Word(w)) if TABLE_CONSTRAINT_WORDS.contains(&w.as_str()) => false,
+                    Some(Tok::Word(w) | Tok::Ident(w)) => cols.iter().any(|c| c.name == *w),
+                    _ => false,
+                };
+                if typed
+                    && matches!(self.peek(), Some(Tok::Word(_) | Tok::Ident(_)))
+                    && (with_options || field(self.peek()))
+                {
+                    let name_tok = self.t[self.i].clone();
+                    let n = self.name()?;
+                    if with_options {
+                        self.i += 1; // WITH
+                        self.t[self.i] = name_tok; // (OPTIONS read as the column's name again)
+                    } else {
+                        self.i -= 1;
+                    }
+                    let Some(at) = cols.iter().position(|c| c.name == n) else {
+                        return err(NO_COLUMN, format!("column \"{n}\" does not exist"));
+                    };
+                    if optioned.contains(&n) {
+                        return err(DUP_COLUMN, format!("column \"{n}\" specified more than once"));
+                    }
+                    optioned.push(n);
+                    cols[at] = self.column_as(Some(cols[at].ty)).map_err(|e| of_table(e, &table))?;
+                    if !self.sym(",") {
+                        self.expect_sym(")")?;
+                        break;
+                    }
+                    continue;
+                }
                 let named = if self.kw("constraint") { Some(self.name()?) } else { None };
                 if named.is_none() && self.kw("like") {
                     likes.push(self.like_clause(cols.len())?);
@@ -17104,7 +17166,8 @@ impl Parser {
                             .contains(&w.as_str()),
                             _ => false,
                         };
-                    cols.push(if untyped { self.column_as(Some(Type::Text))? } else { self.column()? });
+                    let made = if untyped { self.column_as(Some(Type::Text)) } else { self.column() };
+                    cols.push(made.map_err(|e| of_table(e, &table))?);
                 }
                 if !self.sym(",") {
                     self.expect_sym(")")?;
@@ -17154,7 +17217,7 @@ impl Parser {
                 break;
             }
         }
-        Ok(Stmt::Create { table, cols, key, constraints, if_not_exists, temp, likes, on_commit, hier })
+        Ok(Stmt::Create { table, cols, key, constraints, if_not_exists, temp, likes, on_commit, hier, unlogged: false })
     }
 
     /// After LIKE: `table [INCLUDING | EXCLUDING option ...]`.
@@ -17550,6 +17613,15 @@ impl Parser {
                     c.compression = Some(word);
                 }
             } else if self.kw("default") {
+                if c.identity.is_some() {
+                    return err(SYNTAX, format!("both default and identity specified for column \"{}\"", c.name));
+                }
+                if c.generated.is_some() {
+                    return err(
+                        SYNTAX,
+                        format!("both default and generation expression specified for column \"{}\"", c.name),
+                    );
+                }
                 let (e, text) = self.default_expr()?;
                 match (Auto::of(&e), seq_default(&e)) {
                     (_, Some(s)) if c.ty.integral() => (c.auto, c.seq) = (Some(Auto::Serial), Some(s)),
@@ -17563,6 +17635,22 @@ impl Parser {
                     if !always {
                         return err(SYNTAX, "for a generated column, GENERATED ALWAYS must be specified");
                     }
+                    let name = &c.name;
+                    if c.generated.is_some() {
+                        return err(SYNTAX, format!("multiple generation clauses specified for column \"{name}\""));
+                    }
+                    if c.default.is_some() || c.auto.is_some() && c.identity.is_none() {
+                        return err(
+                            SYNTAX,
+                            format!("both default and generation expression specified for column \"{name}\""),
+                        );
+                    }
+                    if c.identity.is_some() {
+                        return err(
+                            SYNTAX,
+                            format!("both identity and generation expression specified for column \"{name}\""),
+                        );
+                    }
                     self.expect_kw("always")?;
                     self.expect_kw("as")?;
                     self.expect_sym("(")?;
@@ -17574,6 +17662,18 @@ impl Parser {
                     continue;
                 }
                 // GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [(options)]: a sequence, as SERIAL
+                if c.identity.is_some() {
+                    return err(SYNTAX, format!("multiple identity specifications for column \"{}\"", c.name));
+                }
+                if c.default.is_some() || c.auto.is_some() {
+                    return err(SYNTAX, format!("both default and identity specified for column \"{}\"", c.name));
+                }
+                if c.generated.is_some() {
+                    return err(
+                        SYNTAX,
+                        format!("both identity and generation expression specified for column \"{}\"", c.name),
+                    );
+                }
                 c.identity = Some(self.identity_kind()?);
                 if !c.ty.integral() {
                     return err("22023", "identity column type must be smallint, integer, or bigint");
@@ -19685,6 +19785,14 @@ impl Parser {
                     (Expr::Lit(Value::Text(_)), Some(at)) if self.t[at] == Tok::Sym("") => Some(at),
                     _ => None,
                 };
+                // 'x'::unknown: a literal of no type yet, which it already is (text where nothing says otherwise)
+                if matches!(e, Expr::Lit(Value::Text(_) | Value::Null))
+                    && matches!(self.peek(), Some(Tok::Word(w)) if w == "unknown")
+                    && !matches!(self.t.get(self.i + 1), Some(Tok::Sym("." | "[")))
+                {
+                    self.i += 1;
+                    continue;
+                }
                 e = self.cast_to(e)?;
                 // (`'x'::timestamp(2)`: the cast inside the rounding)
                 let cast = match &e {
@@ -20920,6 +21028,7 @@ impl Parser {
                 // check_option, security_invoker and security_barrier mean something here
                 let mut option_check = None;
                 let (mut invoker, mut barrier) = (false, false);
+                let mut reloptions: Vec<(String, String)> = vec![];
                 if self.kw("with") {
                     self.expect_sym("(")?;
                     loop {
@@ -20927,9 +21036,19 @@ impl Parser {
                         let value = if self.sym("=") { Some(self.next()) } else { None };
                         if opt == "security_invoker" {
                             invoker = bool_option(&opt, value.clone().flatten())?;
+                            if !materialized {
+                                reloptions.push((opt.clone(), invoker.to_string()));
+                            }
                         }
                         if opt == "security_barrier" && !materialized {
                             barrier = bool_option(&opt, value.clone().flatten())?;
+                            reloptions.push((opt.clone(), barrier.to_string()));
+                        }
+                        // (a view has these three; a materialized view's are a table's storage settings, not kept)
+                        if !materialized
+                            && !matches!(opt.as_str(), "security_invoker" | "security_barrier" | "check_option")
+                        {
+                            return err("22023", format!("unrecognized parameter \"{opt}\""));
                         }
                         if opt == "check_option" {
                             option_check = match value {
@@ -20941,6 +21060,9 @@ impl Parser {
                                 }
                                 _ => None,
                             };
+                            if let Some(c) = option_check {
+                                reloptions.push((opt.clone(), (if c { "cascaded" } else { "local" }).into()));
+                            }
                         }
                         if !self.sym(",") {
                             break;
@@ -20998,6 +21120,9 @@ impl Parser {
                         self.expect_kw("check")?;
                         self.expect_kw("option")?;
                         check = Some(cascaded);
+                        // (kept as the check_option option, as Postgres's DefineView adds it)
+                        reloptions.retain(|(o, _)| o != "check_option");
+                        reloptions.push(("check_option".into(), (if cascaded { "cascaded" } else { "local" }).into()));
                     } else {
                         data = !self.kw("no");
                         self.expect_kw("data")?;
@@ -21018,6 +21143,7 @@ impl Parser {
                     check,
                     invoker,
                     barrier,
+                    reloptions,
                 })
             }
             "drop" => {
@@ -21071,14 +21197,17 @@ impl Parser {
             "refresh" => {
                 self.expect_kw("materialized")?;
                 self.expect_kw("view")?;
-                self.kw("concurrently");
+                let concurrently = self.kw("concurrently");
                 let name = self.rel_name()?;
                 let mut data = true;
                 if self.kw("with") {
                     data = !self.kw("no");
                     self.expect_kw("data")?;
                 }
-                Ok(Stmt::Refresh { name, data })
+                if concurrently && !data {
+                    return err(SYNTAX, "CONCURRENTLY and WITH NO DATA options cannot be used together");
+                }
+                Ok(Stmt::Refresh { name, data, concurrently })
             }
             "truncate" => {
                 self.kw("table");
@@ -22010,6 +22139,7 @@ impl Script {
             self.stmts.get(i),
             Some(Statement(
                 Stmt::Select(_)
+                    | Stmt::Call(_)
                     | Stmt::Locking(..)
                     | Stmt::Insert { .. }
                     | Stmt::Update { .. }
@@ -22082,16 +22212,22 @@ impl Script {
             }
         }
         let not_unique = e.message.starts_with("function ") && e.message.ends_with(" is not unique");
+        // (`f(integer) is a procedure`, `f(integer) is not a procedure`: at the call)
+        let kind =
+            e.code == "42809" && (e.message.ends_with(" is a procedure") || e.message.ends_with(" is not a procedure"));
         if reads
             && e.info.as_ref().is_none_or(|i| i.position.is_none())
-            && (e.message.ends_with(" does not exist") || not_unique)
+            && (e.message.ends_with(" does not exist") || not_unique || kind)
         {
             let m = &e.message;
             let name = ["column \"", "relation \"", "table \"", "type \""]
                 .iter()
                 .find_map(|p| m.strip_prefix(p).and_then(|r| r.split('"').next()))
                 .map(str::to_string)
-                .or_else(|| m.strip_prefix("function ").and_then(|r| r.split('(').next()).map(str::to_string));
+                .or_else(|| {
+                    let call = m.strip_prefix("function ").or_else(|| m.strip_prefix("procedure "));
+                    call.or(kind.then_some(m.as_str())).and_then(|r| r.split('(').next()).map(str::to_string)
+                });
             if let Some(name) = name {
                 let last = name.rsplit('.').next().unwrap_or(&name).to_lowercase();
                 if let Some((_, at)) = self.words.iter().find(|(w, _)| *w == last) {
@@ -22386,6 +22522,8 @@ struct Table {
     /// ALTER TABLE ... SET (merge_by_columns = true): where a merge finds both sides changed a
     /// row but different columns of it, it combines them, as MERGE ... BY COLUMNS does
     by_columns: bool,
+    /// CREATE UNLOGGED TABLE, ALTER TABLE ... SET UNLOGGED (see `Alter::Unlogged`)
+    unlogged: bool,
     /// partitioning and inheritance: what the table is partitioned by, what it is a partition or a
     /// child of (see `hier`)
     hier: hier::Hier,
@@ -22536,6 +22674,26 @@ fn whole_check_error(t: &Table, mut e: SqlError) -> SqlError {
     e
 }
 
+/// A unique index built on rows that already hold a key twice: 23505 as building an index says it (`could not
+/// create unique index`), not as a write does.
+fn index_build_failed(mut e: SqlError) -> SqlError {
+    let Some(name) = e
+        .message
+        .strip_prefix("duplicate key value violates unique constraint \"")
+        .and_then(|r| r.strip_suffix('"'))
+        .map(String::from)
+    else {
+        return e;
+    };
+    e.message = format!("could not create unique index \"{name}\"");
+    if let Some(d) = e.info.as_mut().and_then(|i| i.detail.as_mut())
+        && let Some(key) = d.strip_suffix(" already exists.")
+    {
+        *d = format!("{key} is duplicated.");
+    }
+    e
+}
+
 /// 23505: an index being built on rows two of which hold the same key, as Postgres says it.
 fn index_duplicated(index: &str, cols: &str, vals: &str) -> SqlError {
     SqlError {
@@ -22629,6 +22787,7 @@ impl Table {
             past: None,
             matview: None,
             by_columns: false,
+            unlogged: false,
             hier: Default::default(),
             dropped: vec![],
         }
@@ -23575,6 +23734,7 @@ fn load_world(v: &View, name: &str) -> Result<Option<Table>> {
         past: None,
         matview: None,
         by_columns: false,
+        unlogged: false,
         hier: Default::default(),
         dropped: vec![],
     }))
@@ -23827,6 +23987,7 @@ fn parse_schema(name: &str, s: &str) -> Result<Table> {
             past: None,
             matview: j.get("matview").cloned(),
             by_columns: j["merge_by_columns"] == true,
+            unlogged: j["unlogged"] == true,
             hier: hier::Hier::from_json(&j),
             dropped: j["dropped"]
                 .as_array()
@@ -26728,6 +26889,9 @@ fn schema_json(t: &Table) -> String {
     }
     if t.by_columns {
         j["merge_by_columns"] = Json::Bool(true);
+    }
+    if t.unlogged {
+        j["unlogged"] = Json::Bool(true);
     }
     if !t.dropped.is_empty() {
         j["dropped"] = serde_json::json!(t.dropped);
@@ -33295,6 +33459,14 @@ pub struct TableInfo {
     pub attnums: Vec<i64>,
     /// the attnums of its dropped columns (pg_attribute's rows with attisdropped)
     pub dropped: Vec<i64>,
+    /// pg_class.reloptions: a view's options (`security_barrier=true`)
+    pub reloptions: Vec<(String, String)>,
+    /// the aliases a view's (or materialized view's) query has only because it was written again after a rename
+    /// (see `viewdef::renamed_text`)
+    pub(crate) view_aliases: Vec<String>,
+    /// UNLOGGED (pg_class.relpersistence `u`): a table so made or altered, its indexes, and the sequences its
+    /// columns own
+    pub unlogged: bool,
 }
 
 /// What pg_trigger keeps of trigger `x` of table (or view) `t`: its function, its `tgtype` bits, how many
@@ -33484,6 +33656,9 @@ pub fn tables(db: &crate::Core, branch: &str) -> Result<Vec<TableInfo>> {
             attopts: vec![],
             attnums: vec![],
             dropped: vec![],
+            reloptions: vec![],
+            view_aliases: vec![],
+            unlogged: false,
         };
         if let Some(d) = view_def(&v, &name)? {
             let types = d.types.iter().map(|t| Type::from_name(t).unwrap_or(Type::Text));
@@ -33509,6 +33684,8 @@ pub fn tables(db: &crate::Core, branch: &str) -> Result<Vec<TableInfo>> {
             out.push(TableInfo {
                 definition: Some(d.sql),
                 check: d.check,
+                reloptions: d.reloptions,
+                view_aliases: d.aliases,
                 columns,
                 typmods,
                 reads: d.reads,
@@ -33522,15 +33699,19 @@ pub fn tables(db: &crate::Core, branch: &str) -> Result<Vec<TableInfo>> {
         }
         if let Some(d) = seq_def(&v, &name)? {
             // (an identity column's sequence depends on it internally: `i`)
+            // (a sequence a column owns is as logged as its table)
+            let mut unlogged = false;
             let owner = match d.owned.clone() {
                 Some((t, c)) => {
-                    let identity =
-                        load(&v, &t)?.is_some_and(|x| x.cols.iter().any(|y| y.name == c && y.identity.is_some()));
+                    let table = load(&v, &t)?;
+                    unlogged = table.as_ref().is_some_and(|x| x.unlogged);
+                    let identity = table.is_some_and(|x| x.cols.iter().any(|y| y.name == c && y.identity.is_some()));
                     Some((t, c, if identity { 'i' } else { 'a' }))
                 }
                 None => None,
             };
             out.push(TableInfo {
+                unlogged,
                 sequence: Some((d.ty.into(), d.start, d.min, d.max, d.inc, d.cycle)),
                 sequence_cache: d.cache,
                 sequence_at: Some(reading_state(db, branch, &name, d.clone())?),
@@ -33646,6 +33827,7 @@ pub fn tables(db: &crate::Core, branch: &str) -> Result<Vec<TableInfo>> {
                 sequence_at: Some(reading_state(db, branch, &seq, def)?),
                 name: seq,
                 owner: Some((name.clone(), c.name.clone(), kind)),
+                unlogged: t.unlogged,
                 ..info('S')
             });
         }
@@ -33752,6 +33934,13 @@ pub fn tables(db: &crate::Core, branch: &str) -> Result<Vec<TableInfo>> {
             uniques,
             fks,
             definition,
+            unlogged: t.unlogged,
+            view_aliases: t
+                .matview
+                .as_ref()
+                .and_then(|m| m["aliases"].as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
             populated,
             triggers,
             trigger_plain,
@@ -35796,6 +35985,7 @@ impl Session {
                 likes: vec![],
                 on_commit: None,
                 hier: Default::default(),
+                unlogged: false,
             },
             PlanCache::default(),
             false,
@@ -39232,6 +39422,7 @@ impl Statement {
             || matches!(
                 self.0,
                 Stmt::DropFunction { .. }
+                    | Stmt::AlterRoutine { .. }
                     | Stmt::DropType { .. }
                     | Stmt::AlterType { change: TypeChange::Rename(_), .. }
                     | Stmt::DropExtension { .. }
@@ -39459,8 +39650,6 @@ impl Statement {
             Stmt::Grant(g) => acl::run_grant(db, branch, g),
             Stmt::Foreign(f) => foreign::run(db, branch, f),
             Stmt::AlterOwner(what, to) => acl::alter_owner(db, branch, what, to),
-            Stmt::SetDefiner(what, definer) => acl::set_definer(db, branch, what, *definer),
-            Stmt::RoutineConfig(what, changes) => acl::set_config(db, branch, what, changes),
             Stmt::DropOwned(rs, cascade) => acl::drop_owned(db, branch, rs, *cascade),
             Stmt::Reassign(from, to) => acl::reassign(db, branch, from, to),
             Stmt::Policy(p) => rls::run(db, branch, p),
@@ -40543,8 +40732,11 @@ impl Statement {
                 })?;
                 Ok(Output::tag(*tag))
             }
-            Stmt::DropFunction { names, if_exists, cascade, procedure } => {
-                x.drop_function(names, *if_exists, *cascade, *procedure)
+            Stmt::DropFunction { names, if_exists, cascade, procedure, routine } => {
+                x.drop_function(names, *if_exists, *cascade, (*procedure, *routine))
+            }
+            Stmt::AlterRoutine { name, types, kind, action } => {
+                acl::alter_routine(db, branch, name, types.as_deref(), *kind, action)
             }
             // what it calls may write: atomically with it (see `Exec::write`); its rows say nothing
             Stmt::Do(q) | Stmt::Call(q) => {
@@ -40567,8 +40759,12 @@ impl Statement {
                 let (columns, rows) = x.returning(Some(items.as_slice()), &t, rows)?;
                 Ok(Output { typmods: vec![], columns, rows, tag: tag.clone() })
             }
-            Stmt::Create { table, cols, key, constraints, if_not_exists, likes, hier, .. } => {
-                x.create(table, cols, key, constraints, *if_not_exists, likes, hier)
+            Stmt::Create { table, cols, key, constraints, if_not_exists, likes, hier, unlogged, .. } => {
+                let out = x.create(table, cols, key, constraints, *if_not_exists, likes, hier)?;
+                if *unlogged {
+                    x.alter(table, &[Alter::Unlogged(true)], false)?;
+                }
+                Ok(out)
             }
             Stmt::Drop { tables, if_exists, cascade } => x.drop_relations("table", tables, *if_exists, *cascade),
             // a view over a server file (a file_fdw foreign table's, or one written so): its maker must have the
@@ -40591,6 +40787,7 @@ impl Statement {
                 check,
                 invoker,
                 barrier,
+                reloptions,
             } => x.create_view(
                 name,
                 cols,
@@ -40600,7 +40797,7 @@ impl Statement {
                 *materialized,
                 *data,
                 *if_not_exists,
-                (*check, *invoker, *barrier),
+                (*check, *invoker, *barrier, reloptions),
             ),
             Stmt::DropObjects { kind, names, if_exists, cascade } => {
                 x.drop_relations(kind, names, *if_exists, *cascade)
@@ -40666,6 +40863,7 @@ impl Statement {
                     check,
                     invoker,
                     barrier,
+                    reloptions,
                 } = &**view
                 else {
                     return err(UNSUPPORTED, "not a view");
@@ -40679,10 +40877,39 @@ impl Statement {
                     *materialized,
                     *data,
                     *if_not_exists,
-                    (*check, *invoker, *barrier),
+                    (*check, *invoker, *barrier, reloptions),
                 )
             }
-            Stmt::Refresh { name, data } => x.refresh(name, *data),
+            Stmt::Refresh { name, data, concurrently } => {
+                // (CONCURRENTLY compares the rows there are with the new ones by a unique index of plain columns;
+                // the rows come whole here, but Postgres's conditions for it are kept)
+                if *concurrently {
+                    let t = need_table(&x.view()?, name)?;
+                    if t.matview.as_ref().is_some_and(|m| m["populated"] == false) {
+                        return err("55000", "CONCURRENTLY cannot be used when the materialized view is not populated");
+                    }
+                    let plain = t.has_key() || t.uniques.iter().any(|u| uniq_index(&t, u).is_none());
+                    if !plain {
+                        return Err(SqlError {
+                            code: "55000",
+                            message: format!(
+                                "cannot refresh materialized view \"{}.{}\" concurrently",
+                                schema_part(&t.name),
+                                rel_part(&t.name)
+                            ),
+                            info: Some(Box::new(Violation {
+                                hint: Some(
+                                    "Create a unique index with no WHERE clause on one or more columns of the \
+                                     materialized view."
+                                        .into(),
+                                ),
+                                ..Violation::default()
+                            })),
+                        });
+                    }
+                }
+                x.refresh(name, *data)
+            }
             Stmt::CreateSequence { name, opts, if_not_exists } => x.create_sequence(name, opts, *if_not_exists),
             Stmt::AlterSequence { name, opts, if_exists } => x.alter_sequence(name, opts, *if_exists),
             Stmt::Truncate { tables, restart, cascade, only } => x.truncate(tables, *restart, *cascade, only),
@@ -40701,20 +40928,22 @@ impl Statement {
                 only,
                 concurrently,
                 options,
-            } => x.create_index(
-                name.as_deref(),
-                table,
-                (cols, colls),
-                include,
-                *unique,
-                *nnd,
-                *if_not_exists,
-                filter.as_deref(),
-                (*using, trgm.as_deref()),
-                *only,
-                *concurrently,
-                options,
-            ),
+            } => x
+                .create_index(
+                    name.as_deref(),
+                    table,
+                    (cols, colls),
+                    include,
+                    *unique,
+                    *nnd,
+                    *if_not_exists,
+                    filter.as_deref(),
+                    (*using, trgm.as_deref()),
+                    *only,
+                    *concurrently,
+                    options,
+                )
+                .map_err(index_build_failed),
             Stmt::AttachIndex { parent, child } => x.attach_index(parent, child),
             Stmt::DropIndex { name, if_exists, more, concurrently } => {
                 let mut out = x.drop_index(name, *if_exists, *concurrently)?;
@@ -41440,7 +41669,11 @@ fn ctx_call(f: CtxFn, a: &[Value]) -> Result<Value> {
     }
     let name = seq_name(&a[0]);
     // (a READ ONLY transaction moves no sequence: see `read_only_refusal`)
-    if matches!(f, CtxFn::NextVal | CtxFn::SetVal) && read_only_in(&ctx.core) {
+    // (a temporary sequence, of the session's own database, isn't the transaction's database's: it moves)
+    if matches!(f, CtxFn::NextVal | CtxFn::SetVal)
+        && read_only_in(&ctx.core)
+        && seq_def_named(&ctx.core.view_tx(&ctx.world)?, &name)?.is_some()
+    {
         let what = if f == CtxFn::NextVal { "nextval()" } else { "setval()" };
         return err("25006", format!("cannot execute {what} in a read-only transaction"));
     }
@@ -42055,7 +42288,12 @@ fn err_identity_always<T>(table: &str, column: &str, insert: bool) -> Result<T> 
         false => format!("column \"{column}\" can only be updated to DEFAULT"),
     };
     let detail = format!("Column \"{column}\" is an identity column defined as GENERATED ALWAYS.");
-    Err(violation("428C9", message, table, None, Some(column), Some(detail)))
+    let mut e = violation("428C9", message, table, None, Some(column), Some(detail));
+    // (an INSERT may say OVERRIDING SYSTEM VALUE; an UPDATE has no such clause)
+    if insert && let Some(i) = e.info.as_mut() {
+        i.hint = Some("Use OVERRIDING SYSTEM VALUE to override.".into());
+    }
+    Err(e)
 }
 
 fn seq_def(v: &View, name: &str) -> Result<Option<SeqDef>> {
@@ -42691,6 +42929,10 @@ struct ViewDef {
     barrier: bool,
     /// its columns' own defaults (ALTER VIEW ... SET DEFAULT): each column's name and the default's SQL
     defaults: Vec<(String, String)>,
+    /// its options as pg_class.reloptions shows them, in order
+    reloptions: Vec<(String, String)>,
+    /// the aliases its query has only because it was written again after a rename (see `TableInfo::view_aliases`)
+    aliases: Vec<String>,
 }
 
 /// A view's boolean option's value (`security_invoker`, `security_invoker = off`; none given: true), as
@@ -42730,6 +42972,8 @@ fn view_def(v: &View, name: &str) -> Result<Option<ViewDef>> {
         },
         invoker: j["security_invoker"] == true,
         barrier: j["security_barrier"] == true,
+        reloptions: serde_json::from_value(j["reloptions"].clone()).unwrap_or_default(),
+        aliases: list("aliases"),
         defaults: j["defaults"]
             .as_object()
             .into_iter()
@@ -44412,7 +44656,11 @@ fn view_writes_in(
                         Item::TableStar(t) if *t == name => {
                             proj.iter().map(|(n, e, _)| Item::Expr(e.clone(), Some(n.clone()))).collect()
                         }
-                        Item::Expr(e, a) => vec![Item::Expr(over(e), a.clone())],
+                        // (named as written over the view's columns: `RETURNING s` is s, not what s is of the table)
+                        Item::Expr(e, a) => {
+                            let named = a.clone().or_else(|| figure_name(e).filter(|n| n != "?column?"));
+                            vec![Item::Expr(over(e), named)]
+                        }
                         i => vec![i.clone()],
                     })
                     .collect();
@@ -44559,10 +44807,14 @@ fn matview_rows(t: &Table, rows: &[Vec<Value>]) -> Result<Vec<(String, Option<St
 /// Refuses to read a materialized view made WITH NO DATA, as Postgres does.
 fn populated(t: &Table) -> Result<()> {
     if t.matview.as_ref().is_some_and(|m| m["populated"] == false) {
-        return err(
-            "55000",
-            format!("materialized view \"{}\" has not been populated (REFRESH MATERIALIZED VIEW it)", t.name),
-        );
+        return Err(SqlError {
+            code: "55000",
+            message: format!("materialized view \"{}\" has not been populated", rel_part(&t.name)),
+            info: Some(Box::new(Violation {
+                hint: Some("Use the REFRESH MATERIALIZED VIEW command.".into()),
+                ..Violation::default()
+            })),
+        });
     }
     Ok(())
 }
@@ -44579,7 +44831,7 @@ impl Exec<'_> {
         materialized: bool,
         data: bool,
         if_not_exists: bool,
-        (check, invoker, barrier): (Option<bool>, bool, bool),
+        (check, invoker, barrier, reloptions): (Option<bool>, bool, bool, &[(String, String)]),
     ) -> Result<Output> {
         if name.contains('/') || name.is_empty() {
             return err(SYNTAX, "a view's name can't be empty or contain '/'");
@@ -44607,13 +44859,28 @@ impl Exec<'_> {
             return err(TABLE_EXISTS, format!("relation \"{name}\" already exists"));
         }
         if cols.len() > found.len() {
-            return err(SYNTAX, "CREATE VIEW specifies more column names than columns");
+            // (a materialized view's are a table's, as CREATE TABLE AS words it)
+            return match materialized {
+                true => err(SYNTAX, "too many column names were specified"),
+                false => err(SYNTAX, "CREATE VIEW specifies more column names than columns"),
+            };
         }
         let names: Vec<String> = found.iter().enumerate().map(|(i, (n, _))| cols.get(i).unwrap_or(n).clone()).collect();
         if let Some((_, n)) = names.iter().enumerate().find(|(i, n)| names[..*i].contains(n)) {
             return err(DUP_COLUMN, format!("column \"{n}\" specified more than once"));
         }
         no_void_column(&names, &found)?;
+        // a `*` stands for the columns its relations have now, as Postgres binds it: kept as the query written back
+        // with them named (where it is written back, and reads as the same columns again)
+        // (and its columns' types as that reads them: a merged column of a join is of both sides' common type)
+        let (sql, aliases, found) = match lex(sql)?.contains(&Tok::Sym("*")) {
+            true => match self.star_bound(&v, name, sql, &names, &found, own) {
+                Some((text, aliases, again)) => (text, aliases, again),
+                None => (sql.to_string(), vec![], found),
+            },
+            false => (sql.to_string(), vec![], found),
+        };
+        let sql = sql.as_str();
         let mut reads = vec![];
         read_names(query, &mut reads);
         // a view can't read itself, through other views either
@@ -44652,6 +44919,9 @@ impl Exec<'_> {
         }
         let types: Vec<_> = found.iter().map(|(_, t)| t.name()).collect();
         let mut json = serde_json::json!({ "sql": sql, "columns": names, "types": types, "reads": reads });
+        if !aliases.is_empty() {
+            json["aliases"] = serde_json::json!(aliases);
+        }
         // (which of its columns are varchars and char(n)s, as their lengths: see `ViewDef::chars`)
         if chars.iter().any(Option::is_some) {
             json["chars"] =
@@ -44666,6 +44936,9 @@ impl Exec<'_> {
         }
         if barrier {
             json["security_barrier"] = Json::Bool(true);
+        }
+        if !reloptions.is_empty() {
+            json["reloptions"] = serde_json::json!(reloptions);
         }
         if let Some(cascaded) = check {
             json["check"] = (if cascaded { "cascaded" } else { "local" }).into();
@@ -44724,6 +44997,26 @@ impl Exec<'_> {
         Ok(Output::tag("CREATE VIEW"))
     }
 
+    /// `create_view`'s query `sql` written back bound to what it reads now (see `viewdef::bound_text`), where that
+    /// reads as the same columns (`found`) again; None where it isn't.
+    fn star_bound(
+        &self,
+        v: &View,
+        name: &str,
+        sql: &str,
+        names: &[String],
+        found: &Columns,
+        own: usize,
+    ) -> Option<(String, Vec<String>, Columns)> {
+        let rels = tables(&self.db.core, self.branch).ok()?;
+        let (text, aliases) = viewdef::bound_text(&rels, name, sql, names)?;
+        let mut q = view_query(name, &text).ok()?;
+        expand_select(v, &mut q, Some(self.params), true, own, &Expand::default()).ok()?;
+        inline_catalog(self.db, self.branch, &mut q).ok()?;
+        let again = select_columns_full(v, &q, &[], &[]).ok()?.0;
+        (again.len() == found.len()).then_some((text, aliases, again))
+    }
+
     /// ALTER VIEW name SET (option = value, ...) or RESET (option, ...): security_invoker (whether its tables are
     /// read as whoever reads it), security_barrier and check_option (kept as `check`) from now on. A check option
     /// needs a view that can be written through, as Postgres's ALTER VIEW checks.
@@ -44742,6 +45035,32 @@ impl Exec<'_> {
                 };
             };
             let mut j: Json = serde_json::from_str(&raw).unwrap_or_default();
+            // (pg_class.reloptions: a value set replaces the option's, or comes last; RESET takes it out)
+            let mut relopts: Vec<(String, String)> =
+                serde_json::from_value(j["reloptions"].clone()).unwrap_or_default();
+            for (opt, value) in opts {
+                match value {
+                    Some(x) => {
+                        let text = match x {
+                            Json::String(s) => s.clone(),
+                            x => x.to_string(),
+                        };
+                        match relopts.iter_mut().find(|(o, _)| o == opt) {
+                            Some(r) => r.1 = text,
+                            None => relopts.push((opt.clone(), text)),
+                        }
+                    }
+                    None => relopts.retain(|(o, _)| o != opt),
+                }
+            }
+            match relopts.is_empty() {
+                true => {
+                    if let Some(o) = j.as_object_mut() {
+                        o.remove("reloptions");
+                    }
+                }
+                false => j["reloptions"] = serde_json::json!(relopts),
+            }
             for (opt, value) in opts {
                 let field = if opt == "check_option" { "check" } else { opt.as_str() };
                 match value {
@@ -45227,16 +45546,21 @@ impl Exec<'_> {
                 return err(TABLE_EXISTS, format!("relation \"{to}\" already exists"));
             }
             no_type_named(v, &new, true)?;
-            if let Some(d) = dependents(v, name)?.first() {
+            // (the views reading it are written again to read it by its new name, as Postgres's follow it)
+            let rn = viewdef::Renames { table: name.to_string(), to_table: Some(new.clone()), col: None };
+            let Some(follow) = self.renamed_dependents(v, name, &rn)? else {
+                let d = dependents(v, name)?.into_iter().next().unwrap_or_default();
                 return err(
                     UNSUPPORTED,
                     format!(
                         "can't rename view \"{name}\": view \"{d}\" reads it by name; drop that view, rename, then make it again"
                     ),
                 );
-            }
+            };
             let Some(raw) = v.get(&format!("{VIEWS}/{name}"))? else { return err(NO_TABLE, format!("relation \"{name}\" does not exist")) };
-            Ok((vec![(format!("{VIEWS}/{name}"), None), (format!("{VIEWS}/{new}"), Some(raw.to_string()))], ()))
+            let mut w = vec![(format!("{VIEWS}/{name}"), None), (format!("{VIEWS}/{new}"), Some(raw.to_string()))];
+            w.extend(follow);
+            Ok((w, ()))
         })?;
         Ok(())
     }
@@ -45290,6 +45614,54 @@ impl Exec<'_> {
             x.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(String::from)).collect()
         };
         match change {
+            DomainChange::Rename(to) => {
+                self.db.batch_with(self.branch, |v| self.rename_domain(v, name, to).map(|w| (w, ())))?;
+                return Ok(Output::tag("ALTER DOMAIN"));
+            }
+            DomainChange::RenameConstraint(from, to) => {
+                let (_, own) = domain::own_constraints(&j["domain"], name);
+                let what = |n: &str| format!("constraint \"{n}\" of domain \"{}\"", rel_part(name));
+                if !own.iter().any(|(n, _)| n == from) {
+                    return err("42704", format!("{} does not exist", what(from)));
+                }
+                if own.iter().any(|(n, _)| n == to) {
+                    return err("42710", format!("{} already exists", what(to)));
+                }
+                // (columns of it keep the check as their own, named after it: those follow)
+                if let Some((table, _)) = users.first() {
+                    return err(
+                        UNSUPPORTED,
+                        format!(
+                            "can't rename {}: column of table \"{}\" holds it as its own; drop and add it again",
+                            what(from),
+                            rel_part(table)
+                        ),
+                    );
+                }
+                let mut names = j["domain"]["named"].as_array().cloned().unwrap_or_default();
+                match names.iter_mut().find(|n| n[0] == from.as_str()) {
+                    Some(n) => n[0] = Json::from(to.clone()),
+                    // (one of CREATE DOMAIN's, by its place among them, its name given or `<domain>_check`, ...)
+                    None => {
+                        let made = strs(&j["domain"]["checks"]).len().saturating_sub(names.len());
+                        let given = strs(&j["domain"]["constraint_names"]);
+                        let base = format!("{}_check", rel_part(name));
+                        let mut all: Vec<String> = (0..made)
+                            .map(|k| {
+                                given
+                                    .get(k)
+                                    .cloned()
+                                    .unwrap_or_else(|| if k == 0 { base.clone() } else { format!("{base}{k}") })
+                            })
+                            .collect();
+                        if let Some(n) = all.iter_mut().find(|n| *n == from) {
+                            *n = to.clone();
+                        }
+                        j["domain"]["constraint_names"] = Json::from(all);
+                    }
+                }
+                j["domain"]["named"] = Json::Array(names);
+            }
             DomainChange::Validate(cname) => {
                 let (_, own) = domain::own_constraints(&j["domain"], name);
                 if !own.iter().any(|(n, _)| n == cname) {
@@ -45429,6 +45801,33 @@ impl Exec<'_> {
         }
         self.db.batch_with(self.branch, |_| Ok::<_, SqlError>((vec![(key, Some(j.to_string()))], ())))?;
         Ok(Output::tag("ALTER DOMAIN"))
+    }
+
+    /// ALTER DOMAIN ... RENAME TO (or ALTER TYPE ... RENAME TO of a domain): its row under the new name; refused
+    /// while columns, or a domain over it, name it (they keep its name).
+    fn rename_domain(&self, v: &View, name: &str, to: &str) -> Result<Vec<(String, Option<String>)>> {
+        let Some(raw) = v.get(&type_key(name))? else {
+            return err("42704", format!("type \"{}\" does not exist", shown_type(name)));
+        };
+        if Type::from_name(to).is_some() || v.get(&type_key(to))?.is_some() || relation_kind(v, to)?.is_some() {
+            return err("42710", format!("type \"{}\" already exists", rel_part(to)));
+        }
+        for t in schemas(v)? {
+            if let Some(c) = t.cols.iter().find(|c| c.domain.as_deref() == Some(name)) {
+                return err(
+                    UNSUPPORTED,
+                    format!(
+                        "can't rename domain {}: column \"{}\" of table \"{}\" is of it; drop the column, rename, then add it again",
+                        shown_type(name),
+                        c.name,
+                        rel_part(&t.name)
+                    ),
+                );
+            }
+        }
+        let mut writes = vec![(type_key(name), None), (type_key(to), Some(raw.to_string()))];
+        writes.extend(functions::retype(v, name, to)?);
+        Ok(writes)
     }
 
     /// ALTER VIEW name RENAME COLUMN old TO new: the view's column names, with that one changed (its query stays).
@@ -48188,6 +48587,26 @@ impl Exec<'_> {
         walk(&d.0, &mut |x| reads |= matches!(x, Expr::Col(..)));
         if reads {
             return err(UNSUPPORTED, "cannot use column reference in DEFAULT expression");
+        }
+        // (as Postgres's transformExpr refuses them in EXPR_KIND_COLUMN_DEFAULT)
+        let (mut agg, mut win, mut srf) = (false, false, false);
+        walk(&d.0, &mut |x| match x {
+            Expr::Agg(..) => agg = true,
+            Expr::Window(_) => win = true,
+            Expr::Call(c) => {
+                let name = rel_part(written(&c.name));
+                srf |= catalog_schema::builtin_signatures(name).iter().any(|s| s.1.starts_with("SETOF "));
+            }
+            _ => {}
+        });
+        if agg {
+            return err("42803", "aggregate functions are not allowed in DEFAULT expressions");
+        }
+        if win {
+            return err("42P20", "window functions are not allowed in DEFAULT expressions");
+        }
+        if srf {
+            return err(UNSUPPORTED, "set-returning functions are not allowed in DEFAULT expressions");
         }
         if !refused && per_row(&d.0) {
             // (its type is checked now, without running it: `i int DEFAULT now()` would fail every INSERT)
@@ -51345,6 +51764,10 @@ impl Exec<'_> {
                 true => load_src(&v, src)?.filter(|t| t.schema && t.mem.is_none()),
                 false => None,
             };
+            // (a materialized view's rows are its query's, which no one updates: Postgres refuses to lock them)
+            if let Some(m) = t.as_ref().filter(|t| t.matview.is_some()) {
+                return err("42809", format!("cannot lock rows in materialized view \"{}\"", rel_part(&m.name)));
+            }
             let t = match t {
                 Some(t) if src.bound || temp_table(&v, &src.table)?.is_none() => t,
                 _ if !named => return Ok(()), // a subquery, view, function or temp table: nothing in the world to lock
@@ -52555,6 +52978,7 @@ impl Exec<'_> {
             past: None,
             matview: None,
             by_columns: false,
+            unlogged: false,
             hier: Default::default(),
             dropped: vec![],
         };
@@ -52737,6 +53161,48 @@ impl Exec<'_> {
         Ok(Output::tag("CREATE TABLE"))
     }
 
+    /// The writes that make the views and materialized views reading relation `table` read it as `rn` renames it:
+    /// each one's query written again (see `viewdef::renamed_text`), as Postgres's, which read it by oid and its
+    /// columns by number, follow a rename. None where one of them is of a form not written back.
+    fn renamed_dependents(&self, v: &View, table: &str, rn: &viewdef::Renames) -> Result<Option<hier::Writes>> {
+        let deps = dependents(v, table)?;
+        if deps.is_empty() {
+            return Ok(Some(vec![]));
+        }
+        let rels = tables(&self.db.core, self.branch)?;
+        let mut writes = vec![];
+        for d in deps {
+            let Some(i) = rels.iter().position(|r| r.name == d) else { return Ok(None) };
+            let Some((text, aliases)) = viewdef::renamed_text(&rels, i, rn) else { return Ok(None) };
+            // (it must read as SQL again)
+            if view_query(&d, &text).is_err() {
+                return Ok(None);
+            }
+            let follow = |reads: &mut Json| {
+                if let (Some(to), Some(all)) = (&rn.to_table, reads.as_array_mut()) {
+                    for x in all.iter_mut().filter(|x| *x == table) {
+                        *x = Json::String(to.clone());
+                    }
+                }
+            };
+            if let Some(raw) = v.get(&format!("{VIEWS}/{d}"))? {
+                let mut j: Json = serde_json::from_str(&raw).unwrap_or_default();
+                j["sql"] = Json::String(text);
+                j["aliases"] = serde_json::json!(aliases);
+                follow(&mut j["reads"]);
+                writes.push((format!("{VIEWS}/{d}"), Some(j.to_string())));
+                continue;
+            }
+            let Some(mut t) = load(v, &d)? else { return Ok(None) };
+            let Some(m) = t.matview.as_mut() else { return Ok(None) };
+            m["sql"] = Json::String(text);
+            m["aliases"] = serde_json::json!(aliases);
+            follow(&mut m["reads"]);
+            writes.push((schema_key(&t.name), Some(schema_json(&t))));
+        }
+        Ok(Some(writes))
+    }
+
     fn alter(&self, table: &str, changes: &[Alter], only: bool) -> Result<Output> {
         // ENABLE | DISABLE | FORCE | NO FORCE ROW LEVEL SECURITY: the table's own, not its partitions' or
         // children's, kept in a row of its own (see `rls`)
@@ -52775,7 +53241,8 @@ impl Exec<'_> {
                 let mut writes = build_index(v, &t, None, t.uniques.last(), flush)?;
                 writes.push((schema_key(table), Some(schema_json(&t))));
                 Ok((writes, ()))
-            })?;
+            })
+            .map_err(index_build_failed)?;
             return Ok(Output::tag("ALTER TABLE"));
         }
         // a change that writes every row again, on a big table: in parts (see `rewrite`)
@@ -53396,6 +53863,7 @@ impl Exec<'_> {
             j["enum"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(String::from)).collect();
         let not_label = |l: &str| err("22023", format!("\"{l}\" is not an existing enum label"));
         let (mut to, mut renamed) = (name.to_string(), None);
+        let mut orders = enum_orders(&j, labels.len());
         match change {
             TypeChange::Add(l, quiet, at) => {
                 if l.len() > 63 {
@@ -53418,7 +53886,33 @@ impl Exec<'_> {
                 if labels.len() >= MAX_LABELS {
                     return too_many_labels();
                 }
+                // its sort order as Postgres's AddEnumLabel gives it (a float4): past the last, before the first,
+                // else halfway between its neighbours; where that is no number between them, all are numbered
+                // again first (RenumberEnumType)
+                let between = |o: &[f64]| -> Option<f64> {
+                    let order = match (i.checked_sub(1).map(|k| o[k]), o.get(i).copied()) {
+                        (None, None) => 1.0,
+                        (Some(p), None) => p + 1.0,
+                        (None, Some(n)) => n - 1.0,
+                        (Some(p), Some(n)) => {
+                            let mid = f64::from(((p + n) / 2.0) as f32);
+                            if mid <= p || mid >= n {
+                                return None;
+                            }
+                            mid
+                        }
+                    };
+                    Some(order)
+                };
+                let order = match between(&orders) {
+                    Some(o) => o,
+                    None => {
+                        orders = (1..=orders.len()).map(|k| k as f64).collect();
+                        between(&orders).unwrap_or(orders.len() as f64 + 1.0)
+                    }
+                };
                 labels.insert(i, l.clone());
+                orders.insert(i, order);
             }
             TypeChange::RenameValue(a, b) => {
                 if b.len() > 63 {
@@ -53445,6 +53939,7 @@ impl Exec<'_> {
                 labels[i] = b.clone();
                 renamed = Some((Value::Text(a.clone()), Value::Text(b.clone())));
             }
+            TypeChange::Rename(n) if j.get("domain").is_some() => return self.rename_domain(v, name, n),
             TypeChange::Rename(n) => {
                 if Type::from_name(n).is_some() || v.get(&type_key(n))?.is_some() || relation_kind(v, n)?.is_some() {
                     return err("42710", format!("type \"{n}\" already exists"));
@@ -53471,7 +53966,12 @@ impl Exec<'_> {
             writes.push((type_key(name), None));
             writes.extend(functions::retype(v, name, &to)?);
         }
-        writes.push((type_key(&to), Some(serde_json::json!({ "enum": labels }).to_string())));
+        let mut def = serde_json::json!({ "enum": labels });
+        // (kept where they aren't 1, 2, 3, ...)
+        if orders.iter().enumerate().any(|(k, o)| *o != k as f64 + 1.0) {
+            def["orders"] = serde_json::json!(orders);
+        }
+        writes.push((type_key(&to), Some(def.to_string())));
         let mut keys = vec![];
         for mut t in schemas(v)? {
             let cols: Vec<usize> = (0..t.cols.len())
@@ -53538,8 +54038,8 @@ impl Exec<'_> {
                 format!("table \"{table}\" has no schema: ALTER TABLE works on tables made with CREATE TABLE"),
             );
         }
-        // (a materialized view can be renamed, as tables are, and nothing else)
-        if t.matview.is_some() && !matches!(changes, [Alter::RenameTable(_)]) {
+        // (a materialized view can be renamed or moved to another schema, as tables are, and nothing else)
+        if t.matview.is_some() && !matches!(changes, [Alter::RenameTable(_) | Alter::SetSchema(_)]) {
             return err("42809", format!("\"{table}\" is not a table"));
         }
         let prefix = format!("{table}/");
@@ -53610,6 +54110,20 @@ impl Exec<'_> {
         let mut fresh: Vec<String> = vec![]; // the CHECKs and foreign keys added (by name), whatever was named so
         let mut whole_entries = false;
         for change in changes {
+            // (a typed table's columns are its type's: as Postgres's ATSimplePermissions refuses changing them)
+            if t.hier.of_type.is_some() {
+                let refused = match change {
+                    Alter::AddColumn(..) => Some("cannot add column to typed table"),
+                    Alter::DropColumn(..) => Some("cannot drop column from typed table"),
+                    Alter::RenameColumn(..) => Some("cannot rename column of typed table"),
+                    Alter::SetType(..) => Some("cannot alter column type of typed table"),
+                    Alter::Inherit(..) => Some("cannot change inheritance of typed table"),
+                    _ => None,
+                };
+                if let Some(m) = refused {
+                    return err("42809", m);
+                }
+            }
             match change {
                 Alter::AddColumn(d, quiet) => {
                     let mut own = d.clone();
@@ -54046,6 +54560,13 @@ impl Exec<'_> {
                         );
                     }
                     t.cols[i].name = b.clone();
+                    // the views reading it name the column: written again to name it as renamed (one of a form not
+                    // written back is left as it is)
+                    let rn =
+                        viewdef::Renames { table: t.name.clone(), to_table: None, col: Some((a.clone(), b.clone())) };
+                    if let Some(follow) = self.renamed_dependents(v, &t.name, &rn)? {
+                        extra.extend(follow);
+                    }
                     // so do policies (see `rls::renamed_column`)
                     if v.core.has_row_security() {
                         extra.extend(rls::renamed_column(v, &t.name, a, b)?);
@@ -54597,6 +55118,107 @@ impl Exec<'_> {
                     }
                     let ty = &resolve_type(v, *ty)?;
                     let Some(i) = find(&t, c) else { return no_col(c) };
+                    // (without USING, the old type must convert to the new one on assignment, as Postgres's
+                    // ATPrepAlterColumnType checks: text to a number, a boolean or a time doesn't, nor a number to a
+                    // boolean or the other way)
+                    let from = t.cols[i].ty;
+                    // (text to such a type converts each value here, refusing a value it can't take, unless the
+                    // session asks for Postgres's refusal itself: CHRONOS_PG_EXACT)
+                    let kindly = |t: Type| {
+                        pg_exact()
+                            && (t.integral()
+                                || t.temporal()
+                                || matches!(t, Type::Numeric | Type::Float | Type::Float4 | Type::Bool))
+                    };
+                    // (USING a cast of the column: what it gives must so convert)
+                    if let Some(&last) = via.last()
+                        && last != *ty
+                        && (never_assigned(last, *ty) || (last == Type::Text && kindly(*ty)))
+                    {
+                        return Err(SqlError {
+                            code: WRONG_TYPE,
+                            message: format!(
+                                "result of USING clause for column \"{c}\" cannot be cast automatically to type {}",
+                                ty.pg_name()
+                            ),
+                            info: Some(Box::new(Violation {
+                                hint: Some("You might need to add an explicit cast.".into()),
+                                ..Violation::default()
+                            })),
+                        });
+                    }
+                    // (its default must convert too, and the CHECKs that read it must still be conditions over the
+                    // new type: ATPrepAlterColumnType and the constraints' rebuild)
+                    let has_default =
+                        t.cols[i].default.is_some() || t.cols[i].default_sql.is_some() || t.cols[i].auto.is_some();
+                    if (using.is_some() || !via.is_empty())
+                        && has_default
+                        && t.cols[i].identity.is_none()
+                        && (never_assigned(from, *ty) || (from == Type::Text && kindly(*ty)))
+                    {
+                        return err(
+                            WRONG_TYPE,
+                            format!("default for column \"{c}\" cannot be cast automatically to type {}", ty.pg_name()),
+                        );
+                    }
+                    if using.is_some()
+                        || !via.is_empty()
+                        || !(never_assigned(from, *ty) || (from == Type::Text && kindly(*ty)))
+                    {
+                        let mut cols = t.cols.clone();
+                        cols[i].ty = *ty;
+                        for k in t.checks.iter() {
+                            let e = check_expr(&k.text)?;
+                            let mut reads = false;
+                            walk(&e, &mut |x| reads |= matches!(x, Expr::Col(_, n) if n == c));
+                            if reads
+                                && let Err(x) = Binder::plain(&cols, None).bind(&e)
+                                && x.code == NO_OPERATOR
+                            {
+                                return Err(x);
+                            }
+                        }
+                    }
+                    if using.is_none()
+                        && via.is_empty()
+                        && (never_assigned(from, *ty) || (from == Type::Text && kindly(*ty)))
+                    {
+                        let to = ty.pg_name();
+                        return Err(SqlError {
+                            code: WRONG_TYPE,
+                            message: format!("column \"{c}\" cannot be cast automatically to type {to}"),
+                            info: Some(Box::new(Violation {
+                                hint: Some(format!("You might need to specify \"USING {}::{to}\".", ident(c))),
+                                ..Violation::default()
+                            })),
+                        });
+                    }
+                    // an identity column stays an integer, and its sequence takes its new type (its bounds too,
+                    // where they were the old type's), as Postgres's ALTER SEQUENCE AS does
+                    if t.cols[i].identity.is_some() {
+                        if !matches!(ty, Type::SmallInt | Type::Int | Type::BigInt) {
+                            return err("22023", "identity column type must be smallint, integer, or bigint");
+                        }
+                        let bounds = |t: Type| match t {
+                            Type::SmallInt => ("smallint", i64::from(i16::MIN), i64::from(i16::MAX)),
+                            Type::Int => ("integer", i64::from(i32::MIN), i64::from(i32::MAX)),
+                            _ => ("bigint", i64::MIN, i64::MAX),
+                        };
+                        let old = bounds(if t.cols[i].small { Type::SmallInt } else { t.cols[i].ty });
+                        let new = bounds(if mods.small { Type::SmallInt } else { *ty });
+                        if let Some(s) = t.cols[i].seq.clone().filter(|s| named_sequence(v, s))
+                            && let Some(mut d) = seq_def(v, &s)?
+                        {
+                            d.ty = new.0;
+                            if d.max == old.2 {
+                                d.max = new.2;
+                            }
+                            if d.min == old.1 {
+                                d.min = new.1;
+                            }
+                            extra.push((format!("{SEQUENCES}/{s}"), Some(d.json())));
+                        }
+                    }
                     if using.is_some() && (t.key == Some(i) || t.pk.contains(&i)) {
                         return err(
                             UNSUPPORTED,
@@ -54814,6 +55436,22 @@ impl Exec<'_> {
                             format!("column \"{c}\" of relation \"{}\" is a generated column", rel_part(table)),
                         );
                     }
+                    // (an identity column's default is its sequence: DROP IDENTITY is what takes it)
+                    if col.identity.is_some() {
+                        return Err(SqlError {
+                            code: "42601",
+                            message: format!(
+                                "column \"{c}\" of relation \"{}\" is an identity column",
+                                rel_part(table)
+                            ),
+                            info: e.is_none().then(|| {
+                                Box::new(Violation {
+                                    hint: Some("Use ALTER TABLE ... ALTER COLUMN ... DROP IDENTITY instead.".into()),
+                                    ..Violation::default()
+                                })
+                            }),
+                        });
+                    }
                     col.default_sql = None;
                     match e {
                         // pg_dump sets a serial's default this way, after CREATE TABLE
@@ -54907,6 +55545,12 @@ impl Exec<'_> {
                 }
                 Alter::NotNull(c, on) => {
                     let Some(i) = find(&t, c) else { return no_col(c) };
+                    if !*on && t.cols[i].identity.is_some() {
+                        return err(
+                            "42601",
+                            format!("column \"{c}\" of relation \"{}\" is an identity column", rel_part(table)),
+                        );
+                    }
                     if *on {
                         if values(&t, i)?.iter().any(|(_, x)| *x == Value::Null) {
                             return err(
@@ -54943,6 +55587,32 @@ impl Exec<'_> {
                     }
                 }
                 Alter::MergeByColumns(on) => t.by_columns = *on,
+                Alter::Unlogged(on) => {
+                    // (a foreign key between a logged table and an unlogged one can't be: the tables this one
+                    // references, made logged; those that reference it, made unlogged; itself either way)
+                    let others: Vec<String> = match on {
+                        false => t.fks.iter().map(|f| f.table.clone()).collect(),
+                        true => schemas(v)?
+                            .into_iter()
+                            .filter(|o| o.fks.iter().any(|f| f.table == t.name))
+                            .map(|o| o.name)
+                            .collect(),
+                    };
+                    for o in others.iter().filter(|o| **o != t.name) {
+                        if load(v, o)?.is_some_and(|x| x.unlogged != *on) {
+                            let (to, other) = if *on { ("unlogged", "logged") } else { ("logged", "unlogged") };
+                            return err(
+                                "42P16",
+                                format!(
+                                    "could not change table \"{}\" to {to} because it references {other} table \"{}\"",
+                                    rel_part(table),
+                                    rel_part(o)
+                                ),
+                            );
+                        }
+                    }
+                    t.unlogged = *on;
+                }
                 // (the table's own, then its TOAST table's, as Postgres's ATExecSetRelOptions checks them)
                 Alter::RelOptions(given, reset) => {
                     let valid = ["toast"];
@@ -55276,14 +55946,19 @@ impl Exec<'_> {
             // publications and statistics objects name it by its stored name: they follow it
             writes.extend(publication::renamed_table(v, table, to)?);
             writes.extend(statistics::renamed_table(v, table, to)?);
-            // views name the tables they read, and aren't rewritten
-            if let Some(d) = dependents(v, table)?.first() {
-                return err(
-                    UNSUPPORTED,
-                    format!(
-                        "can't rename table \"{table}\": view \"{d}\" reads it by name; drop the view, rename, then make it again"
-                    ),
-                );
+            // views name the tables they read: written again to read it by its new name, as Postgres's follow it
+            let rn = viewdef::Renames { table: table.to_string(), to_table: Some(to.clone()), col: None };
+            match self.renamed_dependents(v, table, &rn)? {
+                Some(follow) => writes.extend(follow),
+                None => {
+                    let d = dependents(v, table)?.into_iter().next().unwrap_or_default();
+                    return err(
+                        UNSUPPORTED,
+                        format!(
+                            "can't rename table \"{table}\": view \"{d}\" reads it by name; drop the view, rename, then make it again"
+                        ),
+                    );
+                }
             }
             if relation_kind(v, to)?.is_some_and(|k| k != "table") {
                 return err(TABLE_EXISTS, format!("relation \"{to}\" already exists"));
@@ -65029,11 +65704,52 @@ fn check_generated(t: &Table) -> Result<()> {
         if sub {
             return err(UNSUPPORTED, "cannot use subquery in column generation expression");
         }
+        // (as Postgres's transformExpr refuses them in EXPR_KIND_GENERATED_COLUMN)
+        let (mut agg, mut win, mut srf, mut whole, mut system) = (false, false, false, false, None);
+        walk(&e, &mut |x| match x {
+            Expr::Agg(..) => agg = true,
+            Expr::Window(_) => win = true,
+            Expr::Call(c) => {
+                let name = rel_part(written(&c.name));
+                srf |= catalog_schema::builtin_signatures(name).iter().any(|s| s.1.starts_with("SETOF "));
+            }
+            Expr::Col(q, n) if !t.cols.iter().any(|c| c.name == *n) => {
+                if q.is_none() && n == rel_part(&t.name) {
+                    whole = true;
+                } else if system_column(n).is_some() || n == "tableoid" || n == "ctid" {
+                    system.get_or_insert_with(|| n.clone());
+                }
+            }
+            _ => {}
+        });
+        if agg {
+            return err("42803", "aggregate functions are not allowed in column generation expressions");
+        }
+        if win {
+            return err("42P20", "window functions are not allowed in column generation expressions");
+        }
+        if srf {
+            return err(UNSUPPORTED, "set-returning functions are not allowed in column generation expressions");
+        }
+        if whole {
+            return err_detail(
+                UNSUPPORTED,
+                "cannot use whole-row variable in column generation expression",
+                "This would cause the generated column to depend on its own value.",
+            );
+        }
+        if let Some(n) = system {
+            return err(UNSUPPORTED, format!("cannot use system column \"{n}\" in column generation expression"));
+        }
         let bound = Binder::plain(&t.cols, None).bind(&e)?;
         let mut reads = vec![];
         each_idx(&bound, &mut |i| reads.push(i));
         if let Some(g) = reads.iter().find_map(|&i| t.cols.get(i).filter(|x| x.generated.is_some())) {
-            return err("42P17", format!("cannot use generated column \"{}\" in column generation expression", g.name));
+            return err_detail(
+                "42P17",
+                format!("cannot use generated column \"{}\" in column generation expression", g.name),
+                "A generated column cannot reference another generated column.",
+            );
         }
         if per_row(&settle_all(&e, &t.cols)) {
             return err("42P17", "generation expression is not immutable");

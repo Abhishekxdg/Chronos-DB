@@ -1308,7 +1308,7 @@ pub(crate) fn check_as(v: &View, who: &Who, st: &Stmt) -> Result<()> {
         ddl(v, who, st)?;
     }
     // REFRESH reads a materialized view's query as its owner, whoever runs it
-    if let Stmt::Refresh { name, data: true } = st
+    if let Stmt::Refresh { name, data: true, .. } = st
         && let Some(o) = rel(v, name)?
         && let Some(sql) = load(v, name)?.and_then(|t| t.matview).and_then(|m| m["sql"].as_str().map(String::from))
     {
@@ -3412,80 +3412,148 @@ pub(super) fn alter_owner(db: &Db, branch: &str, what: &Owned, to: &Spec) -> Res
     tag(tag_name)
 }
 
-/// ALTER FUNCTION | PROCEDURE ... SECURITY DEFINER | INVOKER: who it runs as, its owner's to change.
-pub(super) fn set_definer(db: &Db, branch: &str, what: &Owned, definer: bool) -> Result<Output> {
-    let Owned::Routine(name, types, procedure) = what else { return err(UNSUPPORTED, "not a function") };
-    let who = roles::current().map_or_else(|| Who::boot("chronos"), |w| (*w).clone());
-    db.batch_with::<(), SqlError>(branch, |v| {
-        let Some(f) = functions::find_routine(v, name, types.as_deref())? else {
-            return err(NO_FUNCTION, format!("function {} does not exist", written(name)));
-        };
-        let o = func(v, &f)?;
-        if !who.has_privs_of(o.owner) {
-            return err("42501", format!("must be owner of {} {}", o.kind.noun(), shown_name(&f.name)));
-        }
-        if f.definer == definer {
-            return Ok((vec![], ()));
-        }
-        let Some(raw) = v.get(&f.key())? else { return Ok((vec![], ())) };
-        let mut j: Json = serde_json::from_str(&raw).unwrap_or_default();
-        match definer {
-            true => j["definer"] = Json::Bool(true),
-            false => {
-                if let Some(m) = j.as_object_mut() {
-                    m.remove("definer");
-                }
-            }
-        }
-        Ok((vec![(f.key(), Some(j.to_string()))], ()))
-    })?;
-    functions::forget_parsed();
-    tag(if *procedure { "ALTER PROCEDURE" } else { "ALTER FUNCTION" })
-}
-
-/// ALTER FUNCTION | PROCEDURE ... SET | RESET: the settings its calls run with (see `Stmt::RoutineConfig`), its
-/// owner's to change.
-pub(super) fn set_config(
+/// ALTER FUNCTION | PROCEDURE | ROUTINE ... RENAME TO, SET SCHEMA or attributes, as Postgres's AlterFunction and
+/// its generic rename and namespace changes do them: on a routine its role owns (or a superuser), one of a
+/// procedure's attributes being SECURITY or a setting, LEAKPROOF a superuser's to give. A rename or a move to
+/// another schema is refused where a routine of the name and argument types is there already (42723).
+pub(super) fn alter_routine(
     db: &Db,
     branch: &str,
-    what: &Owned,
-    changes: &[(Option<String>, Option<Vec<String>>)],
+    name: &str,
+    types: Option<&[Type]>,
+    kind: functions::RoutineKind,
+    action: &functions::RoutineAlter,
 ) -> Result<Output> {
-    let Owned::Routine(name, types, procedure) = what else { return err(UNSUPPORTED, "not a function") };
+    use functions::{RoutineAlter, RoutineAttr};
     let who = roles::current().map_or_else(|| Who::boot("chronos"), |w| (*w).clone());
     db.batch_with::<(), SqlError>(branch, |v| {
-        let Some(f) = functions::find_routine(v, name, types.as_deref())? else {
-            return err(NO_FUNCTION, format!("function {} does not exist", written(name)));
-        };
+        let f = functions::lookup_routine(v, name, types, kind)?;
         let o = func(v, &f)?;
         if !who.has_privs_of(o.owner) {
-            return err("42501", format!("must be owner of {} {}", o.kind.noun(), shown_name(&f.name)));
+            let noun = if f.procedure { "procedure" } else { "function" };
+            return err("42501", format!("must be owner of {noun} {}", written(name)));
         }
-        let mut config = f.config.clone();
-        for (n, values) in changes {
-            match (n, values) {
-                (None, _) => config.clear(),
-                (Some(n), None) => config.retain(|(x, _)| x != n),
-                (Some(n), Some(vals)) => {
-                    config.retain(|(x, _)| x != n);
-                    config.push((n.clone(), vals.clone()));
+        let mut writes = vec![];
+        match action {
+            RoutineAlter::Attrs(attrs) => {
+                let mut j = serde_json::from_str::<Json>(&v.get(&f.key())?.unwrap_or_default()).unwrap_or_default();
+                let mut config = f.config.clone();
+                for (a, at) in attrs {
+                    if f.procedure && !a.procedures_have() {
+                        return Err(SqlError {
+                            code: "42P13",
+                            message: "invalid attribute in procedure definition".into(),
+                            info: Some(Box::new(Violation { position: Some(*at), ..Violation::default() })),
+                        });
+                    }
+                    let flag = |j: &mut Json, k: &str, on: bool| match on {
+                        true => j[k] = Json::Bool(true),
+                        false => {
+                            if let Some(m) = j.as_object_mut() {
+                                m.remove(k);
+                            }
+                        }
+                    };
+                    match a {
+                        RoutineAttr::Volatility(x) => j["volatility"] = Json::from(x.name()),
+                        RoutineAttr::Strict(on) => j["strict"] = Json::Bool(*on),
+                        RoutineAttr::Definer(on) => flag(&mut j, "definer", *on),
+                        RoutineAttr::Leakproof(on) => {
+                            if *on && !who.superuser {
+                                return err("42501", "only superuser can define a leakproof function");
+                            }
+                            flag(&mut j, "leakproof", *on);
+                        }
+                        RoutineAttr::Cost(c) => {
+                            if *c <= 0.0 {
+                                return err("22023", "COST must be positive");
+                            }
+                            j["cost"] = Json::from(*c);
+                        }
+                        RoutineAttr::Rows(r) => {
+                            if *r <= 0.0 {
+                                return err("22023", "ROWS must be positive");
+                            }
+                            if !f.ret.sets() {
+                                return err("22023", "ROWS is not applicable when function does not return a set");
+                            }
+                            j["rows"] = Json::from(*r);
+                        }
+                        RoutineAttr::Parallel(p) => j["parallel"] = Json::String(p.to_string()),
+                        RoutineAttr::Support => {}
+                        RoutineAttr::Set(n, values) => {
+                            if let Some(values) = values {
+                                match config.iter_mut().find(|(c, _)| c == n) {
+                                    Some(c) => c.1 = values.clone(),
+                                    None => config.push((n.clone(), values.clone())),
+                                }
+                            }
+                        }
+                        RoutineAttr::Reset(Some(n)) => config.retain(|(c, _)| c != n),
+                        RoutineAttr::Reset(None) => config.clear(),
+                    }
+                }
+                match config.is_empty() {
+                    true => {
+                        if let Some(m) = j.as_object_mut() {
+                            m.remove("config");
+                        }
+                    }
+                    false => j["config"] = serde_json::json!(config),
+                }
+                writes.push((f.key(), Some(j.to_string())));
+            }
+            RoutineAlter::Rename(_) | RoutineAlter::Schema(_) => {
+                let to = match action {
+                    RoutineAlter::Rename(n) => qualify(schema_part(&f.name), n),
+                    RoutineAlter::Schema(s) => {
+                        if !namespaces(v)?.contains(s) {
+                            return err("3F000", format!("schema \"{s}\" does not exist"));
+                        }
+                        qualify(s, rel_part(&f.name))
+                    }
+                    RoutineAlter::Attrs(_) => unreachable!("matched above"),
+                };
+                if to == f.name {
+                    return Ok((vec![], ()));
+                }
+                // (the schema it goes to, or is renamed in, takes CREATE from whoever puts it there)
+                if !who.superuser {
+                    let s = schema(v, schema_part(&to))?;
+                    if !s.has(&who, CREATE) {
+                        return Err(s.denied());
+                    }
+                }
+                let raw = functions::edited(&f, |j| j["name"] = Json::String(to.clone()));
+                let moved = functions::Function::from_json(&serde_json::from_str(&raw).unwrap_or_default())?;
+                if v.get(&moved.key())?.is_some() {
+                    return err(
+                        "42723",
+                        format!(
+                            "function {}({}) already exists in schema \"{}\"",
+                            rel_part(&to),
+                            f.args.iter().map(|a| a.1.name()).collect::<Vec<_>>().join(", "),
+                            schema_part(&to)
+                        ),
+                    );
+                }
+                writes.push((f.key(), None));
+                writes.push((moved.key(), Some(raw)));
+                // (its triggers call it by name)
+                for mut t in schemas(v)? {
+                    if t.triggers.iter().any(|x| x.func == f.name) {
+                        for x in t.triggers.iter_mut().filter(|x| x.func == f.name) {
+                            x.func = to.clone();
+                        }
+                        writes.push((schema_key(&t.name), Some(schema_json(&t))));
+                    }
                 }
             }
         }
-        let Some(raw) = v.get(&f.key())? else { return Ok((vec![], ())) };
-        let mut j: Json = serde_json::from_str(&raw).unwrap_or_default();
-        match config.is_empty() {
-            true => {
-                if let Some(m) = j.as_object_mut() {
-                    m.remove("config");
-                }
-            }
-            false => j["config"] = serde_json::json!(config),
-        }
-        Ok((vec![(f.key(), Some(j.to_string()))], ()))
+        Ok((writes, ()))
     })?;
     functions::forget_parsed();
-    tag(if *procedure { "ALTER PROCEDURE" } else { "ALTER FUNCTION" })
+    tag(kind.tag())
 }
 
 /// An ACL with `old` (owner) replaced by `new` as grantor and grantee, items merged.
@@ -3872,6 +3940,21 @@ pub(crate) fn moves(v: &View, st: &Stmt) -> Result<Vec<(String, String)>> {
         Stmt::AlterType { name, change: TypeChange::Rename(to) } => {
             // (to the name the rename stores it under)
             out.push((key_of(Kind::Type, name), key_of(Kind::Type, to)));
+        }
+        Stmt::AlterRoutine { name, types, kind, action } => {
+            let to = match action {
+                functions::RoutineAlter::Rename(n) => Some((None, n)),
+                functions::RoutineAlter::Schema(s) => Some((Some(s), &String::new())),
+                functions::RoutineAlter::Attrs(_) => None,
+            };
+            if let (Some((schema, new)), Ok(f)) = (to, functions::lookup_routine(v, name, types.as_deref(), *kind)) {
+                let moved = match schema {
+                    Some(s) => qualify(s, rel_part(&f.name)),
+                    None => qualify(schema_part(&f.name), new),
+                };
+                let args = f.args.iter().map(|a| a.1.name()).collect::<Vec<_>>().join(", ");
+                out.push((key_of(Kind::Function, &f.sig()), key_of(Kind::Function, &format!("{moved}({args})"))));
+            }
         }
         _ => {}
     }

@@ -30,10 +30,101 @@ fn view_text(rels: &[TableInfo], i: usize, pretty: bool, wrap: i32) -> Option<St
     let names: Vec<String> = r.columns.iter().map(|c| c.0.clone()).collect();
     let ctes = recursive_ctes(&q);
     let mut d = Dp::new(rels, pretty, wrap);
+    d.synthetic.clone_from(&r.view_aliases);
     d.ctes = &ctes;
     d.query(&q, Some(&names[..]), true, 0)?;
     d.buf.push(';');
     Some(d.buf)
+}
+
+/// A new view's (or materialized view's) query `sql` as Postgres keeps it: bound to what it reads now, so a `*`
+/// stands for the columns it has now and no more, written back, pretty (`names`: the view's columns), with the
+/// aliases made up where two relations are shown by one name (see `Dp::synthetic`); None for a form this doesn't
+/// write back.
+pub(super) fn bound_text(rels: &[TableInfo], name: &str, sql: &str, names: &[String]) -> Option<(String, Vec<String>)> {
+    let q = view_query(name, sql).ok()?;
+    let ctes = recursive_ctes(&q);
+    let mut d = Dp::new(rels, true, 0);
+    d.ctes = &ctes;
+    d.query(&q, Some(names), true, 0)?;
+    Some((d.buf.trim().to_string(), d.made_up))
+}
+
+/// View `i`'s query (or a materialized view's) written again for rename `rn` of a relation it reads, pretty, as
+/// its new definition, with the aliases that made up where two relations came to be shown by one name (which are
+/// none: see `Dp::synthetic`); None for a form this doesn't write back.
+pub(super) fn renamed_text(rels: &[TableInfo], i: usize, rn: &Renames) -> Option<(String, Vec<String>)> {
+    let r = rels.get(i)?;
+    let q = view_query(&r.name, r.definition.as_deref()?).ok()?;
+    let names: Vec<String> = r.columns.iter().map(|c| c.0.clone()).collect();
+    let ctes = recursive_ctes(&q);
+    let mut d = Dp::new(rels, true, 0);
+    d.ctes = &ctes;
+    d.renames = Some(rn);
+    d.synthetic.clone_from(&r.view_aliases);
+    d.query(&q, Some(&names[..]), true, 0)?;
+    Some((d.buf.trim().to_string(), d.made_up))
+}
+
+/// A function's SQL-standard body as pg_get_functiondef writes it (print_function_sqlbody): `RETURN expr`, or
+/// `BEGIN ATOMIC`, each statement on a line of its own, `END`; its parameters by their names (qualified by the
+/// function's where its query reads more than one relation). None for a form this doesn't write back (an INSERT,
+/// a parameter by number).
+pub(super) fn function_body(rels: &[TableInfo], f: &functions::Function) -> Option<String> {
+    let select = |s: &Statement| match &s.0 {
+        Stmt::Select(q) => Some(q.clone()),
+        _ => None,
+    };
+    let queries: Vec<Box<Select>> = super::parse(&f.body).ok()?.iter().map(select).collect::<Option<_>>()?;
+    let fname = rel_part(&f.name).to_string();
+    let mut d = Dp::new(rels, false, 0);
+    d.base = 1;
+    let mut lv = Level::empty(None, true);
+    lv.rtes.push(Rte {
+        written: fname.clone(),
+        refname: Some(fname),
+        cols: f.args.iter().map(|a| a.0.clone()).collect::<Option<Vec<_>>>()?,
+        types: f.args.iter().map(|a| Ty::of(a.1)).collect(),
+        via: vec![Via::Own; f.args.len()],
+        rel: None,
+        shown: None,
+    });
+    // (an entry of the level, which names find; never written, as no FROM of it is)
+    lv.from.push(Node::Rel { rte: 0, name: String::new(), only: false, aliased: false, cols_given: false });
+    lv.prefix = false;
+    d.levels.push(lv);
+    // (RETURN's value: its SELECT's one item, alone)
+    fn value<'q>(d: &mut Dp<'q>, q: &'q Select) -> Option<String> {
+        let ([Item::Expr(e, None)], None) = (&q.items[..], &q.from) else { return None };
+        d.buf.clear();
+        let t = d.tn(e)?;
+        let want = t.ty.unwrap_or(TEXT);
+        let n = d.settle(t, want);
+        d.emit(&n, false)?;
+        Some(std::mem::take(&mut d.buf))
+    }
+    match &f.std_form {
+        None => {
+            let [q] = &queries[..] else { return None };
+            Some(format!("RETURN {}", value(&mut d, q)?))
+        }
+        Some(returns) => {
+            let mut out = String::from("BEGIN ATOMIC\n");
+            for (q, ret) in queries.iter().zip(returns) {
+                if *ret {
+                    out.push_str(&format!(" RETURN {};\n", value(&mut d, q)?));
+                    continue;
+                }
+                d.buf.clear();
+                d.indent = 1;
+                d.query(q, None, false, 1)?;
+                out.push_str(d.buf.trim_start_matches('\n'));
+                out.push_str(";\n");
+            }
+            out.push_str("END");
+            Some(out)
+        }
+    }
 }
 
 /// The WITH RECURSIVE queries the top level of `q` reads (see `Dp::ctes`), each once.
@@ -66,6 +157,7 @@ pub(super) fn trigger_when(text: &str, cols: &[(String, Type, (i64, i64))], pret
             types: cols.iter().map(|c| Ty::with(c.1, c.2)).collect(),
             via: vec![Via::Own; cols.len()],
             rel: None,
+            shown: None,
         });
     }
     lv.prefix = true;
@@ -84,6 +176,32 @@ pub(super) struct PlanRel {
     pub(super) cols: Vec<(String, Type, (i64, i64))>,
 }
 
+/// An expression over a table's columns `cols` (a constraint's, a default's, a partition key's) as Postgres writes it
+/// back, the columns bare: what `catalog::expr_def` has no form of. `pretty`: with only the parentheses precedence
+/// needs. None for a form this doesn't write either.
+pub(super) fn column_expr(e: &Expr, cols: &[Col], pretty: bool) -> Option<String> {
+    let mut d = Dp::new(&[], pretty, 0);
+    let mut lv = Level::empty(None, true);
+    let typed: Vec<(String, Type, (i64, i64))> = cols.iter().map(col_ty).collect();
+    lv.rtes.push(Rte {
+        written: String::new(),
+        refname: Some(String::new()),
+        cols: typed.iter().map(|c| c.0.clone()).collect(),
+        types: typed.iter().map(|c| Ty::with(c.1, c.2)).collect(),
+        via: vec![Via::Own; typed.len()],
+        rel: None,
+        shown: None,
+    });
+    lv.from.push(Node::Rel { rte: 0, name: String::new(), only: false, aliased: false, cols_given: false });
+    lv.prefix = false;
+    d.levels.push(lv);
+    let t = d.tn(e)?;
+    let want = t.ty.unwrap_or(TEXT);
+    let n = d.settle(t, want);
+    d.emit(&n, false)?;
+    Some(d.buf)
+}
+
 /// An expression of a plan as EXPLAIN writes it (ruleutils.c's deparse_expression over the plan's range table): a
 /// column bare, or named by its relation where `prefix`; constants as the planner has folded them (`1::bigint` is
 /// `'1'::bigint`, an IN list's constants one array constant). An untyped literal standing alone takes type `want`.
@@ -100,6 +218,7 @@ pub(super) fn plan_expr(e: &Expr, rels: &[PlanRel], prefix: bool, want: Type) ->
             types: r.cols.iter().map(|c| Ty::with(c.1, c.2)).collect(),
             via: vec![Via::Own; r.cols.len()],
             rel: None,
+            shown: None,
         });
         lv.from.push(Node::Rel { rte: i, name: r.shown.clone(), only: false, aliased: false, cols_given: false });
     }
@@ -436,6 +555,25 @@ struct Rte {
     via: Vec<Via>,
     /// a relation's stored name (its row type's)
     rel: Option<String>,
+    /// the names its columns are shown by where they aren't `cols` (a column renamed since the query was written,
+    /// which the query's text still names as it was: see `Renames`)
+    shown: Option<Vec<String>>,
+}
+
+impl Rte {
+    /// Column `i`'s name as it is shown.
+    fn shown(&self, i: usize) -> Option<&String> {
+        self.shown.as_ref().and_then(|s| s.get(i)).or_else(|| self.cols.get(i))
+    }
+}
+
+/// A rename a view's (or materialized view's) query is written again for, before it is made (Postgres's views
+/// read their relations by oid and their columns by number, so they follow a rename): relation `table` (its stored
+/// name) now `to_table`, its column `col.0` now `col.1`.
+pub(super) struct Renames {
+    pub(super) table: String,
+    pub(super) to_table: Option<String>,
+    pub(super) col: Option<(String, String)>,
 }
 
 /// What a join's column is: a column of one of its sides, or (a FULL JOIN's merged column) its bare name.
@@ -692,6 +830,16 @@ struct Dp<'q> {
     in_group: bool,
     /// writing a plan's expression (see `plan_expr`): constants as the planner folds them
     fold: bool,
+    /// a rename the query is written for (see `Renames`)
+    renames: Option<&'q Renames>,
+    /// the aliases the query's text has only because writing it again after a rename made them up (see
+    /// `renamed_text`): its relations are unaliased, as the query was written
+    synthetic: Vec<String>,
+    /// the aliases this writing makes up so (a relation not aliased shown by another name than its own)
+    made_up: Vec<String>,
+    /// how many levels outside the query are its context's, not queries of its own (a function's parameters, see
+    /// `function_body`): a query among them qualifies its columns only where it reads more than one relation
+    base: usize,
     /// the view's WITH RECURSIVE queries: name, its column list as written (if one is), and its query as Postgres
     /// keeps it (its two parts put back together: `base UNION [ALL] step`)
     ctes: &'q [(String, Vec<String>, Select)],
@@ -708,6 +856,10 @@ impl<'q> Dp<'q> {
             levels: vec![],
             in_group: false,
             fold: false,
+            renames: None,
+            synthetic: vec![],
+            made_up: vec![],
+            base: 0,
             ctes: &[],
         }
     }
@@ -1139,7 +1291,10 @@ impl<'q> Dp<'q> {
             }
             lv.from.push(cur);
         }
-        lv.prefix = !self.levels.is_empty() || lv.rtes.len() != 1;
+        lv.prefix = match self.base {
+            0 => !self.levels.is_empty() || lv.rtes.len() != 1,
+            b => self.levels.len() > b || lv.rtes.len() > 1,
+        };
         Some(lv)
     }
 
@@ -1168,7 +1323,7 @@ impl<'q> Dp<'q> {
     ) -> usize {
         let refname = Some(self.unique(lv, written));
         let n = cols.len();
-        lv.rtes.push(Rte { written: written.into(), refname, cols, types, via: vec![Via::Own; n], rel });
+        lv.rtes.push(Rte { written: written.into(), refname, cols, types, via: vec![Via::Own; n], rel, shown: None });
         lv.rtes.len() - 1
     }
 
@@ -1305,6 +1460,14 @@ impl<'q> Dp<'q> {
         for (c, n) in names.iter_mut().zip(&src.names) {
             *c = n.clone();
         }
+        // (a column past the aliases with a name one of them took is made unique, as set_relation_column_names
+        // makes it: `c_1`)
+        for i in src.names.len()..names.len() {
+            if names[..i].contains(&names[i]) {
+                let base = names[i].clone();
+                names[i] = (1..).map(|k| format!("{base}_{k}")).find(|n| !names.contains(n)).unwrap_or(base);
+            }
+        }
         let types = r
             .columns
             .iter()
@@ -1312,13 +1475,38 @@ impl<'q> Dp<'q> {
             .map(|(i, c)| Ty::with(c.1, r.typmods.get(i).copied().unwrap_or((0, -1))))
             .collect();
         let rte = self.add_rte(lv, &src.alias, names, types, Some(r.name.clone()));
-        Some(Node::Rel {
-            rte,
-            name: r.name.clone(),
-            only: src.only,
-            aliased: src.alias != rel_part(&src.table),
-            cols_given: !src.names.is_empty(),
-        })
+        // (an alias a rename made up is none: the relation is shown by its own name, made unique)
+        let synthetic = self.synthetic.contains(&src.alias);
+        let aliased = src.alias != rel_part(&src.table) && !synthetic;
+        if synthetic {
+            // (the name it was given a moment ago, by its alias, isn't one taken)
+            lv.rtes[rte].refname = None;
+            let refname = self.unique(lv, rel_part(&r.name));
+            lv.rtes[rte].refname = Some(refname);
+        }
+        // (the relation renamed: shown by its new name, and by the new name of a column renamed that no alias
+        // names)
+        let mut name = r.name.clone();
+        if let Some(rn) = self.renames.filter(|rn| rn.table == r.name) {
+            if let Some((a, b)) = &rn.col {
+                let mut shown = lv.rtes[rte].cols.clone();
+                for (i, c) in shown.iter_mut().enumerate().skip(src.names.len()) {
+                    if r.columns.get(i).is_some_and(|x| x.0 == *a) {
+                        *c = b.clone();
+                    }
+                }
+                lv.rtes[rte].shown = Some(shown);
+            }
+            if let Some(to) = &rn.to_table {
+                name = to.clone();
+                if !aliased {
+                    lv.rtes[rte].refname = None;
+                    let refname = self.unique(lv, rel_part(to));
+                    lv.rtes[rte].refname = Some(refname);
+                }
+            }
+        }
+        Some(Node::Rel { rte, name, only: src.only, aliased, cols_given: !src.names.is_empty() })
     }
 
     /// A join of `left` and `right`, and its entry: USING's columns first (the left side's, the right's for a RIGHT
@@ -1334,6 +1522,7 @@ impl<'q> Dp<'q> {
         using: &[String],
         natural: bool,
     ) -> Option<Node<'q>> {
+        let (mut left, mut right) = (left, right);
         let (lr, rr) = (left.rte(), right.rte());
         let (lcols, rcols) = (lv.rtes[lr].cols.clone(), lv.rtes[rr].cols.clone());
         let using: Vec<String> = match natural {
@@ -1344,11 +1533,26 @@ impl<'q> Dp<'q> {
         for u in &using {
             let li = lcols.iter().position(|c| c == u)?;
             let ri = rcols.iter().position(|c| c == u)?;
+            // (a column renamed that USING names keeps the name USING gives it: its relation is shown with the
+            // names its columns had as an alias list, `tt3 tt3(ax, b, c)`, as Postgres's set_relation_column_names
+            // gives a renamed column its old name back)
+            for (side, node, at) in [(lr, &mut left, li), (rr, &mut right, ri)] {
+                if lv.rtes[side].shown(at) != Some(u) {
+                    let Node::Rel { cols_given, .. } = node else { return None };
+                    lv.rtes[side].shown = None;
+                    *cols_given = true;
+                }
+            }
             cols.push(u.clone());
-            types.push(lv.rtes[lr].types[li]);
+            let (lt, rt) = (lv.rtes[lr].types[li], lv.rtes[rr].types[ri]);
+            let both = common([Some(lt), Some(rt)].into_iter()).unwrap_or(lt);
+            types.push(both);
+            // (an inner join's merged column is the side that needs no cast to their common type, the left where
+            // neither does: buildMergedJoinVar)
             via.push(match kind {
                 JoinKind::Full => Via::Bare,
                 JoinKind::Right => Via::Col(rr, ri),
+                JoinKind::Inner if lt != both && rt == both => Via::Col(rr, ri),
                 _ => Via::Col(lr, li),
             });
         }
@@ -1361,7 +1565,7 @@ impl<'q> Dp<'q> {
                 }
             }
         }
-        lv.rtes.push(Rte { written: String::new(), refname: None, cols, types, via, rel: None });
+        lv.rtes.push(Rte { written: String::new(), refname: None, cols, types, via, rel: None, shown: None });
         let rte = lv.rtes.len() - 1;
         let kind = if kind == JoinKind::Inner && on.is_none() && using.is_empty() { JoinKind::Cross } else { kind };
         Some(Node::Join {
@@ -1464,12 +1668,12 @@ impl<'q> Dp<'q> {
             return match r.via.get(col)? {
                 Via::Col(r2, c2) => self.var_text(up, *r2, *c2, force),
                 _ => {
-                    let n = r.cols.get(col)?.clone();
+                    let n = r.shown(col)?.clone();
                     Some((quoted(&n), n))
                 }
             };
         }
-        let name = r.cols.get(col)?.clone();
+        let name = r.shown(col)?.clone();
         let prefix = force || self.levels.last().is_some_and(|l| l.prefix);
         let text = match (&r.refname, prefix) {
             (Some(refname), true) => format!("{}.{}", quoted(refname), quoted(&name)),
@@ -1624,6 +1828,9 @@ impl<'q> Dp<'q> {
                 }
                 self.buf.push_str(&rel_text(name));
                 let refname = self.refname(*rte)?;
+                if !*aliased && !*cols_given && refname != rel_part(name) {
+                    self.made_up.push(refname.clone());
+                }
                 if *aliased || *cols_given || refname != rel_part(name) {
                     self.buf.push(' ');
                     self.buf.push_str(&quoted(&refname));

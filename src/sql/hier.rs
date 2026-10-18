@@ -454,14 +454,6 @@ fn transition_row_trigger(t: &Table) -> Option<&str> {
     t.triggers.iter().find(|x| x.row && (x.old_table.is_some() || x.new_table.is_some())).map(|x| x.name.as_str())
 }
 
-fn err_detail<T>(code: &'static str, message: impl Into<String>, detail: impl Into<String>) -> Result<T> {
-    Err(SqlError {
-        code,
-        message: message.into(),
-        info: Some(Box::new(Violation { detail: Some(detail.into()), ..Violation::default() })),
-    })
-}
-
 pub(super) fn truncate_only() -> SqlError {
     SqlError {
         code: "42809",
@@ -784,15 +776,31 @@ impl Exec<'_> {
                     parts.push(KeyPart::Col(c.id));
                 }
                 PartItem::Expr(e, text) => {
-                    let mut sub = false;
+                    let (mut sub, mut agg, mut win, mut srf) = (false, false, false, false);
                     let mut reads: Vec<String> = vec![];
                     walk(e, &mut |x| match x {
                         Expr::Sub(_) | Expr::Exists(..) | Expr::InSub(..) => sub = true,
                         Expr::Col(_, n) => reads.push(n.clone()),
+                        Expr::Agg(..) => agg = true,
+                        Expr::Window(_) => win = true,
+                        Expr::Call(c) => srf |= returns_set(&c.name),
                         _ => {}
                     });
                     if sub {
                         return err(UNSUPPORTED, "cannot use subquery in partition key expression");
+                    }
+                    // (as Postgres's transformExpr refuses them in EXPR_KIND_PARTITION_EXPRESSION)
+                    if agg {
+                        return err("42803", "aggregate functions are not allowed in partition key expressions");
+                    }
+                    if win {
+                        return err("42P20", "window functions are not allowed in partition key expressions");
+                    }
+                    if srf {
+                        return err(
+                            UNSUPPORTED,
+                            "set-returning functions are not allowed in partition key expressions",
+                        );
                     }
                     if let Some(n) =
                         reads.iter().find(|n| system_column(n).is_some() || *n == "tableoid" || *n == "ctid")
@@ -850,6 +858,7 @@ impl Exec<'_> {
 
     /// A constant in a partition bound, as a value of the key column's type.
     fn bound_value(&self, e: &Expr, ty: Type, column: &str) -> Result<Value> {
+        bound_refused(e)?;
         let v = self.constant(e)?;
         if v == Value::Null {
             return Ok(v);
@@ -1596,6 +1605,10 @@ impl Exec<'_> {
             let [one] = changes else {
                 return err(UNSUPPORTED, "ATTACH, DETACH and INHERIT can't be combined with other changes yet");
             };
+            // (a typed table's columns are its type's alone)
+            if matches!(one, Alter::Inherit(..)) && t.hier.of_type.is_some() {
+                return err("42809", "cannot change inheritance of typed table");
+            }
             return match one {
                 Alter::Attach(child, spec) => self.attach_partition(v, &t, child, spec),
                 Alter::Detach(child, how) => self.detach_partition(v, &t, child, *how),
@@ -3929,4 +3942,32 @@ fn unspread_triggers(v: &View, t: &Table, names: &[String]) -> Result<Writes> {
         }
     }
     Ok(writes)
+}
+
+/// What a partition bound's expression can't have, as Postgres's transformExpr refuses it there (a column is found
+/// before the aggregate it is in): a column, a subquery, an aggregate, a window function or a set-returning one.
+fn bound_refused(e: &Expr) -> Result<()> {
+    let mut found = (false, false, false, false, false);
+    super::walk(e, &mut |x| match x {
+        Expr::Col(..) => found.0 = true,
+        Expr::Sub(_) | Expr::Exists(..) | Expr::InSub(..) => found.1 = true,
+        Expr::Agg(..) => found.2 = true,
+        Expr::Window(_) => found.3 = true,
+        Expr::Call(c) => found.4 |= returns_set(&c.name),
+        _ => {}
+    });
+    match found {
+        (true, ..) => err("42P10", "cannot use column reference in partition bound expression"),
+        (_, true, ..) => err(UNSUPPORTED, "cannot use subquery in partition bound"),
+        (_, _, true, ..) => err("42803", "aggregate functions are not allowed in partition bound"),
+        (.., true, _) => err("42P20", "window functions are not allowed in partition bound"),
+        (.., true) => err(UNSUPPORTED, "set-returning functions are not allowed in partition bound"),
+        _ => Ok(()),
+    }
+}
+
+/// Whether a call of `name` (as written) is of a built-in set-returning function (`generate_series`).
+fn returns_set(name: &str) -> bool {
+    let name = rel_part(name.strip_prefix(super::PLAIN).unwrap_or(name));
+    super::catalog_schema::builtin_signatures(name).iter().any(|s| s.1.starts_with("SETOF "))
 }

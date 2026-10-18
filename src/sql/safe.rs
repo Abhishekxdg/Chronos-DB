@@ -229,8 +229,7 @@ fn access(s: &Stmt) -> Reach {
         | Stmt::Grant(_) // rows of the world (roles themselves, `Stmt::Role`, are the database's)
         | Stmt::Foreign(_) // wrappers, servers and mappings: rows of the world
         | Stmt::AlterOwner(..)
-        | Stmt::SetDefiner(..)
-        | Stmt::RoutineConfig(..)
+        | Stmt::AlterRoutine { .. }
         | Stmt::DropOwned(..)
         | Stmt::Reassign(..)
         | Stmt::Policy(_) // rows of the world, as a table's schema is

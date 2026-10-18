@@ -435,11 +435,27 @@ impl Catalog {
             Volatility::Stable => flags.push("STABLE"),
             Volatility::Volatile => {}
         }
+        let mut flags: Vec<String> = flags.into_iter().map(String::from).collect();
+        match f.tuning.parallel {
+            Some('s') => flags.push("PARALLEL SAFE".into()),
+            Some('r') => flags.push("PARALLEL RESTRICTED".into()),
+            _ => {}
+        }
         if f.strict {
-            flags.push("STRICT");
+            flags.push("STRICT".into());
         }
         if f.definer {
-            flags.push("SECURITY DEFINER");
+            flags.push("SECURITY DEFINER".into());
+        }
+        if f.tuning.leakproof {
+            flags.push("LEAKPROOF".into());
+        }
+        // (COST and ROWS where they aren't the defaults, as %g writes them)
+        if let Some(c) = f.cost.filter(|c| *c != 100.0) {
+            flags.push(format!("COST {}", Value::Float(c).to_text()));
+        }
+        if let Some(r) = f.tuning.rows.filter(|r| *r > 0.0 && *r != 1000.0) {
+            flags.push(format!("ROWS {}", Value::Float(r).to_text()));
         }
         if !flags.is_empty() {
             d.push_str(&format!(" {}\n", flags.join(" ")));
@@ -447,6 +463,14 @@ impl Catalog {
         // its SET clauses, a line each, the values quoted as Postgres quotes them
         for (name, values) in &f.config {
             d.push_str(&format!(" SET {name} TO {}\n", super::setting_sql(name, values)));
+        }
+        // a SQL-standard body written back, as Postgres keeps it parsed; else the body as it was written
+        if f.std_body
+            && let Some(b) = super::viewdef::function_body(&self.rels, f)
+        {
+            d.push_str(&b);
+            d.push('\n');
+            return d;
         }
         let tag = if f.procedure { "$procedure$" } else { "$function$" };
         d.push_str(&format!("AS {tag}{}{tag}\n", f.body));
@@ -946,7 +970,7 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
                     rows.push(row(vec![
                         ("oid", int(cat.label_oid(n))),
                         ("enumtypid", int(cat.enum_oid(k))),
-                        ("enumsortorder", Value::Float(i as f64 + 1.0)),
+                        ("enumsortorder", Value::Float(cat.enum_orders[k].get(i).copied().unwrap_or(i as f64 + 1.0))),
                         ("enumlabel", t(l)),
                     ]));
                     n += 1;
@@ -989,13 +1013,13 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
                     ("pronamespace", int(cat.schema_oid(schema_part(&f.name)))),
                     ("proowner", int(acl.0)),
                     ("prolang", int(if f.lang == Lang::Sql { 14 } else { 13612 })),
-                    ("procost", Value::Float(100.0)),
-                    ("prorows", Value::Float(if f.ret.sets() { 1000.0 } else { 0.0 })),
+                    ("procost", Value::Float(f.cost.unwrap_or(100.0))),
+                    ("prorows", Value::Float(f.tuning.rows.unwrap_or(if f.ret.sets() { 1000.0 } else { 0.0 }))),
                     ("provariadic", int(0)),
                     ("prosupport", t("-")),
                     ("prokind", t(if f.procedure { "p" } else { "f" })),
                     ("prosecdef", b(f.definer)),
-                    ("proleakproof", b(false)),
+                    ("proleakproof", b(f.tuning.leakproof)),
                     ("proisstrict", b(f.strict)),
                     ("proretset", b(f.ret.sets())),
                     (
@@ -1006,7 +1030,7 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
                             Volatility::Volatile => "v",
                         }),
                     ),
-                    ("proparallel", t("u")),
+                    ("proparallel", t(&f.tuning.parallel.unwrap_or('u').to_string())),
                     ("pronargs", int(args.len() as i64)),
                     ("pronargdefaults", int(f.defaults.iter().filter(|d| d.is_some()).count() as i64)),
                     ("prorettype", int(ret)),
@@ -1015,6 +1039,19 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
                     ("proargmodes", if modes.is_empty() { Null } else { braces(modes) }),
                     ("proargnames", if named { braces(names) } else { Null }),
                     ("prosrc", t(&f.body)),
+                    // (its SET clauses, `name=value`, a list's values joined as Postgres's GUC flattening joins them)
+                    (
+                        "proconfig",
+                        match f.config.is_empty() {
+                            true => Null,
+                            false => braces(
+                                f.config
+                                    .iter()
+                                    .map(|(n, vs)| super::roles::array_elem(&format!("{n}={}", vs.join(", "))))
+                                    .collect(),
+                            ),
+                        },
+                    ),
                     ("proacl", acl.1),
                 ])
             })
@@ -1325,70 +1362,74 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
             }
             rows
         }
-        "pg_trigger" => cat
-            .triggers
-            .iter()
-            .enumerate()
-            .map(|(n, (i, k))| {
-                let r = &cat.rels[*i];
-                let (func, tgtype, nargs, attnums) = &r.trigger_meta[*k];
-                let (old, new, cloned) = r.trigger_links.get(*k).cloned().unwrap_or_default();
-                let name = &r.triggers[*k].0;
-                // a partition's copy: its parent's trigger of the name
-                let parent = match (&r.hier.of, cloned) {
-                    (Some((p, ..)), true) => cat
-                        .triggers
-                        .iter()
-                        .position(|(pi, pk)| cat.rels[*pi].name == *p && cat.rels[*pi].triggers[*pk].0 == *name)
-                        .map_or(0, |m| cat.trigger_oid(m)),
-                    _ => 0,
-                };
-                let opt = |s: &Option<String>| s.as_deref().map_or(Value::Null, t);
-                // a constraint trigger's constraint (contype `t`), and the table its FROM names
-                let con = r.trigger_cons.get(*k).cloned().flatten();
-                let con_oid = con
-                    .as_ref()
-                    .and_then(|_| cat.cons.iter().position(|(ci, c)| *ci == *i && c.kind == 't' && c.name == *name))
-                    .map_or(0, |p| cat.con_oid(p));
-                let from_oid = con
-                    .as_ref()
-                    .and_then(|c| c.2.as_ref())
-                    .and_then(|f| cat.rels.iter().position(|x| x.name == *f))
-                    .map_or(0, |p| cat.rel_oid(p));
-                let (deferrable, deferred) = con.as_ref().map_or((false, false), |c| (c.0, c.1));
-                row(vec![
-                    ("oid", int(cat.trigger_oid(n))),
-                    ("tgrelid", int(cat.rel_oid(*i))),
-                    ("tgparentid", int(parent)),
-                    ("tgname", t(name)),
-                    // (pg_catalog's own trigger functions, built in here, by their oids in Postgres's catalog)
-                    (
-                        "tgfoid",
-                        int(cat.trigger_function(func).map_or_else(
-                            || match func.as_str() {
-                                "tsvector_update_trigger" | "tsvector_update_trigger_column" => {
-                                    super::catalog_schema::builtin_procs(func).first().copied().unwrap_or(0)
-                                }
-                                _ => 0,
-                            },
-                            |f| cat.func_oid(f),
-                        )),
-                    ),
-                    ("tgtype", int(*tgtype)),
-                    ("tgenabled", t(&r.triggers[*k].2.to_string())),
-                    ("tgoldtable", opt(&old)),
-                    ("tgnewtable", opt(&new)),
-                    ("tgisinternal", b(false)),
-                    ("tgconstrrelid", int(from_oid)),
-                    ("tgconstrindid", int(0)),
-                    ("tgconstraint", int(con_oid)),
-                    ("tgdeferrable", b(deferrable)),
-                    ("tginitdeferred", b(deferred)),
-                    ("tgnargs", int(*nargs as i64)),
-                    ("tgattr", t(&attnums.iter().map(i64::to_string).collect::<Vec<_>>().join(" "))),
-                ])
-            })
-            .collect(),
+        "pg_trigger" => {
+            let mut rows: Vec<Vec<Value>> = cat
+                .triggers
+                .iter()
+                .enumerate()
+                .map(|(n, (i, k))| {
+                    let r = &cat.rels[*i];
+                    let (func, tgtype, nargs, attnums) = &r.trigger_meta[*k];
+                    let (old, new, cloned) = r.trigger_links.get(*k).cloned().unwrap_or_default();
+                    let name = &r.triggers[*k].0;
+                    // a partition's copy: its parent's trigger of the name
+                    let parent = match (&r.hier.of, cloned) {
+                        (Some((p, ..)), true) => cat
+                            .triggers
+                            .iter()
+                            .position(|(pi, pk)| cat.rels[*pi].name == *p && cat.rels[*pi].triggers[*pk].0 == *name)
+                            .map_or(0, |m| cat.trigger_oid(m)),
+                        _ => 0,
+                    };
+                    let opt = |s: &Option<String>| s.as_deref().map_or(Value::Null, t);
+                    // a constraint trigger's constraint (contype `t`), and the table its FROM names
+                    let con = r.trigger_cons.get(*k).cloned().flatten();
+                    let con_oid = con
+                        .as_ref()
+                        .and_then(|_| cat.cons.iter().position(|(ci, c)| *ci == *i && c.kind == 't' && c.name == *name))
+                        .map_or(0, |p| cat.con_oid(p));
+                    let from_oid = con
+                        .as_ref()
+                        .and_then(|c| c.2.as_ref())
+                        .and_then(|f| cat.rels.iter().position(|x| x.name == *f))
+                        .map_or(0, |p| cat.rel_oid(p));
+                    let (deferrable, deferred) = con.as_ref().map_or((false, false), |c| (c.0, c.1));
+                    row(vec![
+                        ("oid", int(cat.trigger_oid(n))),
+                        ("tgrelid", int(cat.rel_oid(*i))),
+                        ("tgparentid", int(parent)),
+                        ("tgname", t(name)),
+                        // (pg_catalog's own trigger functions, built in here, by their oids in Postgres's catalog)
+                        (
+                            "tgfoid",
+                            int(cat.trigger_function(func).map_or_else(
+                                || match func.as_str() {
+                                    "tsvector_update_trigger" | "tsvector_update_trigger_column" => {
+                                        super::catalog_schema::builtin_procs(func).first().copied().unwrap_or(0)
+                                    }
+                                    _ => 0,
+                                },
+                                |f| cat.func_oid(f),
+                            )),
+                        ),
+                        ("tgtype", int(*tgtype)),
+                        ("tgenabled", t(&r.triggers[*k].2.to_string())),
+                        ("tgoldtable", opt(&old)),
+                        ("tgnewtable", opt(&new)),
+                        ("tgisinternal", b(false)),
+                        ("tgconstrrelid", int(from_oid)),
+                        ("tgconstrindid", int(0)),
+                        ("tgconstraint", int(con_oid)),
+                        ("tgdeferrable", b(deferrable)),
+                        ("tginitdeferred", b(deferred)),
+                        ("tgnargs", int(*nargs as i64)),
+                        ("tgattr", t(&attnums.iter().map(i64::to_string).collect::<Vec<_>>().join(" "))),
+                    ])
+                })
+                .collect();
+            rows.extend(foreign_key_triggers(cat));
+            rows
+        }
         "pg_rewrite" => cat
             .rewrites
             .iter()
@@ -1494,8 +1535,17 @@ fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             ("reltoastrelid", int(if toasted { cat.rel_oid(i) | (1 << 31) } else { 0 })),
             ("relhasindex", b(!r.indexes.is_empty())),
             ("relisshared", b(false)),
-            // (a temporary table's is `t`: see `Catalog::of_session`)
-            ("relpersistence", t(if schema_part(&r.name) == super::catalog::TEMP_SCHEMA { "t" } else { "p" })),
+            // (a temporary table's is `t`: see `Catalog::of_session`; an unlogged one's `u`)
+            (
+                "relpersistence",
+                t(if schema_part(&r.name) == super::catalog::TEMP_SCHEMA {
+                    "t"
+                } else if r.unlogged {
+                    "u"
+                } else {
+                    "p"
+                }),
+            ),
             ("relkind", t(&r.kind.to_string())),
             ("relnatts", int(natts)),
             ("relchecks", int(r.constraints.iter().filter(|c| c.kind == 'c').count() as i64)),
@@ -1524,6 +1574,20 @@ fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             ("relfrozenxid", int(0)),
             ("relminmxid", int(0)),
             ("relacl", acl),
+            (
+                "reloptions",
+                match r.reloptions.is_empty() {
+                    true => Value::Null,
+                    false => t(&format!(
+                        "{{{}}}",
+                        r.reloptions
+                            .iter()
+                            .map(|(o, v)| super::roles::array_elem(&format!("{o}={v}")))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )),
+                },
+            ),
         ])
     });
     let indexes = cat.idx.iter().enumerate().map(|(k, (i, x))| {
@@ -1545,7 +1609,16 @@ fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             ("reltoastrelid", int(0)),
             ("relhasindex", b(false)),
             ("relisshared", b(false)),
-            ("relpersistence", t(if schema_part(&r.name) == super::catalog::TEMP_SCHEMA { "t" } else { "p" })),
+            (
+                "relpersistence",
+                t(if schema_part(&r.name) == super::catalog::TEMP_SCHEMA {
+                    "t"
+                } else if r.unlogged {
+                    "u"
+                } else {
+                    "p"
+                }),
+            ),
             ("relkind", t(if r.kind == 'p' { "I" } else { "i" })),
             (
                 "reloptions",
@@ -1621,6 +1694,61 @@ fn expr_type(text: &str, r: &TableInfo) -> Type {
         .and_then(|e| Binder::plain(&cols, None).bind(&e))
         .and_then(|e| ty_of(&e, &cols, &[]))
         .unwrap_or(Type::Text)
+}
+
+/// The triggers Postgres keeps a foreign key by (tgisinternal): on its table, RI_FKey_check_ins and
+/// RI_FKey_check_upd; on the table it references, the action of its ON DELETE and ON UPDATE (RI_FKey_cascade_del,
+/// RI_FKey_noaction_upd, ...), which only NO ACTION's can be deferred. Their oids are of a range of their own, after
+/// their constraint's.
+fn foreign_key_triggers(cat: &Catalog) -> Vec<Vec<Value>> {
+    use Value::{Bool as b, Int as int};
+    let t = |s: &str| Value::Text(s.into());
+    let mut rows = vec![];
+    for (p, (i, c)) in cat.cons.iter().enumerate() {
+        let Some((target, _, (upd, del), _)) = c.parent.as_ref().filter(|_| c.kind == 'f' && c.given.is_none()) else {
+            continue;
+        };
+        let Some(ti) = cat.rels.iter().position(|r| r.name == *target) else { continue };
+        let con = cat.con_oid(p);
+        let action = |a: char| match a {
+            'c' => "cascade",
+            'r' => "restrict",
+            'n' => "setnull",
+            'd' => "setdefault",
+            _ => "noaction",
+        };
+        let (deferrable, deferred) = c.defer;
+        let made = [
+            (*i, ti, "c", "RI_FKey_check_ins".to_string(), 5, true),
+            (*i, ti, "c", "RI_FKey_check_upd".to_string(), 17, true),
+            (ti, *i, "a", format!("RI_FKey_{}_del", action(*del)), 9, *del == 'a'),
+            (ti, *i, "a", format!("RI_FKey_{}_upd", action(*upd)), 17, *upd == 'a'),
+        ];
+        for (j, (on, other, side, func, tgtype, may_defer)) in made.into_iter().enumerate() {
+            let oid = 1_000_000_000 + con * 4 + j as i64;
+            rows.push(catalog_schema::named_row(
+                "pg_trigger",
+                vec![
+                    ("oid", int(oid)),
+                    ("tgrelid", int(cat.rel_oid(on))),
+                    ("tgparentid", int(0)),
+                    ("tgname", t(&format!("RI_ConstraintTrigger_{side}_{oid}"))),
+                    ("tgfoid", int(catalog_schema::builtin_procs(&func).first().copied().unwrap_or(0))),
+                    ("tgtype", int(tgtype)),
+                    ("tgenabled", t("O")),
+                    ("tgisinternal", b(true)),
+                    ("tgconstrrelid", int(cat.rel_oid(other))),
+                    ("tgconstrindid", int(0)),
+                    ("tgconstraint", int(con)),
+                    ("tgdeferrable", b(deferrable && may_defer)),
+                    ("tginitdeferred", b(deferred && may_defer)),
+                    ("tgnargs", int(0)),
+                    ("tgattr", t("")),
+                ],
+            ));
+        }
+    }
+    rows
 }
 
 /// pg_attribute: the columns of tables, views and materialized views, typed as Postgres types them; the system

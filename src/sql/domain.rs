@@ -213,7 +213,13 @@ fn chain(v: &View, name: &str) -> Result<Vec<String>> {
 /// `breaks_own` for all of domain `name`'s constraints: a domain it is over first.
 pub(super) fn breaks(v: &View, name: &str, x: &Value, sub: Option<&dyn Runner>) -> Result<Option<SqlError>> {
     for n in chain(v, name)? {
-        if let Some(e) = breaks_own(v, &n, x, sub)? {
+        if let Some(mut e) = breaks_own(v, &n, x, sub)? {
+            // (named as the domain the value is made, as Postgres's domain_check_input names it, whichever of
+            // the domains under it has the constraint)
+            if n != name {
+                let (inner, outer) = (shown_type(&n), shown_type(name));
+                e.message = e.message.replacen(&format!("domain {inner} "), &format!("domain {outer} "), 1);
+            }
             return Ok(Some(e));
         }
     }

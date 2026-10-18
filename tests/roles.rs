@@ -556,7 +556,10 @@ fn types_extensions_and_set_schema_say_what_postgres_says() {
     ok(&db, &mut s, "reset role");
     ok(&db, &mut s, "set role r1_a");
     assert_eq!(fails(&db, &mut s, "alter table s.m set schema s2"), denied("permission denied for schema s2"));
-    assert_eq!(fails(&db, &mut s, "alter function f() set schema s2").0, "0A000");
+    assert_eq!(
+        fails(&db, &mut s, "alter function f() set schema s2"),
+        ("42883".into(), "function f() does not exist".into(), None)
+    );
     ok(&db, &mut s, "reset role");
     ok(&db, &mut s, "drop extension pgcrypto");
     // pgcrypto is trusted: CREATE on the database makes it, and its maker owns it

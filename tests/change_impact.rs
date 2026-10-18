@@ -94,6 +94,10 @@ fn an_update_names_what_reads_its_columns() {
 fn inserts_deletes_and_new_columns_reach_every_reader_of_the_table() {
     let db = Db::new();
     crm(&db);
+    // a merge check's `*` is every column the table has when it runs (a view's is bound when it is made, as in
+    // Postgres: `everything` reads id, name and owner, and a column added later isn't among them)
+    run(&db, MAIN, "create merge check lists_named on tables (lists) as select * from lists where name is null", &[])
+        .unwrap();
     // a deleted list: its key, the foreign key pointing at it, every view and check reading lists,
     // and the function naming lists and owner
     db.fork(MAIN, "drop2").unwrap();
@@ -115,13 +119,15 @@ fn inserts_deletes_and_new_columns_reach_every_reader_of_the_table() {
     let out = run(&db, MAIN, "diff world drop2 readers", &[]).unwrap().pop().unwrap();
     let fk = out.rows.iter().find(|r| r[3].to_text() == "leads_list_fkey" && r[0].to_text() == "lists").unwrap();
     assert_eq!(fk[4].to_text(), "leads references lists");
-    let star = out.rows.iter().find(|r| r[3].to_text() == "everything").unwrap();
+    let star = out.rows.iter().find(|r| r[3].to_text() == "lists_named").unwrap();
     assert_eq!(star[4].to_text(), "reads every column of lists");
+    let bound = out.rows.iter().find(|r| r[3].to_text() == "everything").unwrap();
+    assert_eq!(bound[4].to_text(), "", "a view's * is the columns there were when it was made");
 
-    // a column added: only what reads every column of the table sees it
+    // a column added: only what reads every column of the table as it is now sees it, not a view made with *
     db.fork(MAIN, "note").unwrap();
     run(&db, "note", "alter table lists add column note text", &[]).unwrap();
-    assert_eq!(readers(&db, "note", "lists"), [r("view", "everything", "note")]);
+    assert_eq!(readers(&db, "note", "lists"), [r("merge check", "lists_named", "note")]);
 
     // nothing changed: only what wasn't traced
     db.fork(MAIN, "idle").unwrap();

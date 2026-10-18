@@ -148,6 +148,7 @@ impl Parser {
                 check: None,
                 invoker: false,
                 barrier: false,
+                reloptions: vec![],
             };
             return Ok(Stmt::TableToView { table, view: Box::new(view) });
         }

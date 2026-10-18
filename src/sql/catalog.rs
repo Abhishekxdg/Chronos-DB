@@ -124,7 +124,7 @@ pub struct Idx {
     /// each part's collation (None: a type without one)
     pub(crate) colls: Vec<Option<Coll>>,
     /// each part's ` COLLATE c`, where its collation isn't its column's (or an expression's default)
-    pub(crate) collate: Vec<String>,
+    pub collate: Vec<String>,
 }
 
 /// A table's constraints and indexes. A UNIQUE constraint makes an index of its name, as in
@@ -545,7 +545,7 @@ fn check_clause(def: &str) -> &str {
 /// pg_get_constraintdef(oid, true) writes it. `whole`: an operation stands in parentheses of
 /// its own, as a CHECK's or a WHERE's does. One this doesn't know is left as written.
 pub(super) fn expr_def(text: &str, cols: &[Col], whole: bool) -> String {
-    match check_expr(text).ok().and_then(|e| deparse(&e, cols, false)) {
+    match check_expr(text).ok().and_then(|e| deparse_any(&e, cols, false)) {
         Some((d, _)) if whole || !d.starts_with('(') => d,
         Some((d, _)) => format!("({d})"),
         None if whole => format!("({})", shown_text(text)),
@@ -561,12 +561,29 @@ fn shown_text(text: &str) -> String {
 
 /// An expression as Postgres writes it back (see `expr_def`), and whether it is a function call.
 pub(super) fn deparse_expr(e: &Expr, cols: &[Col]) -> Option<(String, bool)> {
-    deparse(e, cols, false).map(|(d, _)| (d, matches!(e, Expr::Func(..) | Expr::Call(..))))
+    deparse_any(e, cols, false).map(|(d, _)| (d, matches!(e, Expr::Func(..) | Expr::Call(..))))
+}
+
+/// `deparse`, else the views' fuller writer (see `viewdef::column_expr`): what precedence an expression of the
+/// second has is told by its parentheses.
+fn deparse_any(e: &Expr, cols: &[Col], pretty: bool) -> Option<(String, Prec)> {
+    deparse(e, cols, pretty).or_else(|| {
+        let d = super::viewdef::column_expr(e, cols, pretty)?;
+        let p = if d.starts_with('(') || !d.contains(' ') { Prec::Atom } else { Prec::Other };
+        Some((d, p))
+    })
+}
+
+/// A column default as `pg_get_expr(adbin, adrelid, true)` writes it (what psql's \d shows), from the form
+/// `expr_def` kept for table `t` (`(a * 2)` is `a * 2`); the kept form where this has no pretty form of it.
+pub fn pretty_default(t: &super::TableInfo, kept: &str) -> String {
+    let cols: Vec<Col> = t.columns.iter().map(|(n, ty, ..)| Col::new(&t.name, n, *ty)).collect();
+    check_expr(kept).ok().and_then(|e| deparse_any(&e, &cols, true)).map_or_else(|| kept.to_string(), |(d, _)| d)
 }
 
 /// `expr_def`, pretty.
 pub(super) fn pretty_def(text: &str, cols: &[Col]) -> String {
-    check_expr(text).ok().and_then(|e| deparse(&e, cols, true)).map_or_else(|| shown_text(text), |(d, _)| d)
+    check_expr(text).ok().and_then(|e| deparse_any(&e, cols, true)).map_or_else(|| shown_text(text), |(d, _)| d)
 }
 
 /// How tightly an expression binds, for where Postgres's pretty form needs parentheses.
@@ -593,6 +610,8 @@ fn parens(child: Prec, parent: Prec, left: bool) -> bool {
 }
 
 fn deparse(e: &Expr, cols: &[Col], pretty: bool) -> Option<(String, Prec)> {
+    // (a constant converted to a column's type: a cast of it, in parentheses unless pretty)
+    let bare = pretty;
     use Value::*;
     let ty = |e: &Expr| match e {
         Expr::Col(_, n) => cols.iter().find(|c| c.name == *n).map(|c| c.ty),
@@ -603,8 +622,24 @@ fn deparse(e: &Expr, cols: &[Col], pretty: bool) -> Option<(String, Prec)> {
         Some(match (v, to) {
             (Null, _) => "NULL".into(),
             (Bool(b), _) => b.to_string(),
-            (Int(n), Some(Type::Numeric)) => format!("({n})::numeric"),
-            (Int(n), Some(Type::Float)) => format!("({n})::double precision"),
+            // (a constant converted to the column's type: Postgres's implicit cast of it, in parentheses unless pretty)
+            (Int(n), Some(t @ (Type::Numeric | Type::Float | Type::Float4))) => {
+                let shown = t.pg_name();
+                match (*n < 0, bare) {
+                    (true, true) => format!("'{n}'::integer::{shown}"),
+                    (true, false) => format!("('{n}'::integer)::{shown}"),
+                    (false, true) => format!("{n}::{shown}"),
+                    (false, false) => format!("({n})::{shown}"),
+                }
+            }
+            (Numeric(d), Some(t @ (Type::Float | Type::Float4))) if !d.to_string().starts_with('-') => {
+                let shown = t.pg_name();
+                if bare { format!("{d}::{shown}") } else { format!("({d})::{shown}") }
+            }
+            (Float(x), Some(t @ (Type::Float | Type::Float4))) if *x >= 0.0 && x.is_finite() => {
+                let (shown, d) = (t.pg_name(), Float(*x).to_text());
+                if bare { format!("{d}::{shown}") } else { format!("({d})::{shown}") }
+            }
             (Int(n), _) if *n < 0 => format!("'{n}'::integer"),
             (Int(n), _) => n.to_string(),
             (Numeric(d), _) => d.to_string(),
@@ -753,6 +788,8 @@ pub(crate) struct Catalog {
     pub(super) func_oids: Vec<i64>,
     /// the enum types, by stored name, with their labels (a domain is one with none)
     pub(super) enums: Vec<(String, Vec<String>)>,
+    /// for each of `enums`, its labels' pg_enum.enumsortorder (see `enum_orders`)
+    pub(super) enum_orders: Vec<Vec<f64>>,
     /// for each of `enums` that is a domain: whether it is NOT NULL, and its own CHECKs (name, condition)
     pub(super) domains: Vec<Option<DomainFacts>>,
     /// each table column that has a default, as (relation, column)
@@ -939,14 +976,16 @@ impl Catalog {
         for r in v.prefix(&format!("{}/", functions::FUNCTIONS))? {
             funcs.push(functions::Function::from_raw(&r?.1)?);
         }
-        let (mut enums, mut domains) = (vec![], vec![]);
+        let (mut enums, mut domains, mut enum_orders) = (vec![], vec![], vec![]);
         for r in v.prefix("_sonos_types/")? {
             let (k, raw) = r?;
             let j: Json = serde_json::from_str(&raw).unwrap_or_default();
             let labels = j["enum"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(String::from));
             let name = k["_sonos_types/".len()..].to_string();
             domains.push(j.get("domain").filter(|d| d.is_object()).map(|d| super::domain::own_constraints(d, &name)));
-            enums.push((name, labels.collect()));
+            let labels: Vec<String> = labels.collect();
+            enum_orders.push(super::enum_orders(&j, labels.len()));
+            enums.push((name, labels));
         }
         let mut defaults = vec![];
         let (mut rewrites, mut triggers) = (vec![], vec![]);
@@ -980,6 +1019,7 @@ impl Catalog {
             funcs,
             func_oids,
             enums,
+            enum_orders,
             domains,
             defaults,
             rewrites,
@@ -1010,6 +1050,7 @@ impl Catalog {
             funcs: vec![],
             func_oids: vec![],
             enums: vec![],
+            enum_orders: vec![],
             domains: vec![],
             defaults: vec![],
             rewrites: vec![],
