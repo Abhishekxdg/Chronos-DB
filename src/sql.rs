@@ -39392,6 +39392,10 @@ impl Statement {
                 Stmt::Alter { .. }
                     | Stmt::CreateIndex { .. }
                     | Stmt::CreateTrigger(..)
+                    | Stmt::DropTrigger { .. }
+                    | Stmt::RenameTrigger { .. }
+                    | Stmt::RenameRule { .. }
+                    | Stmt::UserDef { .. }
                     | Stmt::Policy(_)
                     | Stmt::Merge(_)
             )
@@ -43667,15 +43671,16 @@ fn expand_select(
         };
         let Some(def) = def else {
             // a table with masked columns, read where masks apply: a subquery of its rows with them masked, named
-            // as the table was; inside it the table is read as any other (its policies, its partitions)
+            // as the table was; inside it the table is read as any other (its policies, its partitions, its
+            // `ctid`, then a last column `*` doesn't give)
             if x.mask
                 && mask::wraps(src)
-                && let Some(mut body) = mask::wrap(v, past.as_ref(), src)?
+                && let Some((mut body, with_ctid)) = mask::wrap(v, past.as_ref(), src, ctid)?
             {
                 expand_select(v, &mut body, params, any, deep, x)?;
                 src.sub = Some(Box::new(body));
                 src.at = None;
-                src.hier = false;
+                src.hier = with_ctid;
                 src.policed = true;
                 changed = true;
                 continue;
@@ -51757,9 +51762,13 @@ impl Exec<'_> {
         q.locking = vec![];
         let mut extra = 0;
         let mut lock = |src: &Source, mode: u8, wait: u8, named: bool| -> Result<()> {
-            // (a table read through its row security's subquery is the table: see `expand_select`)
-            let plain =
-                (src.sub.is_none() || rls_wrapped(src)) && src.srf.is_none() && src.rec.is_none() && !src.working;
+            // (a table read through its row security's subquery, or with its masked columns masked, is the table: see
+            // `expand_select`)
+            let masked = mask::wrapped_of(src);
+            let plain = (src.sub.is_none() || rls_wrapped(src) || masked.is_some())
+                && src.srf.is_none()
+                && src.rec.is_none()
+                && !src.working;
             let t = match plain && src.at.is_none() {
                 true => load_src(&v, src)?.filter(|t| t.schema && t.mem.is_none()),
                 false => None,
@@ -51778,7 +51787,21 @@ impl Exec<'_> {
                 None => t.pk.clone(),
             };
             let keyless = keyed.is_empty();
-            let cols = if keyless { (0..t.cols.len()).filter(|&i| !t.cols[i].hidden).collect() } else { keyed };
+            let cols: Vec<usize> =
+                if keyless { (0..t.cols.len()).filter(|&i| !t.cols[i].hidden).collect() } else { keyed };
+            // (its rows are found again by the columns read here: a masked one reads its mask, which finds none)
+            if let Some(body) = masked
+                && let Some(&c) = cols.iter().find(|&&c| mask::masked_in(body, &t.cols[c].name))
+            {
+                return err(
+                    "42501",
+                    format!(
+                        "FOR UPDATE can't lock rows of \"{}\" here: its rows are found by column \"{}\", which is \
+                         masked",
+                        src.alias, t.cols[c].name
+                    ),
+                );
+            }
             let at = extra;
             for &c in &cols {
                 let e = Expr::Col(Some(src.alias.clone()), t.cols[c].name.clone());

@@ -143,3 +143,25 @@ fn an_agent_may_show_its_own() {
     assert_eq!(out.rows.len(), 4);
     assert!(run(&db, MAIN, "show agent nobody privileges", &[]).is_err());
 }
+
+#[test]
+fn a_column_grant_to_write_shows_on_the_column() {
+    let db = Db::new();
+    setup(&db);
+    run(
+        &db,
+        MAIN,
+        "create role bot; grant select on orders to bot; grant update (status), insert (id, total) on orders to bot",
+        &[],
+    )
+    .unwrap();
+    db.create_agent("bot", &AgentSpec::default()).unwrap();
+    let rows = privileges(&db, "bot");
+    let o = row(&rows, "orders", "");
+    assert_eq!(o[3], "no", "nothing granted on the whole table: {o:?}");
+    let status = row(&rows, "orders", "status");
+    assert_eq!(status[3], "update in its own worlds", "{status:?}");
+    assert!(status[5].contains("granted UPDATE on the column"), "{}", status[5]);
+    assert_eq!(row(&rows, "orders", "total")[3], "insert in its own worlds");
+    assert_eq!(row(&rows, "orders", "id")[3], "insert in its own worlds");
+}

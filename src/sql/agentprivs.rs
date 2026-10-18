@@ -82,24 +82,23 @@ pub(super) fn show(db: &Db, name: &str, world: &str) -> Result<Vec<Vec<Value>>> 
             "yes".into()
         };
         // write
-        let verbs: Vec<&str> = [("insert", acl::INSERT), ("update", acl::UPDATE), ("delete", acl::DELETE)]
-            .into_iter()
-            .filter(|(_, p)| has(*p))
-            .map(|(n, _)| n)
-            .collect();
-        let write = if a.disabled || places.is_empty() {
+        const VERBS: [(&str, u32); 3] = [("insert", acl::INSERT), ("update", acl::UPDATE), ("delete", acl::DELETE)];
+        let verbs: Vec<&str> = VERBS.into_iter().filter(|(_, p)| has(*p)).map(|(n, _)| n).collect();
+        let writes = !(a.disabled || places.is_empty());
+        let write_of = |verbs: &[&str]| format!("{} in {}", verbs.join(", "), places.join(" and "));
+        let write = if !writes {
             if places.is_empty() {
                 why.push("no 'write_own', 'write' or 'write_main' capability".into());
             }
             "no".to_string()
         } else if verbs.is_empty() {
-            why.push(format!("role {role} has no INSERT, UPDATE or DELETE on it"));
+            why.push(format!("role {role} has no INSERT, UPDATE or DELETE on it (columns it was granted are listed)"));
             "no".into()
         } else {
             if verbs.len() < 3 {
                 why.push(format!("role {role} may {} only", verbs.join(", ")));
             }
-            format!("{} in {}", verbs.join(", "), places.join(" and "))
+            write_of(&verbs)
         };
         if can(crate::Can::WriteMain) && policy.is_some() {
             why.push("it keeps to a merge policy, so it changes main only by merging".into());
@@ -129,6 +128,26 @@ pub(super) fn show(db: &Db, name: &str, world: &str) -> Result<Vec<Vec<Value>>> 
                 cwhy.push(format!("role {role} was granted SELECT on the column"));
                 differs = true;
             }
+            // INSERT and UPDATE may be granted on a column alone (DELETE is the table's)
+            let mut cwrite = write.clone();
+            if let (Some(w), Some(o)) = (&who, &obj)
+                && writes
+            {
+                let mut granted: Vec<&str> = vec![];
+                for (n, p) in VERBS.into_iter().take(2).filter(|(n, _)| !verbs.contains(n)) {
+                    if acl::column_has(&v, &t.name, &c.name, w, o.owner, p)? {
+                        granted.push(n);
+                    }
+                }
+                if !granted.is_empty() {
+                    let all: Vec<&str> =
+                        VERBS.iter().map(|(n, _)| *n).filter(|n| verbs.contains(n) || granted.contains(n)).collect();
+                    cwrite = write_of(&all);
+                    let names: Vec<String> = granted.iter().map(|n| n.to_uppercase()).collect();
+                    cwhy.push(format!("role {role} was granted {} on the column", names.join(" and ")));
+                    differs = true;
+                }
+            }
             if let Some((_, m)) = masked.iter().find(|(n, _)| *n == c.name)
                 && cread != "no"
             {
@@ -147,7 +166,7 @@ pub(super) fn show(db: &Db, name: &str, world: &str) -> Result<Vec<Vec<Value>>> 
                     Value::Text(t.name.clone()),
                     Value::Text(c.name.clone()),
                     Value::Text(cread),
-                    Value::Text(write.clone()),
+                    Value::Text(cwrite),
                     Value::Text(cmerge),
                     Value::Text(cwhy.join("; ")),
                 ]);

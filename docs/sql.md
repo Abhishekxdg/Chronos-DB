@@ -750,7 +750,8 @@ See [concepts](concepts.md#agents) for what agents may do. The names `guest` and
 `SHOW AGENT name PRIVILEGES` puts together everything that decides what an agent may do with a table: its capabilities,
 the privileges of a role of its name (both must allow), row-level security, [masked columns](#masked-columns) and its
 merge policy. A row per table of the world (the session's, or `IN WORLD w`), and one per column that differs from its
-table (a column its role was granted on its own, a masked one, one its policy's `review_columns` names):
+table (a column its role was granted SELECT, INSERT or UPDATE on by itself, a masked one, one its policy's
+`review_columns` names):
 
 | column | what it says |
 |---|---|
@@ -867,9 +868,15 @@ alter agent support_bot set (can = 'read,fork,write_own,unmask');   -- this one 
   values masked), and a constraint's error doesn't show the table's key.
 - **What is refused (42501), because it would read the values as they are:** an `UPDATE`, `DELETE` or
   `INSERT ... ON CONFLICT` / `RETURNING` whose `WHERE`, `SET` or `RETURNING` reads a masked column of the table it
-  writes (`update customers set tier = 'gold' where id = 5` is fine; `where email = '...'` is refused); `MERGE` into the
-  table; changing its definition, indexes, triggers or policies; `search()` over it; `DIFF ... AS SQL`; and the HTTP
+  writes (`update customers set tier = 'gold' where id = 5` is fine; `where email = '...'` is refused), the table's
+  whole row included (`returning row_to_json(customers)`); `MERGE` into the table; changing its definition, indexes,
+  triggers, rules or policies (creating, dropping or renaming one); `search()` over it; `DIFF ... AS SQL`; `FOR UPDATE`
+  on a table without a key whose columns include a masked one (its rows are found again by their values); and the HTTP
   and MCP row API (`get`, `find`, `diff`, ...) on it: the agent uses SQL.
+- **Generated columns follow:** a generated column made from a masked one (`exposed text generated always as (email)
+  stored`), whether it was there first or added later, is masked too: with NULL if one it reads is masked with NULL,
+  else with HASH.
+- **Still a table:** `SELECT ... FOR UPDATE` locks the rows of a masked table as of any (by its key), and `ctid` reads.
 - **Who is an agent:** a session with an agent's token (Postgres login, HTTP, MCP over HTTP), `serve --safe`'s
   guest, and `chronos mcp <folder> --agent NAME`. A plain `chronos mcp <folder>` acts as the folder's owner and reads
   the values: give a model you don't want to see them `--agent`.

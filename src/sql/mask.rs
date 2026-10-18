@@ -59,9 +59,11 @@ pub(crate) fn on() -> bool {
 }
 
 /// The masked columns of table `name` in world `v`, with their modes: its own and those of the tables it
-/// inherits from or is a partition of (by column name). Empty for anything else.
+/// inherits from or is a partition of (by column name), and the generated columns made from any of them. Empty
+/// for anything else.
 pub(crate) fn of(v: &View, name: &str) -> Result<Vec<(String, char)>> {
     let mut out: Vec<(String, char)> = vec![];
+    let mut tables = vec![];
     let mut todo = vec![(name.to_string(), 0usize)];
     while let Some((n, depth)) = todo.pop() {
         if depth > 64 {
@@ -77,6 +79,33 @@ pub(crate) fn of(v: &View, name: &str) -> Result<Vec<(String, char)>> {
         }
         todo.extend(t.hier.of.iter().map(|(p, _)| (p.clone(), depth + 1)));
         todo.extend(t.hier.parents.iter().map(|p| (p.clone(), depth + 1)));
+        tables.push(t);
+    }
+    if out.is_empty() {
+        return Ok(out);
+    }
+    // a generated column made from a masked one holds its value as it is (or one worked out from it), whenever it
+    // was added: masked too, NULL if one it reads is, else HASH (the last characters of what it works out could be
+    // the value's own)
+    for t in &tables {
+        for g in t.cols.iter().filter(|c| !c.hidden) {
+            let Some(text) = g.generated.as_deref() else { continue };
+            if out.iter().any(|(o, _)| *o == g.name) {
+                continue;
+            }
+            let Ok(e) = check_expr(text) else { continue };
+            let mut read: Vec<char> = vec![];
+            walk(&e, &mut |x| {
+                if let Expr::Col(_, n) = x
+                    && let Some((_, m)) = out.iter().find(|(o, _)| o == n)
+                {
+                    read.push(*m);
+                }
+            });
+            if !read.is_empty() {
+                out.push((g.name.clone(), if read.contains(&NULL) { NULL } else { HASH }));
+            }
+        }
     }
     Ok(out)
 }
@@ -89,8 +118,9 @@ pub(super) fn wraps(src: &Source) -> bool {
 
 /// For a read `src` of a table with masked columns (in `v`, and in `past` when it is read AS OF a moment, where
 /// the masks then count as well as those now): `SELECT a, <masked b>, ... FROM table`, whose columns are the
-/// table's under their names, the masked ones masked. None if it has none.
-pub(super) fn wrap(v: &View, past: Option<&View>, src: &Source) -> Result<Option<Select>> {
+/// table's under their names, the masked ones masked; with a last column `ctid` if the query reads it (`ctid`)
+/// and the table has one to give (see `ctid_source`), and then true. None if it has none.
+pub(super) fn wrap(v: &View, past: Option<&View>, src: &Source, ctid: bool) -> Result<Option<(Select, bool)>> {
     let mut masked = of(v, &src.table)?;
     if let Some(p) = past {
         for (c, m) in of(p, &src.table)? {
@@ -118,6 +148,14 @@ pub(super) fn wrap(v: &View, past: Option<&View>, src: &Source) -> Result<Option
             Item::Expr(e, Some(c.name.clone()))
         })
         .collect();
+    let ctid = ctid
+        && src.at.is_none()
+        && t.schema
+        && !t.cols.iter().any(|c| c.name == "ctid")
+        && (src.only || !t.hier.is_parent());
+    if ctid {
+        body.items.push(Item::Expr(Expr::Col(None, "ctid".into()), Some("ctid".into())));
+    }
     body.from = Some(Source {
         table: src.table.clone(),
         alias: INNER.into(),
@@ -134,7 +172,21 @@ pub(super) fn wrap(v: &View, past: Option<&View>, src: &Source) -> Result<Option
         policed: src.policed,
         bound: src.bound,
     });
-    Ok(Some(body))
+    Ok(Some((body, ctid)))
+}
+
+/// The masked subquery `wrap` made of a table read `src`, if it is one: FOR UPDATE locks the table's rows through it.
+pub(super) fn wrapped_of(src: &Source) -> Option<&Select> {
+    src.sub.as_deref().filter(|b| {
+        b.set.is_empty()
+            && b.joins.is_empty()
+            && b.from.as_ref().is_some_and(|f| f.alias == INNER && f.table == src.table)
+    })
+}
+
+/// Whether column `name` of a table read through `wrap`'s subquery `body` is masked there.
+pub(super) fn masked_in(body: &Select, name: &str) -> bool {
+    body.items.iter().any(|i| matches!(i, Item::Expr(e, Some(n)) if n == name && !matches!(e, Expr::Col(..))))
 }
 
 /// Column `col` masked by mode `m`.
@@ -229,21 +281,33 @@ pub(super) fn target(v: &View, st: &Stmt) -> Result<()> {
         Stmt::Update { table, .. } | Stmt::Delete { table, .. } => table,
         Stmt::Insert { table, conflict: Some(_), .. } => table,
         // a plain INSERT reads the target only in its RETURNING (the rows it wrote)
-        Stmt::Insert { table, returning: Some(items), .. } => {
+        Stmt::Insert { table, alias, returning: Some(items), .. } => {
             let masked = of(v, table)?;
             if masked.is_empty() {
                 return Ok(());
             }
+            // the target's whole row (`row_to_json(t)`, `t.*`) is every column, the masked ones too; a column of
+            // the name is the column
+            let named = |n: &str| n == rel_part(table) || alias.as_deref() == Some(n);
+            let cols: Vec<String> = match load(v, table)? {
+                Some(t) => t.cols.into_iter().map(|c| c.name).collect(),
+                None => vec![],
+            };
             let mut read: Option<String> = None;
             for i in items {
                 match i {
                     Item::Star | Item::TableStar(_) => read = read.or_else(|| Some(masked[0].0.clone())),
-                    Item::Expr(e, _) => walk(e, &mut |x| {
-                        if let Expr::Col(_, n) = x
-                            && masked.iter().any(|(c, _)| c == n)
-                        {
+                    Item::Expr(e, _) => walk(e, &mut |x| match x {
+                        Expr::Col(Some(q), n) if n == "*" && named(q) => {
+                            read.get_or_insert_with(|| masked[0].0.clone());
+                        }
+                        Expr::Col(None, n) if named(n) && !cols.contains(n) => {
+                            read.get_or_insert_with(|| masked[0].0.clone());
+                        }
+                        Expr::Col(_, n) if masked.iter().any(|(c, _)| c == n) => {
                             read.get_or_insert_with(|| n.clone());
                         }
+                        _ => {}
                     }),
                 }
             }
@@ -310,10 +374,20 @@ fn merge_target(m: &MergeStmt) -> Option<String> {
 pub(super) fn ddl(v: &View, st: &Stmt) -> Result<()> {
     let table = match st {
         Stmt::Alter { table, .. } | Stmt::CreateIndex { table, .. } => table.clone(),
-        Stmt::CreateTrigger(_, table, _) => table.clone(),
+        Stmt::CreateTrigger(_, table, _)
+        | Stmt::DropTrigger { table, .. }
+        | Stmt::RenameTrigger { table, .. }
+        | Stmt::RenameRule { table, .. } => table.clone(),
+        // CREATE, DROP and ALTER TABLE ... ENABLE | DISABLE RULE (a rule's action reads OLD and NEW as they are)
+        Stmt::UserDef { key, .. } => match rules::table_of(key) {
+            Some(t) => t.to_string(),
+            None => return Ok(()),
+        },
+        // (dropping a policy shows the rows it hid)
         Stmt::Policy(p) => match &**p {
-            rls::PolicyStmt::Create { table, .. } | rls::PolicyStmt::Alter { table, .. } => table.clone(),
-            _ => return Ok(()),
+            rls::PolicyStmt::Create { table, .. }
+            | rls::PolicyStmt::Alter { table, .. }
+            | rls::PolicyStmt::Drop { table, .. } => table.clone(),
         },
         _ => return Ok(()),
     };
@@ -322,7 +396,7 @@ pub(super) fn ddl(v: &View, st: &Stmt) -> Result<()> {
     }
     refuse(format!(
         "table \"{}\" has masked columns: an agent without 'unmask' may not change its definition, its indexes, \
-         triggers or policies (they could read the masked values as they are)",
+         triggers, rules or policies (they could read the masked values as they are)",
         rel_part(&table)
     ))
 }
