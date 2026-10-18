@@ -375,7 +375,13 @@ impl Pages {
         rec.extend(raw.to_le_bytes());
         rec.extend((comp.len() as u32).to_le_bytes());
         rec.extend(comp);
-        if let Err(e) = w.file.write_all(&rec) {
+        let wrote = if crate::disk::page_write_fails() {
+            let half = w.file.write_all(&rec[..rec.len() / 2]);
+            half.and(Err(io::Error::new(io::ErrorKind::StorageFull, "no space left on device (injected)")))
+        } else {
+            w.file.write_all(&rec)
+        };
+        if let Err(e) = wrote {
             // part of it may be in the pack (a full disk): cut back to where the records end, or
             // every later record would be read from the wrong place
             let cut = OpenOptions::new().write(true).open(pack_path(&self.dir, w.id)).and_then(|f| f.set_len(w.len));

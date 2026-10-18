@@ -484,6 +484,26 @@ pub(crate) fn crash_point() {
     }
 }
 
+/// For tests (tests/disk_full.rs), in debug builds: with CHRONOS_FAIL_PAGE_WRITES=n,k the n-th
+/// page record written and the k-1 after it fail part way through, as on a full disk.
+pub(crate) fn page_write_fails() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        static AT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+        static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let (at, k) = *AT.get_or_init(|| {
+            let v = std::env::var("CHRONOS_FAIL_PAGE_WRITES").unwrap_or_default();
+            let mut n = v.split(',').map(|x| x.trim().parse::<u64>().unwrap_or(0));
+            (n.next().unwrap_or(0), n.next().unwrap_or(1))
+        });
+        if at > 0 {
+            let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            return n >= at && n < at + k;
+        }
+    }
+    false
+}
+
 /// For crash tests, in debug builds: sleeps for the milliseconds the environment variable `var`
 /// says, so a test can hold one thread at a step while another passes it.
 pub(crate) fn stall_for_tests(var: &str) {

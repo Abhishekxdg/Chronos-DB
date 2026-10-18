@@ -39,6 +39,7 @@ Pages nothing uses any more (overwritten data, merged or discarded branches) are
   - See [concepts](concepts.md#versions-and-crashes).
 - **Checkpoints and cleanup** can be interrupted at any step: tests/crash.rs kills them at every step between their file writes, renames and deletions (232 points), and each time the folder reopens with the same rows and passes `VERIFY DATABASE`.
 - **Schema changes are all or nothing:** a crash comes back as before or after each CREATE, ALTER or DROP, never halfway.
+- **A full disk:** a page write that fails part way is cut off its page file, so the pages written after it in the same process land where the index says; the checkpoint that hit it fails, and the next one, once there is space, writes the rest. A log write that fails stops the process (as Postgres does), and the next open cuts the torn tail. Either way, after freeing space the folder opens with every acknowledged write and passes `VERIFY DATABASE` (tests/disk_full.rs, injected failures and a filled tmpfs).
 
 ## Cloud storage (`--features s3`)
 
