@@ -3422,8 +3422,7 @@ impl Exec<'_> {
                 Expr::Func(
                     Func::Ctx(
                         NextVal | CurrVal | SetVal | LastVal | Notify | Sleep | SetConfig | AdvisoryLock(..)
-                        | AdvisoryUnlock | AdvisoryUnlockAll | AdvisoryShared | CancelBackend | TerminateBackend
-                        | BlockingPids,
+                        | AdvisoryUnlock(_) | AdvisoryUnlockAll | CancelBackend | TerminateBackend | BlockingPids,
                     ),
                     _,
                 ) => Volatility::Volatile,

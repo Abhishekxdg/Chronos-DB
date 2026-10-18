@@ -93,3 +93,41 @@ fn rollback_drops_savepoints_too() {
     chronos::sql::cleanup(&db);
     assert!(db.branches().iter().all(|(b, _)| !b.starts_with("_tx_")));
 }
+
+#[test]
+fn set_transaction_inside_a_savepoint_lasts_until_it_ends() {
+    let (db, mut s) = setup();
+    let read_only =
+        |s: &mut Session| s.run(&db, "show transaction_read_only", &[]).unwrap().pop().unwrap().rows[0][0].to_text();
+    ok(&mut s, &db, "begin");
+    ok(&mut s, &db, "savepoint x");
+    ok(&mut s, &db, "set transaction read only");
+    assert_eq!(read_only(&mut s), "on");
+    ok(&mut s, &db, "rollback to savepoint x");
+    assert_eq!(read_only(&mut s), "off");
+    ok(&mut s, &db, "savepoint y");
+    ok(&mut s, &db, "set transaction read only");
+    ok(&mut s, &db, "release savepoint y");
+    assert_eq!(read_only(&mut s), "off");
+    // a transaction's characteristics are never reset
+    assert_eq!(code(&mut s, &db, "reset transaction_read_only"), "55P02");
+    ok(&mut s, &db, "rollback");
+}
+
+#[test]
+fn a_cursor_whose_rows_fail_fails_at_its_first_fetch() {
+    let (db, mut s) = setup();
+    ok(&mut s, &db, "insert into t values (1, 1)");
+    ok(&mut s, &db, "begin");
+    assert_eq!(ok(&mut s, &db, "declare c cursor for select id / 0 from t"), "DECLARE CURSOR");
+    ok(&mut s, &db, "savepoint two");
+    assert_eq!(code(&mut s, &db, "fetch 10 from c"), "22012");
+    ok(&mut s, &db, "rollback to savepoint two");
+    // the portal is dead from then on
+    assert_eq!(code(&mut s, &db, "fetch 10 from c"), "55000");
+    ok(&mut s, &db, "rollback");
+    // a query that is wrong itself fails at DECLARE
+    ok(&mut s, &db, "begin");
+    assert_eq!(code(&mut s, &db, "declare d cursor for select nope from t"), "42703");
+    ok(&mut s, &db, "rollback");
+}

@@ -42,6 +42,21 @@ pub(super) const TEMP: u32 = 1 << 10;
 pub(super) const CONNECT: u32 = 1 << 11;
 const LETTERS: &[u8] = b"arwdDxtXUCTc";
 
+thread_local! {
+    /// The table CREATE TABLE AS (or SELECT INTO) is filling with its query's rows (see `filling`).
+    static FILLING: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f`, CREATE TABLE AS's INSERT of its query's rows into `table`, the table it made: its maker needs no INSERT
+/// privilege on it (a default privilege may have taken it away), as Postgres's CREATE TABLE AS asks none; what the
+/// query reads still needs SELECT.
+pub(super) fn filling<T>(table: &str, f: impl FnOnce() -> T) -> T {
+    let before = FILLING.replace(Some(table.to_string()));
+    let out = f();
+    FILLING.set(before);
+    out
+}
+
 /// What an ACL is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -510,6 +525,10 @@ pub(crate) fn column_has(v: &View, table: &str, col: &str, who: &Who, owner: i64
 fn columns(v: &View, name: &str) -> Result<Vec<(String, Vec<AclItem>)>> {
     let names: Vec<String> = match view_def(v, name)? {
         Some(d) => d.cols,
+        // (a catalog table's, as Postgres has them)
+        None if name.strip_prefix("pg_catalog.").is_some_and(catalog_table) => {
+            super::catalog_schema::columns(&name["pg_catalog.".len()..]).into_iter().map(|(n, _)| n).collect()
+        }
         None => match load(v, name)? {
             Some(t) => t.cols.iter().filter(|c| !c.hidden).map(|c| c.name.clone()).collect(),
             None => vec!["last_value".into(), "log_cnt".into(), "is_called".into()],
@@ -694,7 +713,8 @@ impl<'a, 'v> Checker<'a, 'v> {
                 // it reads still may)
                 let target = self.relation(table)?;
                 let all = target.clone().unwrap_or_default();
-                if target.is_some() {
+                // (CREATE TABLE AS filling the table it made: its maker needs no INSERT on it, as in Postgres)
+                if target.is_some() && !FILLING.with_borrow(|f| f.as_deref() == Some(table.as_str())) {
                     self.named(table)?;
                     let width = match (cols, query) {
                         (Some(c), _) => c.len(),
@@ -1757,7 +1777,10 @@ fn ddl(v: &View, who: &Who, st: &Stmt) -> Result<()> {
                 }
             }
             // (a wrapper's or server's owner: see `foreign::comment_target`)
+            // (a role's: see `maintain::comment`)
             maintain::Commented::Other
+            | maintain::Commented::Role(_)
+            | maintain::Commented::Publication(_)
             | maintain::Commented::Aggregate(..)
             | maintain::Commented::Foreign(..)
             | maintain::Commented::Rule(..) => {}
@@ -1771,14 +1794,16 @@ fn ddl(v: &View, who: &Who, st: &Stmt) -> Result<()> {
             }
         }
         // LOCK TABLE: a privilege on each table, as Postgres asks (SELECT will do for the weakest)
+        // (as Postgres's LockTableAclCheck: ACCESS SHARE takes SELECT, ROW EXCLUSIVE a privilege to write, the others
+        // UPDATE, DELETE or TRUNCATE; on each relation named, found along the search_path)
         Stmt::Lock(l) => {
-            for n in &l.tables {
-                if let Some(o) = rel(v, n)? {
+            for (n, _) in &l.tables {
+                if let Some(o) = rel(v, &find_named(&text_rel(n), super::Kind::Rel))? {
                     let any = |ps: &[u32]| ps.iter().any(|p| o.has(who, *p));
-                    let ok = if l.strong {
-                        any(&[UPDATE, DELETE, TRUNCATE])
-                    } else {
-                        any(&[SELECT, UPDATE, DELETE, TRUNCATE])
+                    let ok = match l.mode {
+                        "AccessShareLock" => any(&[SELECT]),
+                        "RowExclusiveLock" => any(&[INSERT, UPDATE, DELETE, TRUNCATE]),
+                        _ => any(&[UPDATE, DELETE, TRUNCATE]),
                     };
                     if !ok {
                         return Err(o.denied());
@@ -2400,7 +2425,15 @@ fn targets(v: &View, on: &On) -> Result<Vec<Obj>> {
     match on {
         On::Rels(names, seq) => {
             for n in names {
-                let o = need_rel(v, n)?;
+                // (a catalog table, pg_proc, pg_authid: the bootstrap superuser's, its grants kept as a table's)
+                let bare = n.strip_prefix("pg_catalog.").unwrap_or(n);
+                let o = match rel(v, n)? {
+                    None if !*seq && catalog_table(bare) => {
+                        let key = key_of(Kind::Table, &format!("pg_catalog.{bare}"));
+                        Obj::new(Kind::Table, key.clone(), bare.to_string(), entry(v, &key)?, BOOTSTRAP)
+                    }
+                    _ => need_rel(v, n)?,
+                };
                 if *seq && o.kind != Kind::Sequence {
                     return err("42809", format!("\"{}\" is not a sequence", rel_part(n)));
                 }

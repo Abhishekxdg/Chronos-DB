@@ -426,3 +426,76 @@ fn lock_table_finds_a_deadlock() {
         "exactly one of the two is told about the deadlock"
     );
 }
+
+#[test]
+fn vacuum_options_are_checked_and_a_table_not_owned_is_skipped() {
+    let db = Db::new();
+    let mut s = Session::new(MAIN);
+    tag(&db, &mut s, "create table t (a int)");
+    for (sql, want) in [
+        ("vacuum (parallel -1) t", "42601"),
+        ("vacuum (parallel) t", "42601"),
+        ("vacuum (parallel 2, full) t", "0A000"),
+        ("vacuum (buffer_usage_limit 120) t", "22023"),
+        ("vacuum (buffer_usage_limit 10000000000) t", "22023"),
+        ("vacuum (buffer_usage_limit '512 kB', full) t", "0A000"),
+        ("vacuum (only_database_stats) t", "0A000"),
+        ("vacuum (full, process_toast false) t", "0A000"),
+        ("vacuum (nonsense) t", "42601"),
+        ("analyze (full) t", "42601"),
+    ] {
+        assert_eq!(code(&db, &mut s, sql), want, "{sql}");
+    }
+    for sql in
+        ["vacuum (parallel 2, buffer_usage_limit '1MB') t", "vacuum (only_database_stats)", "vacuum (parallel 0) t"]
+    {
+        assert_eq!(tag(&db, &mut s, sql), "VACUUM", "{sql}");
+    }
+    messages();
+    // a role that doesn't own the table (nor a catalog table) is warned, and the table skipped
+    tag(&db, &mut s, "create role vacuumer");
+    tag(&db, &mut s, "set role vacuumer");
+    assert_eq!(tag(&db, &mut s, "vacuum t"), "VACUUM");
+    assert_eq!(messages(), ["WARNING: permission denied to vacuum \"t\", skipping it"]);
+    assert_eq!(tag(&db, &mut s, "analyze pg_catalog.pg_class"), "ANALYZE");
+    assert_eq!(messages(), ["WARNING: permission denied to analyze \"pg_class\", skipping it"]);
+    tag(&db, &mut s, "reset role");
+    assert_eq!(tag(&db, &mut s, "vacuum pg_class"), "VACUUM");
+    assert!(messages().is_empty());
+}
+
+#[test]
+fn lock_table_holds_its_mode_on_what_it_locks_until_the_transaction_ends() {
+    let db = Db::new();
+    let mut s = Session::new(MAIN);
+    tag(&db, &mut s, "create table parent (a int)");
+    tag(&db, &mut s, "create table child () inherits (parent)");
+    tag(&db, &mut s, "create table other (b int)");
+    tag(&db, &mut s, "create view v as select * from parent, other");
+    let locked = |s: &mut Session| {
+        let o = s
+            .run(
+                &db,
+                "select c.relname || ':' || l.mode from pg_locks l join pg_class c on c.oid = l.relation order by 1",
+                &[],
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+        o.rows.iter().map(|r| r[0].to_text()).collect::<Vec<_>>()
+    };
+    tag(&db, &mut s, "begin");
+    tag(&db, &mut s, "lock table v in exclusive mode");
+    assert_eq!(
+        locked(&mut s),
+        ["child:ExclusiveLock", "other:ExclusiveLock", "parent:ExclusiveLock", "v:ExclusiveLock"]
+    );
+    tag(&db, &mut s, "savepoint a");
+    tag(&db, &mut s, "lock only other in share mode");
+    assert_eq!(locked(&mut s).len(), 5);
+    tag(&db, &mut s, "rollback to savepoint a");
+    assert_eq!(locked(&mut s).len(), 4);
+    tag(&db, &mut s, "commit");
+    assert!(locked(&mut s).is_empty());
+    messages();
+}

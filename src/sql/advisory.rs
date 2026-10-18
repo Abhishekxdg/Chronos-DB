@@ -1,9 +1,9 @@
 //! Postgres's advisory locks: `pg_advisory_lock(key)` and friends, locks on numbers the
 //! application picks, held by a session (until `pg_advisory_unlock` or the session ends) or by
 //! its transaction (`_xact_`: until it commits or rolls back, or outside one, until the
-//! statement ends). Exclusive only; the `_shared` kinds are refused. A lock taken by another
-//! session waits, as long as the statement may run (its timeout, a cancel), and a wait that
-//! would close a cycle of sessions waiting on each other fails at once (40P01), as Postgres's
+//! statement ends), exclusive or (the `_shared` kinds) shared. A lock another session holds in a
+//! mode that conflicts (exclusive with either, shared with exclusive) waits, as long as the
+//! statement may run (its timeout, a cancel), and a wait that would close a cycle of sessions waiting on each other fails at once (40P01), as Postgres's
 //! deadlock check does.
 //!
 //! A transaction reads the database as it was at BEGIN (see `crate::Core`), so after waiting
@@ -21,11 +21,15 @@ use std::time::Duration;
 /// (Postgres keeps those apart).
 pub(crate) type Key = (usize, i64, bool);
 
+/// A lock as held: its key and whether in share mode (the `_shared` functions' ShareLock; else ExclusiveLock). The
+/// two modes of a key are two locks, as in Postgres: a session may hold both.
+pub(crate) type Held = (Key, bool);
+
 #[derive(Default)]
 struct Lock {
-    owner: Option<u64>, // the session holding it
-    session: u32,       // times its session took it for the session
-    xact: u32,          // times for its transaction
+    /// the sessions holding it (one at most in exclusive mode): times each took it for the session, and for its
+    /// transaction
+    holders: HashMap<u64, (u32, u32)>,
     /// `Core::fork_clock` when it was last released: a transaction forked before that may not
     /// see what its holder committed
     released: u64,
@@ -34,8 +38,8 @@ struct Lock {
 
 #[derive(Default)]
 struct Table {
-    locks: HashMap<Key, Lock>,
-    waiting: HashMap<u64, Key>, // what each waiting session waits for
+    locks: HashMap<Held, Lock>,
+    waiting: HashMap<u64, Held>, // what each waiting session waits for
 }
 
 static TABLE: LazyLock<(Mutex<Table>, Condvar)> = LazyLock::new(Default::default);
@@ -43,11 +47,28 @@ static TABLE: LazyLock<(Mutex<Table>, Condvar)> = LazyLock::new(Default::default
 /// Released locks kept for their release times before those old enough to matter to no one go.
 const KEPT: usize = 10_000;
 
-/// The locks held and waited for (pg_locks): the key, the session, and whether it holds it.
-pub(crate) fn listed() -> Vec<(Key, u64, bool)> {
+/// The sessions other than `session` holding a lock that a request for `want` waits for: an exclusive lock's
+/// holders, and for an exclusive request the share lock's too.
+fn blockers(t: &Table, session: u64, (key, share): Held) -> Vec<u64> {
+    let mut out = vec![];
+    for mode in [false, true] {
+        if mode && share {
+            continue;
+        }
+        if let Some(l) = t.locks.get(&(key, mode)) {
+            out.extend(l.holders.keys().copied().filter(|s| *s != session));
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// The locks held and waited for (pg_locks): the key, whether in share mode, the session, and whether it holds it.
+pub(crate) fn listed() -> Vec<(Key, bool, u64, bool)> {
     let t = TABLE.0.lock().unwrap_or_else(|p| p.into_inner());
-    let mut out: Vec<_> = t.locks.iter().filter_map(|(k, l)| l.owner.map(|o| (*k, o, true))).collect();
-    out.extend(t.waiting.iter().map(|(s, k)| (*k, *s, false)));
+    let mut out: Vec<_> =
+        t.locks.iter().flat_map(|((k, m), l)| l.holders.keys().map(move |s| (*k, *m, *s, true))).collect();
+    out.extend(t.waiting.iter().map(|(s, (k, m))| (*k, *m, *s, false)));
     out.sort();
     out
 }
@@ -79,21 +100,30 @@ pub(crate) fn key(db: usize, a: &[Value]) -> Result<Option<Key>> {
     })
 }
 
-/// Takes `key` for `session` (for its transaction when `xact`): waits while another session
-/// holds it, unless `try_only` (then false). Returns whether it's taken, and the time it was last
-/// released by someone else (0: never).
-pub(crate) fn take(session: u64, key: Key, xact: bool, try_only: bool) -> Result<(bool, u64)> {
+/// Takes `key` for `session` (for its transaction when `xact`; in share mode when `share`): waits while another
+/// session holds it in a mode that conflicts, unless `try_only` (then false). Returns whether it's taken, and the
+/// time it was last released by someone else (0: never).
+pub(crate) fn take(session: u64, key: Key, xact: bool, try_only: bool, share: bool) -> Result<(bool, u64)> {
     let (m, cv) = &*TABLE;
     let mut t = m.lock().unwrap();
     loop {
-        let l = t.locks.entry(key).or_default();
-        if l.owner.is_none_or(|o| o == session) {
-            let released = if l.owner.is_none() && l.by != session { l.released } else { 0 };
-            l.owner = Some(session);
+        let holder = blockers(&t, session, (key, share));
+        if holder.is_empty() {
+            // (released by someone else: of the locks it would have waited for)
+            let released = [false, true]
+                .into_iter()
+                .filter(|mode| !(share && *mode))
+                .filter_map(|mode| t.locks.get(&(key, mode)))
+                .filter(|l| l.holders.is_empty() && l.by != session)
+                .map(|l| l.released)
+                .max()
+                .unwrap_or(0);
+            let l = t.locks.entry((key, share)).or_default();
+            let n = l.holders.entry(session).or_default();
             if xact {
-                l.xact += 1;
+                n.1 += 1;
             } else {
-                l.session += 1;
+                n.0 += 1;
             }
             t.waiting.remove(&session);
             return Ok((true, released));
@@ -101,16 +131,15 @@ pub(crate) fn take(session: u64, key: Key, xact: bool, try_only: bool) -> Result
         if try_only {
             return Ok((false, 0));
         }
-        // a cycle: the holder waits (through others, for advisory locks or sequences) for a lock
+        // a cycle: a holder waits (through others, for advisory locks or sequences) for a lock
         // this session holds
-        let holder: Vec<u64> = l.owner.into_iter().collect();
         let mut graph = waits(&t);
         graph.extend(super::counter_waits_now().unwrap_or_default());
         if closes_cycle(session, holder, &graph) {
             t.waiting.remove(&session);
             return err("40P01", "deadlock detected: sessions are waiting for each other's locks");
         }
-        t.waiting.insert(session, key);
+        t.waiting.insert(session, (key, share));
         t = cv.wait_timeout(t, Duration::from_millis(50)).unwrap().0;
         if let Err(e) = super::stopped() {
             t.waiting.remove(&session);
@@ -119,10 +148,9 @@ pub(crate) fn take(session: u64, key: Key, xact: bool, try_only: bool) -> Result
     }
 }
 
-/// What each session waiting for an advisory lock waits for: its holder.
+/// What each session waiting for an advisory lock waits for: its holders.
 fn waits(t: &Table) -> HashMap<u64, Vec<u64>> {
-    let holder = |k: &Key| t.locks.get(k).and_then(|l| l.owner);
-    t.waiting.iter().filter_map(|(s, k)| holder(k).map(|o| (*s, vec![o]))).collect()
+    t.waiting.iter().map(|(s, h)| (*s, blockers(t, *s, *h))).filter(|(_, b)| !b.is_empty()).collect()
 }
 
 /// `waits`, for another kind of wait's deadlock check (see `super::restarting_wait`); None while
@@ -156,34 +184,36 @@ pub(crate) fn closes_cycle(session: u64, mut at: Vec<u64>, graph: &HashMap<u64, 
     false
 }
 
-/// Lets go of `key` once, as `session`'s session lock; false if it didn't hold it so (Postgres
-/// warns, and says false).
-pub(crate) fn release(session: u64, key: Key, now: u64) -> bool {
+/// Lets go of `key` once, as `session`'s session lock (in share mode when `share`); false if it didn't hold it so
+/// (Postgres warns, and says false).
+pub(crate) fn release(session: u64, key: Key, now: u64, share: bool) -> bool {
     let (m, cv) = &*TABLE;
     let mut t = m.lock().unwrap();
-    let Some(l) = t.locks.get_mut(&key).filter(|l| l.owner == Some(session) && l.session > 0) else {
-        return false;
-    };
-    l.session -= 1;
-    if l.session == 0 && l.xact == 0 {
-        (l.owner, l.released, l.by) = (None, now, session);
+    let Some(l) = t.locks.get_mut(&(key, share)) else { return false };
+    let Some(n) = l.holders.get_mut(&session).filter(|n| n.0 > 0) else { return false };
+    n.0 -= 1;
+    if *n == (0, 0) {
+        l.holders.remove(&session);
+        (l.released, l.by) = (now, session);
         cv.notify_all();
     }
     true
 }
 
-/// Undoes one `take` of `key` (a lock taken that the transaction can't use after all).
-pub(crate) fn untake(session: u64, key: Key, xact: bool) {
+/// Undoes one `take` of `held` (a lock taken that the transaction can't use after all).
+pub(crate) fn untake(session: u64, held: Held, xact: bool) {
     let (m, cv) = &*TABLE;
     let mut t = m.lock().unwrap();
-    if let Some(l) = t.locks.get_mut(&key).filter(|l| l.owner == Some(session)) {
+    if let Some(l) = t.locks.get_mut(&held)
+        && let Some(n) = l.holders.get_mut(&session)
+    {
         if xact {
-            l.xact = l.xact.saturating_sub(1);
+            n.1 = n.1.saturating_sub(1);
         } else {
-            l.session = l.session.saturating_sub(1);
+            n.0 = n.0.saturating_sub(1);
         }
-        if l.session == 0 && l.xact == 0 {
-            l.owner = None; // as it was: its release time stands
+        if *n == (0, 0) {
+            l.holders.remove(&session); // as it was: its release time stands
             cv.notify_all();
         }
     }
@@ -191,16 +221,30 @@ pub(crate) fn untake(session: u64, key: Key, xact: bool) {
 
 /// Lets go of every lock `session` holds for its transaction (`xact`) or all it holds.
 pub(crate) fn release_all(session: u64, xact: bool, now: u64, oldest: impl FnOnce() -> Option<u64>) {
+    let_go(session, true, !xact, now, oldest);
+}
+
+/// pg_advisory_unlock_all: every lock `session` holds for the session; those of its transaction stay, as in Postgres.
+pub(crate) fn release_session_locks(session: u64, now: u64, oldest: impl FnOnce() -> Option<u64>) {
+    let_go(session, false, true, now, oldest);
+}
+
+/// Lets go of `session`'s transaction locks (`xact`) and its session locks (`sessions`).
+fn let_go(session: u64, xact: bool, sessions: bool, now: u64, oldest: impl FnOnce() -> Option<u64>) {
     let (m, cv) = &*TABLE;
     let mut t = m.lock().unwrap();
     let mut freed = false;
-    for l in t.locks.values_mut().filter(|l| l.owner == Some(session)) {
-        l.xact = 0;
-        if !xact {
-            l.session = 0;
+    for l in t.locks.values_mut() {
+        let Some(n) = l.holders.get_mut(&session) else { continue };
+        if xact {
+            n.1 = 0;
         }
-        if l.session == 0 {
-            (l.owner, l.released, l.by) = (None, now, session);
+        if sessions {
+            n.0 = 0;
+        }
+        if *n == (0, 0) {
+            l.holders.remove(&session);
+            (l.released, l.by) = (now, session);
             freed = true;
         }
     }
@@ -210,7 +254,7 @@ pub(crate) fn release_all(session: u64, xact: bool, now: u64, oldest: impl FnOnc
     if t.locks.len() > KEPT {
         // ponytail: a walk of the locks each time past KEPT; keep a heap of release times if it shows
         let oldest = oldest();
-        t.locks.retain(|_, l| l.owner.is_some() || oldest.is_some_and(|o| l.released > o));
+        t.locks.retain(|_, l| !l.holders.is_empty() || oldest.is_some_and(|o| l.released > o));
     }
 }
 

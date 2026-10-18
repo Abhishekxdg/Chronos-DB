@@ -134,7 +134,9 @@ fn a_table_that_merges_by_columns() {
     assert!(rows(&q(&db, MAIN, "diff world s")).iter().any(|r| r.contains("merge: whole rows")));
     let sql = rows(&q(&db, MAIN, "diff world s as sql"));
     assert!(sql.iter().any(|r| r.contains("alter table p set (merge_by_columns = false);")), "{sql:?}");
-    assert_eq!(fails("alter table p set (no_such_setting = 70)").code, "0A000"); // (fillfactor and the other storage parameters are accepted: they change nothing here)
+    // (an unknown one is refused as Postgres refuses it; fillfactor and the other storage parameters are checked and
+    // kept: they change nothing here)
+    assert_eq!(fails("alter table p set (no_such_setting = 70)").code, "22023");
 }
 
 #[test]

@@ -61,6 +61,7 @@ mod plpgsql;
 mod publication;
 mod range;
 mod regex;
+mod reloptions;
 mod rewrite;
 mod rls;
 mod roles;
@@ -5401,12 +5402,11 @@ enum CtxFn {
     SqlBody,
     CurrentSchemas,
     UserById,
-    /// pg_[try_]advisory[_xact]_lock: (transaction's, try)
-    AdvisoryLock(bool, bool),
-    AdvisoryUnlock,
+    /// pg_[try_]advisory[_xact]_lock[_shared]: (transaction's, try, shared)
+    AdvisoryLock(bool, bool, bool),
+    /// pg_advisory_unlock[_shared]: (shared)
+    AdvisoryUnlock(bool),
     AdvisoryUnlockAll,
-    /// the `_shared` kinds: refused
-    AdvisoryShared,
     HashText,
     CurrentSetting,
     SetConfig,
@@ -5469,17 +5469,17 @@ enum CtxFn {
 impl CtxFn {
     /// Its name, and how many arguments it takes.
     const ALL: &'static [(&'static str, CtxFn, std::ops::RangeInclusive<usize>)] = &[
-        ("pg_advisory_lock", CtxFn::AdvisoryLock(false, false), 1..=2),
-        ("pg_advisory_xact_lock", CtxFn::AdvisoryLock(true, false), 1..=2),
-        ("pg_try_advisory_lock", CtxFn::AdvisoryLock(false, true), 1..=2),
-        ("pg_try_advisory_xact_lock", CtxFn::AdvisoryLock(true, true), 1..=2),
-        ("pg_advisory_unlock", CtxFn::AdvisoryUnlock, 1..=2),
+        ("pg_advisory_lock", CtxFn::AdvisoryLock(false, false, false), 1..=2),
+        ("pg_advisory_xact_lock", CtxFn::AdvisoryLock(true, false, false), 1..=2),
+        ("pg_try_advisory_lock", CtxFn::AdvisoryLock(false, true, false), 1..=2),
+        ("pg_try_advisory_xact_lock", CtxFn::AdvisoryLock(true, true, false), 1..=2),
+        ("pg_advisory_unlock", CtxFn::AdvisoryUnlock(false), 1..=2),
         ("pg_advisory_unlock_all", CtxFn::AdvisoryUnlockAll, 0..=0),
-        ("pg_advisory_lock_shared", CtxFn::AdvisoryShared, 1..=2),
-        ("pg_advisory_xact_lock_shared", CtxFn::AdvisoryShared, 1..=2),
-        ("pg_try_advisory_lock_shared", CtxFn::AdvisoryShared, 1..=2),
-        ("pg_try_advisory_xact_lock_shared", CtxFn::AdvisoryShared, 1..=2),
-        ("pg_advisory_unlock_shared", CtxFn::AdvisoryShared, 1..=2),
+        ("pg_advisory_lock_shared", CtxFn::AdvisoryLock(false, false, true), 1..=2),
+        ("pg_advisory_xact_lock_shared", CtxFn::AdvisoryLock(true, false, true), 1..=2),
+        ("pg_try_advisory_lock_shared", CtxFn::AdvisoryLock(false, true, true), 1..=2),
+        ("pg_try_advisory_xact_lock_shared", CtxFn::AdvisoryLock(true, true, true), 1..=2),
+        ("pg_advisory_unlock_shared", CtxFn::AdvisoryUnlock(true), 1..=2),
         ("hashtext", CtxFn::HashText, 1..=1),
         ("current_setting", CtxFn::CurrentSetting, 1..=2),
         ("set_config", CtxFn::SetConfig, 3..=3),
@@ -5626,8 +5626,8 @@ impl CtxFn {
             | CtxFn::TxidCurrent => Type::BigInt,
             CtxFn::TableIsVisible
             | CtxFn::InputValid
-            | CtxFn::AdvisoryUnlock
-            | CtxFn::AdvisoryLock(_, true)
+            | CtxFn::AdvisoryUnlock(_)
+            | CtxFn::AdvisoryLock(_, true, _)
             | CtxFn::InRecovery
             | CtxFn::CancelBackend
             | CtxFn::TerminateBackend
@@ -5655,7 +5655,7 @@ impl CtxFn {
             CtxFn::LargeObject(n) => largeobj::result(n),
             CtxFn::ObjAddr(which) => objaddr::result(which),
             CtxFn::PgStat(n) => pgstat::result(n),
-            CtxFn::Sleep | CtxFn::Notify | CtxFn::AdvisoryLock(_, false) | CtxFn::AdvisoryUnlockAll => Type::Void,
+            CtxFn::Sleep | CtxFn::Notify | CtxFn::AdvisoryLock(_, false, _) | CtxFn::AdvisoryUnlockAll => Type::Void,
             _ => Type::Text,
         }
     }
@@ -7047,6 +7047,8 @@ enum Alter {
     Trigger(Option<String>, char),
     /// SET (merge_by_columns = true | false), RESET (merge_by_columns)
     MergeByColumns(bool),
+    /// SET (storage parameters) or RESET (theirs), `true`: RESET (see `reloptions`)
+    RelOptions(Vec<reloptions::Given>, bool),
     /// SET SCHEMA name: the table, moved
     SetSchema(String),
     /// VALIDATE CONSTRAINT name: it has to exist (constraints are checked against every row when added)
@@ -7077,6 +7079,8 @@ enum Alter {
     /// ALTER INDEX name ALTER COLUMN n SET STATISTICS target (the statement's "table" is the index): only an
     /// expression's column takes one
     IndexStats(i64, i64),
+    /// ALTER INDEX ... SET (storage parameters) or RESET (theirs), `true`: RESET (see `reloptions`)
+    IndexOptions(Vec<reloptions::Given>, bool),
     /// ADD [CONSTRAINT name] PRIMARY KEY (true) | UNIQUE USING INDEX index: a unique index of the table made the
     /// constraint, and where in the statement the constraint starts (what its errors point at)
     KeyUsingIndex(String, Option<String>, bool, Option<u32>),
@@ -7115,17 +7119,6 @@ fn column_casts(e: &Expr) -> Vec<Type> {
         _ => vec![],
     }
 }
-
-/// The storage parameters of a table that Postgres has and that mean nothing here.
-const STORAGE_PARAMS: &[&str] = &[
-    "fillfactor",
-    "parallel_workers",
-    "vacuum_truncate",
-    "vacuum_index_cleanup",
-    "log_autovacuum_min_duration",
-    "user_catalog_table",
-    "toast_tuple_target",
-];
 
 /// A default worked out afresh for each row.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -7676,6 +7669,8 @@ enum Stmt {
         only: bool,
         /// CONCURRENTLY (a partitioned table can't have one made so)
         concurrently: bool,
+        /// WITH (storage parameters), checked (see `reloptions`)
+        options: Vec<String>,
     },
     DropIndex {
         name: String,
@@ -14915,7 +14910,16 @@ impl Parser {
             }
             self.i = save;
         }
-        // (ALTER COLUMN n SET STATISTICS, SET (n_distinct = ...): what the planner would read)
+        // SET (fillfactor = 70), RESET (fillfactor): its storage parameters (see `reloptions`)
+        if (self.is_kw("set") || self.is_kw("reset")) && self.t.get(self.i + 1) == Some(&Tok::Sym("(")) {
+            let reset = self.kw("reset");
+            if !reset {
+                self.expect_kw("set")?;
+            }
+            let changes = vec![Alter::IndexOptions(reloptions::parse(self)?, reset)];
+            return Ok(Stmt::Alter { table: name, changes, if_exists, only: false });
+        }
+        // (ALTER COLUMN n SET STATISTICS: what the planner would read)
         if self.kw("set") || self.kw("reset") || self.kw("alter") {
             self.skip_rest(); // TABLESPACE t, (fillfactor = 70): how an index is stored
             return Ok(Stmt::NoopNotice(
@@ -15605,50 +15609,27 @@ impl Parser {
                 } else if set && (self.kw("logged") || self.kw("unlogged")) {
                     Alter::Noop("every table is logged")
                 } else {
-                    // SET (merge_by_columns = true), RESET (merge_by_columns): the one table setting; the
-                    // storage parameters Postgres has (fillfactor, autovacuum_*, ...) do nothing here
-                    self.expect_sym("(")?;
-                    let (mut merge, mut stored) = (None, false);
-                    loop {
-                        let mut name = self.name()?;
-                        if self.sym(".") {
-                            name = format!("{name}.{}", self.name()?); // toast.autovacuum_enabled
-                        }
-                        let mut value = None;
-                        if set && self.sym("=") {
-                            value = match self.next() {
-                                Some(Tok::Word(w) | Tok::Str(w) | Tok::Num(w)) => Some(w),
-                                _ => return self.fail("expected a value"),
-                            };
-                        }
-                        if name == "merge_by_columns" {
-                            merge = Some(match (set, value.as_deref()) {
-                                (false, _) => false,
-                                (true, Some("true" | "on")) => true,
-                                (true, Some("false" | "off")) => false,
-                                _ => return self.fail("expected true or false"),
-                            });
-                        } else if STORAGE_PARAMS
-                            .iter()
-                            .any(|p| name == *p || name.starts_with("autovacuum_") || name.starts_with("toast."))
-                        {
-                            stored = true;
-                        } else {
-                            return err(
-                                UNSUPPORTED,
-                                format!("table setting {name} isn't supported (merge_by_columns is)"),
-                            );
-                        }
-                        if !self.sym(",") {
-                            break;
-                        }
+                    // SET (merge_by_columns = true), RESET (merge_by_columns): Chronos's own table setting; the
+                    // storage parameters Postgres has (fillfactor, autovacuum_*, ...) are checked and kept, though
+                    // they change nothing here (see `reloptions`)
+                    let mut given = reloptions::parse(self)?;
+                    let mut merge = None;
+                    if let Some(k) = given.iter().position(|(s, n, _)| s.is_none() && n == "merge_by_columns") {
+                        let (_, _, value) = given.remove(k);
+                        merge = Some(match (set, value.as_deref()) {
+                            (false, _) => false,
+                            (true, Some("true" | "on")) => true,
+                            (true, Some("false" | "off")) => false,
+                            _ => return self.fail("expected true or false"),
+                        });
                     }
-                    self.expect_sym(")")?;
-                    match (merge, stored) {
-                        (Some(on), _) => Alter::MergeByColumns(on),
-                        (None, _) => {
-                            Alter::Noop("storage parameters aren't used: there is one store, without pages to fill")
+                    match merge {
+                        Some(on) if given.is_empty() => Alter::MergeByColumns(on),
+                        Some(on) => {
+                            changes.push(Alter::MergeByColumns(on));
+                            Alter::RelOptions(given, !set)
                         }
+                        None => Alter::RelOptions(given, !set),
                     }
                 }
             } else if self.is_kw("options") && matches!(self.t.get(self.i + 1), Some(Tok::Sym("("))) {
@@ -16262,6 +16243,11 @@ impl Parser {
         self.in_schema_being_made(&table)?;
         let mut using = Using::Btree;
         let mut trgm = None;
+        // (the access method as written: what its storage parameters are checked against)
+        let method = match (self.is_kw("using"), self.t.get(self.i + 1)) {
+            (true, Some(Tok::Word(w) | Tok::Ident(w))) => w.to_lowercase(),
+            _ => "btree".to_string(),
+        };
         if self.kw("using") && !self.kw("btree") {
             if ["hnsw", "ivfflat"].into_iter().any(|m| self.kw(m)) {
                 self.expect_sym("(")?;
@@ -16420,49 +16406,13 @@ impl Parser {
             vec![]
         };
         let nnd = self.nulls_not_distinct()? && unique; // (meaningless, and accepted, on a plain index)
-        if self.kw("with") {
-            self.expect_sym("(")?;
-            let mut depth = 1;
-            let (mut fill, mut buffering) = (false, false);
-            while depth > 0 {
-                let t = self.next();
-                if let (true, Some(Tok::Num(n))) = (fill, &t)
-                    && !n.parse::<i64>().is_ok_and(|v| (10..=100).contains(&v))
-                {
-                    return Err(SqlError {
-                        code: "22023",
-                        message: format!("value {n} out of bounds for option \"fillfactor\""),
-                        info: Some(Box::new(Violation {
-                            detail: Some("Valid values are between \"10\" and \"100\".".into()),
-                            ..Violation::default()
-                        })),
-                    });
-                }
-                // GiST's buffering: on, off or auto
-                if let (true, Some(Tok::Word(w) | Tok::Str(w) | Tok::Ident(w))) = (buffering, &t)
-                    && !["on", "off", "auto"].contains(&w.to_lowercase().as_str())
-                {
-                    return Err(SqlError {
-                        code: "22023",
-                        message: format!("invalid value for enum option \"buffering\": {w}"),
-                        info: Some(Box::new(Violation {
-                            detail: Some("Valid values are \"on\", \"off\", and \"auto\".".into()),
-                            ..Violation::default()
-                        })),
-                    });
-                }
-                buffering = matches!(&t, Some(Tok::Word(w)) if w == "buffering")
-                    || (buffering && matches!(t, Some(Tok::Sym("="))));
-                fill =
-                    matches!(&t, Some(Tok::Word(w)) if w == "fillfactor") || (fill && matches!(t, Some(Tok::Sym("="))));
-                match t {
-                    Some(Tok::Sym("(")) => depth += 1,
-                    Some(Tok::Sym(")")) => depth -= 1,
-                    None => return self.fail("expected )"),
-                    _ => {}
-                }
-            }
-        }
+        // WITH (fillfactor = 70, ...): checked as the access method's, and kept (pg_class.reloptions)
+        let options = if self.kw("with") {
+            let given = reloptions::parse(self)?;
+            reloptions::for_index(&method, &given)?
+        } else {
+            vec![]
+        };
         if self.kw("tablespace") {
             self.name()?;
         }
@@ -16487,6 +16437,7 @@ impl Parser {
             trgm,
             only,
             concurrently,
+            options,
         })
     }
 
@@ -17149,42 +17100,10 @@ impl Parser {
                     return err("42P16", "ON COMMIT can only be used on temporary tables");
                 }
             } else if self.kw("with") {
-                // WITH (fillfactor = 100, autovacuum_enabled = false): there are no pages to fill
-                self.expect_sym("(")?;
-                loop {
-                    let mut name = self.name()?;
-                    if self.sym(".") {
-                        name = format!("{name}.{}", self.name()?); // toast.autovacuum_enabled
-                    }
-                    if self.sym("=") {
-                        match self.next() {
-                            Some(Tok::Word(_) | Tok::Str(_)) => {}
-                            Some(Tok::Num(n)) => {
-                                if name == "fillfactor" && !n.parse::<i64>().is_ok_and(|v| (10..=100).contains(&v)) {
-                                    return Err(SqlError {
-                                        code: "22023",
-                                        message: format!("value {n} out of bounds for option \"fillfactor\""),
-                                        info: Some(Box::new(Violation {
-                                            detail: Some("Valid values are between \"10\" and \"100\".".into()),
-                                            ..Violation::default()
-                                        })),
-                                    });
-                                }
-                            }
-                            _ => return self.fail("expected a value"),
-                        }
-                    }
-                    if !(STORAGE_PARAMS.contains(&name.as_str())
-                        || name.starts_with("autovacuum_")
-                        || name.starts_with("toast."))
-                    {
-                        return err("22023", format!("unrecognized parameter \"{name}\""));
-                    }
-                    if !self.sym(",") {
-                        break;
-                    }
-                }
-                self.expect_sym(")")?;
+                // WITH (fillfactor = 100, autovacuum_enabled = false): checked and kept (pg_class.reloptions), though
+                // there are no pages to fill
+                let given = reloptions::parse(self)?;
+                hier.reloptions = reloptions::for_table(&given)?;
                 notice("NOTICE", "storage parameters aren't used: there is one store, without pages to fill".into());
             } else if self.is_kw("without") && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "oids") {
                 // WITHOUT OIDS: the old spelling of what every table is now
@@ -20848,6 +20767,11 @@ impl Parser {
         };
         if let (1, true, Some(t)) = (args.len(), names.is_empty(), cast) {
             return Ok(Expr::Cast(Box::new(args.remove(0)), t));
+        }
+        // `regclass('t')`, `regrole('alice')`: a reg type's cast, as `'t'::regclass` is (an object's oid, shown as its
+        // name)
+        if let (1, true, Some(kind)) = (args.len(), names.is_empty(), Reg::named(&name)) {
+            return Ok(Expr::Func(Func::Ctx(CtxFn::RegOid(kind)), vec![args.remove(0)]));
         }
         // timestamptz(date, time) and timestamptz(date, timetz): the date and the time of day, the first read in the
         // session's zone (datetime_timestamptz, datetimetz_timestamptz), as `date + time` makes them
@@ -32305,7 +32229,7 @@ fn hint(e: &Expr, cols: &[Col], want: Option<Type>, out: &mut [Option<Type>]) {
                 let want = match f {
                     CtxFn::CancelBackend | CtxFn::TerminateBackend | CtxFn::BlockingPids => Some(Type::Int),
                     CtxFn::Sleep => Some(Type::Float),
-                    CtxFn::AdvisoryLock(..) | CtxFn::AdvisoryUnlock | CtxFn::AdvisoryShared => {
+                    CtxFn::AdvisoryLock(..) | CtxFn::AdvisoryUnlock(_) => {
                         Some(if args.len() == 2 { Type::Int } else { Type::BigInt })
                     }
                     CtxFn::SetVal if i == 1 => Some(Type::BigInt),
@@ -33854,6 +33778,12 @@ pub struct Session {
     stmt_sql: Mutex<Option<Arc<str>>>,
     /// DECLAREd cursors by name: each ends with its transaction unless it is WITH HOLD
     cursors: HashMap<String, Cursor>,
+    /// a DECLAREd cursor whose query failed as it ran: the error, which its first FETCH raises as Postgres's would
+    /// (Some), and after that None: the portal is dead, and a FETCH of it is refused
+    failed_cursors: HashMap<String, Option<SqlError>>,
+    /// DECLARE is running its cursor's query: an error of it is DECLARE's to raise or keep for the first FETCH, and
+    /// the transaction is aborted by DECLARE's error, not the query's (see `failed_cursors`)
+    declaring: bool,
     /// CREATE TEMP TABLE's tables: a database of the session's own, in memory, so they're never
     /// logged, merged or seen by anyone else, and go with the session. Its branch `tx` holds a
     /// transaction's changes to them (see `temp_branch`).
@@ -34286,6 +34216,12 @@ fn checked_setting(name: &str, value: Option<&str>) -> Result<Option<String>> {
     }
     match (settings::find(name), value) {
         (Some(d), Some(v)) => d.set(v).map(Some),
+        // (a transaction's characteristics are set by BEGIN and SET TRANSACTION, never reset: GUC_NO_RESET)
+        (Some(d), None)
+            if matches!(d.name, "transaction_isolation" | "transaction_read_only" | "transaction_deferrable") =>
+        {
+            err("55P02", format!("parameter \"{}\" cannot be reset", d.name))
+        }
         (Some(d), None) => d.check_context().map(|_| None),
         (None, _) if name.contains('.') && !custom_setting_name(name) => Err(SqlError {
             code: "42602",
@@ -34791,6 +34727,9 @@ struct Tx {
     imported: bool,
     /// READ ONLY: it may change nothing of the world, only temporary tables (see `read_only_refusal`)
     read_only: bool,
+    /// `read_only` as it was when each open savepoint was made: SET TRANSACTION inside one lasts until it is
+    /// released or rolled back to, as Postgres's transaction_read_only does
+    read_only_at: Vec<bool>,
     /// its isolation level: how it reads and writes what others commit meanwhile (see `Iso`)
     iso: Iso,
     /// the tables it made or truncated, and how many savepoints were open then: what COPY FREEZE may load (see
@@ -34825,6 +34764,7 @@ impl Tx {
             let _ = db.discard(&b);
         }
         self.snaps.truncate(from + 1);
+        self.read_only_at.truncate(from);
     }
 }
 
@@ -34905,6 +34845,8 @@ impl Session {
             sql: Mutex::new(Arc::from("")),
             stmt_sql: Mutex::new(None),
             cursors: HashMap::new(),
+            failed_cursors: HashMap::new(),
+            declaring: false,
             temp: None,
             on_commit: vec![],
             in_on_commit: false,
@@ -35222,11 +35164,12 @@ impl Session {
                 n => core.release_intents_above(self.id, n - 1),
             }
         }
-        let gone = |l: &(advisory::Key, usize)| level == 0 || l.1 >= level;
+        let gone = |l: &(advisory::Held, usize)| level == 0 || l.1 >= level;
         for (key, _) in st.xact_locks.iter().filter(|l| gone(l)) {
             advisory::untake(self.id, *key, true);
         }
         st.xact_locks.retain(|l| !gone(l));
+        st.rel_locks.retain(|l| level != 0 && l.2 < level);
     }
 
     /// Rolls back an open transaction. Call when the connection ends.
@@ -35268,6 +35211,7 @@ impl Session {
             }
         }
         if self.tx.is_none() {
+            self.state.lock().unwrap().rel_locks.clear();
             self.state.lock().unwrap().xact_locks.clear();
             advisory::release_all(self.id, true, db.core.fork_clock(), || db.core.oldest_tx());
         }
@@ -35819,7 +35763,7 @@ impl Session {
             if !data {
                 return Ok(out);
             }
-            let out = self.step(db, &insert, params, types)?;
+            let out = acl::filling(table, || self.step(db, &insert, params, types))?;
             let n = out.tag.rsplit(' ').next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
             Ok(Output::tag(format!("SELECT {n}")))
         });
@@ -36722,7 +36666,7 @@ impl Session {
         db.metrics().record(s.op(), t);
         if let Err(e) = &out {
             db.metrics().error(e.code);
-            if !ends {
+            if !ends && !self.declaring {
                 self.abort();
             }
         }
@@ -36870,7 +36814,9 @@ impl Session {
             // (SET transaction_read_only is SET TRANSACTION READ ONLY / READ WRITE)
             Stmt::SetVar { name, value, .. } if name == "transaction_read_only" => {
                 let on = match value.as_deref().map(str::to_lowercase).as_deref() {
-                    None | Some("default") => self.default_read_only(),
+                    // (RESET: a transaction's characteristics are never reset, as Postgres's GUC_NO_RESET has it)
+                    None => return err("55P02", "parameter \"transaction_read_only\" cannot be reset"),
+                    Some("default") => self.default_read_only(),
                     Some("on" | "true" | "yes" | "1") => true,
                     Some("off" | "false" | "no" | "0") => false,
                     Some(v) => {
@@ -37087,6 +37033,7 @@ impl Session {
                 if !hold && !in_tx {
                     return err("25P01", "DECLARE CURSOR can only be used in transaction blocks");
                 }
+                self.failed_cursors.retain(|n, _| self.cursors.contains_key(n));
                 // (PL/pgSQL's open portals are cursors of the same namespace)
                 if self.cursors.contains_key(name) || self.state.lock().unwrap().portals.contains_key(name) {
                     return err("42P03", format!("cursor \"{name}\" already exists"));
@@ -37125,17 +37072,32 @@ impl Session {
                 };
                 self.cursors.insert(name.clone(), cursor);
                 let st = Statement((**query).clone(), PlanCache::default(), s.2);
-                match self.execute(db, &st, params, types) {
+                let was = std::mem::replace(&mut self.declaring, true);
+                let ran = self.execute(db, &st, params, types);
+                self.declaring = was;
+                match ran {
                     Ok(out) => {
                         let c = self.cursors.get_mut(name).expect("inserted above");
                         (c.columns, c.typmods, c.rows) = (out.columns.unwrap_or_default(), out.typmods, out.rows);
                         c.scan = Some(Box::new(cursor_scan(query, &c.columns)));
                         tag("DECLARE CURSOR")
                     }
+                    // (an error of the rows themselves, as division by zero, is the first FETCH's: Postgres runs the
+                    // query as it fetches; one of the query's own, as an unknown column, is DECLARE's)
+                    Err(e) if e.code.starts_with("22") || e.code == "P0001" => {
+                        self.failed_cursors.insert(name.clone(), Some(e));
+                        tag("DECLARE CURSOR")
+                    }
                     Err(e) => {
                         self.cursors.remove(name);
                         Err(e)
                     }
+                }
+            }
+            Stmt::Fetch { name, .. } if self.cursors.contains_key(name) && self.failed_cursors.contains_key(name) => {
+                match self.failed_cursors.insert(name.clone(), None).flatten() {
+                    Some(e) => Err(e),
+                    None => err("55000", format!("portal \"{name}\" cannot be run")),
                 }
             }
             Stmt::Fetch { name, dir, move_only } => {
@@ -37212,6 +37174,7 @@ impl Session {
                         queried: false,
                         imported: false,
                         read_only: self.default_read_only(),
+                        read_only_at: vec![],
                         iso: self.default_iso(),
                         fresh: vec![],
                     });
@@ -37498,6 +37461,7 @@ impl Session {
                     d.fork(t.temps.last().map_or("tx", |(_, b)| b.as_str()), &tb)?;
                     t.temps.push((t.saves.len(), tb));
                 }
+                t.read_only_at.push(t.read_only);
                 t.saves.push((name.clone(), b));
                 tag("SAVEPOINT")
             }
@@ -37510,6 +37474,11 @@ impl Session {
                 let Some(i) = t.saves.iter().rposition(|(n, _)| n == name) else {
                     return err("3B001", format!("savepoint \"{name}\" does not exist"));
                 };
+                // (READ ONLY or READ WRITE as when the savepoint was made)
+                if let Some(ro) = t.read_only_at.get(i).copied() {
+                    t.read_only = ro;
+                }
+                t.read_only_at.truncate(i);
                 if what == "RELEASE" {
                     Self::release(db, t, i)?;
                     db.core.keep_intents_at(self.id, i); // (its row intents are the level's it was released into)
@@ -37535,6 +37504,9 @@ impl Session {
                     }
                     for l in st.xact_locks.iter_mut().filter(|l| l.1 > i) {
                         l.1 = i;
+                    }
+                    for l in st.rel_locks.iter_mut().filter(|l| l.2 > i) {
+                        l.2 = i;
                     }
                     held_savepoint(&mut st, self.id, i, false);
                     for c in st.portals.values_mut().filter(|c| c.depth > i) {
@@ -37570,6 +37542,7 @@ impl Session {
                     advisory::untake(self.id, *key, true);
                 }
                 st.xact_locks.retain(|l| l.1 <= i);
+                st.rel_locks.retain(|l| l.2 <= i);
                 held_savepoint(&mut st, self.id, i, true); // (the sequences it altered since)
                 st.portals.retain(|_, c| c.depth <= i); // (PL/pgSQL's opened since too)
                 drop(st);
@@ -37597,6 +37570,7 @@ impl Session {
                         d.fork(crate::MAIN, "tx")?;
                     }
                 }
+                t.read_only_at.push(t.read_only);
                 t.saves.push((name.clone(), b));
                 t.failed = false;
                 if let Some(snap) = snap {
@@ -40617,6 +40591,7 @@ impl Statement {
                 trgm,
                 only,
                 concurrently,
+                options,
             } => x.create_index(
                 name.as_deref(),
                 table,
@@ -40629,6 +40604,7 @@ impl Statement {
                 (*using, trgm.as_deref()),
                 *only,
                 *concurrently,
+                options,
             ),
             Stmt::AttachIndex { parent, child } => x.attach_index(parent, child),
             Stmt::DropIndex { name, if_exists, more, concurrently } => {
@@ -40646,6 +40622,10 @@ impl Statement {
             }
             Stmt::With(w) => x.with_dml(w),
             Stmt::Merge(m) => x.merge_into(m),
+            Stmt::Alter { table, changes, if_exists, .. } if matches!(&changes[..], [Alter::IndexOptions(..)]) => {
+                let Some(Alter::IndexOptions(given, reset)) = changes.first() else { unreachable!() };
+                x.index_options(table, given, *reset, *if_exists)
+            }
             Stmt::Alter { table, changes, if_exists, .. } if matches!(&changes[..], [Alter::IndexStats(..)]) => {
                 let Some(Alter::IndexStats(col, target)) = changes.first() else { unreachable!() };
                 x.index_stats(table, *col, *target, *if_exists)
@@ -40959,7 +40939,10 @@ struct SessState {
     placeholders: std::collections::HashSet<String>,
     /// the transaction's advisory locks, each with the savepoint depth it was taken at: a
     /// ROLLBACK TO lets go of those taken since, as Postgres does
-    xact_locks: Vec<(advisory::Key, usize)>,
+    xact_locks: Vec<(advisory::Held, usize)>,
+    /// the relations LOCK TABLE locked in the transaction: each's stored name, the mode (pg_locks names it), and the
+    /// savepoint depth it was locked at (a ROLLBACK TO lets go of those since, as Postgres does)
+    rel_locks: Vec<(String, &'static str, usize)>,
     /// the cursors PL/pgSQL functions opened (OPEN, a refcursor), by portal name: open until the transaction
     /// ends, for a later call or the session's FETCH to read, as Postgres's portals are
     portals: HashMap<String, Cursor>,
@@ -41029,32 +41012,41 @@ fn setting_ms(v: &str) -> u64 {
     (n * scale) as u64
 }
 
+/// LOCK TABLE's relations, held by the running session's transaction in `mode` until it ends (or a ROLLBACK TO an
+/// older savepoint): what pg_locks lists (see `catalog_objects`).
+fn hold_relation_locks(names: &[String], mode: &'static str) {
+    let Some(ctx) = STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.clone())) else { return };
+    let mut st = ctx.state.lock().unwrap_or_else(|p| p.into_inner());
+    for n in names {
+        if !st.rel_locks.iter().any(|(x, m, _)| x == n && *m == mode) {
+            st.rel_locks.push((n.clone(), mode, ctx.depth));
+        }
+    }
+}
+
 /// The advisory lock functions (see `advisory`).
 fn advisory_call(ctx: &Ctx, f: CtxFn, a: &[Value]) -> Result<Value> {
     let now = || ctx.core.fork_clock();
     let db = Arc::as_ptr(&ctx.core) as usize;
     match f {
-        CtxFn::AdvisoryShared => err(
-            UNSUPPORTED,
-            "shared advisory locks are not supported: take the exclusive kind (pg_advisory_lock, pg_advisory_xact_lock)",
-        ),
         CtxFn::AdvisoryUnlockAll => {
-            advisory::release_all(ctx.session, false, now(), || ctx.core.oldest_tx());
+            advisory::release_session_locks(ctx.session, now(), || ctx.core.oldest_tx());
             Ok(Value::Text(String::new())) // void
         }
-        CtxFn::AdvisoryUnlock => {
+        CtxFn::AdvisoryUnlock(share) => {
             let Some(key) = advisory::key(db, a)? else { return Ok(Value::Null) };
-            let freed = advisory::release(ctx.session, key, now());
+            let freed = advisory::release(ctx.session, key, now(), share);
             if !freed {
-                notice("WARNING", "you don't own a lock of type ExclusiveLock".into());
+                let mode = if share { "ShareLock" } else { "ExclusiveLock" };
+                notice("WARNING", format!("you don't own a lock of type {mode}"));
             }
             Ok(Value::Bool(freed))
         }
-        CtxFn::AdvisoryLock(xact, try_only) => {
+        CtxFn::AdvisoryLock(xact, try_only, share) => {
             let Some(key) = advisory::key(db, a)? else { return Ok(Value::Null) };
             // only a statement that writes nothing waits: a writing one holds locks of the
             // database's own (the gate) that the holder may need to commit
-            let (got, released) = advisory::take(ctx.session, key, xact, try_only || !ctx.direct)?;
+            let (got, released) = advisory::take(ctx.session, key, xact, try_only || !ctx.direct, share)?;
             if !got && !try_only {
                 return err(
                     "55P03",
@@ -41065,7 +41057,7 @@ fn advisory_call(ctx: &Ctx, f: CtxFn, a: &[Value]) -> Result<Value> {
             let mut st = ctx.state.lock().unwrap();
             st.advisory = true;
             if got && xact {
-                st.xact_locks.push((key, ctx.depth));
+                st.xact_locks.push(((key, share), ctx.depth));
             }
             drop(st);
             // released since the transaction began: what its holder committed is past this
@@ -41074,8 +41066,8 @@ fn advisory_call(ctx: &Ctx, f: CtxFn, a: &[Value]) -> Result<Value> {
                 let (born, wrote) = ctx.core.born_written(tx)?;
                 if born < released {
                     if wrote || ctx.depth > 0 {
-                        advisory::untake(ctx.session, key, xact);
-                        ctx.state.lock().unwrap().xact_locks.retain(|(k, _)| *k != key || !xact);
+                        advisory::untake(ctx.session, (key, share), xact);
+                        ctx.state.lock().unwrap().xact_locks.retain(|(k, _)| *k != (key, share) || !xact);
                         return err(
                             "40001",
                             "could not serialize access: this advisory lock was released by a transaction that \
@@ -41303,7 +41295,7 @@ fn ctx_call(f: CtxFn, a: &[Value]) -> Result<Value> {
     if let CtxFn::PgStat(n) = f {
         return pgstat::call(&ctx, n, a);
     }
-    if matches!(f, CtxFn::AdvisoryLock(..) | CtxFn::AdvisoryUnlock | CtxFn::AdvisoryUnlockAll | CtxFn::AdvisoryShared) {
+    if matches!(f, CtxFn::AdvisoryLock(..) | CtxFn::AdvisoryUnlock(_) | CtxFn::AdvisoryUnlockAll) {
         return advisory_call(&ctx, f, a);
     }
     if matches!(f, CtxFn::CurrentSetting | CtxFn::SetConfig) {
@@ -46328,6 +46320,14 @@ fn catalog_query(branch: &str, name: &str, cat: &catalog::Catalog) -> Select {
                     let (owner, acl) = acl::schema_shown(&cat.reg, cat.acls.get(&format!("schema/{s}")), s);
                     vec![int(cat.schema_oid(s)), t(s), int(owner), acl]
                 })
+                // the session's temporary schema, once it has a temporary table (Postgres names it after the backend:
+                // `pg_temp_3`)
+                .chain(
+                    cat.rels
+                        .iter()
+                        .any(|r| schema_part(&r.name) == catalog::TEMP_SCHEMA)
+                        .then(|| vec![int(catalog::TEMP_SCHEMA_OID), t("pg_temp_3"), int(10), Value::Null]),
+                )
                 .collect(),
         ),
         // (the one comment every database starts with, until COMMENT ON SCHEMA public says otherwise)
@@ -46488,7 +46488,7 @@ fn inline_catalog(db: &Db, branch: &str, q: &mut Select) -> Result<bool> {
     if catalog_names.is_empty() {
         return Ok(!sequences.is_empty());
     }
-    let cat = catalog::Catalog::of(db, branch)?;
+    let cat = catalog::Catalog::of_session(db, branch)?;
     let world = db.world(branch).map_or_else(|_| branch.to_string(), |w| w.name);
     for n in catalog_names {
         let mut catalog = catalog_query(&world, &n, &cat);
@@ -52561,6 +52561,7 @@ impl Exec<'_> {
                 }
                 t.hier.of_type = Some(ty.clone());
             }
+            (t.hier.reloptions, t.hier.toast_reloptions) = hier.reloptions.clone();
             hier::check_all_cover(&t)?;
             if t.has_key() {
                 t.pkey = new_pkey_name(v, &t)?;
@@ -52757,6 +52758,44 @@ impl Exec<'_> {
     /// ALTER INDEX name ALTER COLUMN n SET STATISTICS target, as Postgres checks it: the target in range, the
     /// index's column n there and an expression's (a plain column's statistics are its table column's). The
     /// target isn't kept: an index's columns have no statistics here for it to size.
+    /// ALTER INDEX ... SET (...) | RESET (...): the index's storage parameters, checked as its access method's, kept
+    /// by its table (see `reloptions`).
+    fn index_options(&self, name: &str, given: &[reloptions::Given], reset: bool, if_exists: bool) -> Result<Output> {
+        let full = text_rel(name);
+        let (schema, ix) = (schema_part(&full).to_string(), rel_part(&full).to_string());
+        let mut found = false;
+        self.db.batch_with(self.branch, |v| {
+            found = false;
+            let owner = schemas(v)?.into_iter().find(|t| {
+                schema_part(&t.name) == schema
+                    && (t.indexes.iter().any(|x| x.name == ix)
+                        || t.uniques.iter().any(|u| u.name == ix)
+                        || (t.has_key() && t.pkey_name() == ix))
+            });
+            let Some(mut t) = owner else {
+                if if_exists {
+                    return Ok((vec![], ()));
+                }
+                return err(NO_TABLE, format!("relation \"{name}\" does not exist"));
+            };
+            found = true;
+            let gin = t.indexes.iter().any(|x| x.name == ix && x.gin);
+            let old =
+                t.hier.index_reloptions.iter().find(|(x, _)| *x == ix).map(|(_, o)| o.clone()).unwrap_or_default();
+            let options = reloptions::transform(&old, given, None, &[], reset)?;
+            reloptions::check(if gin { reloptions::Kind::Gin } else { reloptions::Kind::Btree }, &options)?;
+            t.hier.index_reloptions.retain(|(x, _)| *x != ix);
+            if !options.is_empty() {
+                t.hier.index_reloptions.push((ix.clone(), options));
+            }
+            Ok((vec![(schema_key(&t.name), Some(schema_json(&t)))], ()))
+        })?;
+        if !found {
+            notice("NOTICE", format!("relation \"{name}\" does not exist, skipping"));
+        }
+        Ok(Output::tag("ALTER INDEX"))
+    }
+
     fn index_stats(&self, name: &str, col: i64, target: i64, if_exists: bool) -> Result<Output> {
         let v = self.view()?;
         let full = text_rel(name);
@@ -54768,6 +54807,15 @@ impl Exec<'_> {
                     }
                 }
                 Alter::MergeByColumns(on) => t.by_columns = *on,
+                // (the table's own, then its TOAST table's, as Postgres's ATExecSetRelOptions checks them)
+                Alter::RelOptions(given, reset) => {
+                    let valid = ["toast"];
+                    let heap = reloptions::transform(&t.hier.reloptions, given, None, &valid, *reset)?;
+                    reloptions::check(reloptions::Kind::Heap, &heap)?;
+                    let toast = reloptions::transform(&t.hier.toast_reloptions, given, Some("toast"), &valid, *reset)?;
+                    reloptions::check(reloptions::Kind::Toast, &toast)?;
+                    (t.hier.reloptions, t.hier.toast_reloptions) = (heap, toast);
+                }
                 Alter::FdwOptions(col, opts) => foreign::alter_options(v, &mut t, col.as_deref(), opts)?,
                 Alter::Cluster(ix) => {
                     if let Some(ix) = ix {
@@ -54957,6 +55005,9 @@ impl Exec<'_> {
                     }
                 }
                 // (ALTER INDEX's, on its own: see `Exec::index_stats`)
+                Alter::IndexOptions(..) => {
+                    return err(UNSUPPORTED, "an index's storage parameters are set by ALTER INDEX alone");
+                }
                 Alter::IndexStats(..) => {
                     return err(UNSUPPORTED, "ALTER INDEX ... SET STATISTICS can't be combined with other changes");
                 }
@@ -55046,6 +55097,10 @@ impl Exec<'_> {
                         return err(TABLE_EXISTS, format!("relation \"{to}\" already exists"));
                     }
                     let (mut found, unique) = (false, t.uniques.iter().any(|u| u.name == *from));
+                    // (its storage parameters go with it)
+                    for (x, _) in t.hier.index_reloptions.iter_mut().filter(|(x, _)| x == from) {
+                        x.clone_from(to);
+                    }
                     if let Some(x) = t.indexes.iter_mut().find(|x| x.name == *from) {
                         x.name = to.clone();
                         moved.push((btree::IDX, from.clone(), to.clone()));
@@ -55516,6 +55571,7 @@ impl Exec<'_> {
         (using, trgm): (Using, Option<&str>),
         only: bool,
         concurrently: bool,
+        options: &[String],
     ) -> Result<Output> {
         self.long_write(spill::work_mem(), |v, flush| {
             let mut t = need_table(v, table)?;
@@ -55774,6 +55830,11 @@ impl Exec<'_> {
                 hier::check_covers(&t, &ids, "UNIQUE")?;
             }
             t.indexes.push(ix.clone());
+            // (its storage parameters, pg_class.reloptions: kept by the table, by the index's name)
+            t.hier.index_reloptions.retain(|(x, _)| *x != name);
+            if !options.is_empty() {
+                t.hier.index_reloptions.push((name.clone(), options.to_vec()));
+            }
             let u = unique.then_some(Unique { name, cols: ids, nnd, primary: false });
             t.uniques.extend(u.clone());
             // the entries first, a part at a time, then the schema that makes them the index's
@@ -55833,6 +55894,7 @@ impl Exec<'_> {
             }
             t.indexes.retain(|x| x.name != name);
             t.ann.retain(|(n, _, _)| n != name);
+            t.hier.index_reloptions.retain(|(x, _)| x != name);
             let mut gone = vec![btree::prefix(&t.name, name)];
             if t.uniques.iter().any(|u| u.name == name) {
                 t.uniques.retain(|u| u.name != name); // made by CREATE UNIQUE INDEX
@@ -56677,6 +56739,10 @@ impl Exec<'_> {
             let mut t = need_table(v, table)?;
             writable(&t)?;
             foreign::readable(v, &t)?;
+            // (not where nothing can be updated, as Postgres's planner leaves no table to update for WHERE false)
+            if !matches!(filter, Some(Expr::Lit(Value::Bool(false)))) {
+                publication::check_replica_identity(v, &t, true)?;
+            }
             let vchecks = take_view_checks(table);
             let rchecks = rls::Writing::new(checks);
             if t.schema {
@@ -57025,6 +57091,9 @@ impl Exec<'_> {
             let mut t = need_table(v, table)?;
             writable(&t)?;
             foreign::readable(v, &t)?;
+            if !matches!(filter, Some(Expr::Lit(Value::Bool(false)))) {
+                publication::check_replica_identity(v, &t, false)?;
+            }
             let rchecks = rls::Writing::new(checks);
             // a big one goes on in parts (see `bulk`)
             let parts = returning.is_none() && self.bulk_ok(v, &t, true)?;
@@ -61274,6 +61343,11 @@ impl<'a> Binder<'a> {
                 (Some(Type::Float4), Type::Numeric) => Expr::Func(Func::Scalar(funcs::Scalar::Float4Numeric), vec![*a]),
                 // and as text, the digits float4out writes
                 (Some(Type::Float4), Type::Text) => Expr::Func(Func::Scalar(funcs::Scalar::Float4Text), vec![*a]),
+                // a boolean[] as an array of strings: `{true,false}`, each element as boolean's cast to text writes
+                // it (booleans as text in an array are `t` and `f`, which the array's text keeps)
+                (Some(Type::Array(16)), Type::Array(25 | 1043 | 1042)) => {
+                    Expr::Cast(Box::new(Expr::Func(Func::Scalar(funcs::Scalar::BoolArrayText), vec![*a])), *t)
+                }
                 (Some(Type::Reg(r)), Type::Name) => {
                     Expr::Cast(Box::new(Expr::Func(Func::Ctx(CtxFn::RegName(r)), vec![*a])), Type::Name)
                 }

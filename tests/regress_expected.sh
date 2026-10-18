@@ -37,6 +37,8 @@ deps() {
     geometry) echo "point lseg line box path polygon circle" ;;
     horology) echo "date time timetz timestamp timestamptz interval" ;;
     select_views) echo "create_view" ;;
+    # (parallel_schedule: "aggregates depends on create_aggregate", its newavg, newsum, newcnt ...)
+    aggregates) echo "create_aggregate" ;;
     # a_star and its children (b_star ... f_star) are create_misc's
     select_parallel|join) echo "create_misc" ;;
   esac
@@ -61,10 +63,20 @@ for t in $tests; do
     runsql "$R/sql/$t.sql" "$OUT/results/$t.out"
   else echo "start failed" >"$OUT/results/$t.out"; fi
   stop
-  diff -U0 "$R/expected/$t.out" "$OUT/results/$t.out" >"$OUT/diffs/$t.diff"
-  total=$(wc -l <"$R/expected/$t.out"); minus=$(grep -c '^-[^-]' "$OUT/diffs/$t.diff"); plus=$(grep -c '^+[^+]' "$OUT/diffs/$t.diff"); bad=$((minus>plus?minus:plus))
-  [ "$total" -gt 0 ] || total=1
-  pct=$(( (total - bad) * 100 / total )); [ $pct -lt 0 ] && pct=0
+  # (as pg_regress: the expected file, or one of its variants (`t_1.out`, `t_2.out`: another platform's or build's
+  # output, a test skipped where its locales are missing), whichever differs least)
+  best=""
+  for e in "$R/expected/$t.out" "$R/expected/${t}"_[0-9].out; do
+    [ -f "$e" ] || continue
+    diff -U0 "$e" "$OUT/results/$t.out" >"$OUT/cur.diff"
+    tot=$(wc -l <"$e"); mi=$(grep -c '^-[^-]' "$OUT/cur.diff"); pl=$(grep -c '^+[^+]' "$OUT/cur.diff"); b=$((mi>pl?mi:pl))
+    [ "$tot" -gt 0 ] || tot=1
+    p=$(( (tot - b) * 100 / tot )); [ $p -lt 0 ] && p=0
+    if [ -z "$best" ] || [ ! -s "$OUT/cur.diff" ] || [ "$p" -gt "$pct" ]; then
+      best=$e; pct=$p; cp "$OUT/cur.diff" "$OUT/diffs/$t.diff"
+      [ -s "$OUT/cur.diff" ] || break
+    fi
+  done
   [ ! -s "$OUT/diffs/$t.diff" ] && { exact=$((exact+1)); st=PASS; } || st=FAIL
   sumpct=$((sumpct + pct))
   printf "%s\t%s\t%d\n" "$t" "$st" "$pct" >>"$OUT/summary.tsv"

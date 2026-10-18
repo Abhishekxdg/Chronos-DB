@@ -268,7 +268,6 @@ fn waits_end_with_the_statement_timeout_and_deadlocks_are_found() {
 fn what_advisory_locks_refuse() {
     let db = db();
     let (mut a, mut b) = (Session::new(MAIN), Session::new(MAIN));
-    assert_eq!(fails(&db, &mut a, "select pg_advisory_lock_shared(1)").0, "0A000");
     assert_eq!(q(&db, &mut a, "select pg_advisory_lock(null)"), ["null"]);
     assert_eq!(fails(&db, &mut a, "select pg_advisory_lock(1, 5000000000)").0, "22003");
     // a statement that writes doesn't wait: it fails when another session holds the lock
@@ -277,6 +276,31 @@ fn what_advisory_locks_refuse() {
     assert_eq!(code, "55P03");
     let (out, _) = in_thread(&db, "select pg_try_advisory_lock(20)").join().unwrap();
     assert_eq!(out, Ok(vec!["false".to_string()]));
+}
+
+#[test]
+fn shared_locks_wait_only_for_exclusive_ones() {
+    let db = db();
+    let (mut a, mut b) = (Session::new(MAIN), Session::new(MAIN));
+    // two sessions share a lock; an exclusive one waits for both to let go
+    q(&db, &mut a, "select pg_advisory_lock_shared(7)");
+    assert_eq!(q(&db, &mut b, "select pg_try_advisory_lock_shared(7)"), ["true"]);
+    assert_eq!(q(&db, &mut b, "select pg_try_advisory_lock(7)"), ["false"]);
+    let (out, _) = in_thread(&db, "select pg_try_advisory_lock(7)").join().unwrap();
+    assert_eq!(out, Ok(vec!["false".to_string()]));
+    // the two modes are two locks: listed apart, and let go of apart
+    let modes = q(&db, &mut a, "select mode, count(*) from pg_locks where locktype = 'advisory' group by 1 order by 1");
+    assert_eq!(modes, ["ShareLock|2"]);
+    assert_eq!(q(&db, &mut a, "select pg_advisory_unlock(7)"), ["false"]);
+    assert_eq!(q(&db, &mut a, "select pg_advisory_unlock_shared(7)"), ["true"]);
+    assert_eq!(q(&db, &mut b, "select pg_advisory_unlock_shared(7)"), ["true"]);
+    let (out, _) = in_thread(&db, "select pg_try_advisory_lock(7)").join().unwrap();
+    assert_eq!(out, Ok(vec!["true".to_string()]));
+    // an exclusive lock held keeps a shared one out
+    q(&db, &mut a, "select pg_advisory_lock(8)");
+    assert_eq!(q(&db, &mut b, "select pg_try_advisory_xact_lock_shared(8)"), ["false"]);
+    // but not the session holding it
+    assert_eq!(q(&db, &mut a, "select pg_try_advisory_lock_shared(8)"), ["true"]);
 }
 
 #[test]
@@ -328,14 +352,14 @@ fn pg_locks_shows_only_its_own_databases_locks() {
     let (mut a, mut b, mut c) = (Session::new(MAIN), Session::new(MAIN), Session::new(MAIN));
     q(&one, &mut a, "select pg_advisory_lock(31337)");
     q(&two, &mut b, "select pg_advisory_lock(0, 7)");
-    let locks = "select classid, objid, objsubid, granted, pid = pg_backend_pid() from pg_locks order by objsubid";
+    let locks = "select classid, objid, objsubid, granted, pid = pg_backend_pid() from pg_locks where locktype = 'advisory' order by objsubid";
     assert_eq!(q(&one, &mut a, locks), ["0|31337|1|true|true"]);
     assert_eq!(q(&two, &mut b, locks), ["0|7|2|true|true"]);
     // another session of the same database sees the lock (an embedded session has no pid to show)
-    assert_eq!(q(&one, &mut c, "select objid, pid from pg_locks"), ["31337|null"]);
+    assert_eq!(q(&one, &mut c, "select objid, pid from pg_locks where locktype = 'advisory'"), ["31337|null"]);
     q(&one, &mut a, "select pg_advisory_unlock_all()");
-    assert_eq!(q(&one, &mut c, "select count(*) from pg_locks"), ["0"]);
-    assert_eq!(q(&two, &mut c, "select count(*) from pg_locks"), ["1"]);
+    assert_eq!(q(&one, &mut c, "select count(*) from pg_locks where locktype = 'advisory'"), ["0"]);
+    assert_eq!(q(&two, &mut c, "select count(*) from pg_locks where locktype = 'advisory'"), ["1"]);
 }
 
 /// An error in a transaction lets go of its transaction-level advisory locks at once, as Postgres's AbortTransaction
@@ -358,4 +382,16 @@ fn an_error_lets_go_of_the_transactions_advisory_locks() {
     assert_eq!(q(&db, &mut b, held), ["true|false|true"], "an error outside a savepoint lets go of them all");
     q(&db, &mut a, "rollback");
     q(&db, &mut a, "select pg_advisory_unlock(52)");
+}
+
+#[test]
+fn unlock_all_lets_go_of_the_sessions_locks_not_the_transactions() {
+    let db = db();
+    let (mut a, mut b) = (Session::new(MAIN), Session::new(MAIN));
+    q(&db, &mut a, "begin");
+    q(&db, &mut a, "select pg_advisory_xact_lock(51), pg_advisory_lock(52)");
+    q(&db, &mut a, "select pg_advisory_unlock_all()");
+    assert_eq!(q(&db, &mut b, "select pg_try_advisory_lock(51), pg_try_advisory_lock(52)"), ["false|true"]);
+    q(&db, &mut a, "commit");
+    assert_eq!(q(&db, &mut b, "select pg_try_advisory_lock(51)"), ["true"]);
 }

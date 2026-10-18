@@ -1138,31 +1138,106 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
         // (an embedding program's) has none to show.
         "pg_locks" => {
             let ctx = STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.clone()));
-            let here = ctx.as_ref().map(|c| (Arc::as_ptr(&c.core) as usize, c.session, c.pid, c.world.clone()));
+            let here = ctx.as_ref().map(|c| (Arc::as_ptr(&c.core) as usize, c.session, c.pid, c.home.clone()));
             let pids = backend_pids();
             let datoid = here.as_ref().and_then(|h| cat.worlds.iter().position(|w| *w == h.3));
             let cols = catalog_schema::columns(name);
-            advisory::listed()
-                .into_iter()
-                .filter(|((db, ..), ..)| here.as_ref().is_some_and(|h| h.0 == *db))
-                .map(|((_, k, two), session, granted)| {
-                    let mine = here.as_ref().filter(|h| h.1 == session).map(|h| h.2);
-                    let pid = pids.get(&session).copied().or(mine);
-                    let (classid, objid) = ((k >> 32) as u32, k as u32);
-                    (cols.iter())
-                        .map(|(c, _)| match c.as_str() {
-                            "locktype" => t("advisory"),
-                            "database" => datoid.map_or(Null, |i| int(16384 + i as i64)),
-                            "classid" => int(classid.into()),
-                            "objid" => int(objid.into()),
-                            "objsubid" => int(if two { 2 } else { 1 }),
-                            "pid" => pid.map_or(Null, |p| int(p.into())),
-                            "mode" => t("ExclusiveLock"),
-                            "granted" => b(granted),
-                            "fastpath" => b(false),
-                            _ => Null,
-                        })
+            // the running statement's virtual transaction, which its session holds as Postgres's does (ExclusiveLock
+            // on its virtualxid, `backend/local transaction`)
+            let own = here.as_ref().map(|h| {
+                let vxid = format!("{}/{}", h.1, h.2);
+                (cols.iter())
+                    .map(|(c, _)| match c.as_str() {
+                        "locktype" => t("virtualxid"),
+                        "virtualxid" | "virtualtransaction" => t(&vxid),
+                        "pid" => int(h.2.into()),
+                        "mode" => t("ExclusiveLock"),
+                        "granted" | "fastpath" => b(true),
+                        _ => Null,
+                    })
+                    .collect::<Vec<Value>>()
+            });
+            // the relations LOCK TABLE locked in the running session's transaction
+            let rel_locks: Vec<(String, &'static str)> = ctx
+                .as_ref()
+                .map(|c| {
+                    c.state
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .rel_locks
+                        .iter()
+                        .map(|(n, m, _)| (n.clone(), *m))
                         .collect()
+                })
+                .unwrap_or_default();
+            let relations: Vec<Vec<Value>> = rel_locks
+                .iter()
+                .filter_map(|(n, mode)| {
+                    let oid = cat.oid_of(n)?;
+                    let h = here.as_ref()?;
+                    Some(
+                        (cols.iter())
+                            .map(|(c, _)| match c.as_str() {
+                                "locktype" => t("relation"),
+                                "database" => datoid.map_or(Null, |i| int(16384 + i as i64)),
+                                "relation" => int(oid),
+                                "virtualtransaction" => t(&format!("{}/{}", h.1, h.2)),
+                                "pid" => int(h.2.into()),
+                                "mode" => t(mode),
+                                "granted" => b(true),
+                                "fastpath" => b(false),
+                                _ => Null,
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+            own.into_iter()
+                .chain(relations)
+                .chain(
+                    advisory::listed()
+                        .into_iter()
+                        .filter(|((db, ..), ..)| here.as_ref().is_some_and(|h| h.0 == *db))
+                        .map(|((_, k, two), share, session, granted)| {
+                            let mine = here.as_ref().filter(|h| h.1 == session).map(|h| h.2);
+                            let pid = pids.get(&session).copied().or(mine);
+                            let (classid, objid) = ((k >> 32) as u32, k as u32);
+                            (cols.iter())
+                                .map(|(c, _)| match c.as_str() {
+                                    "locktype" => t("advisory"),
+                                    "database" => datoid.map_or(Null, |i| int(16384 + i as i64)),
+                                    "classid" => int(classid.into()),
+                                    "objid" => int(objid.into()),
+                                    "objsubid" => int(if two { 2 } else { 1 }),
+                                    "pid" => pid.map_or(Null, |p| int(p.into())),
+                                    "mode" => t(if share { "ShareLock" } else { "ExclusiveLock" }),
+                                    "granted" => b(granted),
+                                    "fastpath" => b(false),
+                                    _ => Null,
+                                })
+                                .collect()
+                        }),
+                )
+                .collect()
+        }
+        // the build's settings, by the names Postgres's pg_config gives them: where the server's program is, and its
+        // version; the paths and flags of a C build Chronos hasn't are "not recorded", as Postgres says of one it
+        // wasn't told
+        "pg_config" => {
+            let bin = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.display().to_string()))
+                .unwrap_or_else(|| "not recorded".into());
+            let version = format!("PostgreSQL {}", super::SERVER_VERSION);
+            PG_CONFIG_NAMES
+                .iter()
+                .map(|n| {
+                    let setting = match *n {
+                        "BINDIR" => bin.clone(),
+                        "VERSION" => version.clone(),
+                        _ => "not recorded".into(),
+                    };
+                    vec![t(n), t(&setting)]
                 })
                 .collect()
         }
@@ -1349,6 +1424,33 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
     Some((catalog_schema::columns(name), rows))
 }
 
+/// The names pg_config lists, in Postgres 16's order.
+const PG_CONFIG_NAMES: [&str; 23] = [
+    "BINDIR",
+    "DOCDIR",
+    "HTMLDIR",
+    "INCLUDEDIR",
+    "PKGINCLUDEDIR",
+    "INCLUDEDIR-SERVER",
+    "LIBDIR",
+    "PKGLIBDIR",
+    "LOCALEDIR",
+    "MANDIR",
+    "SHAREDIR",
+    "SYSCONFDIR",
+    "PGXS",
+    "CONFIGURE",
+    "CC",
+    "CPPFLAGS",
+    "CFLAGS",
+    "CFLAGS_SL",
+    "LDFLAGS",
+    "LDFLAGS_EX",
+    "LDFLAGS_SL",
+    "LIBS",
+    "VERSION",
+];
+
 /// pg_class: tables, views, materialized views, sequences and indexes.
 fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
     use Value::{Bool as b, Int as int};
@@ -1361,6 +1463,20 @@ fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
         // a sequence is one page holding one row, as Postgres counts it; a table or index that was never
         // analyzed has none counted (-1), as in Postgres (Chronos keeps no statistics)
         let (pages, tuples) = if r.kind == 'S' { (1, 1.0) } else { (0, -1.0) };
+        // a table (or materialized view) with a column whose values may be TOASTed (of a type of no fixed length,
+        // stored other than PLAIN) has a TOAST table in Postgres, as needs_toast_table decides; Chronos has none to
+        // show, but numbers it apart from every relation (the table's oid with the top bit set)
+        let toasted = matches!(r.kind, 'r' | 'm')
+            && r.columns.iter().enumerate().any(|(j, (_, ty, ..))| {
+                let (own, _) = r.typmods.get(j).copied().unwrap_or((0, -1));
+                let oid = if own != 0 { own } else { cat.type_oid(*ty) };
+                let (len, storage) = catalog_schema::type_facts(oid).map_or_else(
+                    || (if matches!(ty, Type::Enum(_)) { 4 } else { -1 }, "x".to_string()),
+                    |f| (f.0, f.3),
+                );
+                let storage = r.attopts.get(j).map_or(storage, |o| o.0.to_string());
+                len == -1 && storage != "p"
+            });
         row(vec![
             ("oid", int(cat.rel_oid(i))),
             ("relname", t(rel_part(&r.name))),
@@ -1375,10 +1491,11 @@ fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             ("relpages", int(pages)),
             ("reltuples", Value::Float(tuples)),
             ("relallvisible", int(0)),
-            ("reltoastrelid", int(0)),
+            ("reltoastrelid", int(if toasted { cat.rel_oid(i) | (1 << 31) } else { 0 })),
             ("relhasindex", b(!r.indexes.is_empty())),
             ("relisshared", b(false)),
-            ("relpersistence", t("p")),
+            // (a temporary table's is `t`: see `Catalog::of_session`)
+            ("relpersistence", t(if schema_part(&r.name) == super::catalog::TEMP_SCHEMA { "t" } else { "p" })),
             ("relkind", t(&r.kind.to_string())),
             ("relnatts", int(natts)),
             ("relchecks", int(r.constraints.iter().filter(|c| c.kind == 'c').count() as i64)),
@@ -1402,6 +1519,7 @@ fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             ),
             ("relispartition", b(r.hier.of.is_some())),
             ("relpartbound", r.hier.of.as_ref().map_or(Value::Null, |(_, text, _)| t(text))),
+            ("reloptions", super::reloptions::shown(&r.hier.reloptions)),
             ("relrewrite", int(0)),
             ("relfrozenxid", int(0)),
             ("relminmxid", int(0)),
@@ -1427,8 +1545,16 @@ fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             ("reltoastrelid", int(0)),
             ("relhasindex", b(false)),
             ("relisshared", b(false)),
-            ("relpersistence", t("p")),
+            ("relpersistence", t(if schema_part(&r.name) == super::catalog::TEMP_SCHEMA { "t" } else { "p" })),
             ("relkind", t(if r.kind == 'p' { "I" } else { "i" })),
+            (
+                "reloptions",
+                r.hier
+                    .index_reloptions
+                    .iter()
+                    .find(|(n, _)| *n == x.name)
+                    .map_or(Value::Null, |(_, o)| super::reloptions::shown(o)),
+            ),
             ("relnatts", int(x.cols.len() as i64)),
             ("relchecks", int(0)),
             ("relhasrules", b(false)),

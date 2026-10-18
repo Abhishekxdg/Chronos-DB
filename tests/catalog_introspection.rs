@@ -320,6 +320,176 @@ fn built_in_function_lookups_read_their_rows_alone() {
     assert!(took < std::time::Duration::from_secs(4), "{took:?}");
 }
 
+#[test]
+fn a_temporary_table_is_in_the_catalog() {
+    script(&[
+        ("create table t (b text)", Ok(&[])),
+        ("create temporary table t (a int primary key)", Ok(&[])),
+        // found first by its bare name, as pg_temp is first on the search_path; the world's by its schema's
+        ("select 't'::regclass = 'pg_temp.t'::regclass, 't'::regclass = 'public.t'::regclass", Ok(&["t|f"])),
+        ("select 'public.t'::regclass::text", Ok(&["public.t"])),
+        ("select to_regclass('t') is not null", Ok(&["t"])),
+        (
+            "select c.relname, c.relpersistence, n.nspname, pg_table_is_visible(c.oid) from pg_class c \
+             join pg_namespace n on n.oid = c.relnamespace where c.relname in ('t', 't_pkey') order by 1, 2",
+            Ok(&["t|p|public|f", "t|t|pg_temp_3|t", "t_pkey|t|pg_temp_3|t"]),
+        ),
+        ("select attname from pg_attribute where attrelid = 't'::regclass and attnum > 0", Ok(&["a"])),
+        ("drop table t", Ok(&[])),
+        ("select 't'::regclass::text", Ok(&["t"])),
+    ]);
+}
+
+#[test]
+fn an_update_or_delete_needs_the_replica_identity_its_publications_need() {
+    script(&[
+        ("create table keyed (a int primary key, b int)", Ok(&[])),
+        ("create table plain (a int)", Ok(&[])),
+        ("create publication by_b for table keyed where (b > 1)", Ok(&[])),
+        ("create publication everything for table plain", Ok(&[])),
+        // a WHERE that reads a column outside the replica identity, for a publication that publishes updates
+        ("update keyed set b = 2", Err("42P10")),
+        ("delete from keyed", Err("42P10")),
+        ("alter table keyed replica identity full", Ok(&[])),
+        ("update keyed set b = 2", Ok(&[])),
+        // no replica identity at all
+        ("update plain set a = 1", Err("55000")),
+        ("delete from plain", Err("55000")),
+        ("insert into plain values (1)", Ok(&[])),
+        ("alter publication everything set (publish = 'insert')", Ok(&[])),
+        ("delete from plain", Ok(&[])),
+    ]);
+}
+
+#[test]
+fn casts_written_as_calls_and_of_arrays() {
+    script(&[
+        (
+            "select regclass('pg_class')::text, regtype('int4')::text, regoper('||/')::text",
+            Ok(&["pg_class|integer|||/"]),
+        ),
+        (
+            "select array[true, false]::text[], format('%s, %s', variadic array[true, null]::text[])",
+            Ok(&["{true,false}|true, "]),
+        ),
+        ("select pg_char_to_encoding('utf-8'), pg_char_to_encoding('nonsense')", Ok(&["6|-1"])),
+        ("select count(*) from pg_conversion where conproc = 'koi8r_to_mic'::regproc", Ok(&["1"])),
+        ("select to_regrole('foo.bar') is null, to_regnamespace('foo.bar') is null", Ok(&["t|t"])),
+        ("select 'ng_catalog.int4'::regtype", Err("3F000")),
+        ("select to_regtype('ng_catalog.int4') is null", Ok(&["t"])),
+    ]);
+}
+
+#[test]
+fn storage_parameters_are_checked_and_kept() {
+    script(&[
+        (
+            "create table r (i int, s text) with (FiLLFaCToR = 30, autovacuum_enabled = false, toast.vacuum_truncate = false)",
+            Ok(&[]),
+        ),
+        ("select reloptions from pg_class where relname = 'r'", Ok(&["{fillfactor=30,autovacuum_enabled=false}"])),
+        // SET keeps the others first, in their order; RESET takes away
+        ("alter table r set (fillfactor = 31, autovacuum_analyze_scale_factor = 0.3)", Ok(&[])),
+        (
+            "select reloptions from pg_class where relname = 'r'",
+            Ok(&["{autovacuum_enabled=false,fillfactor=31,autovacuum_analyze_scale_factor=0.3}"]),
+        ),
+        ("alter table r reset (fillfactor, autovacuum_enabled, autovacuum_analyze_scale_factor)", Ok(&[])),
+        ("select reloptions is null from pg_class where relname = 'r'", Ok(&["t"])),
+        ("alter table r reset (fillfactor = 12)", Err("42601")),
+        ("create table r2 (i int) with (fillfactor = 2)", Err("22023")),
+        ("create table r2 (i int) with (autovacuum_analyze_scale_factor = -10.0)", Err("22023")),
+        ("create table r2 (i int) with (fillfactor = 'string')", Err("22023")),
+        ("create table r2 (i int) with (fillfactor = 30, fillfactor = 40)", Err("22023")),
+        ("create table r2 (i int) with (nope.fillfactor = 30)", Err("22023")),
+        ("create table r2 (i int) with (not_an_option = 1)", Err("22023")),
+        // an index's: its access method's
+        ("create index r_s on r (s) with (fillfactor = 30)", Ok(&[])),
+        ("alter index r_s set (fillfactor = 40)", Ok(&[])),
+        ("select reloptions from pg_class where relname = 'r_s'", Ok(&["{fillfactor=40}"])),
+        ("create index r_s2 on r (s) with (fillfactor = 1)", Err("22023")),
+        ("create index r_s2 on r (s) with (deduplicate_items = maybe)", Err("22023")),
+    ]);
+}
+
+#[test]
+fn a_role_has_a_comment() {
+    script(&[
+        ("create role commented", Ok(&[])),
+        ("comment on role commented is 'a role'", Ok(&[])),
+        ("select shobj_description('commented'::regrole, 'pg_authid')", Ok(&["a role"])),
+        ("alter role commented rename to commented2", Ok(&[])),
+        ("select shobj_description('commented2'::regrole, 'pg_authid')", Ok(&["a role"])),
+        ("comment on role commented2 is ''", Ok(&[])),
+        ("select shobj_description('commented2'::regrole, 'pg_authid') is null", Ok(&["t"])),
+        ("comment on role nobody is 'x'", Err("42704")),
+    ]);
+}
+
+#[test]
+fn create_table_as_needs_no_insert_on_the_table_it_makes() {
+    script(&[
+        ("create role maker", Ok(&[])),
+        ("create schema m", Ok(&[])),
+        ("grant all on schema m to public", Ok(&[])),
+        ("alter default privileges for role maker revoke insert on tables from maker", Ok(&[])),
+        ("set role maker", Ok(&[])),
+        ("create table m.made (a) as select generate_series(1, 3)", Ok(&[])),
+        ("insert into m.made values (4)", Err("42501")),
+        ("select count(*) from m.made", Ok(&["3"])),
+    ]);
+}
+
+#[test]
+fn a_catalog_table_takes_grants() {
+    script(&[
+        ("create role reader", Ok(&[])),
+        ("grant select on pg_proc to reader", Ok(&[])),
+        ("grant select (prosrc) on pg_proc to reader", Ok(&[])),
+        ("grant select (rolname, rolsuper) on pg_authid to reader", Ok(&[])),
+        ("grant select (nope) on pg_proc to reader", Err("42703")),
+    ]);
+}
+
+#[test]
+fn admin_option_reaches_through_any_membership() {
+    script(&[
+        ("create role boss createrole", Ok(&[])),
+        ("set role boss", Ok(&[])),
+        // boss made manager, so holds ADMIN OPTION on it (by a grant without INHERIT); manager made worker
+        ("create role manager createrole", Ok(&[])),
+        ("set role manager", Ok(&[])),
+        ("create role worker", Ok(&[])),
+        ("reset role", Ok(&[])),
+        ("set role boss", Ok(&[])),
+        ("select pg_has_role('boss', 'worker', 'usage with admin option')", Ok(&["t"])),
+        ("drop role worker", Ok(&[])),
+    ]);
+}
+
+#[test]
+fn a_table_of_values_of_no_fixed_length_has_a_toast_table() {
+    script(&[
+        ("create table toasted (a text, c text storage plain)", Ok(&[])),
+        ("create table fixed (a int, b timestamptz)", Ok(&[])),
+        (
+            "select relname, reltoastrelid <> 0 from pg_class where relname in ('toasted', 'fixed') order by 1",
+            Ok(&["fixed|f", "toasted|t"]),
+        ),
+        ("select pg_typeof(datname)::text from pg_database limit 1", Ok(&["name"])),
+    ]);
+}
+
+#[test]
+fn a_publication_has_a_comment() {
+    script(&[
+        ("create publication commented", Ok(&[])),
+        ("comment on publication commented is 'test publication'", Ok(&[])),
+        ("select obj_description(p.oid, 'pg_publication') from pg_publication p", Ok(&["test publication"])),
+        ("comment on publication nope is 'x'", Err("42704")),
+    ]);
+}
+
 /// `pg_constraint`'s one-letter columns are of Postgres's `"char"` type (OID 18), not text, and so is `x::"char"`:
 /// Prisma's schema engine reads `contype` only as one, and failed `prisma db push` on any database with a CHECK
 /// constraint (its constraints query, as Prisma 6.2 sends it, is below).

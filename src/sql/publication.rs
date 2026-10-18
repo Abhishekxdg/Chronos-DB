@@ -104,6 +104,124 @@ pub(crate) fn load(v: &View) -> Result<Vec<Publication>> {
     Ok(out)
 }
 
+/// What an UPDATE (`update`) or DELETE of table `t` needs of the publications it is in, as Postgres's
+/// `CheckCmdReplicaIdentity` checks before a row is read: a WHERE of a publication that publishes the change may read
+/// only replica identity columns, and its column list must cover them (a table of REPLICA IDENTITY FULL may have none);
+/// then the table needs a replica identity (its primary key, an index USING INDEX named, or FULL) if one publishes it.
+/// A partition is in its ancestors' publications too; with publish_via_partition_root, the topmost ancestor the
+/// publication names lends its WHERE and column list.
+pub(super) fn check_replica_identity(v: &View, t: &Table, update: bool) -> Result<()> {
+    let pubs = load(v)?;
+    if pubs.is_empty() || !t.schema {
+        return Ok(());
+    }
+    // the partition's ancestors, nearest first
+    let mut ancestors: Vec<Table> = vec![];
+    let mut up = t.hier.of.as_ref().map(|(p, _)| p.clone());
+    while let Some(p) = up {
+        if ancestors.iter().any(|a| a.name == p) {
+            break;
+        }
+        let Some(a) = super::load(v, &p)? else { break };
+        up = a.hier.of.as_ref().map(|(p, _)| p.clone());
+        ancestors.push(a);
+    }
+    let rels: Vec<&Table> = std::iter::once(t).chain(&ancestors).collect();
+    let replident = t.hier.replident.as_ref().map_or('d', |r| r.0);
+    let name_of = |id: u32| t.cols.iter().find(|c| c.id == id).map(|c| c.name.clone());
+    // the replica identity index's columns (INDEX_ATTR_BITMAP_IDENTITY_KEY), if the table has one
+    let identity: Option<Vec<String>> = match (replident, t.hier.replident.as_ref().and_then(|r| r.1.as_deref())) {
+        ('d', _) if t.has_key() => Some(t.key_cols().iter().map(|&i| t.cols[i].name.clone()).collect()),
+        ('d', _) => t.uniques.iter().find(|u| u.primary).map(|u| u.cols.iter().filter_map(|&c| name_of(c)).collect()),
+        ('i', Some(x)) if x == t.pkey_name() && t.has_key() => {
+            Some(t.key_cols().iter().map(|&i| t.cols[i].name.clone()).collect())
+        }
+        ('i', Some(x)) => t
+            .uniques
+            .iter()
+            .find(|u| u.name == x)
+            .map(|u| u.cols.clone())
+            .or_else(|| t.indexes.iter().find(|i| i.name == x).map(|i| i.cols.clone()))
+            .map(|ids| ids.iter().filter_map(|&c| name_of(c)).collect()),
+        _ => None,
+    };
+    let key: &[String] = identity.as_deref().unwrap_or(&[]);
+    let (mut publishes, mut filter_ok, mut cols_ok) = (false, true, true);
+    for p in &pubs {
+        let named = |r: &Table| p.tables.iter().any(|m| m.table == r.name);
+        let in_schema = |r: &Table| p.schemas.iter().any(|s| s == schema_part(&r.name));
+        if !(p.all || rels.iter().any(|r| named(r) || in_schema(r))) {
+            continue;
+        }
+        let does = if update { p.publish[1] } else { p.publish[2] };
+        publishes |= does;
+        if !(p.publish[1] || p.publish[2]) {
+            continue;
+        }
+        // the member whose WHERE and column list apply: the table's own, or with publish_via_partition_root the
+        // topmost ancestor the publication publishes (GetTopMostAncestorInPublication)
+        let mut from: &Table = t;
+        if p.via_root
+            && let Some(a) = ancestors.iter().rev().find(|a| named(a) || in_schema(a))
+        {
+            from = a;
+        }
+        let Some(m) = p.tables.iter().find(|m| m.table == from.name) else { continue };
+        if let Some(text) = m.filter.as_deref()
+            && replident != 'f'
+            && let Ok(e) = check_expr(text)
+        {
+            let mut read = false;
+            walk(&e, &mut |x| {
+                if let Expr::Col(_, c) = x
+                    && !key.contains(c)
+                {
+                    read = true;
+                }
+            });
+            if read && does {
+                filter_ok = false;
+            }
+        }
+        if let Some(cols) = &m.cols
+            && (replident == 'f' || key.iter().any(|k| !cols.contains(k)))
+            && does
+        {
+            cols_ok = false;
+        }
+    }
+    let table = rel_part(&t.name);
+    let (verb, what) = if update { ("update", "updates") } else { ("delete from", "deletes") };
+    if !filter_ok {
+        return Err(with_detail(
+            "42P10",
+            format!("cannot {verb} table \"{table}\""),
+            "Column used in the publication WHERE expression is not part of the replica identity.",
+        ));
+    }
+    if !cols_ok {
+        return Err(with_detail(
+            "42P10",
+            format!("cannot {verb} table \"{table}\""),
+            "Column list used by the publication does not cover the replica identity.",
+        ));
+    }
+    if publishes && identity.is_none() && replident != 'f' {
+        let hint = if update { "updating" } else { "deleting from" };
+        return Err(SqlError {
+            code: "55000",
+            message: format!(
+                "cannot {verb} table \"{table}\" because it does not have a replica identity and publishes {what}"
+            ),
+            info: Some(Box::new(Violation {
+                hint: Some(format!("To enable {hint} the table, set REPLICA IDENTITY using ALTER TABLE.")),
+                ..Violation::default()
+            })),
+        });
+    }
+    Ok(())
+}
+
 fn find(v: &View, name: &str) -> Result<Option<Publication>> {
     Ok(v.get(&key(name))?.map(|raw| Publication::from_json(name, &serde_json::from_str(&raw).unwrap_or_default())))
 }

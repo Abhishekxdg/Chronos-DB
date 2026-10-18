@@ -69,6 +69,9 @@ pub(super) enum Scalar {
     Float4Numeric,
     /// a real as text (float4out): its float4 digits, not its double's
     Float4Text,
+    /// a boolean[] cast to a text[] (or varchar[], bpchar[]): each element as boolean's cast to text writes it,
+    /// `true` and `false`, not boolout's `t` and `f` an array of booleans is written with
+    BoolArrayText,
     /// a real arithmetic's result held to 32 bits (float4pl and its kin round each result: `0.1::real + 0.2::real` is
     /// the real nearest 0.3), 22003 where a finite result passes a real's range
     Float4Round,
@@ -345,6 +348,8 @@ pub(super) enum Scalar {
     NumNulls,
     NumNonnulls,
     EncodingToChar,
+    /// pg_char_to_encoding: an encoding's number from its name, -1 for a name that is none
+    CharToEncoding,
     Cardinality,
     ArrayLength,
     ArrayLower,
@@ -783,6 +788,7 @@ pub(super) fn lookup(name: &str) -> Option<(Scalar, std::ops::RangeInclusive<usi
         "num_nulls" => (NumNulls, 1..=MANY),
         "num_nonnulls" => (NumNonnulls, 1..=MANY),
         "pg_encoding_to_char" => (EncodingToChar, 1..=1),
+        "pg_char_to_encoding" => (CharToEncoding, 1..=1),
         "cardinality" => (Cardinality, 1..=1),
         "array_length" => (ArrayLength, 2..=2),
         "array_lower" => (ArrayLower, 2..=2),
@@ -900,7 +906,7 @@ pub(super) fn result_type(f: Scalar, first: Option<Type>) -> Type {
         JsonOpFn(5 | 6) => Type::Json,
         JsonOpFn(_) => Type::Bool,
         f if super::pgcrypto::ours(f) => super::pgcrypto::result_type(f),
-        Strpos | Position | OctetLength | Ascii | Grouping | GetByte | BitLength => Type::Int,
+        Strpos | Position | OctetLength | Ascii | Grouping | GetByte | BitLength | CharToEncoding => Type::Int,
         Decode | Sha224 | Sha256 | Sha384 | Sha512 | SetByte | ConvertTo => Type::Bytea,
         // a bytea's part, or its bytea with another in the middle, is a bytea
         Substr | Overlay if first == Some(Type::Bytea) => Type::Bytea,
@@ -908,6 +914,7 @@ pub(super) fn result_type(f: Scalar, first: Option<Type>) -> Type {
         FloatAccum(_) => Type::Array(Type::Float.oid()),
         Float4Numeric => Type::Numeric,
         Float4Text => Type::Text,
+        BoolArrayText => Type::Array(25),
         // x::"char"
         Char => Type::Letter,
         Float4Digits | Float4Round | Float4Acc => Type::Float4,
@@ -2087,6 +2094,14 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
         FloatAccum(k) => return super::stats::transition(k, a),
         Float4Text if matches!(a[0], JsonText(_)) => Text(a[0].to_text()),
         Float4Text => Text(super::fmt_float4(float(&a[0])?)),
+        BoolArrayText if matches!(a[0], Null) => Null,
+        BoolArrayText => Text(super::map_array_text(&text(&a[0]), &mut |x| {
+            Ok(x.map(|x| match x.as_str() {
+                "t" => "true".to_string(),
+                "f" => "false".to_string(),
+                _ => x,
+            }))
+        })?),
         // (held as a JSON number's text, which a row, an array or JSON writes as it is, and a jsonb reads as the
         // number: `1.6777216e+07`)
         Float4Acc => a[0].clone(),
@@ -3311,6 +3326,13 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
         // '' for a number that names no encoding, as in Postgres
         EncodingToChar => {
             Text(usize::try_from(int(&a[0])?).ok().and_then(|i| ENCODINGS.get(i)).map_or("", |e| e).into())
+        }
+        // (its name compared as Postgres's clean_encoding_name leaves it: letters and digits only, in lower case, so
+        // `utf-8` is UTF8)
+        CharToEncoding => {
+            let clean = |s: &str| s.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_lowercase();
+            let name = clean(&s());
+            Int(ENCODINGS.iter().position(|e| clean(e) == name).map_or(-1, |i| i as i64))
         }
         // cardinality: all the elements; the others of dimension d, null for one the array doesn't have
         Cardinality | ArrayLength | ArrayLower | ArrayUpper => {

@@ -889,7 +889,35 @@ pub(crate) enum Obj<'a> {
 
 impl Catalog {
     pub(crate) fn of(core: &crate::Core, branch: &str) -> Result<Catalog> {
-        let rels = tables(core, branch)?;
+        Catalog::build(core, branch, false)
+    }
+
+    /// `of`, with the running session's temporary tables too, in schema `pg_temp` (stored as `pg_temp.name`): what
+    /// a query of the catalog and the catalog's functions (regclass, ...) see, as a Postgres session sees its own
+    /// temporary tables in pg_class.
+    pub(crate) fn of_session(core: &crate::Core, branch: &str) -> Result<Catalog> {
+        Catalog::build(core, branch, true)
+    }
+
+    fn build(core: &crate::Core, branch: &str, temp: bool) -> Result<Catalog> {
+        // (the world's own relations, not the temporary tables the session's statements find first by those names)
+        let temp_tables = super::TEMP.take();
+        let rels = tables(core, branch);
+        super::TEMP.set(temp_tables);
+        let mut rels = rels?;
+        // (none when the statement runs in the temporary tables' database itself: they are its own then)
+        if temp
+            && let Some((db, temp_branch)) = super::TEMP.with_borrow(Clone::clone)
+            && !std::ptr::eq(&*db.core, core)
+        {
+            for mut r in tables(&db.core, &temp_branch)? {
+                if schema_part(&r.name) == "public" {
+                    // (not `qualify`, which leaves pg_temp off as the parser's names have it)
+                    r.name = format!("{TEMP_SCHEMA}.{}", r.name);
+                    rels.push(r);
+                }
+            }
+        }
         let schemas = namespaces(&core.view_tx(branch)?)?.into_iter().skip(1).collect();
         let idx = rels.iter().enumerate().flat_map(|(i, r)| r.indexes.iter().map(move |x| (i, x.clone()))).collect();
         let mut cons: Vec<(usize, Con)> =
@@ -1070,6 +1098,12 @@ impl Catalog {
                 "server" => self.foreign.server_oid(rest).map(|o| (o, 1417, 0)),
                 "type" => self.enums.iter().position(|(n, _)| n == rest).map(|k| (self.enum_oid(k), 1247, 0)),
                 "function" => self.funcs.iter().position(|f| f.sig() == rest).map(|k| (self.func_oid(k), 1255, 0)),
+                // (pg_description has no role's: pg_shdescription does)
+                "role" => None,
+                "publication" => super::publication::publication_oids(self)
+                    .into_iter()
+                    .find(|(_, k)| self.pubs[*k].name == rest)
+                    .map(|(o, _)| (o, 6104, 0)),
                 "large object" => rest.parse().ok().map(|o| (o, 2613, 0)),
                 _ => None,
             };
@@ -1114,6 +1148,13 @@ impl Catalog {
             }
             (None, Some(Slot::Schema(k))) if sub == 0 && is("pg_namespace") => format!("schema/{}", self.schemas[*k]),
             (None, Some(Slot::Enum(k))) if sub == 0 && is("pg_type") => format!("type/{}", self.enums[*k].0),
+            // (a publication's, by name)
+            (None, _) if sub == 0 && is("pg_publication") => {
+                let (_, k) = super::publication::publication_oids(self).into_iter().find(|(o, _)| *o == oid)?;
+                format!("publication/{}", self.pubs[k].name)
+            }
+            // (a role's, which Postgres keeps in pg_shdescription: by its oid, so it stays through a rename)
+            (None, _) if sub == 0 && is("pg_authid") && self.reg.by_oid(oid).is_some() => format!("role/{oid}"),
             _ if sub == 0 && class.as_deref() == Some("pg_largeobject") => format!("large object/{oid}"),
             (None, _) if sub == 0 && is("pg_proc") && self.func_oids.contains(&oid) => {
                 let k = self.func_oids.iter().position(|o| *o == oid)?;
@@ -1155,6 +1196,7 @@ impl Catalog {
             "public" => 2200,
             "pg_catalog" => 11,
             "information_schema" => 13000,
+            TEMP_SCHEMA => TEMP_SCHEMA_OID,
             s => self.schemas.iter().position(|x| x == s).map_or(0, |k| self.named.schemas[k]),
         }
     }
@@ -1269,11 +1311,17 @@ impl Catalog {
     pub(super) fn rel_named(&self, schema: Option<&str>, name: &str) -> Option<i64> {
         match schema {
             Some("pg_catalog") => return table_oid(name).or_else(|| self.oid_of(name)),
+            Some(TEMP_SCHEMA) => return self.oid_of(&format!("{TEMP_SCHEMA}.{name}")),
             Some(s) => return self.oid_of(&qualify(s, name)),
             None => {}
         }
         // a temporary table first, as Postgres reads pg_temp first; else the first schema of the path that has a
         // relation or an index of the name (a serial's sequence too), public only where it is on the path
+        if has_temp(name)
+            && let Some(o) = self.oid_of(&format!("{TEMP_SCHEMA}.{name}"))
+        {
+            return Some(o);
+        }
         let first = find_named(name, Kind::Rel);
         if (first != name || has_temp(name))
             && let Some(o) = self.oid_of(&first)
@@ -1464,7 +1512,7 @@ fn catalog_now() -> Result<Arc<Catalog>> {
         return err(UNSUPPORTED, "the catalog is being built");
     }
     BUILDING.set(true);
-    let built = Catalog::of(&core, &world);
+    let built = Catalog::of_session(&core, &world);
     BUILDING.set(false);
     let c = Arc::new(built?);
     WORLD.with_borrow_mut(|w| {
@@ -1663,7 +1711,8 @@ pub(super) fn call(f: CtxFn, a: &[Value]) -> Result<Value> {
             v => Text(v.to_text()),
         };
         return match reg_cast(&cat, kind, true, &given) {
-            Err(e) if matches!(e.code, "42P01" | "42704" | "3F000" | "42883" | "42725" | "42P02") => Ok(Null),
+            // (and, as Postgres 16's input functions report it softly, a name of the wrong syntax: `foo.bar` for a role)
+            Err(e) if matches!(e.code, "42P01" | "42704" | "3F000" | "42883" | "42725" | "42P02" | "42602") => Ok(Null),
             r => r,
         };
     }
@@ -1910,6 +1959,11 @@ pub(super) fn call(f: CtxFn, a: &[Value]) -> Result<Value> {
         }
         // TableIsVisible: along the search_path, the first relation of its name is this one
         _ => match oid(&a[0])?.and_then(|o| cat.find(o)) {
+            // (the session's temporary tables are first along it, as pg_temp is)
+            Some(Obj::Rel(i)) if schema_part(&cat.rels[i].name) == TEMP_SCHEMA => Bool(true),
+            Some(Obj::Index(r, _)) if schema_part(&cat.rels[r].name) == TEMP_SCHEMA => Bool(true),
+            // (and hide the world's relations of their names)
+            Some(Obj::Rel(i)) if has_temp(rel_part(&cat.rels[i].name)) => Bool(false),
             Some(Obj::Rel(i)) => {
                 let name = &cat.rels[i].name;
                 Bool(match on_path(rel_part(name), Kind::Rel) {
@@ -2710,6 +2764,13 @@ fn type_named(cat: &Catalog, text: &str) -> Result<i64> {
         [s, n] => (Some(s.as_str()), n.as_str()),
         _ => return Err(missing(bare)),
     };
+    // (a schema that isn't there is said first, as Postgres's LookupTypeName finds the schema before the type)
+    if let Some(s) = schema
+        && cat.schema_oid(s) == 0
+        && !matches!(s, "pg_temp" | "pg_toast")
+    {
+        return err("3F000", format!("schema \"{s}\" does not exist"));
+    }
     // (a built-in type's names, its words spaced as written: `double  precision`; an interval's fields are read and
     // left, `interval day to second`)
     let mut spaced = plain.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2781,6 +2842,7 @@ pub(super) fn reg_shown(cat: &Catalog, kind: Reg, oid: i64) -> String {
             11 => Some("pg_catalog".into()),
             2200 => Some("public".into()),
             13000 => Some("information_schema".into()),
+            TEMP_SCHEMA_OID => Some("pg_temp_3".into()),
             o => cat.schemas.iter().find(|s| cat.schema_oid(s) == o).map(|s| super::collation::quoted(s)),
         },
         Reg::Role => cat.reg.by_oid(oid).map(|r| super::collation::quoted(&r.name)),
@@ -2822,6 +2884,12 @@ fn reg_cast(cat: &Catalog, kind: Reg, to_oid: bool, v: &Value) -> Result<Value> 
         },
     }))
 }
+
+/// The schema the session's temporary tables are in, as the catalog names them (see `Catalog::of_session`), and its
+/// oid: Postgres's own `pg_temp_N` is made as a backend first needs it, so its oid is the first a database's objects
+/// get.
+pub(super) const TEMP_SCHEMA: &str = "pg_temp";
+pub(super) const TEMP_SCHEMA_OID: i64 = 16384;
 
 /// The oid Postgres gives the catalog table or view of this name (what `tableoid` says, and
 /// `'pg_class'::regclass`).
@@ -3170,7 +3238,7 @@ pub(super) fn rows(branch: &str, name: &str, cat: &Catalog) -> Option<Rows> {
         "pg_database" => (
             &[
                 ("oid", Oid),
-                ("datname", T),
+                ("datname", Type::Name),
                 ("datdba", Oid),
                 ("encoding", I),
                 ("datlocprovider", T),
@@ -3207,7 +3275,9 @@ pub(super) fn rows(branch: &str, name: &str, cat: &Catalog) -> Option<Rows> {
         ),
         "pg_am" => (
             &[("oid", Oid), ("amname", T), ("amhandler", Type::Reg(Reg::Proc)), ("amtype", T)],
+            // (hnsw is pgvector's: listed once an index uses it, as Postgres lists it only where the extension is)
             AMS.iter()
+                .filter(|(_, n, ..)| *n != "hnsw" || cat.idx.iter().any(|(_, x)| x.method == "hnsw"))
                 .map(|(o, n, h, k)| {
                     let handler = catalog_schema::builtin_procs(h).first().copied().unwrap_or(0);
                     vec![int(*o), t(n), Value::Reg(handler, Reg::Proc), t(k)]

@@ -294,8 +294,22 @@ impl Registry {
         member == role || self.superuser(member) || self.reached(member, Through::Set).contains(&role)
     }
 
+    /// Whether `member` holds ADMIN OPTION on `role` through itself or any role it is a member of, through any grant
+    /// (as Postgres 16's is_admin_of_role follows ROLERECURSE_MEMBERS): what may change or drop a role, and
+    /// pg_has_role's WITH ADMIN OPTION; a superuser does.
+    pub(crate) fn is_admin_of(&self, member: i64, role: i64) -> bool {
+        if self.superuser(member) {
+            return true;
+        }
+        member != role
+            && self
+                .reached(member, Through::Any)
+                .into_iter()
+                .any(|r| self.members.iter().any(|g| g.member == r && g.role == role && g.admin))
+    }
+
     /// The role through which `member` holds ADMIN OPTION on `role` (itself or one whose privileges it
-    /// has), if any; a superuser's is the bootstrap superuser.
+    /// has: what a GRANT is made as), if any; a superuser's is the bootstrap superuser.
     pub(crate) fn admin_of(&self, member: i64, role: i64) -> Option<i64> {
         if self.superuser(member) {
             return Some(BOOTSTRAP);
@@ -1094,7 +1108,7 @@ pub(super) fn run(db: &Db, st: &RoleStmt) -> Result<Output> {
             // (ADMIN OPTION on the group first, as Postgres's AlterRole asks it)
             if let Some(r) = who.reg.named(group)
                 && !who.superuser
-                && who.reg.admin_of(who.oid, r.oid).is_none()
+                && !who.reg.is_admin_of(who.oid, r.oid)
             {
                 return Err(denied(
                     "permission denied to alter role",
@@ -1171,6 +1185,7 @@ fn create(db: &Db, who: &Who, name: &str, user: bool, o: &Opts) -> Result<Output
     if taken(db, &who.reg, name) {
         return Err(already(name));
     }
+    let self_grant = super::session_setting("createrole_self_grant");
     change(db, |reg| {
         if reg.named(name).is_some() {
             return Err(already(name));
@@ -1193,7 +1208,8 @@ fn create(db: &Db, who: &Who, name: &str, user: bool, o: &Opts) -> Result<Output
         };
         reg.roles.push(r);
         // a role made by a CREATEROLE user who isn't a superuser: its maker gets ADMIN OPTION on it,
-        // granted by the bootstrap superuser (Postgres 16, createrole_self_grant unset)
+        // granted by the bootstrap superuser; and with createrole_self_grant set (`set, inherit`), a membership
+        // with those options too, granted by the maker itself (as Postgres 16's CreateRole)
         if !who.superuser {
             let g = reg.new_oid();
             reg.members.push(Member {
@@ -1205,6 +1221,20 @@ fn create(db: &Db, who: &Who, name: &str, user: bool, o: &Opts) -> Result<Output
                 inherit: false,
                 set: false,
             });
+            let options = self_grant.as_deref().unwrap_or_default().to_lowercase();
+            let has = |o: &str| options.split(',').any(|x| x.trim() == o);
+            if has("set") || has("inherit") {
+                let g = reg.new_oid();
+                reg.members.push(Member {
+                    oid: g,
+                    role: oid,
+                    member: who.oid,
+                    grantor: who.oid,
+                    admin: false,
+                    inherit: has("inherit"),
+                    set: has("set"),
+                });
+            }
         }
         let snapshot = Who { reg: Arc::new(reg.clone()), ..who.clone() };
         for r in &o.in_role {
@@ -1229,7 +1259,7 @@ fn missing(name: &str) -> SqlError {
 
 /// Whether `who` may change role `r` at all (ALTER, RENAME, DROP): CREATEROLE and ADMIN OPTION on it.
 fn may_manage(who: &Who, r: &Role) -> bool {
-    who.superuser || (createrole(who) && who.reg.admin_of(who.oid, r.oid).is_some())
+    who.superuser || (createrole(who) && who.reg.is_admin_of(who.oid, r.oid))
 }
 
 fn alter(db: &Db, who: &Who, name: &Spec, o: &Opts) -> Result<Output> {
@@ -1800,7 +1830,7 @@ pub(crate) fn has_role(reg: &Registry, member: i64, role: i64, mode: &str) -> bo
     let mode = mode.trim().to_lowercase();
     let with_admin = mode.ends_with("with admin option") || mode.ends_with("with grant option");
     if with_admin {
-        return reg.admin_of(member, role).is_some();
+        return reg.is_admin_of(member, role);
     }
     match mode.as_str() {
         "usage" => reg.has_privs_of(member, role),

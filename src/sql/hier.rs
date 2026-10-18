@@ -47,6 +47,11 @@ pub(super) struct Hier {
     /// CREATE TABLE ... OF type: the composite type (its stored name) the table is made of (pg_class.reloftype),
     /// which DROP TYPE finds it by
     pub(super) of_type: Option<String>,
+    /// storage parameters, `name=value` as written (pg_class.reloptions): the table's, its TOAST table's
+    /// (`toast.` ones), and its indexes', by index name (see `reloptions`)
+    pub(super) reloptions: Vec<String>,
+    pub(super) toast_reloptions: Vec<String>,
+    pub(super) index_reloptions: Vec<(String, Vec<String>)>,
 }
 
 impl Hier {
@@ -70,6 +75,14 @@ impl Hier {
                 .and_then(|s| s.chars().next())
                 .map(|k| (k, j["replident_index"].as_str().map(String::from))),
             of_type: j["of_type"].as_str().map(String::from),
+            reloptions: strs(&j["reloptions"]),
+            toast_reloptions: strs(&j["toast_reloptions"]),
+            index_reloptions: j["index_reloptions"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(x, o)| (x.clone(), strs(o)))
+                .collect(),
         }
     }
 
@@ -97,6 +110,17 @@ impl Hier {
         }
         if let Some(x) = &self.of_type {
             j["of_type"] = Json::String(x.clone());
+        }
+        if !self.reloptions.is_empty() {
+            j["reloptions"] = serde_json::json!(self.reloptions);
+        }
+        if !self.toast_reloptions.is_empty() {
+            j["toast_reloptions"] = serde_json::json!(self.toast_reloptions);
+        }
+        if !self.index_reloptions.is_empty() {
+            let m: serde_json::Map<String, Json> =
+                self.index_reloptions.iter().map(|(x, o)| (x.clone(), serde_json::json!(o))).collect();
+            j["index_reloptions"] = Json::Object(m);
         }
         if let Some((k, index)) = &self.replident {
             j["replident"] = Json::String(k.to_string());
@@ -159,6 +183,8 @@ pub(super) struct CreateHier {
     pub(super) pkey_name: Option<String>,
     /// OF type: the composite type's stored name (see `Hier::of_type`)
     pub(super) of_type: Option<String>,
+    /// WITH (storage parameters): the table's and its TOAST table's, checked (see `reloptions`)
+    pub(super) reloptions: (Vec<String>, Vec<String>),
 }
 
 /// How ALTER TABLE ... DETACH PARTITION goes about it.
@@ -3333,6 +3359,9 @@ pub struct HierInfo {
     pub replident: char,
     /// a typed table's composite type, by stored name (see `Hier::of_type`)
     pub of_type: Option<String>,
+    /// its storage parameters, and its indexes', by name (see `Hier::reloptions`)
+    pub reloptions: Vec<String>,
+    pub index_reloptions: Vec<(String, Vec<String>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -3585,6 +3614,8 @@ pub(super) fn info(v: &View, t: &Table) -> Result<HierInfo> {
         cols: t.cols.iter().map(|c| (c.local, i64::from(c.inh))).collect(),
         replident: t.hier.replident.as_ref().map_or('d', |r| r.0),
         of_type: t.hier.of_type.clone(),
+        reloptions: t.hier.reloptions.clone(),
+        index_reloptions: t.hier.index_reloptions.clone(),
         ..HierInfo::default()
     };
     h.parents = t.hier.all_parents().into_iter().map(String::from).collect();

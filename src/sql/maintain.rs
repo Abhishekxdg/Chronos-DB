@@ -50,6 +50,10 @@ pub(super) struct Maintain {
     pub using: Option<String>,
     /// REINDEX CONCURRENTLY, which can't run in a transaction block
     pub concurrently: bool,
+    /// VACUUM (with ANALYZE or not): what a skipped table's warning says it couldn't do
+    pub vacuum: bool,
+    /// VACUUM (PARALLEL n), n > 0: which a temporary table can't be vacuumed with
+    pub parallel: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -82,6 +86,10 @@ pub(super) enum Commented {
     Type(String),
     /// a function or procedure, by name and argument types (None: the one of that name)
     Func(String, Option<Vec<Type>>, bool),
+    /// a role, by name
+    Role(String),
+    /// a publication, by name
+    Publication(String),
     /// a large object, by its oid
     LargeObject(i64),
     /// a database, extension, function, role...: nothing here to look up
@@ -98,14 +106,43 @@ pub(super) struct Comment {
 /// LOCK TABLE
 #[derive(Clone, Debug)]
 pub(super) struct Lock {
-    pub tables: Vec<String>,
+    /// each table as written, and whether ONLY (its children aren't locked)
+    pub tables: Vec<(String, bool)>,
     /// held against writers as well as other lockers: a mode that conflicts with its own kind
     pub strong: bool,
     pub nowait: bool,
+    /// the mode, as pg_locks names it (`AccessExclusiveLock`)
+    pub mode: &'static str,
 }
 
-fn bad_option(verb: &str, name: &str) -> SqlError {
-    SqlError { code: SYNTAX, message: format!("unrecognized {verb} option \"{name}\""), info: None }
+/// BUFFER_USAGE_LIMIT's value as Postgres's parse_int reads it in kB (`512 kB`, `1MB`, or a number of kB): 0, or
+/// from 128 kB to 16 GB.
+fn buffer_usage_limit(v: &str) -> Result<()> {
+    let refuse = |hint: Option<&str>| SqlError {
+        code: "22023",
+        message: "BUFFER_USAGE_LIMIT option must be 0 or between 128 kB and 16777216 kB".into(),
+        info: hint.map(|h| Box::new(Violation { hint: Some(h.into()), ..Violation::default() })),
+    };
+    let t = v.trim();
+    let digits = t.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(t.len());
+    let (n, unit) = (&t[..digits], t[digits..].trim());
+    let Ok(n) = n.parse::<f64>() else { return Err(refuse(None)) };
+    let kb = match unit {
+        "" | "kB" => n,
+        "MB" => n * 1024.0,
+        "GB" => n * 1024.0 * 1024.0,
+        "TB" => n * 1024.0 * 1024.0 * 1024.0,
+        "B" => n / 1024.0,
+        _ => return Err(refuse(None)),
+    };
+    let kb = kb.round_ties_even();
+    if kb > f64::from(i32::MAX) {
+        return Err(refuse(Some("Value exceeds integer range.")));
+    }
+    if kb != 0.0 && !(128.0..=16_777_216.0).contains(&kb) {
+        return Err(refuse(None));
+    }
+    Ok(())
 }
 
 impl Parser {
@@ -120,10 +157,12 @@ impl Parser {
         Ok(if self.sym(".") { format!("{first}.{}", self.name()?) } else { first })
     }
 
-    /// `( option [value] [, ...] )` after its `(`, each option one of `known`: (name, value's text).
-    fn options(&mut self, verb: &str, known: &[&str]) -> Result<Vec<(String, Option<String>)>> {
+    /// `( option [value] [, ...] )` after its `(`, each option one of `known`: (name, value's text, and where its
+    /// name is, for an error that points at it). A value is a word, a string or a number, maybe negative.
+    fn options(&mut self, verb: &str, known: &[&str]) -> Result<Vec<(String, Option<String>, usize)>> {
         let mut out = vec![];
         loop {
+            let at = self.i;
             let name = match self.next() {
                 Some(Tok::Word(w)) => w,
                 t => {
@@ -131,17 +170,28 @@ impl Parser {
                     return self.fail("expected an option name");
                 }
             };
-            if !known.contains(&name.as_str()) {
-                return Err(bad_option(verb, &name));
-            }
             let value = match self.peek() {
                 Some(Tok::Word(_) | Tok::Num(_) | Tok::Str(_)) => match self.next() {
                     Some(Tok::Word(v) | Tok::Num(v) | Tok::Str(v)) => Some(v),
                     _ => None,
                 },
+                // (a negative number; `-` before anything else is a syntax error at what follows it)
+                Some(Tok::Sym("-")) => {
+                    self.i += 1;
+                    match self.next() {
+                        Some(Tok::Num(n)) => Some(format!("-{n}")),
+                        t => {
+                            self.put_back(t);
+                            return self.fail("expected a number");
+                        }
+                    }
+                }
                 _ => None,
             };
-            out.push((name, value));
+            if !known.contains(&name.as_str()) {
+                return self.err_at(at, SYNTAX, &format!("unrecognized {verb} option \"{name}\""));
+            }
+            out.push((name, value, at));
             if !self.sym(",") {
                 break;
             }
@@ -150,9 +200,16 @@ impl Parser {
         Ok(out)
     }
 
-    /// After VACUUM or ANALYZE.
+    /// After VACUUM or ANALYZE. Its options are checked as Postgres's ExecVacuum checks them, though none changes
+    /// what it does here.
     pub(super) fn vacuum(&mut self, verb: Verb) -> Result<Stmt> {
         let mut analyze = verb == Verb::Analyze;
+        // (FULL, PARALLEL's workers, BUFFER_USAGE_LIMIT given, DISABLE_PAGE_SKIPPING, PROCESS_TOAST, ONLY_DATABASE_STATS
+        // and whether another option is given with it)
+        let (mut full, mut workers, mut limit, mut skipping, mut toast, mut only, mut others) =
+            (false, 0, false, false, true, false, false);
+        let on =
+            |v: &Option<String>| !matches!(v.as_deref().map(str::to_lowercase).as_deref(), Some("false" | "off" | "0"));
         if self.sym("(") {
             let known: &[&str] = if verb == Verb::Vacuum {
                 &[
@@ -175,15 +232,45 @@ impl Parser {
             } else {
                 &["verbose", "skip_locked", "buffer_usage_limit"]
             };
-            for (name, value) in self.options(verb.tag(), known)? {
-                if matches!(name.as_str(), "analyze" | "analyse") {
-                    analyze = !matches!(value.as_deref(), Some("false" | "off" | "0"));
+            for (name, value, at) in self.options(verb.tag(), known)? {
+                others |=
+                    !matches!(name.as_str(), "verbose" | "process_main" | "process_toast" | "only_database_stats");
+                match name.as_str() {
+                    "analyze" | "analyse" => analyze = on(&value),
+                    "full" => full = on(&value),
+                    "disable_page_skipping" => skipping = on(&value),
+                    "process_toast" => toast = on(&value),
+                    "only_database_stats" => only = on(&value),
+                    "parallel" => {
+                        let Some(v) = value else {
+                            return self.err_at(at, SYNTAX, "parallel option requires a value between 0 and 1024");
+                        };
+                        match v.parse::<i64>() {
+                            Ok(n) if (0..=1024).contains(&n) => workers = n,
+                            _ => {
+                                return self.err_at(
+                                    at,
+                                    SYNTAX,
+                                    "parallel workers for vacuum must be between 0 and 1024",
+                                );
+                            }
+                        }
+                    }
+                    "buffer_usage_limit" => {
+                        buffer_usage_limit(value.as_deref().unwrap_or_default())?;
+                        limit = true;
+                    }
+                    _ => {}
                 }
             }
         } else if verb == Verb::Vacuum {
             // the older spelling: FULL, FREEZE, VERBOSE and ANALYZE, in any order
             loop {
-                if self.kw("full") || self.kw("freeze") || self.kw("verbose") {
+                if self.kw("full") {
+                    full = true;
+                    continue;
+                }
+                if self.kw("freeze") || self.kw("verbose") {
                     continue;
                 }
                 if self.kw("analyze") || self.kw("analyse") {
@@ -196,28 +283,56 @@ impl Parser {
             self.kw("verbose");
         }
         let mut targets = vec![];
+        let mut listed = false;
         while !self.at_end() {
             let name = self.rel_text()?;
             let cols = if self.sym("(") { self.names()? } else { vec![] };
-            if verb == Verb::Vacuum && !analyze && !cols.is_empty() {
-                return err(UNSUPPORTED, "ANALYZE option must be specified when a column list is provided");
-            }
+            listed |= !cols.is_empty();
             targets.push(Target::Rel(name, cols));
             if !self.sym(",") {
                 break;
             }
         }
+        let bad = |message: &str| err(UNSUPPORTED, message.to_string());
+        if full && workers > 0 {
+            return bad("VACUUM FULL cannot be performed in parallel");
+        }
+        if full && limit {
+            return bad("BUFFER_USAGE_LIMIT cannot be specified for VACUUM FULL");
+        }
+        if verb == Verb::Vacuum && !analyze && listed {
+            return bad("ANALYZE option must be specified when a column list is provided");
+        }
+        if full && skipping {
+            return bad("VACUUM option DISABLE_PAGE_SKIPPING cannot be used with FULL");
+        }
+        if full && !toast {
+            return bad("PROCESS_TOAST required with VACUUM FULL");
+        }
+        if only && !targets.is_empty() {
+            return bad("ONLY_DATABASE_STATS cannot be specified with a list of tables");
+        }
+        if only && (others || analyze || full) {
+            return bad("ONLY_DATABASE_STATS cannot be specified with other VACUUM options");
+        }
         if targets.is_empty() {
             targets.push(Target::Everything);
         }
-        Ok(Stmt::Maintain(Box::new(Maintain { verb, targets, using: None, concurrently: false })))
+        Ok(Stmt::Maintain(Box::new(Maintain {
+            verb,
+            targets,
+            using: None,
+            concurrently: false,
+            vacuum: verb == Verb::Vacuum,
+            parallel: workers > 0,
+        })))
     }
 
     /// After REINDEX: `[(options)] {INDEX | TABLE | SCHEMA | DATABASE | SYSTEM} [CONCURRENTLY] name`.
     pub(super) fn reindex(&mut self) -> Result<Stmt> {
         let mut concurrently = false;
         if self.sym("(") {
-            for (name, value) in self.options("REINDEX", &["concurrently", "tablespace", "verbose"])? {
+            for (name, value, _) in self.options("REINDEX", &["concurrently", "tablespace", "verbose"])? {
                 if name == "concurrently" {
                     concurrently = !matches!(value.as_deref(), Some("false" | "off" | "0"));
                 }
@@ -242,7 +357,14 @@ impl Parser {
                 Target::Everything
             }
         };
-        Ok(Stmt::Maintain(Box::new(Maintain { verb: Verb::Reindex, targets: vec![target], using: None, concurrently })))
+        Ok(Stmt::Maintain(Box::new(Maintain {
+            verb: Verb::Reindex,
+            targets: vec![target],
+            using: None,
+            concurrently,
+            vacuum: false,
+            parallel: false,
+        })))
     }
 
     /// After CLUSTER: `[VERBOSE] [table [USING index]]`, or the old `index ON table`.
@@ -267,6 +389,8 @@ impl Parser {
             targets: vec![target],
             using,
             concurrently: false,
+            vacuum: false,
+            parallel: false,
         })))
     }
 
@@ -356,13 +480,15 @@ impl Parser {
                     _ => return self.fail("expected one function"),
                 }
             }
+            "role" => Commented::Role(self.name()?),
+            "publication" => Commented::Publication(self.name()?),
             "large" => {
                 self.expect_kw("object")?;
                 Commented::LargeObject(self.large_object_oid()?)
             }
-            "database" | "extension" | "routine" | "role" | "user" | "group" | "policy" | "trigger" | "publication"
-            | "subscription" | "collation" | "conversion" | "language" | "operator" | "cast" | "transform"
-            | "tablespace" | "statistics" | "text" | "access" | "event" => {
+            "database" | "extension" | "routine" | "user" | "group" | "policy" | "trigger" | "subscription"
+            | "collation" | "conversion" | "language" | "operator" | "cast" | "transform" | "tablespace"
+            | "statistics" | "text" | "access" | "event" => {
                 // skip the name (a function's has a signature): up to IS outside parentheses
                 let mut depth = 0;
                 while let Some(t) = self.peek() {
@@ -403,42 +529,51 @@ impl Parser {
         self.kw("table");
         let mut tables = vec![];
         loop {
-            self.kw("only");
-            tables.push(self.rel_text()?);
+            let only = self.kw("only");
+            tables.push((self.rel_text()?, only));
             self.sym("*");
             if !self.sym(",") {
                 break;
             }
         }
         // the default, ACCESS EXCLUSIVE, conflicts with everything
-        let mut strong = true;
+        let mut mode = "AccessExclusiveLock";
         if self.kw("in") {
-            strong = if self.kw("access") {
+            mode = if self.kw("access") {
                 if self.kw("share") {
-                    false
+                    "AccessShareLock"
                 } else {
                     self.expect_kw("exclusive")?;
-                    true
+                    "AccessExclusiveLock"
                 }
             } else if self.kw("row") {
-                if self.kw("share") || self.kw("exclusive") {
-                    false
+                if self.kw("share") {
+                    "RowShareLock"
+                } else if self.kw("exclusive") {
+                    "RowExclusiveLock"
                 } else {
                     return self.fail("expected SHARE or EXCLUSIVE");
                 }
             } else if self.kw("share") {
-                // SHARE UPDATE EXCLUSIVE and SHARE ROW EXCLUSIVE conflict with themselves; so does SHARE with writers
-                let _ = self.kw("update") || self.kw("row");
-                self.kw("exclusive");
-                true
+                if self.kw("update") {
+                    self.expect_kw("exclusive")?;
+                    "ShareUpdateExclusiveLock"
+                } else if self.kw("row") {
+                    self.expect_kw("exclusive")?;
+                    "ShareRowExclusiveLock"
+                } else {
+                    "ShareLock"
+                }
             } else {
                 self.expect_kw("exclusive")?;
-                true
+                "ExclusiveLock"
             };
             self.expect_kw("mode")?;
         }
+        // (SHARE UPDATE EXCLUSIVE and stronger conflict with their own kind, or with writers)
+        let strong = !matches!(mode, "AccessShareLock" | "RowShareLock" | "RowExclusiveLock");
         let nowait = self.kw("nowait");
-        Ok(Stmt::Lock(Box::new(Lock { tables, strong, nowait })))
+        Ok(Stmt::Lock(Box::new(Lock { tables, strong, nowait, mode })))
     }
 }
 
@@ -490,6 +625,36 @@ pub(super) fn maintain(db: &Db, branch: &str, m: &Maintain) -> Result<Output> {
                 None => return Err(no_rel(name)),
             },
             Target::Rel(name, cols) => {
+                let vacuuming = matches!(m.verb, Verb::Vacuum | Verb::Analyze);
+                // (as Postgres's vacuum_is_permitted_for_relation: a table's owner, or a role with its privileges, or
+                // a superuser; another is warned and the table skipped)
+                let skipped = |owner: i64, table: &str| {
+                    let Some(who) = super::roles::checked() else { return false };
+                    if who.has_privs_of(owner) {
+                        return false;
+                    }
+                    let what = if m.vacuum { "vacuum" } else { "analyze" };
+                    notice("WARNING", format!("permission denied to {what} \"{table}\", skipping it"));
+                    true
+                };
+                // a catalog table (pg_class, pg_authid): the bootstrap superuser's
+                if vacuuming
+                    && let Some(o) = cat.named(name)?
+                    && cat.find(o).is_none()
+                {
+                    skipped(super::roles::BOOTSTRAP, rel_part(&text_rel(name)));
+                    continue;
+                }
+                // (a temporary table: in the temporary tables' database)
+                if vacuuming && m.parallel && has_temp(&text_rel(name)) {
+                    let table = rel_part(&text_rel(name)).to_string();
+                    notice(
+                        "WARNING",
+                        format!(
+                            "disabling parallel option of vacuum on \"{table}\" --- cannot vacuum temporary tables in parallel"
+                        ),
+                    );
+                }
                 let Some((i, r)) = find_rel(&cat, name).or_else(|e| {
                     // VACUUM and ANALYZE skip what isn't a table, with a warning; the others refuse it
                     if e.code == "42809" && matches!(m.verb, Verb::Vacuum | Verb::Analyze) {
@@ -526,6 +691,23 @@ pub(super) fn maintain(db: &Db, branch: &str, m: &Maintain) -> Result<Output> {
                 }
                 if let Some(c) = cols.iter().find(|c| !r.columns.iter().any(|x| x.0 == **c)) {
                     return Err(no_column(c, &r.name));
+                }
+                // the table, and a partitioned table's partitions, each its owner's to vacuum
+                if vacuuming {
+                    let mut tree = vec![i];
+                    let mut k = 0;
+                    while k < tree.len() {
+                        let below = cat.rels[tree[k]].hier.created.clone();
+                        tree.extend(below.iter().filter_map(|n| cat.rels.iter().position(|x| x.name == *n)));
+                        k += 1;
+                    }
+                    if cat.rels[i].kind != 'p' {
+                        tree.truncate(1);
+                    }
+                    for j in tree {
+                        let r = &cat.rels[j];
+                        skipped(cat.rel_acl(r).0, rel_part(&r.name));
+                    }
                 }
                 if let Some(idx) = &m.using
                     && !cat.idx.iter().any(|(rel, x)| *rel == i && x.name == *idx)
@@ -750,6 +932,44 @@ pub(super) fn cluster_writes(v: &View, t: &Table, ix: &str) -> Result<Vec<(Strin
 pub(super) fn comment(db: &Db, branch: &str, c: &Comment) -> Result<Output> {
     let key = match &c.on {
         Commented::Other => None,
+        // a role's comment is its owner's to give: a superuser's a superuser's, another's a role's with CREATEROLE and
+        // the ADMIN option on it (as Postgres's check_object_ownership has it)
+        // a publication's, which has to be there, and is its owner's to give
+        Commented::Publication(name) => {
+            let cat = Catalog::of(&db.core, branch)?;
+            let Some(p) = cat.pubs.iter().find(|p| p.name == *name) else {
+                return err("42704", format!("publication \"{name}\" does not exist"));
+            };
+            if let Some(who) = super::roles::checked()
+                && !who.has_privs_of(p.owner)
+            {
+                return err("42501", format!("must be owner of publication {name}"));
+            }
+            Some(format!("publication/{name}"))
+        }
+        Commented::Role(name) => {
+            let reg = super::roles::registry(&db.core)?;
+            let Some(r) = reg.named(name) else { return err("42704", format!("role \"{name}\" does not exist")) };
+            if let Some(who) = super::roles::checked() {
+                let denied = |detail: String| {
+                    Err(SqlError {
+                        code: "42501",
+                        message: "permission denied".into(),
+                        info: Some(Box::new(Violation { detail: Some(detail), ..Violation::default() })),
+                    })
+                };
+                if r.superuser {
+                    return denied("The current user must have the SUPERUSER attribute.".into());
+                }
+                if !reg.by_oid(who.oid).is_some_and(|me| me.createrole) {
+                    return denied("The current user must have the CREATEROLE attribute.".into());
+                }
+                if !reg.is_admin_of(who.oid, r.oid) {
+                    return denied(format!("The current user must have the ADMIN option on role \"{}\".", r.name));
+                }
+            }
+            Some(format!("role/{}", r.oid))
+        }
         Commented::Foreign(kind, name) => {
             super::foreign::comment_target(&db.view_tx(branch)?, kind, name)?;
             Some(format!("{kind}/{name}"))
@@ -903,28 +1123,56 @@ pub(super) fn comment(db: &Db, branch: &str, c: &Comment) -> Result<Output> {
 pub(super) fn lock(db: &Db, branch: &str, l: &Lock) -> Result<Output> {
     let cat = Catalog::of(&db.core, branch)?;
     let mut names = vec![];
-    for t in &l.tables {
+    // what pg_locks lists the transaction holding: each relation named, a view's relations (and theirs), and a
+    // table's children unless ONLY
+    let mut held: Vec<String> = vec![];
+    for (t, only) in &l.tables {
         match find_rel(&cat, t)? {
             Some((_, r)) if r.kind == 'S' => {
                 return err("42809", format!("cannot lock relation \"{}\"", rel_part(&r.name)));
             }
-            Some((_, r)) => names.push((t, r.name.clone())),
+            Some((i, r)) => {
+                names.push((t, r.name.clone()));
+                let mut at = vec![(i, *only)];
+                while let Some((k, only)) = at.pop() {
+                    let r = &cat.rels[k];
+                    if held.contains(&r.name) {
+                        continue;
+                    }
+                    held.push(r.name.clone());
+                    let below: Vec<&String> = match r.kind {
+                        'v' => r.reads.iter().collect(),
+                        _ if only => vec![],
+                        _ => r.hier.children.iter().map(|(c, _)| c).collect(),
+                    };
+                    at.extend(
+                        below
+                            .into_iter()
+                            .filter_map(|n| cat.rels.iter().position(|x| x.name == *n))
+                            .map(|k| (k, false)),
+                    );
+                }
+            }
             None => names.push((t, t.clone())),
         }
     }
+    super::hold_relation_locks(&held, l.mode);
     if l.strong {
         for (written, stored) in &names {
             // two integers, apart from the numbers an application picks for pg_advisory_lock
             let key = [Value::Int(0x4C4F_434B), Value::Int(i64::from(advisory::hashtext(stored)))];
-            let got = ctx_call(CtxFn::AdvisoryLock(true, l.nowait), &key)?;
+            let got = ctx_call(CtxFn::AdvisoryLock(true, l.nowait, false), &key)?;
             if got == Value::Bool(false) {
                 return err("55P03", format!("could not obtain lock on relation \"{written}\""));
             }
         }
-        notice(
-            "WARNING",
-            "LOCK TABLE holds off other LOCK TABLE statements only: writers don't take table locks here".into(),
-        );
+        // (Chronos's own warning: not under CHRONOS_PG_EXACT, which says only what Postgres says)
+        if !pg_exact() {
+            notice(
+                "WARNING",
+                "LOCK TABLE holds off other LOCK TABLE statements only: writers don't take table locks here".into(),
+            );
+        }
     }
     Ok(Output::tag("LOCK TABLE"))
 }
