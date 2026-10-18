@@ -1258,6 +1258,14 @@ pub(crate) fn columns_used(v: &View, st: &Stmt) -> Result<Vec<(String, BTreeSet<
         .collect())
 }
 
+/// The columns of each relation statement `st` reads (SELECT's need: a whole row is all its columns), by
+/// relation; one it reads no column of (`count(*)`) has none.
+pub(crate) fn columns_read(v: &View, st: &Stmt) -> Result<Vec<(String, BTreeSet<String>)>> {
+    let mut c = Checker::new(v, 0, false);
+    c.stmt(st)?;
+    Ok(c.needs.into_iter().filter_map(|(r, n)| Some((r, n.select?))).collect())
+}
+
 /// The names of a query's columns, as they come out of it.
 fn output_names(c: &mut Checker, q: &Select) -> Result<Vec<String>> {
     let mut out = vec![];
@@ -1513,6 +1521,7 @@ fn superuser_only(st: &Stmt) -> Option<&'static str> {
         Stmt::ShowMergeOutcomes { .. } => "SHOW MERGE OUTCOMES",
         Stmt::ShowOutbox | Stmt::AckOutbox(_) | Stmt::RetryOutbox(_) | Stmt::ClaimOutbox { .. } => "the outbox",
         Stmt::CreateAgent { .. } | Stmt::AlterAgent { .. } | Stmt::DropAgent(_) | Stmt::ShowAgents => "agents",
+        Stmt::ShowAgentPrivileges { .. } => "SHOW AGENT ... PRIVILEGES",
         Stmt::CreatePolicy { .. } | Stmt::AlterPolicy { .. } | Stmt::DropPolicy(..) | Stmt::ShowPolicies => {
             "merge policies"
         }

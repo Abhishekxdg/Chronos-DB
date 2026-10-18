@@ -37,7 +37,7 @@ A world pays only for what it changes. On disk, a world with a few changed rows 
 
 An **agent** is who does something: it has a name, an ID and a secret token, and it can do only what it's allowed to. Agents are made with `CREATE AGENT` (or `create_agent` over HTTP); the token is shown once.
 
-- **What it may do** (`can`): `read` (any world), `fork`, `write_own` (change the worlds it forked), `write` (any world but main), `write_main`, `merge_own` (publish its own worlds into parents it may change, so `main` also needs `write_main`), `merge` (any world), `restore` (restore, undo a merge), `admin` (everything, and managing agents). New agents get `read, fork, write_own`: they work on their own worlds, and a person reviews the diff and merges.
+- **What it may do** (`can`): `read` (any world), `fork`, `write_own` (change the worlds it forked), `write` (any world but main), `write_main`, `merge_own` (publish its own worlds into parents it may change, so `main` also needs `write_main`), `merge` (any world), `restore` (restore, undo a merge), `outbox` (work main's outbox), `unmask` (read [masked columns](sql.md#masked-columns) as they are), `admin` (everything, and managing agents). New agents get `read, fork, write_own`: they work on their own worlds, and a person reviews the diff and merges.
 - **Its worlds:** a world an agent forks is its own (`owner` in `SHOW WORLDS`); no one can change that with metadata. With a `world_ttl`, its worlds are discarded when their time is up (checked every 30 seconds). Those discards, and idle worlds', are in the audit trail as `system`.
 - **Quotas,** and over one it's refused (HTTP 403, or 429 for writing too fast):
   - `max_worlds`: its live worlds at once.

@@ -27,13 +27,15 @@ use std::collections::HashMap;
 
 const AGENTS: &str = "_sonos_agents";
 const POLICIES: &str = "_sonos_policies";
+/// The secret masked columns' hashes are keyed by (see `Core::mask_key`).
+const MASK_KEY: &str = "_sonos_masking/key";
 /// The longest `world_ttl`: 100 years, in ms (an expiry is now plus it, and shows as an interval).
 const WORLD_TTL_MAX: u64 = 36_525 * 86_400_000;
 
 /// Whether `key` is an agent's, a merge policy's, a merge check's or the roles' row (see
 /// `Core::undo`: never put back from the past).
 pub(crate) fn agent_row(key: &str) -> bool {
-    [AGENTS, POLICIES, crate::checks::CHECKS, "_sonos_roles"]
+    [AGENTS, POLICIES, crate::checks::CHECKS, "_sonos_roles", "_sonos_masking"]
         .iter()
         .any(|p| key.strip_prefix(p).is_some_and(|k| k.starts_with('/')))
 }
@@ -77,12 +79,14 @@ pub enum Can {
     Restore,
     /// work main's outbox: claim, acknowledge and retry queued effects (see `outbox`)
     Outbox,
+    /// read masked columns as they are (see `sql::mask`); without it they read masked
+    Unmask,
     /// everything, and managing agents
     Admin,
 }
 
 impl Can {
-    pub const ALL: [Can; 10] = [
+    pub const ALL: [Can; 11] = [
         Can::Read,
         Can::Fork,
         Can::WriteOwn,
@@ -92,6 +96,7 @@ impl Can {
         Can::Merge,
         Can::Restore,
         Can::Outbox,
+        Can::Unmask,
         Can::Admin,
     ];
     /// What a new agent may do unless told otherwise: read, fork, and change its own worlds. A
@@ -109,6 +114,7 @@ impl Can {
             Can::Merge => "merge",
             Can::Restore => "restore",
             Can::Outbox => "outbox",
+            Can::Unmask => "unmask",
             Can::Admin => "admin",
         }
     }
@@ -528,6 +534,42 @@ impl Core {
             Ok((vec![(format!("{AGENTS}/{}", a.name), Some(a.to_json()))], ()))
         })?;
         Ok(())
+    }
+
+    /// The secret masked columns' hashes are keyed by (see `sql::mask`): 32 random bytes, made the first time
+    /// one is asked for and kept on main, where SQL and the row API don't reach.
+    pub(crate) fn mask_key(&self) -> Result<[u8; 32]> {
+        let parse = |raw: &str| -> Option<[u8; 32]> {
+            let b = raw.as_bytes();
+            if b.len() != 64 {
+                return None;
+            }
+            let mut out = [0u8; 32];
+            for (i, pair) in b.chunks(2).enumerate() {
+                out[i] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+            }
+            Some(out)
+        };
+        if let Some(raw) = self.view(MAIN)?.get(MASK_KEY)?
+            && let Some(k) = parse(&raw)
+        {
+            return Ok(k);
+        }
+        let fresh = new_token()?;
+        let fresh = fresh.trim_start_matches("chronos_").to_string();
+        let _system = disk::acting_as(SYSTEM);
+        let (_, kept) = self.batch_with(MAIN, |v| match v.get(MASK_KEY)? {
+            // (another thread made it first)
+            Some(raw) => Ok::<_, Error>((vec![], raw.to_string())),
+            None => Ok((vec![(MASK_KEY.to_string(), Some(fresh.clone()))], fresh.clone())),
+        })?;
+        parse(&kept).ok_or_else(|| bad("the database's mask key is damaged".into()))
+    }
+
+    /// Whether a column was ever masked here (the mask key was made): else nothing is masked, and the row API
+    /// needn't look.
+    pub(crate) fn masks_made(&self) -> bool {
+        self.view(MAIN).and_then(|v| v.get(MASK_KEY)).is_ok_and(|k| k.is_some())
     }
 
     /// Removes agent `name`: its token stops working. Its worlds stay (and keep their owner): the

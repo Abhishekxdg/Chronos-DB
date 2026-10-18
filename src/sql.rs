@@ -13,6 +13,7 @@
 
 mod acl;
 mod advisory;
+mod agentprivs;
 mod btree;
 mod bulk;
 mod bytes;
@@ -48,6 +49,7 @@ mod jsontext;
 mod largeobj;
 mod ltree;
 mod maintain;
+mod mask;
 mod mdarray;
 mod money;
 pub mod net;
@@ -6535,7 +6537,7 @@ impl ColDef {
     fn opts(&self, ty: Type) -> Result<ColOpts> {
         let storage = self.storage.as_deref().map(|w| column_storage(w, ty)).transpose()?.flatten();
         let compression = self.compression.as_deref().map(|w| column_compression(w, ty)).transpose()?.flatten();
-        Ok(ColOpts { storage, stats: None, compression })
+        Ok(ColOpts { storage, stats: None, compression, mask: None })
     }
 }
 
@@ -7086,12 +7088,15 @@ enum Alter {
     KeyUsingIndex(String, Option<String>, bool, Option<u32>),
 }
 
-/// One of ALTER COLUMN's SET STORAGE (its word), SET COMPRESSION (its word) and SET STATISTICS (the target).
+/// One of ALTER COLUMN's SET STORAGE (its word), SET COMPRESSION (its word), SET STATISTICS (the target) and SET
+/// or DROP MASKED.
 #[derive(Clone, Debug)]
 enum ColOpt {
     Storage(String),
     Compression(String),
     Stats(i64),
+    /// SET MASKED [WITH HASH | NULL | PARTIAL] (its mode), DROP MASKED (None): see `mask`
+    Mask(Option<char>),
 }
 
 /// Whether `e` is column `c`, or a cast of it (to `varchar(n)` a `left()` around it, to
@@ -7852,6 +7857,11 @@ enum Stmt {
     },
     DropAgent(String),
     ShowAgents,
+    /// SHOW AGENT name PRIVILEGES [IN WORLD w]: what it may do with each table (see `agentprivs`)
+    ShowAgentPrivileges {
+        agent: String,
+        world: Option<String>,
+    },
     /// CREATE MERGE POLICY name [WITH (max_rows = 500, max_deletes = 0, tables = 'a,b', ...)]
     CreatePolicy {
         name: String,
@@ -11500,6 +11510,18 @@ impl Parser {
                 Ok(Stmt::Checkpoint { world, label: self.branch_name()? })
             }
             "show" if self.kw("agents") => Ok(Stmt::ShowAgents),
+            "show" if self.kw("agent") => {
+                let agent = self.branch_name()?;
+                self.expect_kw("privileges")?;
+                let world = match self.kw("in") {
+                    true => {
+                        let _ = self.kw("world") || self.kw("branch");
+                        Some(self.branch_name()?)
+                    }
+                    false => None,
+                };
+                Ok(Stmt::ShowAgentPrivileges { agent, world })
+            }
             "show" if self.kw("outbox") => {
                 if !self.kw("discarded") {
                     return Ok(Stmt::ShowOutbox);
@@ -15542,6 +15564,15 @@ impl Parser {
                     self.i += 1;
                     self.skip_parens()?;
                     Alter::Noop("column options only tune Postgres's planner: nothing to do here")
+                } else if set && self.kw("masked") {
+                    let m = match self.kw("with") {
+                        false => mask::HASH,
+                        true => match self.next() {
+                            Some(Tok::Word(w)) if mask::mode(&w).is_some() => mask::mode(&w).expect("a mode"),
+                            _ => return self.fail("expected HASH, NULL or PARTIAL after SET MASKED WITH"),
+                        },
+                    };
+                    Alter::ColOpt(c, ColOpt::Mask(Some(m)))
                 } else if set && self.kw("storage") {
                     Alter::ColOpt(c, ColOpt::Storage(self.storage_word()?))
                 } else if set && self.kw("compression") {
@@ -15578,6 +15609,8 @@ impl Parser {
                     self.expect_kw("drop")?;
                     if self.kw("default") {
                         Alter::SetDefault(c, None)
+                    } else if self.kw("masked") {
+                        Alter::ColOpt(c, ColOpt::Mask(None))
                     } else if self.kw("expression") {
                         let quiet = self.kw("if") && {
                             self.expect_kw("exists")?;
@@ -21390,6 +21423,8 @@ struct RewriteKey {
     /// the rewrite of a rewritten statement (see `rls::skipping`), and one of MERGE's (see `rls::merging`)
     skipping: bool,
     merging: bool,
+    /// masked columns read masked (see `mask`)
+    masked: bool,
     declared: Option<Vec<bool>>,
     /// the parameters' types it runs with (see `joined_place`)
     types: Vec<Type>,
@@ -21418,6 +21453,7 @@ impl RewriteKey {
             ],
             skipping: rls::skipped(),
             merging: rls::merging_now(),
+            masked: mask::on(),
             declared,
             types: PARAM_TYPES.with_borrow(Clone::clone),
             temp: session_temp().map(|t| std::ptr::from_ref(&*t.core) as usize),
@@ -22189,12 +22225,19 @@ struct ColOpts {
     storage: Option<char>,
     stats: Option<i64>,
     compression: Option<char>,
+    /// SET MASKED: how agents without `unmask` read the column (see `mask`); None: as it is
+    mask: Option<char>,
 }
 
 impl ColOpts {
     fn from_json(c: &Json) -> ColOpts {
         let letter = |k: &str| c[k].as_str().and_then(|s| s.chars().next());
-        ColOpts { storage: letter("storage"), stats: c["stats"].as_i64(), compression: letter("compression") }
+        ColOpts {
+            storage: letter("storage"),
+            stats: c["stats"].as_i64(),
+            compression: letter("compression"),
+            mask: letter("mask"),
+        }
     }
 
     fn write_json(&self, j: &mut Json) {
@@ -22206,6 +22249,9 @@ impl ColOpts {
         }
         if let Some(m) = self.compression {
             j["compression"] = Json::String(m.to_string());
+        }
+        if let Some(m) = self.mask {
+            j["mask"] = Json::String(m.to_string());
         }
     }
 }
@@ -29362,13 +29408,21 @@ pub(crate) fn may_be_encoded(id: &str) -> bool {
 /// they are: the message refusing agent `agent` the rows of `tables` in world `branch` when
 /// row-level security limits its role on one of them (see `rls`).
 pub fn row_security_refuses(db: &Db, agent: &str, branch: &str, tables: &[&str]) -> Result<Option<String>> {
+    // masked columns too, which the row API would show as they are (see `mask`)
+    let unmask = db.agent(agent).is_ok_and(|a| a.may(crate::Can::Unmask));
+    if !unmask && let Some(m) = mask::agent_refused(db, agent, branch, tables)? {
+        return Ok(Some(m));
+    }
+    if !db.core.has_row_security() {
+        return Ok(None);
+    }
     rls::agent_refused(db, agent, branch, tables)
 }
 
-/// Whether any table of the database has had row-level security or a policy (else
-/// `row_security_refuses` never refuses, and what it would be asked about needn't be worked out).
+/// Whether `row_security_refuses` may refuse anything: a table of the database has had row-level security or a
+/// policy, or the database has a mask key (some column was masked).
 pub fn row_security_possible(db: &Db) -> bool {
-    db.core.has_row_security()
+    db.core.has_row_security() || db.core.masks_made()
 }
 
 /// An hstore's binary form on the wire, as hstore_recv reads it and hstore_send writes it: how many pairs, then
@@ -35092,6 +35146,13 @@ impl Session {
             Stmt::AckOutbox(_) | Stmt::RetryOutbox(_) | Stmt::ClaimOutbox { .. } => {}
             Stmt::Rebase { name, .. } => me.may_write(&world(name), 0)?, // it changes the world only
             Stmt::CheckReads(name) => me.may_read(&world(name))?,        // it reads only
+            // its own; another's is for those who manage agents
+            Stmt::ShowAgentPrivileges { agent, world: w } => {
+                me.may_read(w.as_deref().unwrap_or(&self.branch))?;
+                if *agent != me.agent.name {
+                    me.may_admin()?;
+                }
+            }
             // every agent's results, as /metrics are: the database's own users only
             Stmt::ShowMergeOutcomes { .. } => {
                 return Err(SqlError {
@@ -36442,6 +36503,8 @@ impl Session {
             user: current.name.clone(),
             session_user: session_who.name.clone(),
             agent: self.agent.is_some(),
+            // (an agent without 'unmask' reads masked columns masked: see `mask`)
+            masked: self.agent.is_some() && !agent.as_ref().is_some_and(|a| a.may(crate::Can::Unmask)),
             pid: self.pid,
             txid: self.tx.as_ref().map_or_else(next_txid, |t| t.txid),
             rc: self.tx.as_ref().is_some_and(|t| t.iso.per_statement() && !t.imported),
@@ -38216,7 +38279,7 @@ impl Statement {
             | Stmt::Delete { .. }
             | Stmt::Explain { .. } => {
                 let maybe = db.has_views() || db.has_inherits() || db.core.has_row_security() || branch.contains('@');
-                self.touches(maybe || self.reads_ctid(), db.has_sequences())
+                self.touches(maybe || mask::on() || self.reads_ctid(), db.has_sequences())
             }
             _ => false,
         }
@@ -38292,7 +38355,7 @@ fn catalog_stmt(db: &Db, branch: &str, st: &Stmt, params: Option<&[Value]>) -> R
     }
     // (a world in the past may hold views)
     let maybe = db.has_views() || db.has_inherits() || db.core.has_row_security() || branch.contains('@');
-    let maybe = maybe || reads_ctid(st);
+    let maybe = maybe || mask::on() || reads_ctid(st);
     let seqs = db.has_sequences();
     if !touches(st, maybe, seqs) {
         return Ok(None);
@@ -38803,6 +38866,7 @@ impl Statement {
             Stmt::CreateAgent { .. } => {
                 return fixed(&[("name", Type::Text), ("id", Type::Text), ("token", Type::Text)]);
             }
+            Stmt::ShowAgentPrivileges { .. } => return fixed(&agentprivs::COLUMNS),
             Stmt::ShowAgents | Stmt::AlterAgent { .. } => {
                 return fixed(&[
                     ("name", Type::Text),
@@ -39131,6 +39195,27 @@ impl Statement {
 
     /// `execute`'s own statements, on `x`; a comment goes with the object it is on.
     fn run(&self, x: &Exec, branch: &str, params: &[Value]) -> Result<Output> {
+        // where masks apply, what would read a masked table's values as they are (see `mask`)
+        if mask::on()
+            && matches!(
+                self.0,
+                Stmt::Alter { .. }
+                    | Stmt::CreateIndex { .. }
+                    | Stmt::CreateTrigger(..)
+                    | Stmt::Policy(_)
+                    | Stmt::Merge(_)
+            )
+        {
+            let v = x.view()?;
+            mask::ddl(&v, &self.0)?;
+            mask::target(&v, &self.0)?;
+        }
+        // (SET MASKED: the key masked values are hashed with, made now rather than by a read)
+        if let Stmt::Alter { changes, .. } = &self.0
+            && changes.iter().any(|c| matches!(c, Alter::ColOpt(_, ColOpt::Mask(Some(_)))))
+        {
+            x.db.core.mask_key()?;
+        }
         // (a statement that changes what exists: what comments are on is then moved or dropped)
         let changes = matches!(
             self.0,
@@ -39661,7 +39746,14 @@ impl Statement {
                     rows.push(line("blocked", why));
                 }
                 let columns = self.columns(db, branch, &[])?;
-                Ok(Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows })
+                let mut out = Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows };
+                if mask::on() {
+                    let into = o.into.clone().or_else(|| db.world(b).ok().and_then(|w| w.parent));
+                    let (vb, vi) = (db.view_tx(b)?, into.map(|i| db.view_tx(&i)).transpose()?);
+                    let views: Vec<&View> = [Some(&vb), vi.as_ref()].into_iter().flatten().collect();
+                    mask::output(&views, &mut out)?;
+                }
+                Ok(out)
             }
             Stmt::ShowBranches => {
                 let rows = db
@@ -39746,6 +39838,11 @@ impl Statement {
             Stmt::DropAgent(name) => {
                 db.drop_agent(name)?;
                 Ok(Output::tag("DROP AGENT"))
+            }
+            Stmt::ShowAgentPrivileges { agent, world } => {
+                let rows = agentprivs::show(db, agent, world.as_deref().unwrap_or(branch))?;
+                let columns = self.columns(db, branch, &[])?;
+                Ok(Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows })
             }
             Stmt::ShowPolicies | Stmt::CreatePolicy { .. } | Stmt::AlterPolicy { .. } => {
                 let (tag, policies) = match &self.0 {
@@ -40234,6 +40331,12 @@ impl Statement {
                 }
                 if *as_sql {
                     let after = db.view_tx(to.as_deref().unwrap_or(a))?;
+                    if mask::on() {
+                        let tables: std::collections::BTreeSet<String> =
+                            described.iter().map(|d| d.table.clone()).collect();
+                        mask::diff_sql(&db.view_tx(a)?, &tables)?;
+                        mask::diff_sql(&after, &tables)?;
+                    }
                     let rows: Vec<Vec<Value>> =
                         diff_sql(&after, &described)?.into_iter().map(|s| vec![Value::Text(s)]).collect();
                     let columns = self.columns(db, branch, &[])?;
@@ -40255,7 +40358,13 @@ impl Statement {
                     })
                     .collect();
                 let columns = self.columns(db, branch, &[])?;
-                Ok(Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows })
+                let mut out = Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows };
+                if mask::on() {
+                    let (va, vb) = (db.view_tx(a)?, to.as_deref().map(|b| db.view_tx(b)).transpose()?);
+                    let views: Vec<&View> = [Some(&va), vb.as_ref()].into_iter().flatten().collect();
+                    mask::output(&views, &mut out)?;
+                }
+                Ok(out)
             }
             Stmt::UseBranch(..)
             | Stmt::Begin
@@ -40849,6 +40958,8 @@ struct Ctx {
     session_user: String,
     /// the statement is an agent's (agents' rights aren't roles: see `sysinfo`)
     agent: bool,
+    /// it is an agent's without the `unmask` capability: masked columns read masked (see `mask`)
+    masked: bool,
     /// pg_backend_pid(): the connection's id
     pid: i32,
     /// txid_current(): the transaction's number
@@ -43108,6 +43219,8 @@ struct Expand {
     copied: std::cell::Cell<usize>,
     /// the world has tables with row security: reads of them get their policies (see `rls`)
     rls: bool,
+    /// masked columns read masked: reads of tables with some become subqueries masking them (see `mask`)
+    mask: bool,
     /// whose policies the reads get: a view's owner inside its query (none: the statement's role)
     owners: std::cell::RefCell<Vec<Option<Arc<roles::Who>>>>,
     /// the tables whose policies are being put in: one met again is a loop
@@ -43288,7 +43401,7 @@ fn expand_select(
         }
         // a read of `ctid` of a table here (`ctid`, or `t.ctid` by its alias)
         let ctid = (ctid_bare || ctid_of.contains(&src.alias)) && src.at.is_none() && src.cte == 0;
-        if src.at.is_none() && !any && !mention && !x.rls && !ctid {
+        if src.at.is_none() && !any && !mention && !x.rls && !x.mask && !ctid {
             continue;
         }
         if src.at.is_some() {
@@ -43309,6 +43422,20 @@ fn expand_select(
             (None, _) => view_def(v, &src.table)?,
         };
         let Some(def) = def else {
+            // a table with masked columns, read where masks apply: a subquery of its rows with them masked, named
+            // as the table was; inside it the table is read as any other (its policies, its partitions)
+            if x.mask
+                && mask::wraps(src)
+                && let Some(mut body) = mask::wrap(v, past.as_ref(), src)?
+            {
+                expand_select(v, &mut body, params, any, deep, x)?;
+                src.sub = Some(Box::new(body));
+                src.at = None;
+                src.hier = false;
+                src.policed = true;
+                changed = true;
+                continue;
+            }
             // a table whose `ctid` is read: its rows with their places, a last column `*` doesn't give (see
             // `ctid_source`); its row security is that of the table it reads
             if ctid
@@ -43914,15 +44041,21 @@ fn expand_stmt(v: &View, st: &Stmt, params: Option<&[Value]>, maybe: bool, seqs:
         && (v.prefix(&format!("{VIEWS}/"))?.next().is_some() || v.prefix(&format!("{}/", hier::INH))?.next().is_some());
     // and tables with row security (unless this is the rewrite of a statement that has theirs in)
     let rls = maybe && !rls::skipped() && rls::touched(v, st)?;
-    if !touches(st, any || rls || reads_ctid(st), seqs) {
+    // and, for an agent without 'unmask', tables with masked columns
+    let mask = maybe && mask::on();
+    if !touches(st, any || rls || mask || reads_ctid(st), seqs) {
         return Ok(None);
     }
     let mut st = st.clone();
-    let x = Expand { rls, types: PARAM_TYPES.with_borrow(Clone::clone), ..Expand::default() };
+    let x = Expand { rls, mask, types: PARAM_TYPES.with_borrow(Clone::clone), ..Expand::default() };
     let mut changed = false;
     let mut through = None;
     if any {
         changed |= view_writes(v, &mut st, &mut through)?;
+    }
+    // (what reads its own target's rows reads them as they are: refused for a masked column)
+    if mask {
+        mask::target(v, &st)?;
     }
     if rls {
         // what it writes: as its role, or as the view's owner it writes through
@@ -48732,6 +48865,9 @@ impl Exec<'_> {
         };
         if crate::reserved_table(table) {
             return err("42501", format!("{table}: tables starting with _sonos are the database's own"));
+        }
+        if mask::on() {
+            mask::search(v, table)?;
         }
         let k = match a.get(2) {
             Some(Value::Int(k)) if *k >= 0 => *k as usize,
@@ -55024,6 +55160,7 @@ impl Exec<'_> {
                         ColOpt::Storage(w) => o.storage = column_storage(w, ty)?,
                         ColOpt::Compression(w) => o.compression = column_compression(w, ty)?,
                         ColOpt::Stats(_) => o.stats = stats.filter(|n| *n != -1),
+                        ColOpt::Mask(m) => o.mask = *m,
                     }
                 }
                 Alter::ReplicaIdentity(kind, index) => {

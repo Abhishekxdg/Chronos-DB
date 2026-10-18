@@ -141,6 +141,7 @@ fn access(s: &Stmt) -> Reach {
         | Stmt::ShowZone
         | Stmt::ShowMetrics
         | Stmt::ShowAgents
+        | Stmt::ShowAgentPrivileges { .. }
         | Stmt::ShowPolicies
         | Stmt::ShowChecks
         | Stmt::ShowReviews

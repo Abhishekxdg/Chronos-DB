@@ -367,8 +367,17 @@ pub(super) fn active(ctx: &Ctx, rel: &Value) -> Result<Value> {
 
 /// Whether a constraint's error may show the values of a key of `table` (its DETAIL, `Key (a)=(1) ...`), as
 /// Postgres's ri_ReportViolation and BuildIndexValueDescription decide: not where row security limits the
-/// running role on the table, or the role can't read it (column privileges aside: then not either).
+/// running role on the table, or the role can't read it (column privileges aside: then not either); nor where
+/// the table has masked columns that the running statement reads masked (see `mask`).
 pub(super) fn may_show_key(table: &str) -> bool {
+    if let Some(ctx) = STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.clone()))
+        && ctx.masked
+    {
+        let Ok(v) = ctx.core.view_tx(&ctx.world) else { return false };
+        if !super::mask::of(&v, table).is_ok_and(|m| m.is_empty()) {
+            return false;
+        }
+    }
     let Some(who) = roles::current().filter(|w| !w.superuser) else { return true };
     let Some(ctx) = STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.clone())) else { return true };
     if !ctx.core.has_row_security() && !ctx.core.has_privileges() {

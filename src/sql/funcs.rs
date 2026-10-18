@@ -23,6 +23,8 @@ pub(super) enum Scalar {
     TimeTzFn(u8),
     /// pg_stat_statements_reset()
     StatReset,
+    /// a masked column's value, by its mode (see `mask`): made where a masked table is read, never by name
+    Mask(u8),
     /// ARRAY[[1, 2], [3, 4]]: arrays of a dimension below, made one of more dimensions
     ArrayNest,
     TablespaceLocation,
@@ -903,6 +905,7 @@ pub(super) fn result_type(f: Scalar, first: Option<Type>) -> Type {
     match f {
         Spelled(_) => first.unwrap_or(Type::Json),
         ColumnSize => Type::Int,
+        Mask(_) => Type::Text,
         JsonOpFn(5 | 6) => Type::Json,
         JsonOpFn(_) => Type::Bool,
         f if super::pgcrypto::ours(f) => super::pgcrypto::result_type(f),
@@ -1810,6 +1813,7 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
         XidFn(_) => return super::xid::call(f, a),
         TimeTzFn(_) => return super::timetz::call(f, a),
         StatReset => return super::stmtstats::reset(a, super::stmtstats::world_oids),
+        Mask(m) => return super::mask::apply(m, a),
         Spelled(_) => return Ok(a.first().cloned().unwrap_or(Null)),
         // (read as their operators: see `builtin_call`)
         JsonOpFn(_) => return err("42883", "a jsonb operator's function is read as the operator"),
@@ -2091,6 +2095,7 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
         // (named so for their columns only: they are Ceil and Log, as `call` made them)
         Ceiling => return call(Ceil, a),
         Log10 => return call(Log, a),
+        Mask(m) => return super::mask::apply(m, a),
         FloatAccum(k) => return super::stats::transition(k, a),
         Float4Text if matches!(a[0], JsonText(_)) => Text(a[0].to_text()),
         Float4Text => Text(super::fmt_float4(float(&a[0])?)),

@@ -735,6 +735,8 @@ create agent bot with (can = 'read,fork,write_own', max_worlds = 10, world_ttl =
 alter agent bot set (writes_per_minute = 600, disabled = false);
 alter agent bot set (max_query_ms = 30000, max_concurrent = 4, max_memory_mb = 512);
 show agents;                              -- name, id, can, quotas, world_ttl, created, disabled, limits
+show agent bot privileges;                -- what bot may read, write and merge, table by table
+show agent bot privileges in world w;     -- the same, for world w's tables
 show audit for agent bot limit 20;        -- at, agent, world, action, rows
 show merge outcomes;                      -- how each agent's worlds ended, and how often its merges were held or refused
 show merge outcomes by policy;            -- the same, a row per merge policy
@@ -744,6 +746,21 @@ drop agent bot;                           -- its token stops working; its worlds
 ```
 
 See [concepts](concepts.md#agents) for what agents may do. The names `guest` and `system` are the database's own.
+
+`SHOW AGENT name PRIVILEGES` puts together everything that decides what an agent may do with a table: its capabilities,
+the privileges of a role of its name (both must allow), row-level security, [masked columns](#masked-columns) and its
+merge policy. A row per table of the world (the session's, or `IN WORLD w`), and one per column that differs from its
+table (a column its role was granted on its own, a masked one, one its policy's `review_columns` names):
+
+| column | what it says |
+|---|---|
+| `read` | `yes`, `no`, `rows its policies allow` (row-level security), or for a column `masked (hash)` |
+| `write` | which of insert, update and delete, and where: `its own worlds`, `any world but main`, `main` |
+| `merge` | `on its own`, `on its own within policy p`, `waits for a person`, `refused` (not in the policy's `tables`), `not into main`, or `a person merges` |
+| `why` | the rules behind the row, in words |
+
+It reads the same rules the agent's statements meet; it runs nothing as the agent. An agent may show its own; another
+agent's needs `admin`.
 
 `SHOW MERGE OUTCOMES` reads the history window (`show history_retention`; `since` is where it starts) and counts each
 world once, by how it ended:
@@ -824,6 +841,46 @@ set app.org_id = '42';                                                  -- per s
 - **Cost:** a policy is parsed once, and a prepared statement is rewritten and planned once, again only when a policy, a table's row security, a view or a role it depends on changes, or another role runs it: a point read of a table with a tenant policy costs about what a plain one does. A table with policies joined to others keeps its index reads where its policies can go first (the join's conditions on it compare columns, parameters and constants).
 - **The row API:** the HTTP and MCP `get`, `find`, `put`, `delete`, `batch`, `diff` and `merge` work on rows as they are, so an agent whose role (a role of its name) a policy limits on a table is refused them there (403, 42501): it reads and writes those rows with SQL.
 - **The catalog:** `pg_class.relrowsecurity` and `relforcerowsecurity`, `pg_tables.rowsecurity`, `pg_policy` and `pg_policies`; psql's `\d` shows a table's policies and `\dp` their column, and `pg_dump` writes them, which restore.
+
+## Masked columns
+
+A masked column's values are never shown to an agent: it reads a keyed hash of each value instead, or NULL, or the
+last four characters. People, and agents given the `unmask` capability, read the values as they are.
+
+```sql
+alter table customers alter column email set masked;                 -- WITH HASH, the default
+alter table customers alter column phone set masked with partial;    -- '******1234'
+alter table customers alter column notes set masked with null;
+alter table customers alter column email drop masked;
+alter agent support_bot set (can = 'read,fork,write_own,unmask');   -- this one reads them as they are
+```
+
+- **What an agent reads:** `HASH` gives `m_` and 24 hex digits, the same for the same value in every table, so an
+  agent can still join, group and count distinct values (`customers.email = leads.email`) without seeing one. The hash
+  is keyed by a secret the database keeps on main, where neither SQL nor the row API reaches, so it can't be looked up
+  in a list of hashes of likely values, and no SQL function makes one, so an agent can't hash a guess to compare.
+- **No oracle through filters:** a read of the table becomes a subquery that masks first, so `WHERE`, joins,
+  `ORDER BY`, `LIKE` and every function above it see the mask, never the value: `where email like 'a%'` tests the
+  hash. Row-level security's policies run inside, on the values as they are.
+- **Everywhere it reads:** joins, subqueries, `WITH`, views (whoever owns them), functions' statements, `COPY ... TO`
+  (a table is copied as a `SELECT` of it), `AS OF` reads, `DIFF` and `MERGE ... DRY RUN` (their rows show masked
+  values masked), and a constraint's error doesn't show the table's key.
+- **What is refused (42501), because it would read the values as they are:** an `UPDATE`, `DELETE` or
+  `INSERT ... ON CONFLICT` / `RETURNING` whose `WHERE`, `SET` or `RETURNING` reads a masked column of the table it
+  writes (`update customers set tier = 'gold' where id = 5` is fine; `where email = '...'` is refused); `MERGE` into the
+  table; changing its definition, indexes, triggers or policies; `search()` over it; `DIFF ... AS SQL`; and the HTTP
+  and MCP row API (`get`, `find`, `diff`, ...) on it: the agent uses SQL.
+- **Who is an agent:** a session with an agent's token (Postgres login, HTTP, MCP over HTTP), `serve --safe`'s
+  guest, and `chronos mcp <folder> --agent NAME`. A plain `chronos mcp <folder>` acts as the folder's owner and reads
+  the values: give a model you don't want to see them `--agent`.
+- **The mask is the column's:** it forks, merges, renames and drops with the column, `DIFF` shows it as a change to the
+  table, and a partition or child of a masked table has its masks too.
+- **What it doesn't hide:** an agent may write a masked column, and an agent that may insert into a table with a unique
+  masked column can tell whether a value is there (the insert fails); an existing trigger that copies a value
+  elsewhere copies it as it is; a person who reads values out into another table, or a materialized view a person
+  refreshes, is a copy masks don't follow (mask a copied table's columns too).
+  Give agents that mustn't learn the values no write on such tables, or put them under a merge policy's
+  `review_tables`. `SHOW AGENT name PRIVILEGES` shows each masked column as the agent reads it.
 
 ## Limits for the whole database
 
