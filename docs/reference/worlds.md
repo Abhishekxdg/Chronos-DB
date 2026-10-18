@@ -634,7 +634,8 @@ CREATE AGENT name [WITH (key = value, ...)]      -- name, id, token (shown only 
 ALTER AGENT name SET (key = value, ...)          -- the agent's row, tag ALTER AGENT
 DROP AGENT name                                  -- tag DROP AGENT; its worlds stay
 SHOW AGENTS                                      -- name, id, can, max_worlds, writes_per_minute, max_changes,
-                                                 -- world_ttl, created, disabled, max_query_ms, max_concurrent, max_memory_mb, policy
+                                                 -- world_ttl, created, disabled, max_query_ms, max_concurrent, max_memory_mb, policy,
+                                                 -- max_idle_ms
 SHOW AUDIT [FOR [AGENT] name] [LIMIT n]          -- at, agent, world, action, rows (LIMIT 100 by default)
 ```
 
@@ -648,6 +649,7 @@ SHOW AUDIT [FOR [AGENT] name] [LIMIT n]          -- at, agent, world, action, ro
 | `max_query_ms` | ms, or an interval string | 0 (no limit) |
 | `max_concurrent` | statements at once | 0 (no limit) |
 | `max_memory_mb` | working memory per statement | 0 (no limit) |
+| `max_idle_ms` | ms, or an interval string: how long a Postgres connection of its may sit idle inside a transaction | 0 (no limit) |
 | `disabled` | `true` / `false` | `false` |
 | `policy` | a merge policy's name (see below); `null` for none | none |
 

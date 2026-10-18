@@ -762,7 +762,13 @@ impl Conn<'_> {
         if !self.at_ready {
             return None;
         }
-        let (in_tx, out_of_tx) = self.session.idle_limits();
+        let (mut in_tx, out_of_tx) = self.session.idle_limits();
+        // an agent's max_idle_ms caps how long its transaction may wait on it (its model thinking): past it, the
+        // connection goes, the transaction is rolled back and its locks let go
+        let cap = self.session.agent.as_deref().and_then(|a| self.db.agent(a).ok()).map_or(0, |a| a.max_idle_ms);
+        if cap > 0 && (in_tx == 0 || in_tx > cap) {
+            in_tx = cap;
+        }
         let (ms, code, what) = match self.session.status() {
             b'I' => (out_of_tx, "57P05", "idle-session"),
             _ => (in_tx, "25P03", "idle-in-transaction"),

@@ -195,10 +195,12 @@ All are off (`0`) by default, for agents and for the guest.
 | `max_query_ms` | how long one of its SQL statements runs. It may lower its `statement_timeout`, never raise it past this | stopped, `57014` | 400, with `"code": "57014"` |
 | `max_concurrent` | its statements and HTTP requests running at once | refused, `53300` | 429 |
 | `max_memory_mb` | rows one of its statements holds (joined rows, a join's other side, its result); its sorts, groups and joins spill at a quarter of it | stopped, `53200` | 413 |
+| `max_idle_ms` | how long a Postgres connection of its sits idle inside a transaction. It may lower its `idle_in_transaction_session_timeout`, never raise it past this | connection dropped (FATAL `25P03`), its transaction rolled back and its locks let go | |
 
 - **`max_changes` counts a transaction at `COMMIT`,** so one huge transaction uses memory before it's refused.
 - **`max_memory_mb` counts rows,** not every structure: a `GROUP BY`'s groups and a window's rows aren't counted (see [operations](operations.md#memory-and-spilling-to-disk)).
 - **The rate limiter and `max_concurrent`** are counted in memory: a restart resets them.
+- **Agents hold connections while their model thinks.** A request over HTTP or MCP holds nothing between calls; an agent on `psql` or a Postgres driver holds its connection, and a transaction it has open, across every model call, which can take seconds. Point agents at [HTTP](http-api.md) or [MCP](reference/mcp.md) where you can. Where they use the Postgres protocol, set `max_idle_ms` (`ALTER AGENT bot SET (max_idle_ms = '30s')`) so one that stops mid-transaction lets its rows go; `idle_session_timeout` (`SET`, or `options=-c idle_session_timeout=5min` in its connection string) also drops a connection idle outside a transaction, freeing its slot.
 - **The guest has no quotas,** and all guests share one set of worlds. Bound what it can do with the server-wide limits below.
 
 ## Protecting `main`

@@ -252,6 +252,41 @@ fn agents_log_in_with_their_token() {
 /// psql's catalog queries (\dt, \l), which the Postgres port answers itself, get the checks every
 /// statement gets first: an agent that may not read its world is refused them, as it is refused
 /// the same query run by the engine; one that may read gets the answer.
+/// An agent's `max_idle_ms`: a connection of its left idle inside a transaction (its model thinking) past it is
+/// dropped, the transaction rolled back and its locks let go; SET can lower it, not raise it. Issue #42.
+#[test]
+fn an_agent_idle_in_a_transaction_is_dropped() {
+    let (_server, port) = start("idle_agent", Some("s3cret-s3cret-s3cret-s3cret"));
+    let mut admin = connect(port, "password=s3cret-s3cret-s3cret-s3cret").unwrap();
+    admin.batch_execute("create table t (id int primary key, v text); insert into t values (1, 'one')").unwrap();
+    let token: String = admin
+        .query_one("create agent bot with (can = 'read,fork,write_own,write_main', max_idle_ms = '300ms')", &[])
+        .unwrap()
+        .get("token");
+    let shown = admin.query_one("show agents", &[]).unwrap();
+    assert_eq!(shown.get::<_, i64>("max_idle_ms"), 300);
+    let login = format!("host=127.0.0.1 port={port} user=bot dbname=main password={token}");
+    let mut bot = Client::connect(&login, NoTls).unwrap();
+    // outside a transaction it holds nothing: no limit
+    std::thread::sleep(Duration::from_millis(700));
+    bot.batch_execute("select 1").unwrap();
+    // a higher timeout of its own doesn't raise its limit
+    bot.batch_execute("set idle_in_transaction_session_timeout = '1min'; begin; update t set v = 'held' where id = 1")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(900));
+    let e = bot.batch_execute("commit").unwrap_err();
+    assert!(
+        bot.is_closed() || e.code() == Some(&SqlState::IDLE_IN_TRANSACTION_SESSION_TIMEOUT) || e.is_closed(),
+        "{e}"
+    );
+    // rolled back, and the row isn't held
+    assert_eq!(admin.query_one("select v from t where id = 1", &[]).unwrap().get::<_, String>(0), "one");
+    // the database's own user has no such limit
+    admin.batch_execute("begin").unwrap();
+    std::thread::sleep(Duration::from_millis(700));
+    admin.batch_execute("commit").unwrap();
+}
+
 #[test]
 fn catalog_answers_take_the_same_checks() {
     let (_server, port) = start("catalog-checks", None);

@@ -23570,6 +23570,14 @@ fn agent_spec(j: &Json) -> Result<crate::AgentSpec> {
             "max_changes" => spec.max_changes = Some(num()?),
             "max_concurrent" => spec.max_concurrent = Some(num()?),
             "max_memory_mb" => spec.max_memory_mb = Some(num()?),
+            "max_idle_ms" => {
+                spec.max_idle_ms = Some(match v {
+                    Json::String(s) => {
+                        interval_ms(time::parse_interval(s).ok_or_else(|| bad(format!("'{s}' is not an interval")))?)
+                    }
+                    _ => num()?,
+                })
+            }
             "max_query_ms" => {
                 spec.max_query_ms = Some(match v {
                     Json::String(s) => {
@@ -39076,6 +39084,7 @@ impl Statement {
                     ("max_concurrent", Type::BigInt),
                     ("max_memory_mb", Type::BigInt),
                     ("policy", Type::Text),
+                    ("max_idle_ms", Type::BigInt),
                 ]);
             }
             Stmt::ShowPolicies | Stmt::CreatePolicy { .. } | Stmt::AlterPolicy { .. } => {
@@ -40285,6 +40294,7 @@ impl Statement {
                             Value::Int(a.max_concurrent as i64),
                             Value::Int(a.max_memory_mb as i64),
                             a.policy.map_or(Value::Null, Value::Text),
+                            Value::Int(a.max_idle_ms as i64),
                         ]
                     })
                     .collect();

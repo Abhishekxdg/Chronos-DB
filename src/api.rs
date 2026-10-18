@@ -492,7 +492,7 @@ fn agent(a: &chronos::Agent) -> Value {
         "name": a.name, "id": a.id, "can": a.can.iter().map(|c| c.name()).collect::<Vec<_>>(),
         "max_worlds": a.max_worlds, "writes_per_minute": a.writes_per_minute, "max_changes": a.max_changes,
         "world_ttl": a.world_ttl, "max_query_ms": a.max_query_ms, "max_concurrent": a.max_concurrent,
-        "max_memory_mb": a.max_memory_mb, "created": a.created, "disabled": a.disabled, "policy": a.policy,
+        "max_memory_mb": a.max_memory_mb, "max_idle_ms": a.max_idle_ms, "created": a.created, "disabled": a.disabled, "policy": a.policy,
         // made before agents had SCRAM verifiers: one login over HTTP with its token makes it one (see `admit`)
         "needs_http_login": a.verifier().is_none(),
     })
@@ -525,6 +525,7 @@ fn agent_spec(a: &Value) -> Result<chronos::AgentSpec, Fail> {
         max_query_ms: num("max_query_ms"),
         max_concurrent: num("max_concurrent"),
         max_memory_mb: num("max_memory_mb"),
+        max_idle_ms: num("max_idle_ms"),
         disabled: a.get("disabled").and_then(Value::as_bool),
         policy,
     })

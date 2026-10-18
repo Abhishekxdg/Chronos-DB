@@ -144,6 +144,10 @@ pub struct Agent {
     pub max_concurrent: u64,
     /// working memory each of its statements may hold, in MB (0: no limit)
     pub max_memory_mb: u64,
+    /// how long a Postgres connection of its may sit idle inside a transaction, in ms, before it's
+    /// dropped and the transaction rolled back, its locks let go: its
+    /// idle_in_transaction_session_timeout can't go past it (0: no limit)
+    pub max_idle_ms: u64,
     pub created: u64,
     pub disabled: bool,
     /// the merge policy its merges keep to (see `MergePolicy`); None: its rights alone decide
@@ -165,6 +169,7 @@ pub struct AgentSpec {
     pub max_query_ms: Option<u64>,
     pub max_concurrent: Option<u64>,
     pub max_memory_mb: Option<u64>,
+    pub max_idle_ms: Option<u64>,
     pub disabled: Option<bool>,
     /// a merge policy's name; "" takes the agent's away
     pub policy: Option<String>,
@@ -181,7 +186,8 @@ impl Agent {
             "id": self.id, "can": self.can.iter().map(|c| c.name()).collect::<Vec<_>>(),
             "max_worlds": self.max_worlds, "writes_per_minute": self.writes_per_minute,
             "max_changes": self.max_changes, "world_ttl": self.world_ttl, "max_query_ms": self.max_query_ms,
-            "max_concurrent": self.max_concurrent, "max_memory_mb": self.max_memory_mb, "created": self.created,
+            "max_concurrent": self.max_concurrent, "max_memory_mb": self.max_memory_mb, "max_idle_ms": self.max_idle_ms,
+            "created": self.created,
             "disabled": self.disabled, "policy": self.policy, "token_hash": self.token_hash, "scram": self.scram,
         })
         .to_string()
@@ -201,6 +207,7 @@ impl Agent {
             max_query_ms: n("max_query_ms"),
             max_concurrent: n("max_concurrent"),
             max_memory_mb: n("max_memory_mb"),
+            max_idle_ms: n("max_idle_ms"),
             created: n("created"),
             disabled: j["disabled"].as_bool().unwrap_or(false),
             policy: j["policy"].as_str().map(String::from),
@@ -222,6 +229,7 @@ impl Agent {
             max_query_ms: 0,
             max_concurrent: 0,
             max_memory_mb: 0,
+            max_idle_ms: 0,
             created: 0,
             disabled: false,
             policy: None,
@@ -252,6 +260,7 @@ impl Agent {
         self.max_query_ms = spec.max_query_ms.unwrap_or(self.max_query_ms);
         self.max_concurrent = spec.max_concurrent.unwrap_or(self.max_concurrent);
         self.max_memory_mb = spec.max_memory_mb.unwrap_or(self.max_memory_mb);
+        self.max_idle_ms = spec.max_idle_ms.unwrap_or(self.max_idle_ms);
         self.disabled = spec.disabled.unwrap_or(self.disabled);
         if let Some(p) = &spec.policy {
             self.policy = (!p.is_empty()).then(|| p.clone());
@@ -482,6 +491,7 @@ impl Core {
             max_query_ms: 0,
             max_concurrent: 0,
             max_memory_mb: 0,
+            max_idle_ms: 0,
             created: disk::now_ms(),
             disabled: false,
             policy: None,
