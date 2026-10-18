@@ -48,7 +48,9 @@ use sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use sync::mpsc::{SyncSender, sync_channel};
 use sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak};
 
-pub use agents::{Acting, Agent, AgentSpec, Audit, Can, GUEST, MergePolicy, Outcome, Outcomes, Review, SYSTEM, Slot};
+pub use agents::{
+    Acting, Agent, AgentSpec, Audit, Can, GUEST, MergePolicy, Outcome, Outcomes, Review, SYSTEM, Slot, Verdict,
+};
 pub use backup::{Backup, Verified};
 pub use checks::MergeCheck;
 /// Makes this thread act for an agent until the guard is dropped: what it writes is logged as the

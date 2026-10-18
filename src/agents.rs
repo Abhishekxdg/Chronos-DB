@@ -809,7 +809,18 @@ impl Core {
                 }
                 Step::Rebase { world, onto } => (world, format!("rebase onto {onto}"), 0),
                 Step::Discard(w) => (w, "discard".into(), 0),
-                Step::Meta(w, _) => (w, "metadata".into(), 0),
+                Step::Meta(w, meta) => {
+                    // a reviewer's decision on its held merge (see `decide_review`), or other metadata
+                    let d = serde_json::from_str::<Json>(&meta).ok().map(|m| m[REVIEW]["decision"].clone());
+                    match d.filter(|d| d["at"].as_u64().is_some_and(|t| t + 1000 >= at)) {
+                        Some(d) => {
+                            let verdict = d["verdict"].as_str().unwrap_or("decided");
+                            let reason = d["reason"].as_str().filter(|r| !r.is_empty());
+                            (w, format!("review {verdict}{}", reason.map_or(String::new(), |r| format!(": {r}"))), 0)
+                        }
+                        None => (w, "metadata".into(), 0),
+                    }
+                }
             };
             out.push(Audit { at, agent: who.into(), world, action, rows });
         })?;
@@ -1027,7 +1038,35 @@ pub struct MergePolicy {
     /// whether its agents must declare what a world may change when forking it (`may_change` or
     /// `tenant`: see `scope`)
     pub require_scope: bool,
+    /// an agent (a reviewer model's) that looks at its held merges before a person: it approves (the merge goes
+    /// through), rejects, or passes one on, with a reason (see `Core::decide_review`)
+    pub reviewer: Option<String>,
     pub created: u64,
+}
+
+/// What a reviewer decides about a held merge (see `Core::decide_review`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Verdict {
+    /// merged, as held: the version the policy held
+    Approve,
+    /// not merged; it stays held, with the reason, for a person to see (who may still merge it)
+    Reject,
+    /// left to a person, with the reason
+    Pass,
+}
+
+impl Verdict {
+    pub fn name(self) -> &'static str {
+        match self {
+            Verdict::Approve => "approved",
+            Verdict::Reject => "rejected",
+            Verdict::Pass => "passed to a person",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Verdict> {
+        [Verdict::Approve, Verdict::Reject, Verdict::Pass].into_iter().find(|v| v.name() == s)
+    }
 }
 
 /// A merge waiting for a person (see `Core::reviews`).
@@ -1048,6 +1087,8 @@ pub struct Review {
     pub partly_merged: bool,
     /// what the world was forked to change (see `scope`)
     pub scope: Option<Json>,
+    /// its policy's reviewer, before a person (see `MergePolicy::reviewer`): who, and what it decided (None: not yet)
+    pub reviewer: Option<(String, Option<(Verdict, String)>)>,
 }
 
 impl Review {
@@ -1124,9 +1165,16 @@ impl MergePolicy {
                 "critical" => self.critical = flag()?,
                 "check_reads" => self.check_reads = flag()?,
                 "require_scope" => self.require_scope = flag()?,
+                "reviewer" => {
+                    self.reviewer = match v {
+                        Json::Null => None,
+                        Json::String(s) if !s.is_empty() => Some(s.clone()),
+                        _ => return Err(bad("reviewer must be an agent's name, or null for none".into())),
+                    }
+                }
                 k => {
                     return Err(bad(format!(
-                        "merge policies have no setting {k} (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, require_scope)"
+                        "merge policies have no setting {k} (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, require_scope, reviewer)"
                     )));
                 }
             }
@@ -1143,7 +1191,7 @@ impl MergePolicy {
             "review_channels": self.review_channels,
             "review_tables": self.review_tables, "review_columns": self.review_columns, "schema": self.schema, "overwrite": self.overwrite,
             "critical": self.critical, "check_reads": self.check_reads,
-            "require_scope": self.require_scope, "created": self.created,
+            "require_scope": self.require_scope, "reviewer": self.reviewer, "created": self.created,
         })
         .to_string()
     }
@@ -1176,6 +1224,7 @@ impl MergePolicy {
             critical: j["critical"].as_bool().unwrap_or(false),
             check_reads: j["check_reads"].as_bool().unwrap_or(false),
             require_scope: j["require_scope"].as_bool().unwrap_or(false),
+            reviewer: j["reviewer"].as_str().map(String::from),
             created: j["created"].as_u64().unwrap_or(0),
         })
     }
@@ -1582,6 +1631,53 @@ impl Core {
         self.set_reserved(b, REVIEW, Some(v))
     }
 
+    /// A reviewer's decision on world `b`'s held merge (see `MergePolicy::reviewer`), with its reason: kept with the
+    /// hold (SHOW REVIEWS, the audit), and for `Approve` the merge made as the policy held it, at that version, as a
+    /// person approving it makes it. Only the policy's reviewer, an admin, or the database's own users decide; an
+    /// approval of a world written to (or partly merged) since it was held is refused, as it would merge what wasn't
+    /// reviewed. Returns the rows merged (0 unless approved).
+    pub fn decide_review(&self, b: &str, verdict: Verdict, reason: &str) -> Result<usize> {
+        let w = self.world(b)?;
+        let Some(mut r) = w.meta.get(REVIEW).cloned() else {
+            return Err(Error::Constraint {
+                code: "55000",
+                message: format!("{} isn't waiting for review (SHOW REVIEWS lists those that are)", w.name),
+            });
+        };
+        let policy = r["policy"].as_str().unwrap_or_default().to_string();
+        let actor = disk::actor();
+        if !actor.is_empty() {
+            let reviewer = self.policy(&policy).ok().and_then(|p| p.reviewer);
+            let admin = self.agent(&actor).is_ok_and(|a| a.may(Can::Admin));
+            if reviewer.as_deref() != Some(actor.as_str()) && !admin {
+                return Err(refused(format!(
+                    "agent {actor} isn't merge policy {policy}'s reviewer, so it can't decide {}'s review",
+                    w.name
+                )));
+            }
+        }
+        let held = r["version"].as_u64().unwrap_or(0);
+        if verdict == Verdict::Approve && (w.version != held || r["partly_merged"].as_bool() == Some(true)) {
+            return Err(Error::Constraint {
+                code: "40001",
+                message: format!(
+                    "{} changed since its merge was held (version {held}, now {}): approving it would merge what \
+                     wasn't reviewed; it waits for a person",
+                    w.name, w.version
+                ),
+            });
+        }
+        let by = if actor.is_empty() { Json::Null } else { json!(actor) };
+        r["decision"] = json!({ "by": by, "verdict": verdict.name(), "reason": reason, "at": disk::now_ms() });
+        self.set_reserved(&w.name, REVIEW, Some(r))?;
+        if verdict != Verdict::Approve {
+            return Ok(0);
+        }
+        // past the policy that held it, as a person merging it is; only if it is still as it was held
+        let _person = disk::acting_as("");
+        self.merge_at(&w.name, crate::Resolve::Fail, Some(held))
+    }
+
     /// Notes on world `b`'s queue entry, if it has one, that part of it was merged (see
     /// `Review::partly_merged`).
     pub(crate) fn partly_merged(&self, b: &str) -> Result<()> {
@@ -1606,6 +1702,14 @@ impl Core {
                     now: w.version,
                     owner: w.owner,
                     scope: w.scope,
+                    reviewer: {
+                        let decided = r.get("decision").and_then(|d| {
+                            Some((Verdict::parse(d["verdict"].as_str()?)?, d["reason"].as_str().unwrap_or("").into()))
+                        });
+                        let by = r["decision"]["by"].as_str().map(String::from);
+                        let named = self.policy(r["policy"].as_str().unwrap_or_default()).ok().and_then(|p| p.reviewer);
+                        by.or(named).map(|who| (who, decided))
+                    },
                     world: w.name,
                 })
             })

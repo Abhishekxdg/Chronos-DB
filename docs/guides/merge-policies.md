@@ -109,6 +109,7 @@ Every rule is optional. A rule left out doesn't limit anything, except `schema` 
 | `critical` | `false` and it changes a column a reader marked critical reads (`MARK READER billing CRITICAL`) | `false` |
 | `check_reads` | `true` and it read rows that changed in its parent since the fork (its agent decided on state that's gone) | `false` |
 | `require_scope` | never itself: `true` makes its agents declare what each world may change when forking it (`may_change`, `tenant`); a merge outside that [declared scope](../reference/worlds.md#declared-scope-may_change-tenant) waits for a person | `false` |
+| `reviewer` | never itself: an agent that decides its held merges before a person ([a reviewer before a person](#a-reviewer-before-a-person)) | none |
 
 `max_age` complements the [stale-read check](../reference/worlds.md#stale-reads-check_reads): `check_reads` holds a merge whose reads changed since the fork, `max_age` one whose reads may be fine but are old (`was forked 2 h 5 min ago (at most 1 h)`).
 
@@ -223,6 +224,33 @@ show reviews;                -- (0 rows)
 - **The agent can't skip the queue:** its queue entry is in the world's metadata under a key only the database sets. The agent can't remove it, and can't merge the world until a person does, or until it fits the rules.
 - **Who did what:** `SHOW AUDIT FOR AGENT bot` lists the agent's forks, writes and merges. A refused merge shows as `metadata`: that's the world being queued.
 - **Whether the rules work:** `SHOW MERGE OUTCOMES` counts how each agent's worlds ended within the history window (merged on the rules alone, approved, rejected, dropped, open) and how often its merges were held, conflicted or were refused. `rules_rate` is the share of decided worlds that merged on the rules alone: if it's low, the rules hold too much; if people undo what passed, they hold too little (undone merges still count as merged; see [SQL](../sql.md#agents)). `BY POLICY` gives a row per policy.
+
+### A reviewer before a person
+
+Rules first, a reviewer model next, a person for what's left. Name an agent as the policy's reviewer; it reads each
+held merge as any agent reads (masked columns stay masked) and decides it, with a reason:
+
+```sql
+create agent critic with (can = 'read');                -- reads only: its decisions are its one power
+alter merge policy careful set (reviewer = 'critic');
+-- as critic (its token; or the MCP tools reviews, diff and review):
+show reviews;                                           -- reviewer: waiting for critic
+diff world bot_bulk;
+review world bot_bulk approve reason 'a duplicate of lead 4';     -- merged, as it was held
+review world bot_refund reject reason 'lead 2 has an open deal'; -- not merged
+review world bot_odd pass reason 'not sure: check the deal';     -- left to a person
+```
+
+- **Approve** merges the world at the version that was held, as a person approving it does. A world written to (or
+  partly merged) since is refused (`40001`): what's merged is what was reviewed. A big delete under
+  `confirm_deletes_over` still needs a person's count.
+- **Reject** and **pass** leave the world in `SHOW REVIEWS` with the decision in its `reviewer` column
+  (`rejected by critic: lead 2 has an open deal`): a person reads the reason and merges or drops it. A person can
+  overrule any decision.
+- **Who decides:** the policy's reviewer, an admin, or the database's own users (`55000` for a world that isn't
+  held). The decision is in the audit: `SHOW AUDIT FOR AGENT critic` lists `review approved: ...`.
+- **Over MCP and HTTP:** the `review` tool and op (`branch`, `verdict`: approve, reject or pass, `reason`). The
+  reviewer is any agent you run: a model with a review prompt, polling `reviews`.
 
 ## 6. Tune the rules
 

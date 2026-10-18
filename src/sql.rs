@@ -7968,6 +7968,12 @@ enum Stmt {
         world: String,
         skip_changed: bool,
     },
+    /// REVIEW WORLD w APPROVE | REJECT | PASS [REASON 'why']: a merge policy's reviewer decides a held merge
+    ReviewWorld {
+        world: String,
+        verdict: crate::agents::Verdict,
+        reason: String,
+    },
     /// UNDO AGENT name SINCE <time> [SKIP CHANGED]: in the session's world
     UndoAgent {
         agent: String,
@@ -11795,6 +11801,29 @@ impl Parser {
                 let name = self.branch_name()?;
                 self.expect_kw("set")?;
                 Ok(Stmt::AlterAgent { name, spec: self.meta_pairs()? })
+            }
+            "review" if self.kw("world") => {
+                let world = self.branch_name()?;
+                let verdict = if self.kw("approve") {
+                    crate::agents::Verdict::Approve
+                } else if self.kw("reject") {
+                    crate::agents::Verdict::Reject
+                } else if self.kw("pass") {
+                    crate::agents::Verdict::Pass
+                } else {
+                    return self.fail("expected APPROVE, REJECT or PASS");
+                };
+                let reason = match self.kw("reason") {
+                    true => match self.next() {
+                        Some(Tok::Str(s)) => s,
+                        t => {
+                            self.put_back(t);
+                            return self.fail("expected the reason as a string (REASON 'why')");
+                        }
+                    },
+                    false => String::new(),
+                };
+                Ok(Stmt::ReviewWorld { world, verdict, reason })
             }
             "undo" if self.kw("agent") => {
                 let agent = self.branch_name()?;
@@ -35344,6 +35373,7 @@ impl Session {
             Stmt::Checkpoint { world, .. } => me.may_manage(world)?,
             Stmt::Restore { world, .. } => me.may_restore(world)?,
             Stmt::UndoMerge { .. } | Stmt::UndoAgent { .. } => me.may_undo()?,
+            Stmt::ReviewWorld { .. } => {} // checked as it runs: the policy's reviewer, or an admin
             // checked as they run: 'outbox' or 'admin', policy or not
             Stmt::AckOutbox(_) | Stmt::RetryOutbox(_) | Stmt::ClaimOutbox { .. } => {}
             Stmt::Rebase { name, .. } => me.may_write(&world(name), 0)?, // it changes the world only
@@ -37879,6 +37909,7 @@ impl Session {
             | Stmt::Restore { .. }
             | Stmt::UndoMerge { .. }
             | Stmt::UndoAgent { .. }
+            | Stmt::ReviewWorld { .. }
             | Stmt::SetRetention(_)
             | Stmt::SetSync(_)
             | Stmt::Simulate(_)
@@ -39108,6 +39139,7 @@ impl Statement {
                     ("effects_per_hour", Type::BigInt),
                     ("review_channels", Type::Text),
                     ("confirm_deletes_over", Type::BigInt),
+                    ("reviewer", Type::Text),
                 ]);
             }
             Stmt::ShowChecks | Stmt::CreateCheck { .. } => {
@@ -39178,6 +39210,7 @@ impl Statement {
                     ("scope", Type::Json),
                     ("changes", Type::Text),
                     ("effects", Type::Text),
+                    ("reviewer", Type::Text),
                 ]);
             }
             Stmt::ShowMergeOutcomes { by_policy } => return fixed(&outcome_columns(*by_policy)),
@@ -40003,6 +40036,14 @@ impl Statement {
                 Ok(Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows })
             }
             Stmt::Simulate(_) | Stmt::Replay { .. } => self.simulate(db, branch, None),
+            Stmt::ReviewWorld { world, verdict, reason } => {
+                let n = db.decide_review(world, *verdict, reason)?;
+                Ok(Output::tag(match verdict {
+                    crate::agents::Verdict::Approve => format!("REVIEW APPROVE {n}"),
+                    crate::agents::Verdict::Reject => "REVIEW REJECT".into(),
+                    crate::agents::Verdict::Pass => "REVIEW PASS".into(),
+                }))
+            }
             Stmt::UndoMerge { world, skip_changed } => {
                 let u = db.undo_merge(world, *skip_changed)?;
                 Ok(Output::tag(format!("UNDO MERGE {}", u.rows)))
@@ -40094,6 +40135,7 @@ impl Statement {
                             limit(p.effects_per_hour),
                             Value::Text(crate::agents::listed(&p.review_channels)),
                             limit(p.confirm_deletes_over),
+                            p.reviewer.map_or(Value::Null, Value::Text),
                         ]
                     })
                     .collect();
@@ -40255,6 +40297,14 @@ impl Statement {
                             r.scope.map_or(Value::Null, Value::Json),
                             changes,
                             effects,
+                            match r.reviewer {
+                                None => Value::Null,
+                                Some((who, None)) => Value::Text(format!("waiting for {who}")),
+                                Some((who, Some((v, why)))) => Value::Text(match why.is_empty() {
+                                    true => format!("{} by {who}", v.name()),
+                                    false => format!("{} by {who}: {why}", v.name()),
+                                }),
+                            },
                         ]
                     })
                     .collect();

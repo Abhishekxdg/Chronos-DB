@@ -271,6 +271,7 @@ pub fn call_as(db: &Db, me: &chronos::Acting, op: &str, a: &Value) -> Result<Val
         "discard" | "set_meta" | "checkpoint" => me.may_manage(branch)?,
         "restore" => me.may_restore(branch)?,
         "undo_merge" => me.may_undo()?,
+        "review" => {} // checked as it runs: the policy's reviewer, or an admin
         "sql" => return run_sql(db, a, Some(&me.agent.name)),
         "simulate" | "replay" => return simulate(db, op, a, Some(&me.agent.name)), // checked as it runs
         // every agent's results, as /metrics are: the server's token only
@@ -731,6 +732,16 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
         "checkpoint" => {
             let at = db.checkpoint_world(need("branch")?, need("name")?)?;
             Ok(json!({ "ok": true, "at": at }))
+        }
+        "review" => {
+            let verdict = match need("verdict")? {
+                "approve" => chronos::Verdict::Approve,
+                "reject" => chronos::Verdict::Reject,
+                "pass" => chronos::Verdict::Pass,
+                v => return Err(bad(format!("'verdict' must be approve, reject or pass, not '{v}'"))),
+            };
+            let n = db.decide_review(need("branch")?, verdict, s("reason").unwrap_or(""))?;
+            Ok(json!({ "ok": true, "merged": n }))
         }
         "undo_merge" => {
             let skip = a.get("skip_changed").and_then(Value::as_bool) == Some(true);

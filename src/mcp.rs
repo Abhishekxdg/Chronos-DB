@@ -646,6 +646,15 @@ fn call(sh: &mut Shell, g: &mut Guard, name: &str, a: &Value) -> Result<String, 
             } + " (rows both sides changed are merge_preview's: a merge that doesn't settle them fails anyway)")
         }
         "reviews" => sh.sql_as("show reviews", &[], g.agent.as_deref()),
+        "review" => {
+            let verdict = match word("verdict")? {
+                v @ ("approve" | "reject" | "pass") => v,
+                v => return Err(format!("'verdict' must be approve, reject or pass, not '{v}'")),
+            };
+            let world = format!("\"{}\"", word("branch")?.replace('"', "\"\""));
+            let reason = a.get("reason").and_then(Value::as_str).unwrap_or("");
+            sh.sql_as(&format!("review world {world} {verdict} reason {}", lit(reason)), &[], g.agent.as_deref())
+        }
         "merge_checks" => sh.sql_as("show merge checks", &[], g.agent.as_deref()),
         "set_merge_check" | "drop_merge_check" => {
             let sql = check_sql(name, word("name")?, a)?;
@@ -1235,6 +1244,19 @@ fn tools(hidden: &[&str]) -> Value {
              whether it changed since the agent asked. A person approves by merging the branch, or discards it.",
             json!({}),
             &[],
+        ),
+        tool(
+            "review",
+            "For a merge policy's reviewer (its `reviewer` setting names this agent): decide a held merge before a \
+             person does. Read it first (`reviews`, then `diff` of the branch: masked columns stay masked). `approve` \
+             merges it as it was held (refused if it changed since); `reject` keeps it from merging; `pass` leaves it \
+             to a person. The reason is kept with it, in `reviews` and the audit: say what you checked.",
+            json!({
+                "branch": { "type": "string" },
+                "verdict": { "type": "string", "enum": ["approve", "reject", "pass"] },
+                "reason": { "type": "string", "description": "Why, in a sentence a person can check" }
+            }),
+            &["branch", "verdict", "reason"],
         ),
     ]);
     let Value::Array(all) = all else { unreachable!() };

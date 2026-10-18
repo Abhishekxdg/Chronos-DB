@@ -1510,6 +1510,7 @@ fn superuser_only(st: &Stmt) -> Option<&'static str> {
         Stmt::AlterWorld { .. } => "ALTER WORLD",
         Stmt::Restore { .. } => "RESTORE WORLD",
         Stmt::UndoMerge { .. } | Stmt::UndoAgent { .. } => "UNDO",
+        Stmt::ReviewWorld { .. } => "REVIEW",
         // (Postgres's own CHECKPOINT takes pg_checkpoint's privileges: see `Stmt::Checkpoint`)
         Stmt::Checkpoint { world, .. } if world.is_empty() => return None,
         Stmt::Checkpoint { .. } => "CHECKPOINT WORLD",

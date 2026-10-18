@@ -117,6 +117,7 @@ Every tool that reads or writes rows takes `branch` (string, default `main`). A 
 | [`set_merge_policy`](#set_merge_policy) | create or change a policy, give it to agents | drafts the SQL for a person |
 | [`drop_merge_policy`](#drop_merge_policy) | remove a policy | drafts the SQL for a person |
 | [`reviews`](#reviews) | merges waiting for a person | yes |
+| [`review`](#review) | a policy's reviewer decides a held merge: approve, reject or pass | yes |
 | [`merge_checks`](#merge_checks) | queries every merge's result must find nothing in | yes |
 | [`set_merge_check`](#set_merge_check) | create or replace a merge check | drafts the SQL for a person |
 | [`drop_merge_check`](#drop_merge_check) | remove a merge check | drafts the SQL for a person |
@@ -432,6 +433,16 @@ Removes a merge policy. Refused while an agent keeps to it, unless `release_agen
 ### reviews
 
 Merges a policy sent to a person, oldest first: `world`, `owner`, `policy`, `reasons`, `asked`, `version`, `changed_since` (the branch was written to, or partly merged, after its agent asked), `scope`, `changes` (per table, deleted, updated and inserted, deletes first), `effects` (what its merge would send, per channel). A person approves with `merge` (or `MERGE WORLD`), or throws it away with `discard`. No parameters. Runs [`SHOW REVIEWS`](worlds.md#merge-policies).
+
+### review
+
+For a merge policy's reviewer (the policy's `reviewer` names the agent): decide a held merge before a person does. `approve` merges it as it was held (refused if the branch changed since), `reject` keeps it from merging, `pass` leaves it to a person; the reason is kept in `reviews` and the audit. Runs `REVIEW WORLD ... APPROVE | REJECT | PASS REASON '...'` ([a reviewer before a person](../guides/merge-policies.md#a-reviewer-before-a-person)).
+
+| Parameter | Type | Required | Default |
+|---|---|---|---|
+| `branch` | string | yes | |
+| `verdict` | `approve`, `reject` or `pass` | yes | |
+| `reason` | string | yes | |
 
 ### merge_checks
 
