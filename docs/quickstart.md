@@ -15,6 +15,31 @@ The examples below use `psql`; on a machine without it: `sudo apt-get install po
 
 The script picks the build for your OS and CPU, checks its SHA-256 against the release's `SHA256SUMS`, and installs it for your user; it never runs anything as root. `CHRONOS_INSTALL_DIR=<folder>` installs into another folder you can write (for `/usr/local/bin`, download the script and run it with `sudo` yourself), `CHRONOS_VERSION=v0.3.2` picks a release, and `CHRONOS_VERIFY=1` also checks the build's signature with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/): proof Chronos DB's release workflow built it. The Linux builds are static (musl), so they run on any distribution.
 
+## Already run Postgres? Start beside it
+
+Your data stays in your Postgres. Chronos copies the tables agents work on into a folder, agents fork worlds of it
+at once, and a merge into main is written back to your Postgres in one checked transaction (a row changed there
+meanwhile comes back as a conflict, and nothing is written):
+
+```bash
+export CHRONOS_SOURCE_URL='postgres://agent_writer:...@staging-db:5432/crm?sslmode=verify-full'
+chronos attach ./crm --tables public.leads,public.accounts   # or --schema app
+claude mcp add chronos -- chronos mcp ./crm                  # agents get worlds now (or: chronos serve ./crm)
+```
+
+The URL is read from the environment (or a file only you can read), never from the command line, and isn't written
+to the folder. What attach doesn't do yet, before you rely on it:
+
+- **Each table needs a primary key**, and no generated column or row-level security; partitioned and inheriting
+  tables aren't attached.
+- **At most 10,000 changed rows per merge** (merge a world a table at a time past that).
+- **No refresh:** rows no merge touches stay as of the attach; attach again into a new folder to pick up the rest.
+- **Your schema doesn't change through Chronos:** change tables in Postgres, then attach again.
+- **For staging copies first.** It's Stage 1: [the guide](guides/attach-postgres.md) has the details, the limits and
+  what happens at a merge.
+
+Moving the data into Chronos instead, or starting from nothing, is the rest of this page.
+
 ## Start a server and connect with psql
 
 ```bash
@@ -118,7 +143,7 @@ agent.merge()
 ## From Claude Code (MCP)
 
 ```bash
-claude mcp add chronos -- chronos mcp /path/to/mydb
+claude mcp add chronos -- chronos mcp /path/to/mydb   # a folder beside your Postgres works the same (see above)
 ```
 
 The agent gets `describe`, `find`, `sql`, `get`, `put`, `delete`, `fork`, `set_meta`, `branches`, `diff` (rows, or with `as_sql` the SQL statements that make the change), `history`, `merge_preview` (what a merge would do, row by row and why), `checkpoint` and `rollback` (name a moment of its world and go back to it), `simulate` and `replay`, and `discard`, plus instructions for the safe workflow: describe, fork, edit, diff, then a person merges. Every tool and its parameters: [MCP reference](reference/mcp.md).
