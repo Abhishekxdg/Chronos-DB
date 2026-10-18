@@ -10,6 +10,7 @@ module.exports = {
     ] },
     'postgres-compatibility',
     'security',
+    'what-chronos-protects',
     'operations',
   ],
 };
