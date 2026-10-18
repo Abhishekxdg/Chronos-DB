@@ -1017,7 +1017,7 @@ fn tools(hidden: &[&str]) -> Value {
             json!({
                 "name": { "type": "string", "description": "New branch name, e.g. your task id" },
                 "from": { "type": "string", "description": "Branch to copy (default main)" },
-                "meta": { "type": "object", "description": "Optional notes on the branch, e.g. {\"task\": \"...\"}. Declare what it may change, held to at its merge: {\"may_change\": \"leads.status, lists\", \"tenant\": \"org_id = 42\", \"max_rows\": 250, \"max_deletes\": 0, \"intent\": \"close stale leads\", \"run\": \"your run or subagent id\"}" },
+                "meta": { "type": "object", "description": "Optional notes on the branch, e.g. {\"task\": \"...\"}. Declare what it may change, held to at its merge: {\"may_change\": \"leads.status, lists\", \"tenant\": \"org_id = 42\", \"max_rows\": 250, \"max_deletes\": 0, \"intent\": \"close stale leads\", \"run\": \"your run or subagent id\"}. Say which run made it, shown in the audit and reviews: {\"run_id\": \"r42\", \"prompt_version\": \"...\", \"model\": \"...\", \"tool_schema\": \"...\"}" },
             }),
             &["name"],
         ),

@@ -684,7 +684,9 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
             let events: Vec<Value> = db
                 .audit(s("agent"), limit)?
                 .into_iter()
-                .map(|e| json!({ "at": e.at, "agent": e.agent, "world": e.world, "action": e.action, "rows": e.rows }))
+                .map(|e| {
+                    json!({ "at": e.at, "agent": e.agent, "world": e.world, "action": e.action, "rows": e.rows, "run": e.run })
+                })
                 .collect();
             Ok(json!({ "events": events }))
         }

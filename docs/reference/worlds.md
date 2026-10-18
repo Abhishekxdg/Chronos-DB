@@ -71,10 +71,12 @@ CREATE BRANCH name [FROM source] [WITH (...) | META '...']
 
 - **Source:** the session's world unless `FROM` names one: a name, an ID, or `'name@when'` (the new world holds that past; agents need `admin` for this).
 - **Metadata:** `WITH` values are strings, numbers, `true`, `false` or `null`. `META` takes a JSON object. Keys starting with `_sonos` are the database's (22023). At most 64 KB as JSON (22023).
+- **Which run made it:** `run_id`, `prompt_version`, `model` and `tool_schema` (text; 22023 otherwise) say which run of an agent made the world's changes, and with what prompt, model and tool schema. `SHOW AUDIT` and `SHOW REVIEWS` show them in a `run` column (JSON), and [`UNDO AGENT ... WHERE run_id`](#undo-agent) puts back one run's changes. Over HTTP and MCP, put them in the fork's `meta`.
 - **The session stays** on its world. Switch with `SWITCH WORLD`.
 
 ```sql
 create world agent_7 from main with (owner = 'claude', task = 42);
+create world run_r42 with (run_id = 'r42', prompt_version = 'triage-v9', model = 'claude-opus-5-5', tool_schema = 'crm-tools-3');
 create world check_it from 'main@-1 hour';
 ```
 
@@ -482,10 +484,12 @@ This is the SQL statement. The shell's own `checkpoint` command compacts the log
 ## UNDO AGENT
 
 ```
-UNDO AGENT name SINCE when [SKIP CHANGED]
+UNDO AGENT name SINCE when [SKIP CHANGED] [WHERE run_id = 'id']
 ```
 
 In the session's world, puts back every row agent `name` changed since `when`.
+
+- **One run:** `WHERE run_id = 'r42'` puts back only the changes that came from worlds whose metadata has that `run_id` (written in them and merged by the agent). The agent's changes in other runs count as anyone else's: a row another run changed afterwards is named (or left, with `SKIP CHANGED`).
 
 - **Rows someone else changed after the agent:** 40001, naming up to 10; nothing is undone. `SKIP CHANGED` leaves those.
 - **History** must reach back to `when` (22023).
@@ -494,6 +498,7 @@ Returns tag `UNDO AGENT n`.
 
 ```sql
 undo agent bot since '-2 hours' skip changed;
+undo agent bot since '-1 day' where run_id = 'r42';
 ```
 
 ## SHOW HISTORY
@@ -636,7 +641,7 @@ DROP AGENT name                                  -- tag DROP AGENT; its worlds s
 SHOW AGENTS                                      -- name, id, can, max_worlds, writes_per_minute, max_changes,
                                                  -- world_ttl, created, disabled, max_query_ms, max_concurrent, max_memory_mb, policy,
                                                  -- max_idle_ms
-SHOW AUDIT [FOR [AGENT] name] [LIMIT n]          -- at, agent, world, action, rows (LIMIT 100 by default)
+SHOW AUDIT [FOR [AGENT] name] [LIMIT n]          -- at, agent, world, action, rows, run (LIMIT 100 by default)
 ```
 
 | Key | Value | Default |

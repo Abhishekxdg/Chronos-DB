@@ -158,6 +158,7 @@ fn an_exposed_server_whose_token_can_change_main_warns() {
         let mut c = Command::new(env!("CARGO_BIN_EXE_chronos"));
         c.args(["serve", dir.to_str().unwrap(), "--listen", listen, "--pg", "off"]).args(args);
         c.env("CHRONOS_TOKEN", long).env_remove("CHRONOS_ADMIN_TOKEN");
+        c.env("CHRONOS_PROTECT_MAIN", "off"); // (a folder serve makes is protected: this one starts without)
         let mut child = c.stderr(std::process::Stdio::piped()).spawn().unwrap();
         let mut err = std::io::BufReader::new(child.stderr.take().unwrap());
         let mut log = String::new();

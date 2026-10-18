@@ -7974,11 +7974,12 @@ enum Stmt {
         verdict: crate::agents::Verdict,
         reason: String,
     },
-    /// UNDO AGENT name SINCE <time> [SKIP CHANGED]: in the session's world
+    /// UNDO AGENT name SINCE <time> [SKIP CHANGED] [WHERE run_id = '...']: in the session's world
     UndoAgent {
         agent: String,
         since: Expr,
         skip_changed: bool,
+        run: Option<String>,
     },
     /// ALTER SYSTEM SET history_retention = '<interval>'
     SetRetention(String),
@@ -11833,7 +11834,24 @@ impl Parser {
                 if skip_changed {
                     self.expect_kw("changed")?;
                 }
-                Ok(Stmt::UndoAgent { agent, since, skip_changed })
+                // one run's changes: those its worlds' metadata gives this run_id (see `agents::RUN_KEYS`)
+                let run = match self.kw("where") {
+                    true => {
+                        self.expect_kw("run_id")?;
+                        if !self.sym("=") {
+                            return self.fail("expected = after run_id");
+                        }
+                        match self.next() {
+                            Some(Tok::Str(s)) => Some(s),
+                            t => {
+                                self.put_back(t);
+                                return self.fail("expected the run's id as a string (WHERE run_id = 'r42')");
+                            }
+                        }
+                    }
+                    false => None,
+                };
+                Ok(Stmt::UndoAgent { agent, since, skip_changed, run })
             }
             "undo" => {
                 self.expect_kw("merge")?;
@@ -39240,6 +39258,7 @@ impl Statement {
                     ("scope", Type::Json),
                     ("changes", Type::Text),
                     ("effects", Type::Text),
+                    ("run", Type::Json),
                     ("reviewer", Type::Text),
                 ]);
             }
@@ -39251,6 +39270,7 @@ impl Statement {
                     ("world", Type::Text),
                     ("action", Type::Text),
                     ("rows", Type::BigInt),
+                    ("run", Type::Json),
                 ]);
             }
             Stmt::MergeBranch { dry: true, .. } => {
@@ -40078,8 +40098,9 @@ impl Statement {
                 let u = db.undo_merge(world, *skip_changed)?;
                 Ok(Output::tag(format!("UNDO MERGE {}", u.rows)))
             }
-            Stmt::UndoAgent { agent, since, skip_changed } => {
-                let u = db.undo_agent(agent, &db.world(branch)?.name, when(since, params)?, *skip_changed)?;
+            Stmt::UndoAgent { agent, since, skip_changed, run } => {
+                let w = db.world(branch)?.name;
+                let u = db.undo_run(agent, &w, when(since, params)?, *skip_changed, run.as_deref())?;
                 Ok(Output::tag(format!("UNDO AGENT {}", u.rows)))
             }
             Stmt::Restore { world, at, checkpoint } => {
@@ -40327,6 +40348,7 @@ impl Statement {
                             r.scope.map_or(Value::Null, Value::Json),
                             changes,
                             effects,
+                            r.run.map_or(Value::Null, Value::Json),
                             match r.reviewer {
                                 None => Value::Null,
                                 Some((who, None)) => Value::Text(format!("waiting for {who}")),
@@ -40441,6 +40463,7 @@ impl Statement {
                             Value::Text(e.world),
                             Value::Text(e.action),
                             Value::Int(e.rows as i64),
+                            e.run.map_or(Value::Null, Value::Json),
                         ]
                     })
                     .collect();

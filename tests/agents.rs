@@ -1105,3 +1105,66 @@ fn a_settled_merge_is_pinned_to_the_target_the_preview_saw() {
         .unwrap();
     assert_eq!(run(&db, MAIN, "select v from t", &[]).unwrap()[0].rows[0][0].to_text(), "w");
 }
+
+/// Which run made a change: `run_id`, `prompt_version`, `model` and `tool_schema` in a world's metadata are shown by
+/// SHOW AUDIT and SHOW REVIEWS, and `UNDO AGENT ... WHERE run_id = '...'` puts back that run's changes alone.
+/// Issue #44.
+#[test]
+fn runs_are_recorded_and_undone_one_at_a_time() {
+    use chronos::sql::{Session, run};
+    let dir = std::env::temp_dir().join(format!("chronos-undo-run-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = Db::open(&dir).unwrap();
+    let q = |sql: &str| run(&db, MAIN, sql, &[]).unwrap();
+    let col = |sql: &str| -> Vec<String> { q(sql)[0].rows.iter().map(|r| r[0].to_text()).collect() };
+    q("create table t (id int primary key, v text); insert into t select g, 'v' || g from generate_series(1, 6) g");
+    q("create merge policy careful with (max_deletes = 0)");
+    let can = vec![Can::Read, Can::Fork, Can::WriteOwn, Can::WriteMain, Can::MergeOwn];
+    db.create_agent("bot", &AgentSpec { can: Some(can), policy: Some("careful".into()), ..Default::default() })
+        .unwrap();
+    let mut bot = Session::new(MAIN);
+    bot.agent = Some("bot".into());
+    let meta =
+        |r: &str, p: &str| format!("run_id = '{r}', prompt_version = '{p}', model = 'claude-x', tool_schema = 's7'");
+    for (w, r, p, sql) in [
+        ("a", "r1", "p1", "update t set v = 'r1' where id in (1, 2)"),
+        ("b", "r2", "p2", "update t set v = 'r2' where id in (3, 4)"),
+        ("c", "r1", "p1", "update t set v = 'r1 again' where id = 5"),
+    ] {
+        let fork =
+            format!("create world {w} with ({}); use world {w}; {sql}; use world main; merge world {w}", meta(r, p));
+        bot.run(&db, &fork, &[]).unwrap();
+    }
+    // shown with each thing the run did
+    let audit = q("show audit for agent bot")[0].clone();
+    let at = |n: &str| audit.columns.as_ref().unwrap().iter().position(|(c, _)| c == n).unwrap();
+    let merged_b =
+        audit.rows.iter().find(|r| r[at("world")].to_text() == "b" && r[at("action")].to_text().starts_with("merge"));
+    let run_b: serde_json::Value =
+        serde_json::from_str(&merged_b.expect("b's merge").get(at("run")).unwrap().to_text()).unwrap();
+    let want = serde_json::json!({ "run_id": "r2", "prompt_version": "p2", "model": "claude-x", "tool_schema": "s7" });
+    assert_eq!(run_b, want);
+    // and with a merge waiting for a person
+    bot.run(
+        &db,
+        &format!("create world d with ({}); use world d; delete from t where id = 6; use world main", meta("r3", "p3")),
+        &[],
+    )
+    .unwrap();
+    assert!(bot.run(&db, "merge world d", &[]).is_err());
+    let reviews = q("show reviews")[0].clone();
+    let rc = reviews.columns.as_ref().unwrap().iter().position(|(c, _)| c == "run").unwrap();
+    let run_d: serde_json::Value = serde_json::from_str(&reviews.rows[0][rc].to_text()).unwrap();
+    assert_eq!(run_d["run_id"], "r3");
+    // run keys are text
+    let e = run(&db, MAIN, "create world x with (run_id = 5)", &[]).unwrap_err();
+    assert!(e.message.contains("run_id must be text"), "{}", e.message);
+
+    // run r1 put back alone: r2's rows stay
+    q("undo agent bot since '-1 hour' where run_id = 'r1'");
+    assert_eq!(col("select v from t order by id"), ["v1", "v2", "r2", "r2", "v5", "v6"]);
+    let e = run(&db, MAIN, "undo agent bot since '-1 hour' where run_id = 5", &[]).unwrap_err();
+    assert_eq!(e.code, "42601", "{}", e.message);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -309,7 +309,7 @@ fn reserved_keys(m: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
     // `sim` holds what `replay` reruns: only a simulation sets it
     match m.keys().find(|k| k.starts_with("_sonos") || *k == SIM) {
         Some(k) => Err(bad_meta(format!("metadata key {k} is kept by the database; pick another name"))),
-        None => Ok(()),
+        None => agents::check_run(m), // run_id, model, ...: text
     }
 }
 
@@ -3604,6 +3604,13 @@ impl Core {
     // ponytail: replays all history since the checkpoint before `since` in memory on every call;
     // index changes by agent if undoing weeks back gets slow
     pub fn undo_agent(&self, agent: &str, b: &str, since: u64, skip_changed: bool) -> Result<Undone> {
+        self.undo_run(agent, b, since, skip_changed, None)
+    }
+
+    /// `undo_agent`, of one run's changes alone when `run` is given: those made in (or merged from) worlds whose
+    /// metadata has that `run_id` (see `agents::RUN_KEYS`). The agent's other changes count as anyone else's: a row
+    /// another of its runs changed after this one is left, and named.
+    pub fn undo_run(&self, agent: &str, b: &str, since: u64, skip_changed: bool, run: Option<&str>) -> Result<Undone> {
         if b == MAIN {
             attach::refuse_main(self, "UNDO AGENT")?;
         }
@@ -3654,6 +3661,16 @@ impl Core {
                 }
                 _ => None,
             };
+            // the world the change comes from (written, or merged), and whether it's of the run asked for
+            let from = match &op {
+                Op::Write(w, _) | Op::Bulk(w, ..) | Op::Merge(w, ..) | Op::MergeWith(w, ..) => Some(w.as_str()),
+                Op::MergeSome { branch, .. } => Some(branch.as_str()),
+                _ => None,
+            };
+            let of_run = run.is_none_or(|r| {
+                from.and_then(|w| scratch.branch(w).ok())
+                    .is_some_and(|br| br.info.read().unwrap().meta.get("run_id").and_then(|v| v.as_str()) == Some(r))
+            });
             let before = (at >= since && into.as_deref() == Some(b))
                 .then(|| scratch.branch(b).map(|br| br.snapshot()).ok())
                 .flatten();
@@ -3681,7 +3698,7 @@ impl Core {
                     }
                 };
                 for c in changes {
-                    if who == agent {
+                    if who == agent && of_run {
                         rows.entry(c.key).or_insert_with(|| (c.before, None, false)).1 = c.after;
                     } else if let Some(r) = rows.get_mut(&c.key) {
                         r.2 = true;

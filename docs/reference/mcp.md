@@ -202,7 +202,7 @@ Creates a branch: an instant private copy. In safe mode it becomes one of the se
 | `from` | string | no | `main`; a branch, or `name@when` |
 | `meta` | object | no | none; notes, e.g. `{"owner": "you", "task": "..."}` |
 
-To say what the branch is meant to change, held to at its merge, put a [declared scope](worlds.md#declared-scope-may_change-tenant) in `meta`: `{"may_change": "leads.status, lists", "tenant": "org_id = 42", "max_rows": 250, "max_deletes": 0, "intent": "close stale leads", "run": "your run or subagent id"}`.
+To say what the branch is meant to change, held to at its merge, put a [declared scope](worlds.md#declared-scope-may_change-tenant) in `meta`: `{"may_change": "leads.status, lists", "tenant": "org_id = 42", "max_rows": 250, "max_deletes": 0, "intent": "close stale leads", "run": "your run or subagent id"}`. To say which run made its changes (shown in the audit and in reviews, and undone together with `UNDO AGENT ... WHERE run_id`), add `run_id`, `prompt_version`, `model` and `tool_schema` ([which run made it](worlds.md#create-world)).
 
 Returns `created branch task-1 (world id <id>) from main; pass branch="task-1" to work on it`.
 

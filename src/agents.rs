@@ -277,6 +277,28 @@ pub struct Audit {
     pub world: String,
     pub action: String, // write, fork from ..., merge into ..., discard, metadata
     pub rows: usize,
+    /// the run that made it, from the world's metadata (see `RUN_KEYS`): None when it names none
+    pub run: Option<Json>,
+}
+
+/// World metadata keys that say which run made a world's changes: the caller's id for the run, and the prompt,
+/// model and tool schema it ran with. Set at the fork (or with ALTER WORLD); shown by SHOW AUDIT and SHOW REVIEWS,
+/// and `UNDO AGENT ... WHERE run_id = '...'` puts back one run's changes.
+pub const RUN_KEYS: [&str; 4] = ["run_id", "prompt_version", "model", "tool_schema"];
+
+/// The run keys `meta` (a world's metadata object) has, as an object; None when it has none.
+pub fn run_of(meta: &serde_json::Map<String, Json>) -> Option<Json> {
+    let run: serde_json::Map<String, Json> =
+        RUN_KEYS.iter().filter_map(|k| Some((k.to_string(), meta.get(*k)?.clone()))).collect();
+    (!run.is_empty()).then_some(Json::Object(run))
+}
+
+/// Refuses run keys (see `RUN_KEYS`) in `meta` that aren't text.
+pub(crate) fn check_run(meta: &serde_json::Map<String, Json>) -> Result<()> {
+    match RUN_KEYS.iter().find(|k| meta.get(**k).is_some_and(|v| !v.is_string() && !v.is_null())) {
+        Some(k) => Err(bad(format!("{k} must be text"))),
+        None => Ok(()),
+    }
 }
 
 /// How one agent's worlds (or one merge policy's agents' worlds) ended within the history window, and how often
@@ -793,7 +815,23 @@ impl Core {
     pub fn audit(&self, agent: Option<&str>, limit: usize) -> Result<Vec<Audit>> {
         let Some(win) = self.window()? else { return Ok(vec![]) };
         let mut out = vec![];
+        // each world's run as its metadata says it (see `RUN_KEYS`): as the window opened, then as forks and
+        // metadata changes in it say
+        let parse = |m: &str| serde_json::from_str::<serde_json::Map<String, Json>>(m).ok().and_then(|m| run_of(&m));
+        let mut runs: HashMap<String, Json> =
+            win.open.iter().filter_map(|m| Some((m.name.clone(), parse(&m.meta)?))).collect();
         self.walk(&win, |at, who, step| {
+            match &step {
+                Step::Fork { world, meta, .. } | Step::Meta(world, meta) => match parse(meta) {
+                    Some(r) => {
+                        runs.insert(world.clone(), r);
+                    }
+                    None => {
+                        runs.remove(world);
+                    }
+                },
+                _ => {}
+            }
             if who.is_empty() || agent.is_some_and(|a| a != who) {
                 return;
             }
@@ -822,7 +860,8 @@ impl Core {
                     }
                 }
             };
-            out.push(Audit { at, agent: who.into(), world, action, rows });
+            let run = runs.get(&world).cloned();
+            out.push(Audit { at, agent: who.into(), world, action, rows, run });
         })?;
         out.sort_by_key(|e| e.at); // a batch of writes is logged after records from later
         out.reverse();
@@ -1087,6 +1126,8 @@ pub struct Review {
     pub partly_merged: bool,
     /// what the world was forked to change (see `scope`)
     pub scope: Option<Json>,
+    /// the run that made it (see `RUN_KEYS`)
+    pub run: Option<Json>,
     /// its policy's reviewer, before a person (see `MergePolicy::reviewer`): who, and what it decided (None: not yet)
     pub reviewer: Option<(String, Option<(Verdict, String)>)>,
 }
@@ -1702,6 +1743,7 @@ impl Core {
                     now: w.version,
                     owner: w.owner,
                     scope: w.scope,
+                    run: w.meta.as_object().and_then(run_of),
                     reviewer: {
                         let decided = r.get("decision").and_then(|d| {
                             Some((Verdict::parse(d["verdict"].as_str()?)?, d["reason"].as_str().unwrap_or("").into()))
