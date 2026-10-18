@@ -120,6 +120,22 @@ Settings for a server shared by agents, all off by default:
 - **`ALTER SYSTEM SET protect_main = on`:** `main`'s rows change only by merging a world, for every user (see [SQL](sql.md#limits-for-the-whole-database)).
 - **`chronos serve --safe --admin-token A`:** clients without an agent's token get MCP's safe mode (see [concepts](concepts.md#agents)); `A` (or `CHRONOS_ADMIN_TOKEN`) is the database's own user. `--token` still guards the port: with both, the server's token alone gets a guest.
 
+## Limits the operator sets
+
+For a host that runs databases for others, whose admins hold the admin token and so can change every setting above: two limits set where the process starts, which nothing inside the database can raise. In Rust, `Open::max_disk_bytes` and `Open::ceilings` (None reads the environment).
+
+- **`CHRONOS_MAX_DISK_BYTES=536870912`:** the most the folder may hold, in bytes (unset or 0: no cap). It counts the page files, the log (the live segment by its records, not the 4 MB of zeros kept ahead of them), history, page indexes, big statements' spills in `<database>/spill`, and the rest of the folder; and queries' spill files when `CHRONOS_SPILL_DIR` is inside the folder (set it to `<database>/spill` so they count; files there are deleted as queries end, and the folder emptied at open). Pages and the live segment are followed by running counts, the rest measured at most a second apart (and after every checkpoint and cleanup), so the check costs a few atomic reads per write. A write (`INSERT`, `UPDATE`, `COPY`, a big statement's part, a query's spill), a fork, `CREATE DATABASE` and a world's `CHECKPOINT 'label'` that would take the folder past the cap is refused: `53100` `database is over its 512 MB limit: drop worlds, delete rows or upgrade`, over HTTP `507`. Reads, `DELETE`, `DROP`, `TRUNCATE`, `BEGIN`, `COMMIT`, merges (their rows were let in when written in the world), discarding worlds, `ALTER SYSTEM`, checkpoints and cleanup keep working, so a full database can free itself: within a tenth of its cap every checkpoint cleans up too, and the background worker checkpoints once a megabyte of log (a sixteenth of the cap, if less) has piled up since the last, so deleted rows give their space back within about 30 seconds (`CHECKPOINT` does it at once). History is kept for its window whatever the cap: lower `history_retention` to free it. A change near the cap can still pass it a little (a checkpoint's new pages, a merge, a delete's log record); the filesystem's own quota is the backstop. `SHOW DISK` gives `total` (the folder as the cap counts it) and `limit`; `/metrics` `chronos_disk_bytes` and `chronos_disk_limit_bytes`.
+- **`CHRONOS_LIMITS=/etc/chronos/limits.toml`:** ceilings over the database's own settings, one `key = integer` a line (`#` comments; `_` between digits). A key it doesn't know, or a value that isn't a whole number, stops the database from opening.
+
+  ```toml
+  max_worlds = 100
+  history_retention_ms = 86_400_000   # a day
+  world_idle_ttl_ms = 604_800_000     # 7 days
+  statement_timeout_ms = 30_000
+  ```
+
+  `ALTER SYSTEM SET` past a ceiling is refused: `42501` `max_worlds may be at most 100 on this database, not 500: a limit of its plan, which its operator sets (CHRONOS_LIMITS) and ALTER SYSTEM can't raise`. A setting left at 0 (no limit) is the ceiling, and so is one set before the ceiling was: `SHOW max_worlds` says what's in force. `history_retention` past its ceiling is lowered to it when the database opens, and the history past it goes at the next checkpoint. A session's `SET statement_timeout` above the ceiling, or to 0, is clamped to it (`SHOW statement_timeout` says so), as an agent's `max_query_ms` clamps it.
+
 ## Memory and spilling to disk
 
 A query's grouping or sorting holds up to `CHRONOS_WORK_MEM` (default `256MB`; also `64MB`, `2GB`, or plain bytes). Past that it spills to temporary files in `CHRONOS_SPILL_DIR` (default the system's temporary folder), deleted when the query ends. `spilled_bytes` in `SHOW METRICS` counts what was written.
@@ -163,7 +179,8 @@ What the database has done since it opened: each kind of operation's count and l
 - **In SQL:** `SHOW METRICS;` (also in the shell).
 - **For Prometheus:** `GET /metrics` on `chronos serve`, with the server's token if it has one (agents' tokens get 403). Latencies are a summary, `chronos_op_seconds{op="...",quantile="..."}`.
 - **Operations timed:** `select`, `insert`, `update`, `delete`, `schema` (CREATE, ALTER, DROP), `other_sql`, `commit` (a transaction going into its world), `log_sync` (waiting for the log to reach disk), `fork`, `diff`, `merge`, `search`, `checkpoint`, `gc`, `simulate` (SIMULATE and REPLAY WORLD).
-- **Counters:** `rows_written`, `errors`, `conflicts`, `spilled_bytes`, `cache_hits`, `cache_misses` (since opening); `worlds`, `pages_bytes`, `log_bytes`, `history_bytes`, `cache_bytes`, `uptime_seconds` (now).
+- **Counters:** `rows_written`, `errors`, `conflicts`, `spilled_bytes`, `cache_hits`, `cache_misses` (since opening); `worlds`, `pages_bytes`, `log_bytes`, `history_bytes`, `cache_bytes`, `uptime_seconds` (now); `disk_bytes` and `disk_limit_bytes` (the folder as its cap counts it, and the cap; see [limits the operator sets](#limits-the-operator-sets)); `last_statement_unix_ms`, when a client's last statement or operation started or ended (ms since 1970, 0 for none since opening; background checkpoints and cleanups don't count).
+- **Idle:** `GET /metrics` also gives `chronos_connections_open`, the HTTP and Postgres connections open now, not counting the one asking. With `chronos_last_statement_unix_ms`, a host tells an idle database from these two without reading its logs.
 - **Cost:** a few atomic adds per operation, no locks. Quantiles are within 6% of the true value.
 - **Search graphs:** `chronos_search_graphs_building` is 1 while an HNSW graph builds in the background (searches scan until it's done).
 

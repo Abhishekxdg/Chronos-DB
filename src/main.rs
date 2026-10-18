@@ -221,6 +221,7 @@ fn main() {
             key,
             anchor: anchor.clone().map(Into::into),
             anchor_reset,
+            ..Default::default()
         };
         let split = |v: &Option<String>| -> Vec<String> {
             v.iter().flat_map(|s| s.split(',')).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
@@ -248,6 +249,7 @@ fn main() {
             key,
             anchor: anchor.clone().map(Into::into),
             anchor_reset,
+            ..Default::default()
         };
         let db = match dry_run {
             true => None,
@@ -379,7 +381,14 @@ fn main() {
         Some(serde_json::json!({"mode": "shell", "branch": branch.clone()}))
     };
     let studio_opts = studio::Options { port, open: !no_open, login: signin };
-    let opts = chronos::Open { remote: remote.clone(), takeover, key, anchor: anchor.map(Into::into), anchor_reset };
+    let opts = chronos::Open {
+        remote: remote.clone(),
+        takeover,
+        key,
+        anchor: anchor.map(Into::into),
+        anchor_reset,
+        ..Default::default()
+    };
     let opened = local::open_or_connect(&dir, || Db::open_with(&dir, &opts).map_err(|e| e.to_string()), hello);
     let db = match opened {
         Ok(local::Opened::Here(db)) => db,

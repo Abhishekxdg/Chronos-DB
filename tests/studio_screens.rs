@@ -315,7 +315,7 @@ fn history_retention_shows_and_changes() {
     assert_eq!(s.rows("main", "show history_retention")[0]["history_retention"], "7 days");
     let disk: Vec<String> =
         s.rows("main", "show disk").iter().map(|r| r["what"].as_str().unwrap().to_string()).collect();
-    assert_eq!(disk, ["live", "history", "reclaimable", "log"]);
+    assert_eq!(disk, ["live", "history", "reclaimable", "log", "total", "limit"]);
 }
 
 /// A server that asks for the password in the clear over a connection without TLS is refused unless the form allows

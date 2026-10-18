@@ -28178,6 +28178,11 @@ pub(crate) fn spilled_bytes() -> u64 {
     spill::SPILLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Bytes in queries' spill files now (see `spill`): what CHRONOS_SPILL_DIR holds for this process.
+pub(crate) fn spill_held() -> u64 {
+    spill::HELD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A joined table's rows: in memory, or in files by their join value's hash (see `read_bounded`).
 enum Right {
     Held(Batch),
@@ -35361,14 +35366,12 @@ impl Session {
     }
 
     /// The statement_timeout this session's statements get, in ms (0: none): its own SET, else
-    /// the database's default; never past its agent's max_query_ms.
+    /// the database's default; never past its agent's max_query_ms, nor the operator's ceiling
+    /// (CHRONOS_LIMITS), which a SET of 0 (none) or more is clamped to.
     fn timeout(&self, db: &Db, agent: Option<&crate::Agent>) -> u64 {
         let t = self.timeout.unwrap_or_else(|| db.setting(crate::Setting::StatementTimeout));
-        match agent.map_or(0, |a| a.max_query_ms) {
-            0 => t,
-            most if t == 0 => most,
-            most => t.min(most),
-        }
+        let t = crate::limits::ceil(t, agent.map_or(0, |a| a.max_query_ms));
+        crate::limits::ceil(t, db.ceilings().statement_timeout_ms)
     }
 
     /// The branch statements run on: the open transaction's, else the session's.
@@ -36661,6 +36664,7 @@ impl Session {
             return err("25P02", "current transaction is aborted, commands ignored until end of transaction block");
         }
         let t = std::time::Instant::now();
+        db.metrics().started(s.op()); // a long statement is activity from its start
         let before = EF.replace(self.ef); // read by vector searches (see `nearest`)
         self.cancel.store(false, std::sync::atomic::Ordering::Relaxed); // a cancel stops the statement it came during
         let ms = self.timeout(db, agent.as_ref());
@@ -39639,11 +39643,18 @@ impl Statement {
             }
             Stmt::ShowDisk => {
                 let d = db.disk_usage().map_err(crate::Error::from)?;
-                let rows: Vec<Vec<Value>> =
-                    [("live", d.live), ("history", d.history), ("reclaimable", d.reclaimable), ("log", d.log)]
-                        .into_iter()
-                        .map(|(what, n)| vec![Value::Text(what.into()), Value::Int(n as i64)])
-                        .collect();
+                // and the folder as its cap counts it, and the cap (0: none)
+                let rows: Vec<Vec<Value>> = [
+                    ("live", d.live),
+                    ("history", d.history),
+                    ("reclaimable", d.reclaimable),
+                    ("log", d.log),
+                    ("total", db.disk_bytes()),
+                    ("limit", db.disk_limit()),
+                ]
+                .into_iter()
+                .map(|(what, n)| vec![Value::Text(what.into()), Value::Int(n as i64)])
+                .collect();
                 let columns = self.columns(db, branch, &[])?;
                 Ok(Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows })
             }

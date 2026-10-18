@@ -123,6 +123,12 @@ pub struct Open {
     /// Accept the folder as it is and re-anchor it: after a deliberate restore from a backup, or
     /// to start anchoring an existing database.
     pub anchor_reset: bool,
+    /// The most the folder may hold, in bytes (0: no cap; see `Core::disk_bytes`). None reads
+    /// CHRONOS_MAX_DISK_BYTES.
+    pub max_disk_bytes: Option<u64>,
+    /// Ceilings over the database's settings that its admin can't raise. None reads the file
+    /// CHRONOS_LIMITS names, if it's set.
+    pub ceilings: Option<limits::Ceilings>,
 }
 pub const MAIN: &str = "main";
 
@@ -587,6 +593,23 @@ pub struct Core {
     tallies: Mutex<tally::Tallies>, // agents' merges into main in the last hour (see `tally`)
     /// the folder is attached to a Postgres database (see `attach`): its main changes only by merges written there
     attached: Option<Arc<attach::Attached>>,
+    /// the folder's size against its cap (see `disk_bytes`)
+    folder: Folder,
+    /// the operator's ceilings over `settings` and the history retention (see `setting`)
+    ceilings: limits::Ceilings,
+}
+
+/// What `Core::disk_bytes` needs besides the running counts of pages and the log.
+#[derive(Default)]
+struct Folder {
+    /// CHRONOS_MAX_DISK_BYTES (0: no cap)
+    limit: u64,
+    /// bytes of the files no running count follows (page indexes, history, finished log segments,
+    /// spilled statements' runs, settings), as last measured, and when (std's: never simulated)
+    rest: AtomicU64,
+    measured: std::sync::Mutex<Option<std::time::Instant>>,
+    /// CHRONOS_SPILL_DIR is inside the folder: queries' spill files count too
+    spills: bool,
 }
 
 /// A database-wide setting (`ALTER SYSTEM SET`), kept in the folder across restarts.
@@ -637,6 +660,9 @@ pub struct DiskUsage {
     pub reclaimable: u64, // pages nothing needs: cleanup frees the files mostly made of them
     pub log: u64,         // the log, and the checkpoints history keeps
 }
+
+/// About what a new world adds to the folder (its log record), for its cap (see `Core::guard_disk`).
+const WORLD_BYTES: u64 = 256;
 
 /// Discards since the last cleanup that make the background worker run one (checkpoint, then
 /// cleanup): this many worlds, or worlds that changed this many rows.
@@ -1024,7 +1050,9 @@ impl Db {
                     }
                     if let (Some(log), Some(pages)) = (&core.log, &core.pages) {
                         let reclaim = core.reclaim_due();
-                        if (log.needs_checkpoint() || reclaim) && log.retry_due() {
+                        // near its cap: what deletes and discards gave back, freed now
+                        let full = core.near_cap() && log.since_checkpoint() > (1 << 20).min(core.folder.limit / 16);
+                        if (log.needs_checkpoint() || reclaim || full) && log.retry_due() {
                             let _one = log.ckpt.lock().unwrap();
                             let done = core.checkpoint_now(log, false).and_then(|()| match core.reclaim_due() {
                                 true => core.gc_now(pages).map(|_| ()),
@@ -1144,6 +1172,8 @@ impl Core {
             ledger: Mutex::new(outbox::Ledger::default()),
             tallies: Default::default(),
             attached: None,
+            folder: Folder::default(),
+            ceilings: limits::Ceilings::default(),
         }
     }
 
@@ -1169,6 +1199,15 @@ impl Core {
     /// `open_at`; `taken` gets the remote and owner of a lease it took, once it has.
     fn open_leased(dir: &Path, o: &Open, taken: &mut Option<(String, String)>) -> io::Result<Core> {
         let (url, takeover, key) = (o.remote.as_deref(), o.takeover, o.key.as_ref());
+        // the operator's limits, before anything changes in the folder: a bad one stops the open
+        let ceilings = match o.ceilings {
+            Some(c) => c,
+            None => limits::Ceilings::from_env()?,
+        };
+        let limit = match o.max_disk_bytes {
+            Some(n) => n,
+            None => limits::max_disk_bytes_from_env()?,
+        };
         let lock = disk::lock(dir)?;
         // what big statements under way when the last process stopped had spilled (see `spill_dir`)
         let _ = std::fs::remove_dir_all(dir.join("spill"));
@@ -1245,6 +1284,14 @@ impl Core {
         for s in Setting::ALL {
             db.settings.get_mut().unwrap()[s as usize] = saved.get(s.name()).and_then(|v| v.as_u64()).unwrap_or(0);
         }
+        // history kept past the ceiling goes at the next checkpoint
+        if ceilings.history_retention_ms > 0 && disk::retention(dir) > ceilings.history_retention_ms {
+            disk::set_retention(dir, ceilings.history_retention_ms)?;
+        }
+        db.ceilings = ceilings;
+        db.folder.limit = limit;
+        db.folder.spills = spills_inside(dir);
+        db.measure_folder(std::time::Duration::ZERO);
         if !dir.join("manifest").exists() && disk::history(dir)?.is_empty() {
             // no checkpoint yet: the log starts from an empty database, which is history too
             let main = disk::ManBranch {
@@ -1445,18 +1492,43 @@ impl Core {
     /// next checkpoint; 0 keeps none.
     pub fn set_retention(&self, ms: u64) -> Result<()> {
         let Some(log) = &self.log else { return Err(no_history("an in-memory database keeps no history".into())) };
+        let most = self.ceilings.history_retention_ms;
+        if most > 0 && ms > most {
+            return Err(over_ceiling("history_retention", &format!("{ms} ms"), &format!("{most} ms")));
+        }
         disk::set_retention(&log.dir, ms)?;
         self.past.lock().unwrap().clear();
         Ok(())
     }
 
     /// A database-wide setting's value (see `Setting`).
+    /// Under the operator's ceiling for it, if there is one: then 0 (no limit) is the ceiling.
     pub fn setting(&self, s: Setting) -> u64 {
-        self.settings.lock().unwrap()[s as usize]
+        limits::ceil(self.settings.lock().unwrap()[s as usize], self.ceiling(s))
+    }
+
+    /// The operator's ceilings over this database's settings (see `Open::ceilings`).
+    pub fn ceilings(&self) -> limits::Ceilings {
+        self.ceilings
+    }
+
+    /// The operator's ceiling over setting `s` (0: none).
+    fn ceiling(&self, s: Setting) -> u64 {
+        match s {
+            Setting::StatementTimeout => self.ceilings.statement_timeout_ms,
+            Setting::MaxWorlds => self.ceilings.max_worlds,
+            Setting::WorldIdleTtl => self.ceilings.world_idle_ttl_ms,
+            Setting::ProtectMain | Setting::OutboxKeepPayloads => 0,
+        }
     }
 
     /// Changes a database-wide setting; on disk it's kept in the folder across restarts.
     pub fn set_setting(&self, s: Setting, v: u64) -> Result<()> {
+        let most = self.ceiling(s);
+        if most > 0 && v > most {
+            let unit = if s == Setting::MaxWorlds { "" } else { " ms" };
+            return Err(over_ceiling(s.name(), &format!("{v}{unit}"), &format!("{most}{unit}")));
+        }
         let mut all = self.settings.lock().unwrap(); // held while the file is written: one writer at a time
         let mut next = *all;
         next[s as usize] = v;
@@ -1760,9 +1832,10 @@ impl Core {
             }
         }
         drop(_quiet);
-        if pages.should_gc() {
+        if pages.should_gc() || self.near_cap() {
             self.gc_now(pages)?;
         }
+        self.measure_folder(std::time::Duration::ZERO); // history pruned, a segment finished, packs freed
         // overlays folded into pages, and worlds discarded since the last one, leave memory free
         // that glibc's malloc keeps for itself otherwise (100,000 worlds discarded: 1 GB of 1.05)
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -1883,7 +1956,9 @@ impl Core {
         let (mut roots, history) = self.roots()?;
         roots.extend(history);
         let live = prolly::reachable(pages, &roots)?;
-        pages.compact(&live)
+        let freed = pages.compact(&live);
+        self.measure_folder(std::time::Duration::ZERO);
+        freed
     }
 
     /// Every tree root still needed: the checkpoint's and every tree in use, then history's.
@@ -1932,6 +2007,97 @@ impl Core {
             reclaimable: total.saturating_sub(live + history),
             log: wal + size(&log.dir.join("history")),
         })
+    }
+
+    /// The folder's size as its cap (CHRONOS_MAX_DISK_BYTES) counts it, in bytes, without reading
+    /// the folder: the page files and the live log segment from their running counts, everything
+    /// else (page indexes, history, finished segments, big statements' spills, settings) as last
+    /// measured (at most a second ago while there's a cap, and after each checkpoint), and the
+    /// spill files of queries running now if CHRONOS_SPILL_DIR is inside the folder. The live
+    /// segment counts its records, not the zeros kept ahead of them (see `disk::PREALLOC`).
+    /// 0 in memory.
+    pub fn disk_bytes(&self) -> u64 {
+        let (Some(log), Some(pages)) = (&self.log, &self.pages) else { return 0 };
+        let spills = if self.folder.spills { sql::spill_held() } else { 0 };
+        pages.bytes() + log.seg_len() + self.folder.rest.load(Ordering::Relaxed) + spills
+    }
+
+    /// The most the folder may hold, in bytes (CHRONOS_MAX_DISK_BYTES; 0: no cap).
+    pub fn disk_limit(&self) -> u64 {
+        self.folder.limit
+    }
+
+    /// Measures the files `disk_bytes` has no running count of, unless that was done less than
+    /// `every` ago or another thread is at it.
+    fn measure_folder(&self, every: std::time::Duration) {
+        let Some(log) = &self.log else { return };
+        let Ok(mut at) = self.folder.measured.try_lock() else { return };
+        if at.is_some_and(|t| t.elapsed() < every) {
+            return;
+        }
+        let live = disk::segments(&log.dir).ok().and_then(|s| s.last().map(|&s| disk::seg_path(&log.dir, s)));
+        let pages = log.dir.join("pages");
+        let counted = |p: &Path| {
+            let pack = p.parent() == Some(pages.as_path())
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("pack-") && !n.ends_with(".idx"));
+            pack || live.as_deref() == Some(p)
+        };
+        self.folder.rest.store(tree_bytes(&log.dir, &counted), Ordering::Relaxed);
+        *at = Some(std::time::Instant::now());
+    }
+
+    /// Refuses a change that writes about `adding` bytes when that would take the folder past its
+    /// cap (`disk_full`, 53100). Never while replaying the log, which holds only what was accepted.
+    pub(crate) fn guard_disk(&self, adding: u64) -> Result<()> {
+        let limit = self.folder.limit;
+        if limit == 0 || self.log.is_none() || self.me.get().is_none() || RECOVERING.get() {
+            return Ok(());
+        }
+        self.measure_folder(std::time::Duration::from_secs(1));
+        if self.disk_bytes().saturating_add(adding) <= limit {
+            return Ok(());
+        }
+        // what deletes, discards and cleanup gave back since the last measure
+        self.measure_folder(std::time::Duration::from_millis(100));
+        if self.disk_bytes().saturating_add(adding) <= limit {
+            return Ok(());
+        }
+        Err(disk_full(limit))
+    }
+
+    /// `guard_disk` for writing `rows` (key, and the value's length; None deletes). Deletes, and the
+    /// database's own rows but index entries (tables' definitions, agents, sequences), always go
+    /// through, so a full database can still DELETE, DROP and TRUNCATE its way back under its cap.
+    pub(crate) fn guard_rows<'r>(&self, rows: impl Iterator<Item = (&'r str, Option<usize>)>) -> Result<()> {
+        if self.folder.limit == 0 {
+            return Ok(());
+        }
+        let data = |k: &str| {
+            !reserved_table(k.split('/').next().unwrap_or(k)) || (sql::internal(k) && !k.starts_with("_sonos_seq/"))
+        };
+        let adding: u64 = rows.filter_map(|(k, v)| data(k).then_some(k.len() + v?)).map(|n| n as u64).sum();
+        match adding {
+            0 => Ok(()),
+            n => self.guard_disk(n),
+        }
+    }
+
+    /// Refuses a query's spill of `bytes` more when CHRONOS_SPILL_DIR is inside the folder and that
+    /// would take it past its cap.
+    pub(crate) fn spill_room(&self, bytes: u64) -> Result<()> {
+        match self.folder.spills {
+            true => self.guard_disk(bytes),
+            false => Ok(()),
+        }
+    }
+
+    /// Within a tenth of its cap: every checkpoint then cleans up too, and the worker checkpoints
+    /// once a little log has piled up, so deletes give their space back without waiting.
+    fn near_cap(&self) -> bool {
+        let limit = self.folder.limit;
+        limit > 0 && self.disk_bytes() >= limit - limit / 10
     }
 
     /// The object storage URL this folder is attached to, if any.
@@ -2576,6 +2742,7 @@ impl Core {
     /// `batch` without SQL's rules: what log replay uses.
     fn write(&self, b: &str, rows: &[(&str, Option<&str>)]) -> Result<u64> {
         self.guard_main(b, rows.iter().map(|(k, _)| *k))?;
+        self.guard_rows(rows.iter().map(|(k, v)| (*k, v.map(str::len))))?;
         self.note_sql(rows.iter().map(|(k, _)| *k));
         let rec = self.record(|| Op::Write(b, rows.to_vec()));
         let quota = self.quota(b)?;
@@ -2670,6 +2837,7 @@ impl Core {
             q.check(b, br.changed.load(Ordering::Relaxed), rows.len() as u64)?;
         }
         self.guard_main(b, rows.iter().map(|(k, _)| k.as_str()))?;
+        self.guard_rows(rows.iter().map(|(k, v)| (k.as_str(), v.as_ref().map(String::len))))?;
         let rows: Vec<(&str, Option<&str>)> = rows.iter().map(|(k, v)| (k.as_str(), v.as_deref())).collect();
         self.note_sql(rows.iter().map(|(k, _)| *k));
         let rec = self.record(|| Op::Write(b, rows.clone()));
@@ -3642,6 +3810,11 @@ impl Core {
             ("search_graphs_building", u64::from(!self.search_graphs_ready())),
             // bytes queries wrote to disk because their working state outgrew CHRONOS_WORK_MEM
             ("spilled_bytes", sql::spilled_bytes()),
+            // the folder as its cap counts it, and the cap (CHRONOS_MAX_DISK_BYTES; 0: none)
+            ("disk_bytes", self.disk_bytes()),
+            ("disk_limit_bytes", self.folder.limit),
+            // when a client's last statement or operation ran (ms since 1970; 0: none since opening)
+            ("last_statement_unix_ms", m.last_op_ms()),
         ];
         if let Some(p) = &self.pages {
             out.extend(p.cache_stats()); // cache_bytes (now), cache_hits, cache_misses
@@ -3960,6 +4133,7 @@ impl Core {
     fn empty_world(&self, name: &str, info: Info) -> Result<()> {
         let _t = self.metrics.time(metrics::Op::Fork);
         let most = self.setting(Setting::MaxWorlds);
+        self.guard_disk(WORLD_BYTES)?;
         let rec = self.record(|| {
             let meta = serde_json::Value::Object(info.meta.clone()).to_string();
             Op::World(String::new(), name.to_string(), info.id.clone(), info.created, meta)
@@ -3990,6 +4164,7 @@ impl Core {
         worlds.iter().try_for_each(|(name, _)| check_name(name))?; // generated names too (`<prefix>_<i>`)
         let _t = self.metrics.time(metrics::Op::Fork);
         let most = self.setting(Setting::MaxWorlds);
+        self.guard_disk(WORLD_BYTES * worlds.len() as u64)?;
         let recs: Vec<_> = worlds
             .iter()
             .map(|(name, info)| {
@@ -4046,6 +4221,9 @@ impl Core {
     fn fork_info(&self, from: &str, name: &str, info: Info) -> Result<()> {
         let _t = (!name.starts_with("_tx_")).then(|| self.metrics.time(metrics::Op::Fork)); // not BEGIN's
         let most = if name.starts_with("_tx_") { 0 } else { self.setting(Setting::MaxWorlds) };
+        if !name.starts_with("_tx_") {
+            self.guard_disk(WORLD_BYTES)?; // a transaction's own world is no new world: a full database still BEGINs
+        }
         let rec = self.record(|| {
             let meta = serde_json::Value::Object(info.meta.clone()).to_string();
             Op::World(from.to_string(), name.to_string(), info.id.clone(), info.created, meta)
@@ -6334,6 +6512,56 @@ fn locks_lost(keys: &[String]) -> Error {
             "rows locked with FOR UPDATE or FOR SHARE were changed or locked by another commit since this began ({rows})"
         ),
     }
+}
+
+/// A setting asked above the ceiling the database's operator put on it (CHRONOS_LIMITS).
+fn over_ceiling(name: &str, asked: &str, most: &str) -> Error {
+    Error::Constraint {
+        code: "42501", // insufficient_privilege
+        message: format!(
+            "{name} may be at most {most} on this database, not {asked}: a limit of its plan, which its operator \
+             sets (CHRONOS_LIMITS) and ALTER SYSTEM can't raise"
+        ),
+    }
+}
+
+/// A change that would take the folder past CHRONOS_MAX_DISK_BYTES.
+fn disk_full(limit: u64) -> Error {
+    Error::Constraint {
+        code: "53100", // disk_full
+        message: format!(
+            "database is over its {} limit: drop worlds, delete rows or upgrade (deletes free their space at the \
+             next checkpoint and cleanup)",
+            limits::show_bytes(limit)
+        ),
+    }
+}
+
+/// Whether CHRONOS_SPILL_DIR is inside folder `dir`, so queries' spill files count toward its cap.
+fn spills_inside(dir: &Path) -> bool {
+    let Some(spill) = std::env::var_os("CHRONOS_SPILL_DIR").map(std::path::PathBuf::from) else { return false };
+    let abs = |p: &Path| match p.is_absolute() {
+        true => p.to_path_buf(),
+        false => std::env::current_dir().map_or_else(|_| p.to_path_buf(), |c| c.join(p)),
+    };
+    let (spill, folder) = (abs(&spill), abs(dir));
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    spill.starts_with(&folder) || real(&spill).starts_with(real(&folder))
+}
+
+/// Bytes of the files under `dir`, but those `skip` names (links not followed).
+fn tree_bytes(dir: &Path, skip: &dyn Fn(&Path) -> bool) -> u64 {
+    let Ok(d) = std::fs::read_dir(dir) else { return 0 };
+    let mut n = 0;
+    for e in d.flatten() {
+        let p = e.path();
+        match e.metadata() {
+            Ok(m) if m.is_dir() => n += tree_bytes(&p, skip),
+            Ok(m) if m.is_file() && !skip(&p) => n += m.len(),
+            _ => {}
+        }
+    }
+    n
 }
 
 fn max_worlds(most: u64) -> Error {

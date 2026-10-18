@@ -245,6 +245,13 @@ Set as the database's own user; kept in the folder across restarts. All off by d
 | `alter system set protect_main = on` | `main`'s rows change only by merging a world, for everyone, the database's own user and admins included (see [SQL](sql.md#limits-for-the-whole-database)) | `42501`, naming a row |
 | `alter system set history_retention = '7 days'` | how far back time travel, undo and the audit trail reach (1 hour by default for a new database, 30 days for one made by an older release) | |
 
+Set by the operator where the process starts, and not by anyone inside the database, its own user and admins included (see [operations](operations.md#limits-the-operator-sets)):
+
+| Environment | Does | Over it |
+|---|---|---|
+| `CHRONOS_MAX_DISK_BYTES=536870912` | the most the folder may hold: pages, log, history, spills (queries' too with `CHRONOS_SPILL_DIR` inside the folder). Reads, `DELETE`, `DROP`, `TRUNCATE`, merges, discarding worlds and cleanup still work | write, fork, `CREATE DATABASE`, a world's `CHECKPOINT 'label'` or spill refused: `53100` (HTTP 507) |
+| `CHRONOS_LIMITS=/etc/chronos/limits.toml` | ceilings `max_worlds`, `history_retention_ms`, `world_idle_ttl_ms`, `statement_timeout_ms`; a setting left at 0 (no limit) is the ceiling | `ALTER SYSTEM SET` past one: `42501` (HTTP 403), naming the limit. A session's `SET statement_timeout` above it, or to 0, is clamped to it |
+
 Fixed and environment limits:
 
 - **Memory:** `CHRONOS_WORK_MEM` (default `256MB`) per grouping, sort or join before it spills; `CHRONOS_CACHE_MB` (default 256) for the page cache. There's no cap on the whole process, and a query's result is held whole before it's sent.

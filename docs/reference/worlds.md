@@ -602,7 +602,7 @@ What each world (or one) costs on its own.
 SHOW DISK
 ```
 
-Four rows of `what` (text) and `bytes` (bigint): `live` (pages in use), `history` (pages kept only for time travel), `reclaimable` (pages nothing needs), `log`. See [operations](../operations.md#cleanup).
+Six rows of `what` (text) and `bytes` (bigint): `live` (pages in use), `history` (pages kept only for time travel), `reclaimable` (pages nothing needs), `log`; then `total`, the whole folder as its cap counts it, and `limit`, the cap (`CHRONOS_MAX_DISK_BYTES`, 0 for none). See [operations](../operations.md#cleanup) and [limits the operator sets](../operations.md#limits-the-operator-sets).
 
 ## SHOW METRICS
 

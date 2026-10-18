@@ -129,6 +129,8 @@ pub struct Metrics {
     pub(crate) rows_written: AtomicU64,
     pub(crate) errors: AtomicU64,
     pub(crate) conflicts: AtomicU64,
+    /// when an operation a client asked for last started or ended (ms since 1970; 0: none yet)
+    last: AtomicU64,
     started: Instant,
 }
 
@@ -139,6 +141,7 @@ impl Default for Metrics {
             rows_written: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             conflicts: AtomicU64::new(0),
+            last: AtomicU64::new(0),
             started: Instant::now(),
         }
     }
@@ -151,11 +154,33 @@ impl Metrics {
         h.counts[bucket(us)].fetch_add(1, Ordering::Relaxed);
         h.sum.fetch_add(us, Ordering::Relaxed);
         h.max.fetch_max(us, Ordering::Relaxed);
+        self.note(op);
     }
 
     /// Records how long until the returned guard is dropped.
     pub fn time(&self, op: Op) -> Timer<'_> {
+        self.note(op);
         Timer(self, op, Instant::now())
+    }
+
+    /// Notes that an operation `record` will be given later has started (see `last_op_ms`).
+    pub fn started(&self, op: Op) {
+        self.note(op);
+    }
+
+    /// Notes the time of an operation a client asked for: the background's own checkpoints and
+    /// cleanups aren't activity.
+    fn note(&self, op: Op) {
+        if !matches!(op, Op::Checkpoint | Op::Gc) {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+            self.last.fetch_max(now as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// When the last operation a client asked for started or ended, in ms since 1970 (0: none
+    /// since the database was opened): a host tells an idle database by it.
+    pub fn last_op_ms(&self) -> u64 {
+        self.last.load(Ordering::Relaxed)
     }
 
     /// An error returned to a client; `code` is its SQLSTATE.

@@ -675,6 +675,11 @@ impl Pages {
         (a, b, self.bytes.load(Ordering::Relaxed))
     }
 
+    /// Bytes of the pack files here (indexes not included).
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
     /// A page's size as stored (compressed), if the store has it.
     pub fn size(&self, h: &Hash) -> Option<u64> {
         self.index.read().unwrap().get(h).map(|l| l.comp as u64)

@@ -40,6 +40,10 @@ fn parse_size(s: &str) -> Option<usize> {
 /// Bytes spilled since the process started (a metric).
 pub(crate) static SPILLED: AtomicU64 = AtomicU64::new(0);
 
+/// Bytes in the spill files open now, across the process: with CHRONOS_SPILL_DIR inside a
+/// database's folder, they count toward its cap (see `Core::disk_bytes`).
+pub(crate) static HELD: AtomicU64 = AtomicU64::new(0);
+
 /// About how much memory values take.
 pub(crate) fn size_of(vals: &[Value]) -> usize {
     vals.iter()
@@ -65,6 +69,7 @@ pub(crate) struct Spill {
     crypt: Option<Arc<Crypt>>,
     width: usize,
     left: Option<PathBuf>, // its name, if unlinking it failed: tried again when it's dropped
+    held: u64,             // bytes written, in `HELD` until it's dropped
 }
 
 /// A new file in `dir` named `<prefix>-<pid>-<random>`: made new (never a file or link already
@@ -82,6 +87,7 @@ pub(crate) fn create(dir: &std::path::Path, prefix: &str) -> io::Result<(File, P
 
 impl Drop for Spill {
     fn drop(&mut self) {
+        HELD.fetch_sub(self.held, Ordering::Relaxed);
         if let Some(p) = &self.left {
             let _ = std::fs::remove_file(p);
         }
@@ -94,12 +100,13 @@ const AAD: &[u8] = b"sonos spill rows";
 impl Spill {
     pub fn new(width: usize) -> io::Result<Spill> {
         let dir = std::env::var_os("CHRONOS_SPILL_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
+        std::fs::create_dir_all(&dir)?; // inside the database's folder, opening it emptied that folder
         let (file, path) = create(&dir, "sonos-spill")?;
         // unlinked now, so a crash leaves nothing; if that fails, when it's dropped
         let left = std::fs::remove_file(&path).is_err().then_some(path);
         // the running statement's database: its key, if it has one
         let crypt = super::STOP.with_borrow(|s| s.as_ref()?.ctx.as_ref()?.core.spill_dir()?.1);
-        Ok(Spill { file, block: vec![], read: false, crypt, width, left })
+        Ok(Spill { file, block: vec![], read: false, crypt, width, left, held: 0 })
     }
 
     pub fn write(&mut self, seq: u64, row: &[Value]) -> io::Result<()> {
@@ -120,9 +127,17 @@ impl Spill {
     fn put(&mut self) -> io::Result<()> {
         let sealed = self.crypt.as_ref().map(|c| c.seal(AAD, &self.block));
         let data = sealed.as_deref().unwrap_or(&self.block);
+        let n = 4 + data.len() as u64;
+        // the running statement's database's cap, when its spill files count toward it
+        let room = super::STOP.with_borrow(|s| Some(s.as_ref()?.ctx.as_ref()?.core.spill_room(n)));
+        if let Some(Err(e)) = room {
+            return Err(io::Error::new(io::ErrorKind::StorageFull, e.to_string()));
+        }
         let mut w = &self.file;
         w.write_all(&(data.len() as u32).to_le_bytes())?;
         w.write_all(data)?;
+        HELD.fetch_add(n, Ordering::Relaxed);
+        self.held += n;
         self.block.clear();
         Ok(())
     }

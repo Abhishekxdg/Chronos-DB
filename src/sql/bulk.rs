@@ -273,6 +273,8 @@ impl Spilled {
         mut writes: Vec<(String, Option<String>)>,
         marks: Vec<(String, u8)>,
     ) -> Result<()> {
+        // the folder's cap, a part at a time: before its run or its pages are written
+        db.guard_rows(writes.iter().map(|(k, v)| (k.as_str(), v.as_ref().map(String::len))))?;
         self.writes += writes.len() as u64;
         self.rows += writes.iter().filter(|w| !crate::reserved_table(&w.0)).count() as u64;
         if self.runs.is_empty() && writes.iter().all(|w| w.1.is_some()) && marks.iter().all(|m| m.1 == NEW) {

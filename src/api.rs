@@ -53,6 +53,7 @@ impl From<Error> for Fail {
             Error::Constraint { code: "42501", .. } => 403, // an agent may not
             Error::Constraint { code: "53400" | "53300", .. } => 429, // too fast, too many worlds or statements at once
             Error::Constraint { code: "53200", .. } => 413, // a query past its agent's memory limit
+            Error::Constraint { code: "53100", .. } => 507, // the folder at its cap (CHRONOS_MAX_DISK_BYTES)
             Error::Constraint { code, .. } if !code.starts_with("23") => 400, // a row that doesn't fit its table
             Error::Exists(_)
             | Error::HasChildren(_)
@@ -191,7 +192,10 @@ fn handle(db: &Db, auth: &crate::Auth, req: &http::Request, (agent, admin): Who)
         if agent.as_deref().is_some_and(|a| a != chronos::GUEST) {
             return Err(fail(403, "metrics are for the server's token, not an agent's"));
         }
-        return Ok(Value::String(db.metrics().prometheus(&db.counters())));
+        let mut counters = db.counters();
+        // client connections open now (HTTP and Postgres), not counting this one
+        counters.push(("connections_open", http::live().saturating_sub(1) as u64));
+        return Ok(Value::String(db.metrics().prometheus(&counters)));
     }
     if req.method != "POST" {
         return Err(fail(405, format!("use POST {path} with a JSON body")));
@@ -343,6 +347,7 @@ fn sql_fail(e: sql::SqlError) -> Fail {
         "42501" => 403,
         "53400" | "53300" => 429,
         "53200" => 413,
+        "53100" => 507,
         c if c.starts_with("23") => 409,
         "3D000" | "42P01" => 404,
         c if c.starts_with("58") || c.starts_with("XX") => 500,

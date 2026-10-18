@@ -657,6 +657,16 @@ impl Log {
         self.unpublished.load(Ordering::Relaxed) > CHECKPOINT_BYTES
     }
 
+    /// Log bytes since the last checkpoint that got its manifest out.
+    pub(crate) fn since_checkpoint(&self) -> u64 {
+        self.unpublished.load(Ordering::Relaxed)
+    }
+
+    /// The live segment's length, its records only (not the zeros kept ahead of them).
+    pub(crate) fn seg_len(&self) -> u64 {
+        self.seg_bytes.load(Ordering::Relaxed)
+    }
+
     /// So far past the checkpoint point that writers should wait for one.
     pub(crate) fn far_behind(&self) -> bool {
         self.unpublished.load(Ordering::Relaxed) > 4 * CHECKPOINT_BYTES

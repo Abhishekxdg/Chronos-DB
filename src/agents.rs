@@ -648,6 +648,7 @@ impl Core {
     /// Marks world `w` as it is now with a name, to read or restore later (`w@name` doesn't
     /// exist: use `checkpoint_time`, then time travel).
     pub fn checkpoint_world(&self, w: &str, name: &str) -> Result<u64> {
+        self.guard_disk(crate::WORLD_BYTES)?; // a mark, kept with the history it names
         let at = disk::now_ms();
         std::thread::sleep(std::time::Duration::from_millis(1)); // later writes get a later time
         let mut marks = self.world(w)?.checkpoints;

@@ -53,6 +53,11 @@ pub struct Response {
 /// what the process's descriptors hold, so the listeners share it rather than each having it.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// Connections open now, across every listener (HTTP and Postgres).
+pub fn live() -> usize {
+    LIVE.load(Ordering::SeqCst)
+}
+
 /// Runs `f` for each connection accepted on `l`, each on its own thread; a connection past
 /// `max_connections()` (counted across all listeners) goes to `refuse` instead. Accept errors (out of file descriptors, say) are logged
 /// and retried after a pause. Runs until the process ends.
@@ -335,6 +340,7 @@ fn write<W: Write>(w: &mut W, res: &Response, extra: &str, keep: bool) -> io::Re
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
+        507 => "Insufficient Storage",
         _ => "Error",
     };
     let head = format!(
