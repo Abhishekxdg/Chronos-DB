@@ -67,15 +67,18 @@ pub struct Guard {
     safe: bool,
     owned: HashSet<String>,
     agent: Option<String>,
+    /// no agent acts, yet masked columns read masked: the model this serves is the owner's (`--unmask`: off)
+    masked: bool,
 }
 
 impl Guard {
-    pub fn new(allow_merge: bool) -> Guard {
-        Guard { safe: !allow_merge, owned: HashSet::new(), agent: None }
+    /// The database's own user's session; `unmask`: it reads masked columns as they are (`chronos mcp --unmask`).
+    pub fn new(allow_merge: bool, unmask: bool) -> Guard {
+        Guard { safe: !allow_merge, owned: HashSet::new(), agent: None, masked: !unmask }
     }
 
     pub fn agent(name: &str) -> Guard {
-        Guard { safe: false, owned: HashSet::new(), agent: Some(name.into()) }
+        Guard { safe: false, owned: HashSet::new(), agent: Some(name.into()), masked: false }
     }
 
     /// Whether this session may merge its own branches: the `merge` tool is offered.
@@ -147,7 +150,7 @@ impl Guard {
             "merge_preview" => "merge",
             n => n,
         };
-        crate::api::row_security(db, agent, op, a)
+        crate::api::row_security(db, Some(agent), op, a)
             .map_err(|f| f.1.get("message").and_then(Value::as_str).map_or_else(|| f.1.to_string(), String::from))
     }
 
@@ -309,9 +312,17 @@ fn call(sh: &mut Shell, g: &mut Guard, name: &str, a: &Value) -> Result<String, 
         }
         None => {
             g.check(&db, name, a)?;
+            // a model the owner runs reads masked columns masked: its SQL is masked, its row tools refused on them
+            if g.masked {
+                let op = if name == "merge_preview" { "merge" } else { name };
+                crate::api::row_security(&db, None, op, a).map_err(|f| {
+                    f.1.get("message").and_then(Value::as_str).map_or_else(|| f.1.to_string(), String::from)
+                })?;
+            }
             (None, None)
         }
     };
+    sh.sql.masked = g.masked;
     let me = g.agent.clone();
     let me = me.as_deref(); // the SQL a tool runs is checked and limited as the agent's, as its own `sql` is
     // what the check can't see (a prepared statement, a function's body, a trigger) is refused
@@ -328,11 +339,13 @@ fn call(sh: &mut Shell, g: &mut Guard, name: &str, a: &Value) -> Result<String, 
     match name {
         "describe" => {
             // a table a row-level security policy limits the agent on shows no rows here: SQL applies the policy
+            let masked = g.masked;
             let limited = |t: &str| {
-                me.is_some_and(|ag| {
-                    chronos::sql::row_security_possible(&db)
-                        && !matches!(chronos::sql::row_security_refuses(&db, ag, &sh.branch, &[t]), Ok(None))
-                })
+                chronos::sql::row_security_possible(&db)
+                    && match me {
+                        Some(ag) => !matches!(chronos::sql::row_security_refuses(&db, ag, &sh.branch, &[t]), Ok(None)),
+                        None => masked && !matches!(chronos::sql::masks_refuse(&db, &sh.branch, &[t]), Ok(None)),
+                    }
             };
             sh.describe(opt("table").unwrap_or(""), &limited)
         }

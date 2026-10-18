@@ -349,3 +349,80 @@ fn bot2_peer(db: &Db) -> Session {
     let _ = db;
     s
 }
+
+/// FORMAT keeps a value's shape (letters, digits, `@` and `.` where they were, the same length) with keyed stand-ins,
+/// the same for the same value, for agents that validate formats. Issue #45.
+#[test]
+fn a_format_mask_keeps_the_shape() {
+    let db = Db::new();
+    setup(&db);
+    run(&db, MAIN, "alter table customers alter column email set masked with format", &[]).unwrap();
+    run(&db, MAIN, "alter table leads alter column email set masked with format", &[]).unwrap();
+    let mut b = bot(&db);
+    let got = rows(&db, &mut b, "select email from customers order by id");
+    let (ann, bob) = (&got[0][0], &got[1][0]);
+    assert_ne!(ann, "ann@example.com");
+    assert_eq!(ann.len(), "ann@example.com".len());
+    let shape = |s: &str| s.chars().map(|c| if c.is_ascii_lowercase() { 'a' } else { c }).collect::<String>();
+    assert_eq!(shape(ann), "aaa@aaaaaaa.aaa", "{ann}");
+    assert_ne!(ann, bob);
+    // the same value masks the same, so joins still work
+    let joined = rows(&db, &mut b, "select l.id from leads l join customers c on c.email = l.email");
+    assert_eq!(joined, [["10"]]);
+    // and a filter on it tests the stand-in, not the value
+    assert!(rows(&db, &mut b, "select id from customers where email = 'ann@example.com'").is_empty());
+    let shown = run(&db, MAIN, "show agent bot privileges", &[]).unwrap().pop().unwrap();
+    assert!(shown.rows.iter().any(|r| r[2].to_text() == "masked (format)"));
+}
+
+/// An agent that may insert into a table with a unique masked column can tell whether a value is there: SHOW AGENT
+/// PRIVILEGES says so on the column. Issue #45.
+#[test]
+fn a_unique_masked_column_says_an_insert_reveals_it() {
+    let db = Db::new();
+    setup(&db);
+    bot(&db);
+    let shown = run(&db, MAIN, "show agent bot privileges", &[]).unwrap().pop().unwrap();
+    let email = shown.rows.iter().find(|r| r[0].to_text() == "customers" && r[1].to_text() == "email").unwrap();
+    assert!(email[3].to_text().contains("an insert reveals whether a value is there"), "{:?}", email);
+    let phone = shown.rows.iter().find(|r| r[0].to_text() == "customers" && r[1].to_text() == "phone").unwrap();
+    assert!(!phone[3].to_text().contains("reveals"), "not unique: {:?}", phone);
+}
+
+/// A table or materialized view a person makes from masked columns masks its copies of them: a column copied as it
+/// is keeps its mode, one worked out from one is masked with HASH (NULL from a NULL one), the rest aren't. Issue #45.
+#[test]
+fn copies_a_person_makes_stay_masked() {
+    let db = Db::new();
+    setup(&db);
+    run(
+        &db,
+        MAIN,
+        "create table copy as select id, email, phone, lower(email) as low, notes || '!' as n2, tier from customers;
+         create materialized view mv as select c.id, c.email, l.id as lead from customers c join leads l on l.email = c.email;
+         create table everything as select * from customers;
+         create table both_ as select email from customers union select email from leads",
+        &[],
+    )
+    .unwrap();
+    let mut b = bot(&db);
+    let got = rows(&db, &mut b, "select id, email, phone, low, n2, tier from copy where id = 1");
+    let r = &got[0];
+    assert_eq!(r[0], "1");
+    assert!(r[1].starts_with("m_"), "{r:?}");
+    assert_eq!(r[2], "****0101");
+    assert!(r[3].starts_with("m_"), "{r:?}");
+    assert_eq!(r[4], "", "NULL");
+    assert_eq!(r[5], "gold");
+    let mv = rows(&db, &mut b, "select id, email, lead from mv");
+    assert_eq!(mv[0][0], "2");
+    assert!(mv[0][1].starts_with("m_") && mv[0][2] == "10", "{mv:?}");
+    let all = rows(&db, &mut b, "select email, tier from everything where id = 2");
+    assert!(all[0][0].starts_with("m_") && all[0][1] == "free", "{all:?}");
+    // too involved to follow column by column: every column masked
+    let u = rows(&db, &mut b, "select email from both_ limit 1");
+    assert!(u[0][0].starts_with("m_"), "{u:?}");
+    // a person reads them as they are
+    let p = run(&db, MAIN, "select email from copy where id = 1", &[]).unwrap().pop().unwrap();
+    assert_eq!(p.rows[0][0].to_text(), "ann@example.com");
+}

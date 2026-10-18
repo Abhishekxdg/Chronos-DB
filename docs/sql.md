@@ -852,6 +852,7 @@ last four characters. People, and agents given the `unmask` capability, read the
 alter table customers alter column email set masked;                 -- WITH HASH, the default
 alter table customers alter column phone set masked with partial;    -- '******1234'
 alter table customers alter column notes set masked with null;
+alter table customers alter column email set masked with format;     -- 'qzt@xkwrpla.mzc': same shape, same length
 alter table customers alter column email drop masked;
 alter agent support_bot set (can = 'read,fork,write_own,unmask');   -- this one reads them as they are
 ```
@@ -873,21 +874,31 @@ alter agent support_bot set (can = 'read,fork,write_own,unmask');   -- this one 
   triggers, rules or policies (creating, dropping or renaming one); `search()` over it; `DIFF ... AS SQL`; `FOR UPDATE`
   on a table without a key whose columns include a masked one (its rows are found again by their values); and the HTTP
   and MCP row API (`get`, `find`, `diff`, ...) on it: the agent uses SQL.
+- **`FORMAT`:** each ASCII letter becomes a letter of the same case, each digit a digit, any other letter `x`, and
+  everything else (`@`, `.`, `-`, spaces) stays where it was: an email stays email-shaped and the same length, for
+  agents that check formats. Like `HASH` it's keyed and the same for the same value, so joins and `GROUP BY` work;
+  unlike `HASH` it shows the value's shape and length.
+- **Copies a person makes follow:** a table made with `CREATE TABLE AS`, or a materialized view, from masked columns
+  masks its copies of them: a column copied as it is keeps its mode, one worked out from masked columns is masked with
+  `HASH` (`NULL` if one it reads is masked with `NULL`), the rest aren't. A query too involved to follow column by
+  column (`UNION`, a subquery or function in `FROM`) that reads a masked column masks every column with `HASH`;
+  `DROP MASKED` takes off what isn't needed. (An agent's copy is made from the masks it reads.)
 - **Generated columns follow:** a generated column made from a masked one (`exposed text generated always as (email)
   stored`), whether it was there first or added later, is masked too: with NULL if one it reads is masked with NULL,
   else with HASH.
 - **Still a table:** `SELECT ... FOR UPDATE` locks the rows of a masked table as of any (by its key), and `ctid` reads.
-- **Who is an agent:** a session with an agent's token (Postgres login, HTTP, MCP over HTTP), `serve --safe`'s
-  guest, and `chronos mcp <folder> --agent NAME`. A plain `chronos mcp <folder>` acts as the folder's owner and reads
-  the values: give a model you don't want to see them `--agent`.
+- **Who reads masks:** a session with an agent's token (Postgres login, HTTP, MCP over HTTP), `serve --safe`'s
+  guest, `chronos mcp <folder> --agent NAME`, and a plain `chronos mcp <folder>`: it acts as the folder's owner but
+  serves a model, so its SQL reads masks and its row tools (`get`, `find`, `diff`, ...) are refused on tables with
+  masked columns. `chronos mcp <folder> --unmask` gives that model the values.
 - **The mask is the column's:** it forks, merges, renames and drops with the column, `DIFF` shows it as a change to the
   table, and a partition or child of a masked table has its masks too.
 - **What it doesn't hide:** an agent may write a masked column, and an agent that may insert into a table with a unique
-  masked column can tell whether a value is there (the insert fails); an existing trigger that copies a value
-  elsewhere copies it as it is; a person who reads values out into another table, or a materialized view a person
-  refreshes, is a copy masks don't follow (mask a copied table's columns too).
-  Give agents that mustn't learn the values no write on such tables, or put them under a merge policy's
-  `review_tables`. `SHOW AGENT name PRIVILEGES` shows each masked column as the agent reads it.
+  masked column can tell whether a value is there (the insert fails): `SHOW AGENT name PRIVILEGES` says so on the
+  column (`an insert reveals whether a value is there`). An existing trigger that copies a value elsewhere copies it as
+  it is, and a person who copies values with `INSERT ... SELECT` into a table of their own makes a copy masks don't
+  follow (mask its columns too). Give agents that mustn't learn the values no write on such tables, or put them under a
+  merge policy's `review_tables`. `SHOW AGENT name PRIVILEGES` shows each masked column as the agent reads it.
 
 ## Limits for the whole database
 

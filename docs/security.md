@@ -106,6 +106,7 @@ In safe mode, the guest can read `/metrics`, as its `read` right already gives i
 | `POST /mcp` on `chronos serve`, with an agent's token | that agent | as `--agent` with its name; the server's and admin tokens get `403` |
 
 - **`--agent` takes a name, not a token:** anyone who can run `chronos mcp` on the folder can act as any agent. It names who does what; the OS decides who may start it. A disabled or unknown agent is refused at start.
+- **Masked columns read masked** without `--agent` too, `--allow-merge` included: the session serves a model, so its SQL reads [masks](sql.md#masked-columns) and its row tools are refused on tables with masked columns. `--unmask` gives it the values.
 - **Safe mode without `--agent`** leaves no audit trail: its writes aren't attributed to anyone, like the database's own user's. Use `--agent` to get the audit trail and quotas.
 
 ### Studio (`chronos studio <folder>`)

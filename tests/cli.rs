@@ -1059,3 +1059,28 @@ fn mcp_merge_checks() {
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A plain `chronos mcp <folder>` serves a model the owner runs: it reads masked columns masked (SQL) and its row
+/// tools are refused on tables with some; `--unmask` gives it the values (issue #45).
+#[test]
+fn a_plain_mcp_reads_masked_columns_masked() {
+    let dir = std::env::temp_dir().join(format!("chronos-mcp-masked-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let setup = "create table customers (id int primary key, email text);\n\
+                 insert into customers values (1, 'ann@example.com');\n\
+                 alter table customers alter column email set masked;\n";
+    let (ok, _, err) = chronos(&dir, &[], setup);
+    assert!(ok, "{err}");
+    let text = |r: &serde_json::Value| r["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string();
+    let script = [
+        call(1, "sql", r#"{"sql":"select email from customers"}"#),
+        call(2, "get", r#"{"table":"customers","id":"1"}"#),
+    ];
+    let masked = mcp(&dir, &[], &script);
+    assert!(text(&masked[0]).contains("m_") && !text(&masked[0]).contains("ann@"), "{masked:?}");
+    assert!(text(&masked[1]).contains("has masked columns"), "{masked:?}");
+    let open = mcp(&dir, &["--unmask"], &script);
+    assert!(text(&open[0]).contains("ann@example.com"), "{open:?}");
+    assert!(text(&open[1]).contains("ann@example.com"), "{open:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

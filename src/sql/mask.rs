@@ -2,8 +2,10 @@
 //!
 //! A masked column's values are never shown to an agent without the `unmask` capability (see `on`): it reads
 //! a keyed hash of each value (`HASH`, the default: equal values hash the same, so joins, GROUP BY and
-//! DISTINCT still work, across tables too), NULL, or the value's last four characters (`PARTIAL`). People,
-//! and agents with `unmask`, read the values as they are.
+//! DISTINCT still work, across tables too), NULL, the value's last four characters (`PARTIAL`), or a keyed
+//! stand-in of the same shape (`FORMAT`: each letter a letter, each digit a digit, the rest kept, so an
+//! email stays email-shaped and the same length, for agents that validate formats). People, and agents with
+//! `unmask`, read the values as they are.
 //!
 //! The mask is the column's own (pg_attribute's options, see `ColOpts`), so it forks, merges, renames and drops
 //! with the column, and a table that inherits from or is a partition of a masked one takes its masks too.
@@ -34,6 +36,7 @@ pub(super) const INNER: &str = "\u{1}masked";
 pub(super) const HASH: char = 'h';
 pub(super) const NULL: char = 'n';
 pub(super) const PARTIAL: char = 'p';
+pub(super) const FORMAT: char = 'f';
 
 /// The mode a word of SET MASKED WITH names.
 pub(super) fn mode(word: &str) -> Option<char> {
@@ -41,6 +44,7 @@ pub(super) fn mode(word: &str) -> Option<char> {
         "hash" => Some(HASH),
         "null" => Some(NULL),
         "partial" => Some(PARTIAL),
+        "format" => Some(FORMAT),
         _ => None,
     }
 }
@@ -49,6 +53,7 @@ pub(super) fn mode_name(m: char) -> &'static str {
     match m {
         NULL => "null",
         PARTIAL => "partial",
+        FORMAT => "format",
         _ => "hash",
     }
 }
@@ -226,11 +231,14 @@ pub(super) fn apply(mode: u8, a: &[Value]) -> Result<Value> {
     Ok(match mode as char {
         NULL => Value::Null,
         PARTIAL => Value::Text(partial(&v.to_text())),
-        _ => {
+        m => {
             let Some(Value::Int(id)) = a.get(1) else { return err("XX000", "a masked value without its key") };
             let key = keys().get(*id as usize).copied();
             let Some(key) = key else { return err("XX000", "a masked value's key isn't known") };
-            Value::Text(hashed(&key, &v.to_text()))
+            Value::Text(match m {
+                FORMAT => shaped(&key, &v.to_text()),
+                _ => hashed(&key, &v.to_text()),
+            })
         }
     })
 }
@@ -239,6 +247,27 @@ pub(super) fn apply(mode: u8, a: &[Value]) -> Result<Value> {
 fn hashed(key: &[u8; 32], text: &str) -> String {
     let h = blake3::keyed_hash(key, text.as_bytes());
     format!("m_{}", &crate::pages::hex(h.as_bytes())[..24])
+}
+
+/// FORMAT's text: the value's shape with keyed stand-ins: each ASCII letter a letter of the same case, each digit
+/// a digit, any other letter `x`, and everything else (`@`, `.`, `-`, spaces) kept. The same value gives the same
+/// text, so joins and GROUP BY still work; unlike HASH, the shape (and length) shows.
+fn shaped(key: &[u8; 32], text: &str) -> String {
+    let mut stream = blake3::Hasher::new_keyed(key).update(text.as_bytes()).finalize_xof();
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        let mut b = [0u8; 1];
+        stream.fill(&mut b);
+        let r = b[0];
+        out.push(match c {
+            'a'..='z' => (b'a' + r % 26) as char,
+            'A'..='Z' => (b'A' + r % 26) as char,
+            '0'..='9' => (b'0' + r % 10) as char,
+            c if c.is_alphanumeric() => 'x',
+            c => c,
+        });
+    }
+    out
 }
 
 /// PARTIAL's text: the last four characters, the rest `*` (all of them for four or fewer).
@@ -260,6 +289,7 @@ fn masked_json(j: &Json, m: char, key: &[u8; 32]) -> Json {
     match m {
         NULL => Json::Null,
         PARTIAL => Json::String(partial(&text)),
+        FORMAT => Json::String(shaped(key, &text)),
         _ => Json::String(hashed(key, &text)),
     }
 }
@@ -491,11 +521,89 @@ pub(crate) fn agent_refused(db: &Db, agent: &str, branch: &str, tables: &[&str])
         if !of(&v, t)?.is_empty() {
             return Ok(Some(format!(
                 "table \"{}\" has masked columns, and the row API works on rows as they are: read it with SQL (the \
-                 sql tool, or POST /v1/sql), which shows them masked (agent {} hasn't 'unmask')",
+                 sql tool, or POST /v1/sql), which shows them masked ({} hasn't 'unmask')",
                 rel_part(t),
-                agent
+                if agent.contains(' ') { agent.to_string() } else { format!("agent {agent}") }
             )));
         }
     }
     Ok(None)
+}
+
+/// The masks the columns of a table made from query `q` (CREATE TABLE AS, a materialized view) take, by place
+/// (`n` columns), when a person makes it: a copy of a masked column's values is masked too. A column that is a
+/// masked column as it is keeps its mode; one worked out from masked columns (or with a subquery that reads one)
+/// is masked with NULL if one it reads is masked with NULL, else with HASH. A query too involved to follow column by
+/// column (UNION, a subquery or function in FROM) that reads any masked column masks every column with HASH.
+pub(super) fn derived(v: &View, q: &Select, n: usize) -> Result<Vec<Option<char>>> {
+    // what the whole query reads that's masked: none, and nothing is masked (the usual case)
+    let reads = impact::plain_reads(&Stmt::Select(Box::new(q.clone())));
+    let mut masks: HashMap<String, Vec<(String, char)>> = HashMap::new();
+    for t in reads.iter().map(|(t, _)| t) {
+        if !masks.contains_key(t) {
+            masks.insert(t.clone(), of(v, t)?);
+        }
+    }
+    let reads_masked = |reads: &impact::Reads| {
+        reads
+            .iter()
+            .any(|(t, c)| masks.get(t).is_some_and(|m| (c == "*" && !m.is_empty()) || m.iter().any(|(x, _)| x == c)))
+    };
+    if !reads_masked(&reads) {
+        return Ok(vec![None; n]);
+    }
+    let all = vec![Some(HASH); n];
+    let sources: Vec<&Source> = q.from.iter().chain(q.joins.iter().map(|j| &j.src)).collect();
+    if !q.set.is_empty() || sources.iter().any(|s| s.sub.is_some() || s.rec.is_some() || s.srf.is_some()) {
+        return Ok(all);
+    }
+    // this level's tables: (alias, table, its visible columns, its masks)
+    let mut level = vec![];
+    for s in &sources {
+        let Some(t) = load(v, &s.table)? else { return Ok(all) };
+        let cols: Vec<String> = t.cols.iter().filter(|c| !c.hidden).map(|c| c.name.clone()).collect();
+        level.push((s.alias.clone(), s.table.clone(), cols, of(v, &s.table)?));
+    }
+    let mode_of = |table: &(String, String, Vec<String>, Vec<(String, char)>), c: &str| {
+        table.3.iter().find(|(x, _)| x == c).map(|(_, m)| *m)
+    };
+    let mut out = vec![];
+    for item in &q.items {
+        match item {
+            Item::Star => {
+                for t in &level {
+                    out.extend(t.2.iter().map(|c| mode_of(t, c)));
+                }
+            }
+            Item::TableStar(a) => {
+                let Some(t) = level.iter().find(|t| t.0 == *a || t.1 == *a) else { return Ok(all) };
+                out.extend(t.2.iter().map(|c| mode_of(t, c)));
+            }
+            Item::Expr(e, _) => {
+                // the masked columns it reads, and whether it is one of them as it is
+                let mut found: Vec<char> = vec![];
+                let mut sub = false;
+                walk(e, &mut |x| match x {
+                    Expr::Col(qual, name) => {
+                        let at = level.iter().filter(|t| match qual {
+                            Some(q) => t.0 == *q || t.1 == *q,
+                            None => t.2.iter().any(|c| c == name),
+                        });
+                        found.extend(at.filter_map(|t| mode_of(t, name)));
+                    }
+                    Expr::Sub(sq) | Expr::Exists(sq, _) | Expr::InSub(_, sq, _) => {
+                        sub |= reads_masked(&impact::plain_reads(&Stmt::Select(sq.q.clone())))
+                    }
+                    _ => {}
+                });
+                out.push(match (e, found.first()) {
+                    (Expr::Col(..), Some(m)) if found.len() == 1 && !sub => Some(*m),
+                    _ if found.contains(&NULL) => Some(NULL),
+                    _ if !found.is_empty() || sub => Some(HASH),
+                    _ => None,
+                });
+            }
+        }
+    }
+    Ok(if out.len() == n { out } else { all })
 }

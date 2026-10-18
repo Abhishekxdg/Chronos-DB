@@ -278,7 +278,7 @@ pub fn call_as(db: &Db, me: &chronos::Acting, op: &str, a: &Value) -> Result<Val
         "merge_outcomes" => return Err(fail(403, "merge outcomes are for the server's token, not an agent's")),
         _ => me.may_admin()?,
     }
-    row_security(db, &me.agent.name, op, a)?;
+    row_security(db, Some(&me.agent.name), op, a)?;
     call(db, op, a)
 }
 
@@ -286,7 +286,8 @@ pub fn call_as(db: &Db, me: &chronos::Acting, op: &str, a: &Value) -> Result<Val
 /// 403 (42501) when a policy limits the agent's role (a role of its name) on a table whose rows `op`
 /// reads or writes (get, find, put, delete, batch; diff and merge: the tables the world changed).
 /// SQL applies the policies instead.
-pub fn row_security(db: &Db, agent: &str, op: &str, a: &Value) -> Result<(), Fail> {
+/// `agent` None: a session that reads masked columns masked with no agent acting (see `sql::masks_refuse`).
+pub fn row_security(db: &Db, agent: Option<&str>, op: &str, a: &Value) -> Result<(), Fail> {
     if !sql::row_security_possible(db) {
         return Ok(());
     }
@@ -310,7 +311,11 @@ pub fn row_security(db: &Db, agent: &str, op: &str, a: &Value) -> Result<(), Fai
     };
     let names: Vec<&str> = tables.iter().map(String::as_str).collect();
     for w in worlds {
-        match sql::row_security_refuses(db, agent, w, &names) {
+        let refused = match agent {
+            Some(agent) => sql::row_security_refuses(db, agent, w, &names),
+            None => sql::masks_refuse(db, w, &names),
+        };
+        match refused {
             Ok(None) => {}
             Ok(Some(m)) => return Err(Fail(403, json!({ "message": m, "code": "42501" }))),
             Err(e) => return Err(Fail(400, json!({ "message": e.message, "code": e.code }))),

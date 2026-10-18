@@ -4,8 +4,9 @@
 //!   chronos mydb get users 1       run one command and exit (exit code 1 on error)
 //!   chronos mydb < script.txt      run commands from stdin, one per line
 //!   chronos -b agent-7 mydb ...    start on a branch other than main
-//!   chronos mcp mydb [--allow-merge]  serve the database to AI agents over MCP (stdio); agents
-//!                                change only branches they fork, and a person merges, unless --allow-merge
+//!   chronos mcp mydb [--allow-merge] [--unmask]  serve the database to AI agents over MCP (stdio); agents
+//!                                change only branches they fork, and a person merges, unless --allow-merge;
+//!                                masked columns read masked, unless --unmask
 //!   chronos import mydb users data.csv --schema schema.csv
 //!                                a copy of one Postgres table (see src/import.rs, docs/sql.md)
 //!   chronos mydb backup /backups/mydb-1   copy the database into a new folder (while it runs: BACKUP
@@ -170,6 +171,7 @@ fn main() {
     let anchor_reset = args.iter().position(|a| a == "--anchor-reset").map(|i| args.remove(i)).is_some()
         || std::env::var("CHRONOS_ANCHOR_RESET").is_ok_and(|v| v == "1");
     let allow_merge = args.iter().position(|a| a == "--allow-merge").map(|i| args.remove(i)).is_some();
+    let unmask = args.iter().position(|a| a == "--unmask").map(|i| args.remove(i)).is_some();
     let no_open = args.iter().position(|a| a == "--no-open").map(|i| args.remove(i)).is_some();
     let login = args.iter().position(|a| a == "--login").map(|i| args.remove(i)).is_some();
     let dry_run = args.iter().position(|a| a == "--dry-run").map(|i| args.remove(i)).is_some();
@@ -368,7 +370,9 @@ fn main() {
     let hello = if serve || remote.is_some() {
         None // a server must own the folder; a remote folder has one owner by lease
     } else if mcp {
-        Some(serde_json::json!({"mode": "mcp", "branch": branch.clone(), "agent": agent, "allow_merge": allow_merge}))
+        Some(
+            serde_json::json!({"mode": "mcp", "branch": branch.clone(), "agent": agent, "allow_merge": allow_merge, "unmask": unmask}),
+        )
     } else if studio {
         Some(serde_json::json!({"mode": "api"}))
     } else if import {
@@ -455,7 +459,7 @@ fn main() {
                 }
                 mcp::Guard::agent(name)
             }
-            None => mcp::Guard::new(allow_merge),
+            None => mcp::Guard::new(allow_merge, unmask),
         };
         let db = sh.db.clone();
         mcp::serve(sh, guard);
@@ -731,7 +735,7 @@ fn db_key() -> std::io::Result<Option<[u8; 32]>> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: chronos [-b branch] [--remote s3://bucket/prefix [--takeover]] [--anchor FILE [--anchor-reset]] <folder> [command]\n       chronos mcp <folder> [--allow-merge | --agent NAME]   (MCP server for AI agents, over stdio; without --allow-merge, agents can't merge; --agent acts as that agent)\n       chronos import <folder> <table> <data.csv> --schema <schema.csv>   (a copy of one Postgres table)\n       chronos attach <new folder> --tables a,b | --schema s [--yes]   (work beside a Postgres: merges into main are written there; CHRONOS_SOURCE_URL)\n       chronos restore <backup> <new folder>   (start a database from a backup, and verify it)\n       chronos init [--no-open]   (in a project folder: its Chronos Cloud database, wired up for agents; chronos cloud help)\n       chronos keygen   (a new encryption key: CHRONOS_KEY=<key> chronos <new folder> makes an encrypted database)\n       chronos studio <folder> [--port N] [--no-open]   (a web UI for the database, on 127.0.0.1; works beside a running serve)\n       chronos studio <folder> --login [--port N | --listen ADDR:PORT] [--host NAME[:PORT]]... [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--no-open]\n                                  (the web UI, signed in with a database role and its password, acting with its privileges;\n                                   make one with: create role admin login superuser password '...'; any address but loopback needs TLS)\n       chronos serve <folder> [--listen 127.0.0.1:7070] [--pg 127.0.0.1:5433|off] [--token T] [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--safe [--admin-token A]]
+        "usage: chronos [-b branch] [--remote s3://bucket/prefix [--takeover]] [--anchor FILE [--anchor-reset]] <folder> [command]\n       chronos mcp <folder> [--allow-merge | --agent NAME] [--unmask]   (MCP server for AI agents, over stdio; without --allow-merge, agents can't merge; --agent acts as that agent; masked columns read masked unless --unmask)\n       chronos import <folder> <table> <data.csv> --schema <schema.csv>   (a copy of one Postgres table)\n       chronos attach <new folder> --tables a,b | --schema s [--yes]   (work beside a Postgres: merges into main are written there; CHRONOS_SOURCE_URL)\n       chronos restore <backup> <new folder>   (start a database from a backup, and verify it)\n       chronos init [--no-open]   (in a project folder: its Chronos Cloud database, wired up for agents; chronos cloud help)\n       chronos keygen   (a new encryption key: CHRONOS_KEY=<key> chronos <new folder> makes an encrypted database)\n       chronos studio <folder> [--port N] [--no-open]   (a web UI for the database, on 127.0.0.1; works beside a running serve)\n       chronos studio <folder> --login [--port N | --listen ADDR:PORT] [--host NAME[:PORT]]... [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--no-open]\n                                  (the web UI, signed in with a database role and its password, acting with its privileges;\n                                   make one with: create role admin login superuser password '...'; any address but loopback needs TLS)\n       chronos serve <folder> [--listen 127.0.0.1:7070] [--pg 127.0.0.1:5433|off] [--token T] [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--safe [--admin-token A]]
                                   (HTTP JSON API, and Postgres protocol: psql postgres://127.0.0.1:5433/main; with --safe,
                                    clients that aren't agents only fork and change their own worlds, unless they give the admin token;
                                    a token is 24 characters or more (openssl rand -hex 24; pass it as CHRONOS_TOKEN, not on the
@@ -1158,6 +1162,7 @@ impl Shell {
     ) -> Result<String, String> {
         let mut s = Closing(chronos::sql::Session::new(&self.branch), &self.db);
         s.0.agent = agent.map(String::from);
+        s.0.masked = self.sql.masked; // (a plain chronos mcp reads masked columns masked)
         s.0.run(&self.db, q, params).map(|o| show(&o)).map_err(|e| e.described())
     }
 

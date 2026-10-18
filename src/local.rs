@@ -161,7 +161,10 @@ fn session(db: Arc<Db>, conn: UnixStream) -> io::Result<()> {
                     Ok(_) => mcp::Guard::agent(name),
                     Err(e) => return reply(&mut out, false, e.to_string()),
                 },
-                None => mcp::Guard::new(hello["allow_merge"].as_bool() == Some(true)),
+                None => mcp::Guard::new(
+                    hello["allow_merge"].as_bool() == Some(true),
+                    hello["unmask"].as_bool() == Some(true),
+                ),
             };
             reply(&mut out, true, String::new())?;
             mcp::serve_io(sh, guard, reader, out);

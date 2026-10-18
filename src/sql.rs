@@ -29625,6 +29625,13 @@ pub fn row_security_refuses(db: &Db, agent: &str, branch: &str, tables: &[&str])
     rls::agent_refused(db, agent, branch, tables)
 }
 
+/// For the row API of a session that reads masked columns masked with no agent acting (a plain `chronos mcp`): the
+/// message refusing it the rows of `tables` in world `branch` that have masked columns, which it would show as they
+/// are.
+pub fn masks_refuse(db: &Db, branch: &str, tables: &[&str]) -> Result<Option<String>> {
+    mask::agent_refused(db, "chronos mcp (started without --unmask)", branch, tables)
+}
+
 /// Whether `row_security_refuses` may refuse anything: a table of the database has had row-level security or a
 /// policy, or the database has a mask key (some column was masked).
 pub fn row_security_possible(db: &Db) -> bool {
@@ -34045,6 +34052,9 @@ pub struct Session {
     /// the agent this session acts for, if any: its statements are checked against what it may do
     /// (see `crate::agents`), and what they write is logged as its
     pub agent: Option<String>,
+    /// masked columns read masked though no agent acts (a plain `chronos mcp <folder>`, a model the database's
+    /// owner runs: see `mask`)
+    pub masked: bool,
     /// SET hnsw.ef_search (0: the search index's default)
     ef: usize,
     /// SET statement_timeout, in ms (0: none; None: the database's default, see `Setting`)
@@ -35115,6 +35125,7 @@ impl Session {
             id: IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             tx: None,
             agent: None,
+            masked: false,
             ef: 0,
             timeout: None,
             cancel: Default::default(),
@@ -36051,7 +36062,26 @@ impl Session {
         if own {
             self.step(db, &plain(Stmt::Begin), &[], &[])?;
         }
+        // made by a person from masked columns: its copies of them are masked too, before any row is in it (an
+        // agent's query read masks already)
+        let masks = match mask::on() {
+            true => vec![],
+            false => mask::derived(&db.view_tx(self.target())?, query, names.len())?,
+        };
         let made = self.step(db, &create, &[], &[]).and_then(|out| {
+            for (n, m) in names.iter().zip(&masks) {
+                if let Some(m) = m {
+                    let sql = format!(
+                        "alter table {} alter column {} set masked with {}",
+                        ident(table),
+                        ident(n),
+                        mask::mode_name(*m)
+                    );
+                    for st in parse(&sql)? {
+                        self.step(db, &st, &[], &[])?;
+                    }
+                }
+            }
             if !data {
                 return Ok(out);
             }
@@ -36736,7 +36766,7 @@ impl Session {
             session_user: session_who.name.clone(),
             agent: self.agent.is_some(),
             // (an agent without 'unmask' reads masked columns masked: see `mask`)
-            masked: self.agent.is_some() && !agent.as_ref().is_some_and(|a| a.may(crate::Can::Unmask)),
+            masked: self.masked || (self.agent.is_some() && !agent.as_ref().is_some_and(|a| a.may(crate::Can::Unmask))),
             pid: self.pid,
             txid: self.tx.as_ref().map_or_else(next_txid, |t| t.txid),
             rc: self.tx.as_ref().is_some_and(|t| t.iso.per_statement() && !t.imported),
@@ -45225,6 +45255,11 @@ impl Exec<'_> {
         if_not_exists: bool,
     ) -> Result<Output> {
         let rows = if data { self.select(q)?.rows } else { vec![] };
+        // made by a person from masked columns: its copies of them are masked too (an agent's query read masks)
+        let masks = match mask::on() {
+            true => vec![None; found.len()],
+            false => mask::derived(&self.db.view_tx(self.branch)?, q, found.len())?,
+        };
         let mut t = Table::default_named(name);
         t.cols = found
             .iter()
@@ -45232,6 +45267,7 @@ impl Exec<'_> {
             .enumerate()
             .map(|(i, ((_, ty), n))| Col {
                 id: i as u32,
+                opts: ColOpts { mask: masks.get(i).copied().flatten(), ..ColOpts::default() },
                 coll: colls.get(i).copied().unwrap_or(collation::Coll::DEFAULT),
                 // (a varchar or char(n) column of its query is one of its own)
                 chars: held_chars(chars.get(i).copied().flatten())

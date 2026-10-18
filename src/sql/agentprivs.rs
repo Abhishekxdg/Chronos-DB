@@ -157,6 +157,17 @@ pub(super) fn show(db: &Db, name: &str, world: &str) -> Result<Vec<Vec<Value>>> 
                 } else {
                     cread = format!("masked ({})", mask::mode_name(*m));
                     cwhy.push("masked column: it reads a mask of each value, and may not filter on the value".into());
+                    // a unique value's insert fails when the value is there: the failure says what the mask hides
+                    let unique = t.key_cols().iter().any(|&k| t.cols.get(k).is_some_and(|k| k.id == c.id))
+                        || t.uniques.iter().any(|u| u.cols.contains(&c.id));
+                    if unique && cwrite.contains("insert") {
+                        cwrite = format!("{cwrite} (an insert reveals whether a value is there)");
+                        cwhy.push(
+                            "unique and masked: an insert that fails on it says the value is there; give it no INSERT, \
+                             or put the table in its merge policy's review_tables"
+                                .into(),
+                        );
+                    }
                 }
             }
             let cmerge = merge_of(&a, policy.as_ref(), &t.name, Some(&c.name), &mut cwhy);
