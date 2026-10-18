@@ -665,3 +665,95 @@ fn reads_are_checked_against_postgres() {
     drop(pg);
     drop_db(&name);
 }
+
+/// "Found nothing, then production added it": an agent looks for a lead, finds none, creates one and queues a welcome;
+/// Postgres gets a matching lead straight before the merge. The merge is held or refused, with neither the lead nor
+/// the welcome landing: through the world's own reads, through a merge check run in Postgres inside the write-back
+/// (main, Chronos's copy, never saw the row), and queued for a person under an agent's merge policy. Issue #39.
+#[test]
+fn a_row_added_in_postgres_after_an_empty_read_holds_the_merge() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("absent") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute("create table leads (id int primary key, email text); insert into leads values (1, 'bo@x.com')")
+        .unwrap();
+    let dir = folder("absent");
+    let (ok, out) = attach(&dir, &["--tables", "leads"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    // forks `w` (`with`), finds no lead for ada, creates one (id `next`) and queues the welcome; Postgres then gets its
+    // own
+    let create_if_missing = |pg: &mut postgres::Client, s: &mut Session, w: &str, with: &str, next: i32| {
+        s.run(&db, &format!("create world {w}{with}; use world {w}"), &[]).unwrap();
+        let found = s.run(&db, "select count(*) from leads where lower(email) = 'ada@x.com'", &[]).unwrap();
+        assert_eq!(found[0].rows[0][0].to_text(), "0");
+        s.run(
+            &db,
+            &format!(
+                "insert into leads values ({next}, 'ada@x.com'); notify on merge crm, '{{\"welcome\": \"ada@x.com\"}}'; use world main"
+            ),
+            &[],
+        )
+        .unwrap();
+        pg.batch_execute(&format!("insert into leads values ({}, 'Ada@X.com')", next + 1)).unwrap();
+    };
+    let nothing_landed = |pg: &mut postgres::Client, db: &Db, w: &str| {
+        assert_eq!(pg_cell(pg, "select count(*) from leads where lower(email) = 'ada@x.com'"), "1", "only Postgres's");
+        assert_eq!(pg_cell(pg, "select count(*) from chronos.merges where id like 'merge:%'"), "0");
+        assert_eq!(run(db, MAIN, "show outbox", &[]).unwrap().pop().unwrap().rows.len(), 0, "no welcome queued");
+        assert!(db.world(w).is_ok(), "the world stays, to redo or drop");
+        pg.batch_execute("delete from leads where lower(email) = 'ada@x.com'").unwrap();
+        run(db, MAIN, &format!("drop world {w}"), &[]).unwrap();
+    };
+    let mut me = Session::new(MAIN);
+
+    // the world checks its reads: the empty read is checked against Postgres in the write-back
+    create_if_missing(&mut pg, &mut me, "r", " with (check_reads = true)", 10);
+    let e = run(&db, MAIN, "merge world r", &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    assert!(e.message.contains("changed in Postgres since it forked"), "{}", e.message);
+    nothing_landed(&mut pg, &db, "r");
+
+    // it doesn't: a merge check on duplicate emails catches it, run in Postgres as the write-back leaves it
+    run(
+        &db,
+        MAIN,
+        "create merge check one_lead_per_email on tables (leads) as \
+         select lower(email) as email, count(*) as n from leads group by 1 having count(*) > 1",
+        &[],
+    )
+    .unwrap();
+    create_if_missing(&mut pg, &mut me, "c", "", 20);
+    let e = run(&db, MAIN, "merge world c", &[]).unwrap_err();
+    assert_eq!(e.code, "23514", "{}", e.message);
+    assert!(e.message.contains("breaks merge check one_lead_per_email in Postgres"), "{}", e.message);
+    assert!(e.message.contains(r#""email":"ada@x.com","n":2"#), "the rows it found: {}", e.message);
+    nothing_landed(&mut pg, &db, "c");
+
+    // an agent keeping to a merge policy: queued for a person, not refused, and nothing written
+    run(&db, MAIN, "create merge policy p", &[]).unwrap();
+    run(&db, MAIN, "create agent bot with (can = 'read,fork,write_own,write_main,merge_own', policy = 'p')", &[])
+        .unwrap();
+    let mut bot = Session::new(MAIN);
+    bot.agent = Some("bot".into());
+    create_if_missing(&mut pg, &mut bot, "b", "", 30);
+    let e = bot.run(&db, "merge world b", &[]).unwrap_err();
+    assert!(e.message.contains("SHOW REVIEWS"), "{}", e.message);
+    let reviews = db.reviews();
+    assert_eq!(reviews.len(), 1);
+    assert!(format!("{:?}", reviews[0]).contains("in Postgres"), "{:?}", reviews[0]);
+    nothing_landed(&mut pg, &db, "b");
+
+    // without the duplicate, the same merge goes through, welcome and all
+    create_if_missing(&mut pg, &mut me, "ok", "", 40);
+    pg.batch_execute("delete from leads where email = 'Ada@X.com'").unwrap();
+    run(&db, MAIN, "merge world ok", &[]).unwrap();
+    assert_eq!(pg_cell(&mut pg, "select count(*) from leads where lower(email) = 'ada@x.com'"), "1");
+    assert_eq!(run(&db, MAIN, "show outbox", &[]).unwrap().pop().unwrap().rows.len(), 1);
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}

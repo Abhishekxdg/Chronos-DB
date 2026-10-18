@@ -8,7 +8,9 @@
 //!     ├─ Postgres, one transaction:  settings ─> source identity ─> schema unchanged? ─> per table, parents first:
 //!     │    lock the rows ─> compare each with main's value ─(any differs)─> roll back; main takes Postgres's
 //!     │                                                                     values for them; conflict error
-//!     │    ─> update, insert (parents first), delete (children first), each RETURNING ─> marker row ─> COMMIT
+//!     │    ─> update, insert (parents first), delete (children first), each RETURNING
+//!     │    ─> merge checks on attached tables, on Postgres as the writes leave it (rows found: roll back, held)
+//!     │    ─> marker row ─> COMMIT
 //!     ├─ the merge published in Chronos
 //!     └─ rows Postgres changed as it wrote them (a trigger, a default): main takes them too
 //!
@@ -642,13 +644,26 @@ pub(crate) struct Reads<'a> {
     pub(crate) wrote: &'a HashSet<String>,
 }
 
+/// Why a write-back rolled back rather than commit (see `write_back`), in words.
+pub(crate) enum Held {
+    /// what the world read changed in Postgres since its fork (see `live_reads`)
+    Stale(Vec<String>),
+    /// merge checks that found rows in Postgres as the merge's writes left it (see `live_checks`)
+    Checks(Vec<String>),
+}
+
+/// The merge checks of a merge into main that run in Postgres too (see `live_checks`): those whose ON TABLES are all
+/// attached tables. A check with no ON TABLES may read any table, so it runs only in Chronos.
+pub(crate) fn checks_for(att: &Attached, checks: Vec<crate::checks::MergeCheck>) -> Vec<crate::checks::MergeCheck> {
+    checks.into_iter().filter(|c| !c.tables.is_empty() && c.tables.iter().all(|t| att.table(t).is_some())).collect()
+}
+
 /// The write-back of a merge into main (see the module's doc), run by `merge_locked` under the merge's locks once
 /// everything Chronos checks has passed: `apply` is what the merge changes in main (`theirs`), the world's rows
-/// as `ours` holds them; `reads`, for a world that checks its reads. Ok, empty: Postgres committed (or there was
-/// nothing to write), and the merge goes on. Ok, reasons: what the world read changed in Postgres since its fork
-/// (see `live_reads`): rolled back, nothing written, and the merge is held as for any stale read. Err: nothing was
-/// written to Postgres, and nothing merges; on a conflict main takes Postgres's rows after the locks (see
-/// `after_merge`).
+/// as `ours` holds them; `reads`, for a world that checks its reads; `checks`, the merge's checks to run in Postgres
+/// (see `checks_for`). Ok(None): Postgres committed (or there was nothing to write), and the merge goes on.
+/// Ok(Some): rolled back, nothing written, and the merge is held for what it says. Err: nothing was written to
+/// Postgres, and nothing merges; on a conflict main takes Postgres's rows after the locks (see `after_merge`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_back(
     core: &Core,
@@ -659,13 +674,14 @@ pub(crate) fn write_back(
     ours: &State,
     apply: &[crate::Change],
     reads: Option<&Reads>,
-) -> Result<Vec<String>> {
+    checks: &[crate::checks::MergeCheck],
+) -> Result<Option<Held>> {
     let rows = rows_of(core, att, world, theirs, ours, apply)?;
     if rows.is_empty() {
-        return Ok(vec![]);
+        return Ok(None);
     }
     let mut pg = connect().map_err(|e| refused(format!("{e}; nothing was merged")))?;
-    let out = transaction(core, &mut pg, att, world, world_id, &rows, reads);
+    let out = transaction(core, &mut pg, att, world, world_id, &rows, reads, checks);
     if out.is_err() {
         rollback(&mut pg);
     }
@@ -878,6 +894,7 @@ fn run(pg: &mut Client, what: &str, sql: &str, params: &[String]) -> Result<pgcl
 }
 
 /// One write-back transaction (see the module's doc). Err leaves the transaction for the caller to roll back.
+#[allow(clippy::too_many_arguments)]
 fn transaction(
     core: &Core,
     pg: &mut Client,
@@ -886,7 +903,8 @@ fn transaction(
     world_id: &str,
     rows: &[Row],
     reads: Option<&Reads>,
-) -> Result<Vec<String>> {
+    checks: &[crate::checks::MergeCheck],
+) -> Result<Option<Held>> {
     begin(pg, att, false)?;
     let by_table = by_table(rows);
     for &ti in by_table.keys() {
@@ -897,7 +915,7 @@ fn transaction(
         let stale = live_reads(core, pg, att, r)?;
         if !stale.is_empty() {
             rollback(pg);
-            return Ok(stale);
+            return Ok(Some(Held::Stale(stale)));
         }
     }
     // every row locked and compared before anything is written: any conflict, and nothing is
@@ -1030,6 +1048,12 @@ fn transaction(
         let got = run(pg, &format!("deleting from {}", t.pg), &sql, &arrays(&deletes, t, false, &[], false))?;
         count(t, "deleted", deletes.len(), got.len())?;
     }
+    // the merge checks, on Postgres as these writes leave it: rows added there straight since the attach count too
+    let found = live_checks(pg, checks);
+    if !found.is_empty() {
+        rollback(pg);
+        return Ok(Some(Held::Checks(found)));
+    }
     // the merge's own row, and what recovery needs should the commit's outcome be lost
     let merge_id = format!("merge:{}", random_id());
     run(
@@ -1078,7 +1102,46 @@ fn transaction(
         }
     }
     AFTER.set(Some(After { rows: sent_back, committed: true }));
-    Ok(vec![])
+    Ok(None)
+}
+
+/// The merge checks `checks` (see `checks_for`) run in the write-back's transaction, after its writes, each within
+/// its own timeout: what they break, in the words `Core::failed_checks` uses (none: all found nothing). A check that
+/// fails leaves the transaction aborted, so the checks after it aren't run; the merge is held either way.
+fn live_checks(pg: &mut Client, checks: &[crate::checks::MergeCheck]) -> Vec<String> {
+    let mut out = vec![];
+    for c in checks {
+        let query = c.query.trim().trim_end_matches(';');
+        let sql = format!(
+            "set local statement_timeout = '{}ms'; select row_to_json(c)::text from ({query}\n) c limit {}; \
+             set local statement_timeout = '{STATEMENT_TIMEOUT}'",
+            c.timeout,
+            crate::checks::SHOWN + 1
+        );
+        match pg.query(&sql) {
+            Ok(rows) if rows.is_empty() => {}
+            Ok(rows) => {
+                let mut shown: Vec<String> =
+                    rows.iter().take(crate::checks::SHOWN).filter_map(|r| r[0].clone()).collect();
+                if rows.len() > crate::checks::SHOWN {
+                    shown.push("and more".into());
+                }
+                out.push(format!("breaks merge check {} in Postgres, which finds {}", c.name, shown.join(", ")));
+            }
+            Err(e) if pg_error(&e).is_some_and(|p| p.code == "57014") => {
+                out.push(format!(
+                    "breaks merge check {} in Postgres: it didn't finish within {} ms",
+                    c.name, c.timeout
+                ));
+                break;
+            }
+            Err(e) => {
+                out.push(format!("breaks merge check {} in Postgres: it failed ({e})", c.name));
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Starts a transaction on the source (see `SETTINGS`, the timeouts) and checks it is the database this folder was

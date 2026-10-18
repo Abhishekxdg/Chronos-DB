@@ -5169,20 +5169,47 @@ impl Core {
             }
             // a world that checks its reads: what it read of the attached tables, checked against Postgres too
             let reads = read_set.as_ref().map(|set| attach::Reads { set, base: &base_state, wrote: &wrote });
-            let written =
-                attach::write_back(self, att, b, &world_id, &theirs_state, &ours_state, &written, reads.as_ref());
+            // and the merge checks on attached tables, on Postgres as the merge leaves it: main is only Chronos's
+            // copy, so a row added straight in Postgres since is seen there alone
+            let checks = match rebase {
+                true => vec![],
+                false => {
+                    let changed: std::collections::HashSet<&str> =
+                        keys.iter().filter_map(|k| k.split_once('/').map(|(t, _)| t)).collect();
+                    let run =
+                        self.checks()?.into_iter().filter(|c| c.tables.iter().any(|t| changed.contains(t.as_str())));
+                    attach::checks_for(att, run.collect())
+                }
+            };
+            let written = attach::write_back(
+                self,
+                att,
+                b,
+                &world_id,
+                &theirs_state,
+                &ours_state,
+                &written,
+                reads.as_ref(),
+                &checks,
+            );
             match written {
-                Ok(stale) if stale.is_empty() => {}
+                Ok(None) => {}
                 out => {
                     if !locked.is_empty() {
                         *lock(&child.locked) = locked; // unchanged, should the caller keep the world
                     }
-                    // read rows Postgres changed since the fork: held as any stale read (nothing was written there)
-                    let why = out?;
+                    // nothing was written there: held as any stale read, or broken check
+                    let held = out?.expect("held");
+                    let why = match &held {
+                        attach::Held::Stale(w) | attach::Held::Checks(w) => w.clone(),
+                    };
                     if let Some(r) = review(why.clone()) {
                         return Ok(r);
                     }
-                    return Err(stale::stale(b, "merging", &why));
+                    return Err(match held {
+                        attach::Held::Stale(_) => stale::stale(b, "merging", &why),
+                        attach::Held::Checks(_) => checks::broken(b, &why),
+                    });
                 }
             }
         }

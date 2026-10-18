@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) const CHECKS: &str = "_sonos_checks";
 /// The rows of a failing check a reason shows.
-const SHOWN: usize = 10;
+pub(crate) const SHOWN: usize = 10;
 /// How long a check may run unless it says, in ms.
 const TIMEOUT: u64 = 1000;
 

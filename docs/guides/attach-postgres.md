@@ -38,8 +38,10 @@ What happens at `merge world`:
 2. One Postgres transaction: each row the world changed is locked and compared with the value main holds. Any
    difference means it changed in Postgres since: everything is rolled back, main takes Postgres's current values
    for those rows, and the merge returns the conflicts. Merge again and settle them as any conflict.
-3. Otherwise the updates, inserts and deletes are applied with `RETURNING`, and committed. Values a Postgres trigger
-   or default set come back into main.
+3. Otherwise the updates, inserts and deletes are applied with `RETURNING`. Then, in the same transaction, the
+   [merge checks](#merge-checks-against-live-postgres) on attached tables run on Postgres as those writes leave it;
+   rows found roll everything back. Otherwise it commits. Values a Postgres trigger or default set come back into
+   main.
 
 ### Dry run against live Postgres
 
@@ -79,6 +81,36 @@ suppressed/(12)`), or queued for a person under the agent's merge policy. A dry 
 
 The check reads without a predicate lock (`READ COMMITTED`): a row Postgres takes between the check and `COMMIT`
 lands after the merge in time, an order in which the world's decision was right.
+
+**An empty read isn't checked at all without `check_reads`.** An agent that decides "create it if it's missing" (no
+lead for this email, so make one) relies on a read that found nothing. Without `check_reads` nothing at merge
+looks at that read again, so a matching row added in Postgres meanwhile isn't seen, and the agent's row is written
+beside it (Postgres refuses only an exact duplicate of a unique key). Turn on `check_reads` for such agents (a
+merge policy with `check_reads`, plus `require_scope` if they must also declare what they change), or add a merge
+check (below) that finds the duplicates.
+
+### Merge checks against live Postgres
+
+A [merge check](../reference/worlds.md#merge-checks) runs first on main, Chronos's copy, as for any merge. A row added straight in
+Postgres since the attach isn't there, so a check such as "no two leads with the same `lower(email)`" passes on main
+and the duplicate is written, when no unique index in Postgres catches it (case-insensitive and fuzzy matches seldom
+have one). So a merge check whose `ON TABLES` are all attached tables also runs in Postgres, inside the write-back,
+after the merge's rows are applied and before `COMMIT`:
+
+```sql
+create merge check one_lead_per_email on tables (leads) as
+  select lower(email) as email, count(*) as n from leads group by 1 having count(*) > 1;
+```
+
+- Rows found: `ROLLBACK`, nothing written, and the merge is refused with `23514` (`breaks merge check
+  one_lead_per_email in Postgres, which finds {"email":"ada@x.com","n":2}`), or queued in `SHOW REVIEWS` under the
+  agent's merge policy. The world and its queued effects (`NOTIFY ON MERGE`) stay in the world.
+- The check's SQL runs in Postgres as written, under the write-back's settings (UTC, ISO dates, `search_path =
+  public`) with its timeout as `statement_timeout`; a check that fails or times out there holds the merge too.
+- A check with no `ON TABLES` may read any table, Chronos-only ones too, so it runs only on main. Give it `ON TABLES`
+  naming the attached tables it reads to have it run in Postgres.
+- `MERGE ... DRY RUN` runs merge checks on main only: its Postgres transaction is read only, so the merge's rows
+  aren't there to check.
 
 Main's rows change only this way: writes to main, `RESTORE` and `UNDO` on main are refused, and no statement may
 change a table's shape (do that in Postgres, then attach again into a new folder).
