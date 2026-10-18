@@ -237,7 +237,11 @@ fn step(v: &Value, sub: Type) -> Option<Value> {
     match (v, sub) {
         (Value::Int(n), Type::Int) => n.checked_add(1).filter(|n| *n <= i32::MAX as i64).map(Value::Int),
         (Value::Int(n), Type::BigInt) => n.checked_add(1).map(Value::Int),
-        (Value::Date(d), Type::Date) => d.checked_add(1).map(Value::Date),
+        // (an infinite date has no next one; past 5874897-12-31, the last date, is out of range)
+        (Value::Date(d), Type::Date) if super::time::infinite_date(*d) => None,
+        (Value::Date(d), Type::Date) => {
+            Some(Value::Date(d + 1)).filter(|_| i64::from(*d) < super::time::days_from_civil(5_874_897, 12, 31))
+        }
         _ => None,
     }
 }
@@ -699,6 +703,16 @@ pub(super) fn normalize(mut v: Vec<Range>, k: Kind) -> Result<Vec<Range>> {
     Ok(out)
 }
 
+/// unnest(multirange): its ranges, a row each, in order (multirange `multi`'s values, of the multirange type with
+/// that oid).
+pub(super) fn unnest_multi(v: &Value, multi: u32) -> Result<Vec<Vec<Value>>> {
+    if *v == Value::Null {
+        return Ok(vec![]);
+    }
+    let k = of_multi(multi).and_then(kind).unwrap_or(Kind { sub: Type::Text, canon: false });
+    Ok(parse_multi(&v.to_text(), k)?.iter().map(|r| vec![Value::Text(r.text())]).collect())
+}
+
 pub(super) fn multi_text(v: &[Range]) -> String {
     format!("{{{}}}", v.iter().map(Range::text).collect::<Vec<_>>().join(","))
 }
@@ -799,7 +813,14 @@ fn minus_pieces(a: &Range, b: &Range, k: Kind) -> Result<Vec<Range>> {
 
 fn list_op(op: &str, a: &[Range], b: &[Range], k: Kind) -> Result<Value> {
     use Value::Bool;
-    let touch = |x: &Range, y: &Range| adjacent(x, y);
+    // (x's upper bound meets y's lower one, as Postgres's bounds_adjacent checks: a multirange is adjacent where its
+    // last range ends as the other's first begins, or the other's last ends as its first begins)
+    let touch = |x: &Range, y: &Range| -> Result<bool> {
+        match (&x.hi, &y.lo) {
+            (Some(h), Some(l)) if !x.empty && !y.empty => Ok(compare(h, l)? == Ordering::Equal && x.hi_inc != y.lo_inc),
+            _ => Ok(false),
+        }
+    };
     Ok(match op {
         "@>" => Bool(b.iter().try_fold(true, |acc, y| -> Result<bool> {
             Ok(acc && a.iter().try_fold(false, |f, x| Ok::<_, SqlError>(f || contains(x, y)?))?)

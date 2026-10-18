@@ -26,6 +26,9 @@ pub(super) fn handles(f: CtxFn) -> bool {
             | CtxFn::BlockingPids
             | CtxFn::HasPrivilege(_)
             | CtxFn::TxidCurrent
+            | CtxFn::XactId(..)
+            | CtxFn::CurrentSnapshot(_)
+            | CtxFn::XactStatus(_)
             | CtxFn::SerialSequence
             | CtxFn::SizePretty
             | CtxFn::SizeBytes
@@ -39,12 +42,33 @@ pub(super) fn handles(f: CtxFn) -> bool {
 /// Flyway parse it); the rest says what this is.
 fn version() -> String {
     format!(
-        "PostgreSQL {SERVER_VERSION} (Chronos {}) on {}-{}, compiled by rustc, {}-bit",
+        "PostgreSQL {SERVER_VERSION} (Chronos {}) on {}, compiled by rustc, {}-bit",
         env!("CARGO_PKG_VERSION"),
-        std::env::consts::ARCH,
-        std::env::consts::OS,
+        target_triple(),
         usize::BITS
     )
+}
+
+/// The platform this was built for, as a target triple names it (`x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`),
+/// which is where Postgres's version() names its host.
+fn target_triple() -> String {
+    let vendor = if cfg!(target_vendor = "apple") {
+        "apple"
+    } else if cfg!(target_vendor = "pc") {
+        "pc"
+    } else {
+        "unknown"
+    };
+    let env = if cfg!(target_env = "gnu") {
+        "-gnu"
+    } else if cfg!(target_env = "musl") {
+        "-musl"
+    } else if cfg!(target_env = "msvc") {
+        "-msvc"
+    } else {
+        ""
+    };
+    format!("{}-{vendor}-{}{env}", std::env::consts::ARCH, std::env::consts::OS)
 }
 
 pub(super) fn call(ctx: &Ctx, f: CtxFn, a: &[Value]) -> Result<Value> {
@@ -68,7 +92,20 @@ pub(super) fn call(ctx: &Ctx, f: CtxFn, a: &[Value]) -> Result<Value> {
         }
         CtxFn::InRecovery => Bool(false),
         CtxFn::PostmasterStart => TimestampTz(time::started()),
-        CtxFn::TxidCurrent => Int(ctx.txid),
+        CtxFn::TxidCurrent => Int(current_xact_id(ctx.txid, ctx.tx.is_some(), false).unwrap_or(ctx.txid)),
+        CtxFn::XactId(xid8, if_assigned) => match current_xact_id(ctx.txid, ctx.tx.is_some(), if_assigned) {
+            Some(n) if xid8 => coerce(Int(n), Type::Xid8)?,
+            Some(n) => Int(n),
+            None => Null,
+        },
+        CtxFn::CurrentSnapshot(_) => Text(current_snapshot(ctx.txid)),
+        CtxFn::XactStatus(_) => match coerce(a[0].clone(), Type::Xid8)? {
+            Null => Null,
+            v => match v.to_text().parse::<i64>() {
+                Ok(n) => xact_status(n)?,
+                Err(_) => return err("22023", format!("transaction ID {} is in the future", v.to_text())),
+            },
+        },
         // null, as Postgres answers for a connection over a Unix socket
         CtxFn::InetNull(_) => Null,
         CtxFn::Sleep => {

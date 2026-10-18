@@ -177,7 +177,9 @@ impl Parser<'_> {
         }
     }
 
-    fn quantified(&mut self, atom: Node) -> std::result::Result<Node, String> {
+    fn quantified(&mut self, mut atom: Node) -> std::result::Result<Node, String> {
+        // (`{m}` and `{m}?`, which keep their atom's greediness, as Postgres's rules have it; `{m,m}` doesn't)
+        let mut fixed = false;
         let (min, max) = match self.p.get(self.i) {
             Some('*') => (0, None),
             Some('+') => (1, None),
@@ -190,6 +192,7 @@ impl Parser<'_> {
                 let (min, max) = match body.split_once(',') {
                     None => {
                         let n = num(&body)?;
+                        fixed = true;
                         (n, Some(n))
                     }
                     Some((a, b)) if b.trim().is_empty() => (num(a)?, None),
@@ -225,6 +228,12 @@ impl Parser<'_> {
         } else {
             true
         };
+        // a parenthesized subexpression with a quantifier takes the quantifier's greediness as a whole (it matches
+        // its longest or shortest), as Postgres's regex engine decides a subexpression's match: what it repeats
+        // prefers as it does (`(l*){1,1}?` matches nothing, `(l*?){1,1}` all the l's)
+        if !fixed && matches!(atom, Node::Group(..)) {
+            prefer(&mut atom, greedy);
+        }
         // `\1?` and `\1*` fail, unlike `(\1)?`, when their group has not matched (`\1{0}` cannot)
         let bound = match atom {
             Node::Backref(g) if max != Some(0) => Some(g),
@@ -537,6 +546,19 @@ impl Opts {
             }
         }
         Ok(())
+    }
+}
+
+/// Every repetition in `n` (but in a lookaround, which matches apart) made greedy or not.
+fn prefer(n: &mut Node, greedy: bool) {
+    match n {
+        Node::Repeat(inner, _, _, g) => {
+            *g = greedy;
+            prefer(inner, greedy);
+        }
+        Node::Group(inner, _) => prefer(inner, greedy),
+        Node::Alt(items) | Node::Seq(items) => items.iter_mut().for_each(|x| prefer(x, greedy)),
+        _ => {}
     }
 }
 

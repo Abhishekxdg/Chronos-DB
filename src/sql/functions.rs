@@ -1875,7 +1875,11 @@ impl Function {
 
 /// The functions taking or returning enum type `name`.
 pub(super) fn using_type(v: &View, name: &str) -> Result<Vec<Arc<Function>>> {
-    let is = |t: &Type| matches!(t, Type::Enum(i) if *enum_type(*i).name == *name);
+    let is = |t: &Type| match t {
+        Type::Enum(i) => *enum_type(*i).name == *name,
+        Type::Base(i) => userdefs::base_name(*i) == name,
+        _ => false,
+    };
     let mut out = vec![];
     for r in v.prefix(&format!("{FUNCTIONS}/"))? {
         let f = Function::from_raw(&r?.1)?;
@@ -3406,12 +3410,12 @@ impl Exec<'_> {
     /// How volatile `e` is: as its most volatile function, as Postgres marks them.
     fn volatility_of(&self, e: &Expr) -> Result<Volatility> {
         use CtxFn::*;
-        use funcs::Scalar::{Random, SetSeed};
+        use funcs::Scalar::{Random, RandomNormal, SetSeed};
         let mut v = Volatility::Immutable;
         let mut calls = vec![];
         walk(e, &mut |x| {
             let here = match x {
-                Expr::Func(Func::GenRandomUuid | Func::ClockTs | Func::Scalar(Random | SetSeed), _) => {
+                Expr::Func(Func::GenRandomUuid | Func::ClockTs | Func::Scalar(Random | RandomNormal | SetSeed), _) => {
                     Volatility::Volatile
                 }
                 Expr::Func(Func::Scalar(f), _) if super::pgcrypto::volatile(*f) => Volatility::Volatile,
@@ -3853,6 +3857,24 @@ impl Exec<'_> {
         // (what plpgsql.extra_warnings and extra_errors say of its body, as Postgres's compiler says it when made)
         if let Code::Pl(b) = &f.code {
             plpgsql::created(b)?;
+        }
+        // a shell type (`CREATE TYPE name` alone) in its signature: Postgres's notices, the type to be filled in by
+        // the CREATE TYPE these functions are for
+        let shell = |t: &Type| {
+            (*t == Type::record(vec![]))
+                .then(|| userdefs::composite_name(*t))
+                .flatten()
+                .filter(|n| userdefs::is_shell(n))
+        };
+        if let Ret::Value(t) | Ret::SetOf(t) = &f.ret
+            && let Some(n) = shell(t)
+        {
+            super::notice("NOTICE", format!("return type {} is only a shell", rel_part(&n)));
+        }
+        for (_, t) in &f.args {
+            if let Some(n) = shell(t) {
+                super::notice("NOTICE", format!("argument type {} is only a shell", rel_part(&n)));
+            }
         }
         self.db.batch_with(self.branch, |v| {
             need_schema(v, &f.name)?;

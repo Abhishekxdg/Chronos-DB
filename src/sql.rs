@@ -437,6 +437,10 @@ pub enum Type {
     /// void, what a function that returns nothing gives: its value is empty text, which is not NULL (only a function
     /// can give one; no column has this type)
     Void,
+    /// A base type made with CREATE TYPE name (INPUT = f, OUTPUT = g, ...) whose functions are a built-in type's
+    /// (LANGUAGE internal, `int4in`): its place in `userdefs`'s base types. Its values are that type's, read and
+    /// written as it reads and writes them; it is another type for casts and functions.
+    Base(u16),
 }
 
 /// The kinds of object a reg type names: regproc and regprocedure a function, regoper and regoperator an operator,
@@ -965,9 +969,34 @@ fn enum_type(i: u64) -> Arc<EnumType> {
     enum_of(i).unwrap_or_else(|_| UNKNOWN.clone())
 }
 
-/// The operator a range function of two ranges is (`range_adjacent` is `-|-`).
+/// The operator a range function of two ranges is (`range_adjacent` is `-|-`); and a multirange one, whose name says
+/// its operands' kinds (`range_overlaps_multirange`, `elem_contained_by_multirange`, `multirange_union`).
 fn range_fn_op(name: &str) -> Option<&'static str> {
+    let kinds = ["elem", "range", "multirange"];
+    if let Some((left, rest)) = name.split_once('_')
+        && kinds.contains(&left)
+        && let Some((op, right)) = rest.rsplit_once('_')
+        && kinds.contains(&right)
+        && (left == "multirange" || right == "multirange")
+    {
+        return Some(match op {
+            "contains" => "@>",
+            "contained_by" => "<@",
+            "overlaps" => "&&",
+            "before" => "<<",
+            "after" => ">>",
+            "overleft" => "&<",
+            "overright" => "&>",
+            "adjacent" => "-|-",
+            _ => return None,
+        });
+    }
     Some(match name {
+        "elem_contained_by_range" => "<@",
+        "range_contains_elem" => "@>",
+        "multirange_union" => "+",
+        "multirange_intersect" => "*",
+        "multirange_minus" => "-",
         "range_contains" => "@>",
         "range_contained_by" => "<@",
         "range_overlaps" => "&&",
@@ -1232,6 +1261,10 @@ fn resolve_type(v: &View, ty: Type) -> Result<Type> {
         let c = Parser::new(lex(&format!("x {sub}"))?).column()?;
         return Ok(Type::Range(range::register(&name, resolve_type(v, c.ty)?)));
     }
+    // a base type of a built-in type's I/O functions: its values that type's
+    if let Some(repr) = j["base"]["repr"].as_str().and_then(Type::from_name) {
+        return Ok(userdefs::register_base(&name, repr));
+    }
     let labels = j["enum"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(String::from)).collect();
     Ok(enum_named(&name, Some(labels)))
 }
@@ -1309,6 +1342,8 @@ impl Type {
     /// The Postgres type id.
     pub fn oid(self) -> u32 {
         match self {
+            // (a base type's values go out as its representation's)
+            Type::Base(i) => userdefs::base_repr(i).oid(),
             // (in the order of their names: see `Type::name`)
             Type::Poly(n) => [2283, 2277, 2776, 3500, 3831, 5077, 5078, 5080, 4537, 4538, 5079][n as usize % 11],
             Type::SmallInt => 21,
@@ -1433,6 +1468,8 @@ impl Type {
             5069 => Type::Xid8,
             5038 | 2970 => Type::PgSnapshot,
             27 => Type::Tid,
+            28 => Type::Xid,
+            3220 => Type::PgLsn,
             4072 => Type::JsonPath,
             r if range::name_of(r).is_some() => Type::Range(r),
             m if range::of_multi(m).is_some() => Type::Multirange(m),
@@ -1478,6 +1515,9 @@ impl Type {
             && let Some(n) = userdefs::composite_name(self)
         {
             return Cow::Owned(n);
+        }
+        if let Type::Base(i) = self {
+            return Cow::Owned(userdefs::base_name(i));
         }
         Cow::Borrowed(match self {
             Type::Poly(n) => [
@@ -1585,6 +1625,7 @@ impl Type {
                 _ => "text[]",
             },
             Type::Enum(i) => return Cow::Owned(enum_name(i)),
+            Type::Base(i) => return Cow::Owned(userdefs::base_name(i)),
         })
     }
 
@@ -1617,6 +1658,9 @@ impl Type {
         }
         if let Some(r) = range::by_name(n) {
             return Some(Range(r));
+        }
+        if let Some(b) = userdefs::base_named(n) {
+            return Some(b);
         }
         if let Some(c) = userdefs::composite(n) {
             return Some(c);
@@ -1761,7 +1805,7 @@ impl Value {
             // (ISO 8601, whatever DateStyle says: JSON's dates are, and what is kept is read back under any style)
             Value::Date(d) => Json::String(time::iso(|| time::format_date(*d))),
             Value::Timestamp(t) => Json::String(time::iso(|| time::format_timestamp(*t, false, 'T'))),
-            Value::TimestampTz(t) => Json::String(time::iso(|| time::format_timestamp(*t, true, 'T'))),
+            Value::TimestampTz(t) => Json::String(time::json_timestamptz(*t)),
             Value::Interval(i) => Json::String(time::format_interval(*i)),
             Value::Time(t) => Json::String(time::format_time(*t)),
             // ponytail: JSON numbers are doubles here, so past ~15 digits the JSON view rounds
@@ -1874,6 +1918,107 @@ pub(super) fn f4_checked(f: f64) -> Result<f64> {
     Ok(f64::from(r))
 }
 
+/// The shortest digits of a float as Postgres's float4out and float8out find them (`single`: of its nearest float4),
+/// with the exponent of the first (the value is `d.ddd` × 10^exponent). Postgres's Ryu is built without
+/// `STRICTLY_SHORTEST`, so a decimal lying exactly halfway to a neighbouring float is never taken; the ryu crate takes
+/// it when the float's mantissa is even (as reading rounds halves to even), so there one more digit is found
+/// (`9.999999999999999e+22` for the float nearest 1e23, not `1e+23`). Ties in the last digit go to even, as in both.
+fn pg_shortest(x: f64, single: bool) -> (String, i32) {
+    /// The digits and the power of ten of the last of a float's text (`1.5e-7`, `150.0`): leading and trailing zeros
+    /// dropped.
+    fn digits_of(s: &str) -> (String, i32) {
+        let s = s.trim_start_matches('-');
+        let (m, e) = s.split_once(['e', 'E']).unwrap_or((s, "0"));
+        let (int, frac) = m.split_once('.').unwrap_or((m, ""));
+        let mut k = e.parse::<i32>().unwrap_or(0) - frac.len() as i32;
+        let all = format!("{int}{frac}");
+        let d = all.trim_start_matches('0');
+        let kept = d.trim_end_matches('0');
+        k += (d.len() - kept.len()) as i32;
+        (kept.to_string(), k)
+    }
+    /// Whether `digits` × 10^`k` is exactly `odd` × 2^`p` (`odd` an odd number).
+    fn is_dyadic(digits: &str, k: i32, odd: u128, p: i32) -> bool {
+        let Ok(mut d) = digits.parse::<u128>() else { return false };
+        if d == 0 {
+            return false;
+        }
+        let twos = d.trailing_zeros() as i32;
+        d >>= twos;
+        // digits × 10^k = (d × 5^k) × 2^(twos + k): odd parts and powers of two must both match
+        if p != twos + k {
+            return false;
+        }
+        let five = |n: u32| 5u128.checked_pow(n);
+        if k >= 0 {
+            five(k as u32).and_then(|f| d.checked_mul(f)) == Some(odd)
+        } else {
+            five(k.unsigned_abs()).and_then(|f| odd.checked_mul(f)) == Some(d)
+        }
+    }
+    let shortest = if single {
+        ryu::Buffer::new().format_finite(x as f32).to_string()
+    } else {
+        ryu::Buffer::new().format_finite(x).to_string()
+    };
+    let (digits, k) = digits_of(&shortest);
+    // the float as m × 2^e, and the two halfway points to its neighbours
+    let (field, exp, mant_bits, bias) = if single {
+        let b = (x as f32).to_bits();
+        (u128::from(b & 0x7f_ffff), i32::try_from((b >> 23) & 0xff).unwrap_or(0), 23, 127)
+    } else {
+        let b = x.to_bits();
+        (u128::from(b & 0xf_ffff_ffff_ffff), i32::try_from((b >> 52) & 0x7ff).unwrap_or(0), 52, 1023)
+    };
+    let (m, e) =
+        if exp == 0 { (field, 1 - bias - mant_bits) } else { (field | 1 << mant_bits, exp - bias - mant_bits) };
+    let halfway = m % 2 == 0
+        && m > 0
+        && (is_dyadic(&digits, k, 2 * m + 1, e - 1)
+            || if field == 0 && exp > 1 {
+                is_dyadic(&digits, k, 4 * m - 1, e - 2)
+            } else {
+                is_dyadic(&digits, k, 2 * m - 1, e - 1)
+            });
+    if halfway {
+        let most = if single { 9 } else { 17 };
+        for n in digits.len() + 1..=most {
+            let c = format!("{:.*e}", n - 1, if single { f64::from(x as f32) } else { x });
+            let back = if single { c.parse::<f32>().map(f64::from).ok() } else { c.parse::<f64>().ok() };
+            let (d2, k2) = digits_of(&c);
+            if back == Some(if single { f64::from(x as f32) } else { x }) && d2 != digits {
+                return (d2.clone(), k2 + d2.len() as i32 - 1);
+            }
+        }
+    }
+    let exponent = k + digits.len() as i32 - 1;
+    (digits, exponent)
+}
+
+/// A float written from its shortest digits as Postgres's float4out and float8out write them: plainly when its
+/// exponent is in `-4..below`, else as `d.ddde+XX`.
+fn pg_float_text(x: f64, single: bool, below: i32) -> String {
+    let sign = if x.is_sign_negative() { "-" } else { "" };
+    if x == 0.0 {
+        return format!("{sign}0");
+    }
+    let (digits, exp) = pg_shortest(x, single);
+    if (-4..below).contains(&exp) {
+        if exp < 0 {
+            format!("{sign}0.{}{digits}", "0".repeat((-exp - 1) as usize))
+        } else if digits.len() as i32 <= exp + 1 {
+            format!("{sign}{digits}{}", "0".repeat((exp + 1) as usize - digits.len()))
+        } else {
+            let (int, frac) = digits.split_at((exp + 1) as usize);
+            format!("{sign}{int}.{frac}")
+        }
+    } else {
+        let (first, rest) = digits.split_at(1);
+        let dot = if rest.is_empty() { String::new() } else { format!(".{rest}") };
+        format!("{sign}{first}{dot}e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs())
+    }
+}
+
 /// A float4 as Postgres writes it: the shortest digits that read back as the same 32 bits (or `%.*g` with 6 + extra
 /// digits below 1), in exponent form outside 1e-4..1e6 (f2s.c's thresholds: `1e+06`, `999999.94`).
 pub fn fmt_float4(f: f64) -> String {
@@ -1888,14 +2033,7 @@ pub fn fmt_float4(f: f64) -> String {
     if digits <= 0 {
         return fmt_g(f64::from(x), (6 + digits).max(1) as usize);
     }
-    let e = format!("{x:e}");
-    let (mantissa, exp) = e.split_once('e').unwrap_or((&e, "0"));
-    let exp: i32 = exp.parse().unwrap_or(0);
-    if (-4..6).contains(&exp) {
-        x.to_string()
-    } else {
-        format!("{mantissa}e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs())
-    }
+    pg_float_text(f64::from(x), true, 6)
 }
 
 /// An xml value as Postgres's output function writes it: its XML declaration rewritten (see `xmlfn::out`).
@@ -1912,17 +2050,8 @@ fn fmt_float(f: f64) -> String {
         f if f.is_nan() => "NaN".into(),
         f64::INFINITY => "Infinity".into(),
         f64::NEG_INFINITY => "-Infinity".into(),
-        f => {
-            // Postgres's float8 output: the shortest exact digits, in exponent form outside 1e-4..1e15
-            let e = format!("{f:e}");
-            let (mantissa, exp) = e.split_once('e').unwrap_or((&e, "0"));
-            let exp: i32 = exp.parse().unwrap_or(0);
-            if (-4..15).contains(&exp) {
-                f.to_string()
-            } else {
-                format!("{mantissa}e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs())
-            }
-        }
+        // Postgres's float8 output: the shortest exact digits, in exponent form outside 1e-4..1e15
+        f => pg_float_text(f, false, 15),
     }
 }
 
@@ -2106,12 +2235,11 @@ pub fn rel_part(name: &str) -> &str {
 fn one_column_srf(c: &Call) -> bool {
     c.def.is_none()
         && match c.name.as_str() {
-            "generate_series"
-            | "generate_subscripts"
-            | "regexp_split_to_table"
-            | "regexp_matches"
-            | "string_to_table" => (2..=3).contains(&c.args.len()),
-            "jsonb_path_query" | "jsonb_path_query_tz" => (2..=4).contains(&c.args.len()),
+            "generate_subscripts" | "regexp_split_to_table" | "regexp_matches" | "string_to_table" => {
+                (2..=3).contains(&c.args.len())
+            }
+            // (the fourth: a timestamptz series' time zone)
+            "generate_series" | "jsonb_path_query" | "jsonb_path_query_tz" => (2..=4).contains(&c.args.len()),
             "information_schema._pg_expandarray" => c.args.len() == 1,
             "jsonb_each" | "json_each" | "jsonb_each_text" | "json_each_text" => c.args.len() == 1,
             "pg_snapshot_xip" | "txid_snapshot_xip" => c.args.len() == 1,
@@ -2130,6 +2258,37 @@ fn one_column_srf(c: &Call) -> bool {
         }
 }
 
+/// Whether `w` names a set-returning function a select list runs (see `one_column_srf`).
+fn srf_name(w: &str) -> bool {
+    matches!(
+        w,
+        "generate_series"
+            | "generate_subscripts"
+            | "regexp_split_to_table"
+            | "regexp_matches"
+            | "string_to_table"
+            | "jsonb_path_query"
+            | "jsonb_path_query_tz"
+            | "jsonb_each"
+            | "json_each"
+            | "jsonb_each_text"
+            | "json_each_text"
+            | "pg_snapshot_xip"
+            | "txid_snapshot_xip"
+            | "pg_listening_channels"
+            | "unnest"
+            | "jsonb_array_elements"
+            | "json_array_elements"
+            | "jsonb_array_elements_text"
+            | "json_array_elements_text"
+            | "jsonb_object_keys"
+            | "pg_partition_ancestors"
+            | "skeys"
+            | "svals"
+            | "json_object_keys"
+    )
+}
+
 /// The fields of the record a set-returning function of the select list gives (its OUT parameters), where it
 /// gives one: `(jsonb_each(j)).key` reads one.
 fn record_srf(name: &str) -> Option<&'static [&'static str]> {
@@ -2140,484 +2299,487 @@ fn record_srf(name: &str) -> Option<&'static [&'static str]> {
     }
 }
 
-/// Set-returning functions inside select-list expressions (`generate_series(1, 3) * 2`,
-/// `unnest(tags) || '!'`, `upper(regexp_split_to_table(s, ','))`): one is a LATERAL source of its
-/// own, its column put where the call was; several run side by side, as Postgres runs them, each
-/// as the array of its rows read at one position (a shorter one padded with nulls). False if the
-/// list has none of these, or only ones the special cases in `select_srfs` do.
-fn general_srfs(q: &mut Select) -> bool {
-    let mut calls: Vec<Call> = vec![];
-    let mut bare = 0; // those a bare unnest/generate_subscripts/generate_series item is
-    for it in &q.items {
-        let Item::Expr(e, _) = it else { continue };
-        let mut inner: Vec<Call> = vec![];
+/// Whether `e` calls a set-returning function the select list runs (a subquery is a scope of its own).
+fn has_srf(e: &Expr) -> bool {
+    let mut found = false;
+    walk(e, &mut |x| found |= matches!(x, Expr::Call(c) if one_column_srf(c)));
+    found
+}
+
+/// An error about a set-returning function where Postgres can't run one, with its hint.
+fn srf_refused<T>(message: impl Into<String>) -> Result<T> {
+    Err(SqlError {
+        code: UNSUPPORTED,
+        message: message.into(),
+        info: Some(Box::new(Violation {
+            hint: Some("You might be able to move the set-returning function into a LATERAL FROM item.".into()),
+            ..Violation::default()
+        })),
+    })
+}
+
+/// Postgres's refusals of a select list's set-returning function inside CASE or COALESCE (which would run it for
+/// some rows only), or inside an aggregate's or a window function's arguments.
+fn srf_placement(e: &Expr) -> Result<()> {
+    let mut wrong: Option<&'static str> = None;
+    walk(e, &mut |x| {
+        if wrong.is_some() {
+            return;
+        }
+        let (holds, message) = match x {
+            Expr::Case(o, ws, el) => (
+                o.iter().chain(el.iter()).any(|y| has_srf(y)) || ws.iter().any(|(w, t)| has_srf(w) || has_srf(t)),
+                "set-returning functions are not allowed in CASE",
+            ),
+            Expr::Func(Func::Coalesce, args) => {
+                (args.iter().any(has_srf), "set-returning functions are not allowed in COALESCE")
+            }
+            Expr::Agg(_, Some(a), _) => {
+                (has_srf(a), "aggregate function calls cannot contain set-returning function calls")
+            }
+            Expr::Window(w) => {
+                (w.args.iter().any(has_srf), "window function calls cannot contain set-returning function calls")
+            }
+            _ => return,
+        };
+        if holds {
+            wrong = Some(message);
+        }
+    });
+    match wrong {
+        Some(m) => srf_refused(m),
+        None => Ok(()),
+    }
+}
+
+/// unnest as a select list runs it (see `SrfLevels::add_to`): a value a row, as unnest gives in FROM but for a
+/// tsvector, whose lexeme, positions and weights make one record.
+const UNNEST_ROW: &str = "\u{1}unnest_row";
+
+/// The alias of the query a grouped select list's set-returning functions run over (see `project_srfs`).
+const SRF_INNER: &str = "?inner";
+
+/// The set-returning functions of a select list by level, as Postgres's ProjectSet nodes run them: a function whose
+/// arguments call another runs a level above it. Each level's functions run side by side in one LATERAL source
+/// (`ROWS FROM`, a shorter one padded with nulls), called the prefix and the level's number, and each call is put
+/// where it was as the column (or the record of columns) it gives there.
+struct SrfLevels {
+    /// `?pre` for those that run before a GROUP BY, `?srf` for the rest
+    prefix: &'static str,
+    /// each level's calls (their arguments' own calls put as columns), with their keys: a call written twice runs once
+    levels: Vec<Vec<(String, Call)>>,
+    /// where the functions run over an inner query (see `project_srfs`): the expressions free of set-returning
+    /// functions that read its rows, each lifted into it as a column of its own, with their keys
+    lifted: Option<Vec<(String, Expr)>>,
+}
+
+impl SrfLevels {
+    fn new(prefix: &'static str, lift: bool) -> std::cell::RefCell<SrfLevels> {
+        std::cell::RefCell::new(SrfLevels { prefix, levels: vec![], lifted: lift.then(Vec::new) })
+    }
+
+    /// The highest level whose columns `e` reads (0: none).
+    fn level_of(&self, e: &Expr) -> usize {
+        let mut top = 0;
         walk(e, &mut |x| {
-            if let Expr::Call(c) = x
-                && one_column_srf(c)
+            if let Expr::Col(Some(a), _) = x
+                && let Some(n) = a.strip_prefix(self.prefix).and_then(|n| n.parse::<usize>().ok())
             {
-                inner.push((**c).clone());
+                top = top.max(n);
             }
         });
-        let top = {
-            let mut e = e;
-            while let Expr::Cast(a, _) = e {
-                e = a;
-            }
-            e
-        };
-        // (casts around a generate_series stay around its column; unnest and generate_subscripts take none)
-        let cast = !std::ptr::eq(top, e);
-        if matches!(top, Expr::Call(c) if inner.len() == 1
-            && (c.name == "generate_series" || (!cast && ["unnest", "generate_subscripts"].contains(&c.name.as_str()))))
-        {
-            bare += 1;
-        }
-        for c in inner {
-            if !calls.iter().any(|d| format!("{d:?}") == format!("{c:?}")) {
-                calls.push(c);
-            }
-        }
+        top
     }
-    let plain = q.items.iter().filter(|it| matches!(it, Item::Expr(e, _) if { let mut n = 0; walk(e, &mut |x| n += usize::from(matches!(x, Expr::Call(c) if one_column_srf(c)))); n > 0 })).count();
-    // ones the GROUP BY holds or names (`GROUP BY 1`, by alias, or the call itself): Postgres runs those before the
-    // grouping, a row for each of their rows, and groups by what they give
-    let grouped = !q.group.is_empty() && general_srfs_grouped(q);
-    if grouped {
-        for g in &q.group {
-            walk(g, &mut |x| {
-                if let Expr::Call(c) = x
-                    && one_column_srf(c)
-                    && !calls.iter().any(|d| format!("{d:?}") == format!("{c:?}"))
-                {
-                    calls.push((**c).clone());
-                }
-            });
-        }
-    }
-    // the special cases keep a list of bare unnests/generate_subscripts, or a bare generate_series alone
-    if calls.is_empty()
-        || (!grouped
-            && bare == plain
-            && calls.len() == plain
-            && (calls.iter().all(|c| c.name != "generate_series") || plain == 1))
-    {
-        return false;
-    }
-    if !grouped
-        && (!q.group.is_empty()
-            || q.having.is_some()
-            || q.items.iter().any(|it| matches!(it, Item::Expr(e, _) if has_agg(e) || has_window(e))))
-    {
-        return false; // (Postgres runs them after the grouping)
-    }
-    let key = |c: &Call| format!("{c:?}");
-    let scalar = |f, args| Expr::Func(Func::Scalar(f), args);
-    let src = |name: &str, alias: &str, call: &Call, at_names: Vec<String>| Source {
-        table: alias.into(),
-        alias: alias.into(),
-        sub: None,
-        names: at_names,
-        rec: None,
-        working: false,
-        at: None,
-        lateral: true,
-        srf: Some(Box::new((name.into(), call.args.clone()))),
-        cte: 0,
-        only: false,
-        hier: false,
-        policed: false,
-        bound: false,
-    };
-    let add = |q: &mut Select, source: Source| match q.from {
-        None => q.from = Some(source),
-        Some(_) => q.joins.push(Join {
-            kind: JoinKind::Cross,
-            src: source,
-            on: None,
-            using: vec![],
-            natural: false,
-            using_as: None,
-        }),
-    };
-    // each item: the call's name where the item is nothing but the call (or casts of it)
-    let item_names: Vec<Option<String>> = q
-        .items
-        .iter()
-        .map(|it| {
-            let Item::Expr(e, alias) = it else { return None };
-            let mut top = e;
-            while let Expr::Cast(a, _) = top {
-                top = a;
-            }
-            match (top, alias) {
-                (Expr::Call(c), None) if one_column_srf(c) => Some(rel_part(&c.name).to_string()),
-                _ => None,
-            }
-        })
-        .collect();
-    let replaced: Vec<Expr> = if let [only] = &calls[..] {
-        if let Some(fields) = record_srf(&only.name) {
-            // several columns: a record of them, whose fields `(..).x` and `(..).n` read
-            add(q, src(&only.name, "?srf", only, fields.iter().map(|f| f.to_string()).collect()));
-            vec![Expr::Func(
+
+    /// What reads the value of call `i` of `level` in its source.
+    fn column(&self, level: usize, i: usize, name: &str) -> Expr {
+        let alias = format!("{}{level}", self.prefix);
+        match record_srf(name) {
+            Some(fields) => Expr::Func(
                 Func::Record(fields),
-                fields.iter().map(|f| Expr::Col(Some("?srf".into()), f.to_string())).collect(),
-            )]
-        } else {
-            let column = Expr::Col(Some("?srf".into()), "?v".into());
-            add(q, src(&only.name, "?srf", only, vec!["?v".into()]));
-            vec![column]
+                fields.iter().map(|f| Expr::Col(Some(alias.clone()), format!("?{i}{f}"))).collect(),
+            ),
+            None => Expr::Col(Some(alias), format!("?{i}")),
         }
-    } else if calls.iter().any(|c| record_srf(&c.name).is_some()) {
-        return false; // (several set-returning functions side by side, one giving a record: not yet)
-    } else {
-        // the array of each one's rows, and a position that runs to the longest
-        let arrays: Vec<Expr> = calls
-            .iter()
-            .map(|c| match (c.name.as_str(), &c.args[..]) {
-                ("unnest", [a]) => a.clone(),
+    }
+
+    /// The LATERAL sources of the levels, joined after the query's own FROM items in order (each reads those before).
+    fn add_to(self, q: &mut Select) {
+        for (k, calls) in self.levels.into_iter().enumerate() {
+            let alias = format!("{}{}", self.prefix, k + 1);
+            let mut names = vec![];
+            for (i, (_, c)) in calls.iter().enumerate() {
+                match record_srf(&c.name) {
+                    Some(fields) => names.extend(fields.iter().map(|f| format!("?{i}{f}"))),
+                    None => names.push(format!("?{i}")),
+                }
+            }
+            // (unnest in a select list gives one value a row: a tsvector's lexeme, positions and weights as a record)
+            let own = |c: &Call| if c.name == "unnest" { UNNEST_ROW.to_string() } else { c.name.clone() };
+            let srf = match &calls[..] {
+                [(_, c)] => (own(c), c.args.clone()),
                 _ => {
-                    let inner = Select {
-                        set: vec![],
-                        distinct: false,
-                        distinct_on: vec![],
-                        items: vec![Item::Expr(
-                            Expr::Func(
-                                Func::Coalesce,
-                                vec![
-                                    Expr::Agg(
-                                        Agg::List(
-                                            ListAgg::Array,
-                                            Keys {
-                                                n: 0,
-                                                desc: 0,
-                                                nulls_first: 0,
-                                                filtered: false,
-                                                arrays: false,
-                                                object: 0,
-                                            },
-                                        ),
-                                        Some(Box::new(Expr::Func(
-                                            Func::Row,
-                                            vec![Expr::Col(Some("?e".into()), "?v".into())],
-                                        ))),
-                                        false,
-                                    ),
-                                    Expr::Lit(Value::Text("{}".into())),
-                                ],
-                            ),
-                            None,
-                        )],
-                        from: Some(src(&c.name, "?e", c, vec!["?v".into()])),
-                        joins: vec![],
-                        filter: None,
-                        group: vec![],
-                        having: None,
-                        order: vec![],
-                        limit: None,
-                        offset: None,
-                        locking: vec![],
-                    };
-                    Expr::Sub(Box::new(SubQ {
-                        q: Box::new(inner),
-                        outer: vec![],
-                        ty: Type::Text,
-                        cmp: None,
-                        sig: 0,
-                        coll: collation::Strength::None,
-                    }))
+                    let (mut name, mut all) = (ROWS_FROM.to_string(), vec![]);
+                    for (_, c) in &calls {
+                        name.push_str(&format!("\u{1d}{}\u{1c}{}", own(c), c.args.len()));
+                        all.extend(c.args.iter().cloned());
+                    }
+                    (name, all)
                 }
-            })
-            .collect();
-        let card = |a: &Expr| scalar(funcs::Scalar::Cardinality, vec![a.clone()]);
-        let longest = match &arrays[..] {
-            [a] => card(a),
-            all => scalar(funcs::Scalar::Greatest, all.iter().map(card).collect()),
-        };
-        let last = bin(longest, Op::Sub, Expr::Lit(Value::Int(1)));
-        let positions = Call {
-            name: "generate_series".into(),
-            args: vec![Expr::Lit(Value::Int(0)), last],
-            names: vec![],
-            def: None,
-            via_call: false,
-            builtin: false,
-        };
-        add(q, src("generate_series", "?srf", &positions, vec!["k".into()]));
-        let k = Expr::Col(Some("?srf".into()), "k".into());
-        arrays
-            .iter()
-            .map(|a| {
-                // (the k-th element in order, whatever the array's dimensions: see `funcs::Scalar::ArrayFlat`)
-                let flat = scalar(funcs::Scalar::ArrayFlat, vec![a.clone()]);
-                scalar(funcs::Scalar::ArrayAt, vec![flat, bin(k.clone(), Op::Add, Expr::Lit(Value::Int(1)))])
-            })
-            .collect()
-    };
-    let swap = |e: &Expr| {
-        rewrite(e, &|x| match x {
-            Expr::Call(c) if one_column_srf(c) => {
-                calls.iter().position(|d| key(d) == key(c)).map(|i| replaced[i].clone())
-            }
-            _ => None,
-        })
-    };
-    for (it, name) in q.items.iter_mut().zip(item_names) {
-        if let Item::Expr(e, alias) = it {
-            *e = swap(e);
-            if alias.is_none() {
-                *alias = name;
+            };
+            let src = Source {
+                table: alias.clone(),
+                alias,
+                sub: None,
+                names,
+                rec: None,
+                working: false,
+                at: None,
+                lateral: true,
+                srf: Some(Box::new(srf)),
+                cte: 0,
+                only: false,
+                hier: false,
+                policed: false,
+                bound: false,
+            };
+            match q.from {
+                None => q.from = Some(src),
+                Some(_) => q.joins.push(Join {
+                    kind: JoinKind::Cross,
+                    src,
+                    on: None,
+                    using: vec![],
+                    natural: false,
+                    using_as: None,
+                }),
             }
         }
     }
-    for (e, _) in &mut q.order {
-        *e = swap(e);
-    }
-    for e in &mut q.group {
-        *e = swap(e);
-    }
-    if let Some(h) = &mut q.having {
-        *h = swap(h);
-    }
-    true
 }
 
-/// Whether every set-returning function in a grouped select list is one the GROUP BY holds or names: by its place
-/// (`GROUP BY 1`), its alias, or the call written there. Those run before the grouping; one the GROUP BY leaves
-/// alone runs after it (not built here), and one inside an aggregate is Postgres's error.
-fn general_srfs_grouped(q: &Select) -> bool {
-    let calls_in = |e: &Expr| {
-        let mut found = vec![];
-        walk(e, &mut |x| {
-            if let Expr::Call(c) = x
-                && one_column_srf(c)
-            {
-                found.push(format!("{c:?}"));
-            }
-        });
-        found
-    };
-    let in_group: Vec<String> = q.group.iter().flat_map(calls_in).collect();
-    let mut any = !in_group.is_empty();
-    for (i, it) in q.items.iter().enumerate() {
-        let Item::Expr(e, alias) = it else { continue };
-        let own = calls_in(e);
-        if own.is_empty() {
-            continue;
-        }
-        any = true;
-        let mut inside_agg = false;
-        walk(e, &mut |x| {
-            if let Expr::Agg(_, Some(a), _) = x {
-                walk(a, &mut |y| inside_agg |= matches!(y, Expr::Call(c) if one_column_srf(c)));
-            }
-        });
-        let named = q.group.iter().any(|g| match g {
-            Expr::Lit(Value::Int(n)) => *n == i as i64 + 1,
-            Expr::Col(None, a) => alias.as_deref() == Some(a.as_str()),
-            g => format!("{g:?}") == format!("{e:?}"),
-        });
-        if inside_agg || !(named || own.iter().all(|c| in_group.contains(c))) {
-            return false;
-        }
-    }
-    any
+/// Whether `e` reads the rows of the query it is in: a column, an aggregate, a window function or a subquery (which
+/// may read them). What doesn't (a constant) can be computed anywhere.
+fn reads_rows(e: &Expr) -> bool {
+    let mut found = false;
+    walk(e, &mut |x| {
+        found |= matches!(
+            x,
+            Expr::Col(..) | Expr::Agg(..) | Expr::Window(_) | Expr::Sub(_) | Expr::Exists(..) | Expr::InSub(..)
+        )
+    });
+    found
 }
 
-/// `SELECT unnest(a), generate_subscripts(a, 1) FROM ...`: set-returning functions in the
-/// select list, as Postgres runs them: for each row, a row per element, the functions side by
-/// side (a shorter one padded with nulls). Made a LATERAL generate_series over the positions,
-/// and each function the element (or subscript) at one.
-// ponytail: unnest and generate_subscripts, without GROUP BY (Postgres runs them after grouping)
-fn select_srfs(q: &mut Select) -> Result<()> {
-    const AT: &str = "?srf";
-    // set-returning functions are not for WHERE, GROUP BY, HAVING or ON
-    let mut misplaced = false;
-    let mut look = |e: &Expr| misplaced |= matches!(e, Expr::Call(c) if one_column_srf(c));
-    for e in q.filter.iter().chain(&q.having).chain(q.joins.iter().filter_map(|j| j.on.as_ref())) {
-        walk(e, &mut look);
-    }
-    if misplaced {
-        return err(UNSUPPORTED, "set-returning functions are not allowed in WHERE, HAVING or ON");
-    }
-    // (GROUP BY may hold them, as Postgres lets it: see `general_srfs`; a plain one it can't lower stays an error)
-    if q.group.iter().any(|g| {
-        let mut found = false;
-        walk(g, &mut |e| found |= matches!(e, Expr::Call(c) if one_column_srf(c)));
-        found
-    }) && !general_srfs_grouped(q)
-    {
-        return err(UNSUPPORTED, "set-returning functions are not allowed in GROUP BY here: put them in a FROM item");
-    }
-    // a function giving a record runs alone: next to other set-returning functions it would have to run
-    // side by side with them (not built), so say so rather than leave it to fail as an unknown function
-    let (mut distinct, mut record) = (vec![], None);
-    for it in &q.items {
-        if let Item::Expr(e, _) = it {
-            walk(e, &mut |x| {
-                if let Expr::Call(c) = x
-                    && one_column_srf(c)
-                {
-                    if record_srf(&c.name).is_some() {
-                        record = Some(c.name.clone());
-                    }
-                    let key = format!("{c:?}");
-                    if !distinct.contains(&key) {
-                        distinct.push(key);
-                    }
-                }
-            });
-        }
-    }
-    if let Some(name) = record.filter(|_| distinct.len() > 1) {
-        return err(
-            UNSUPPORTED,
-            format!(
-                "{name} next to other set-returning functions in one select list isn't supported: put it in a select \
-                 of its own"
-            ),
-        );
-    }
-    if general_srfs(q) {
-        return Ok(());
-    }
-    let srf = |e: &Expr| match e {
-        Expr::Call(c)
-            if (c.name == "unnest" && c.args.len() == 1) || (c.name == "generate_subscripts" && c.args.len() == 2) =>
+/// `e` with each call of a set-returning function made a column of its level's source (see `SrfLevels`), and, where
+/// they are lifted, each expression free of them that reads the rows a column of the inner query.
+fn place_srfs(e: &Expr, st: &std::cell::RefCell<SrfLevels>) -> Expr {
+    rewrite(e, &|x| {
+        if let Expr::Call(c) = x
+            && one_column_srf(c)
         {
-            Some((c.name.clone(), c.args[0].clone(), c.args.get(1).cloned()))
+            let args: Vec<Expr> = c.args.iter().map(|a| place_srfs(a, st)).collect();
+            let call = Call { args, ..(**c).clone() };
+            let mut s = st.borrow_mut();
+            let level = call.args.iter().map(|a| s.level_of(a)).max().unwrap_or(0) + 1;
+            while s.levels.len() < level {
+                s.levels.push(vec![]);
+            }
+            let key = format!("{call:?}");
+            let name = call.name.clone();
+            let at = &mut s.levels[level - 1];
+            let i = match at.iter().position(|(k, _)| *k == key) {
+                Some(i) => i,
+                None => {
+                    at.push((key, call));
+                    at.len() - 1
+                }
+            };
+            return Some(s.column(level, i, &name));
         }
-        _ => None,
+        if has_srf(x) || !reads_rows(x) {
+            return None;
+        }
+        let mut s = st.borrow_mut();
+        let lifted = s.lifted.as_mut()?;
+        let key = format!("{x:?}");
+        let k = match lifted.iter().position(|(k, _)| *k == key) {
+            Some(k) => k,
+            None => {
+                lifted.push((key, x.clone()));
+                lifted.len() - 1
+            }
+        };
+        Some(Expr::Col(Some(SRF_INNER.into()), format!("?c{k}")))
+    })
+}
+
+/// `e` with the calls `known` has (by key: see `place_srfs`) put as their columns, the rest left as they are.
+fn swap_srfs(e: &Expr, known: &[(String, Expr)]) -> Expr {
+    if known.is_empty() {
+        return e.clone();
+    }
+    rewrite(e, &|x| {
+        let Expr::Call(c) = x else { return None };
+        if !one_column_srf(c) {
+            return None;
+        }
+        let call = Call { args: c.args.iter().map(|a| swap_srfs(a, known)).collect(), ..(**c).clone() };
+        let key = format!("{call:?}");
+        Some(known.iter().find(|(k, _)| *k == key).map_or_else(|| Expr::Call(Box::new(call)), |(_, col)| col.clone()))
+    })
+}
+
+/// Before a GROUP BY: the set-returning functions it holds (written there or in a grouping set, or in the select-list
+/// item it names by place or by alias) run before the grouping, a row for each of their rows, as Postgres's
+/// ProjectSet below its Agg runs them; their calls, wherever the query writes them, become columns of LATERAL sources
+/// of the query's own. The calls and their columns, for an ORDER BY read later (see `project_srfs`).
+fn grouped_srfs(q: &mut Select, sets: Option<&mut GroupingSets>) -> Result<Vec<(String, Expr)>> {
+    let named = |g: &Expr| -> Expr {
+        match g {
+            Expr::Lit(Value::Int(n)) if *n >= 1 => match q.items.get(*n as usize - 1) {
+                Some(Item::Expr(x, _)) => x.clone(),
+                _ => g.clone(),
+            },
+            Expr::Col(None, name) => q
+                .items
+                .iter()
+                .find_map(|it| match it {
+                    Item::Expr(x, Some(a)) if a == name && has_srf(x) => Some(x.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| g.clone()),
+            g => g.clone(),
+        }
     };
-    // (each one's row count: an unnest's, its elements; a generate_subscripts's, its dimension's length)
-    let counts: Vec<Expr> = q
-        .items
-        .iter()
-        .filter_map(|it| if let Item::Expr(e, _) = it { srf(e) } else { None })
-        .map(|(name, a, dim)| match (name.as_str(), dim) {
-            ("generate_subscripts", Some(d)) => Expr::Func(
-                Func::Coalesce,
-                vec![Expr::Func(Func::Scalar(funcs::Scalar::ArrayLength), vec![a, d]), Expr::Lit(Value::Int(0))],
-            ),
-            _ => Expr::Func(Func::Scalar(funcs::Scalar::Cardinality), vec![a]),
-        })
-        .collect();
-    let arrays = counts.clone();
-    // one generate_series(a, b[, step]) in the list: a LATERAL source of it, and its column in its place
-    // (a cast around it, as in generate_series(a, b, '1 day')::date, stays around its column)
-    fn series_call(e: &Expr) -> Option<&Call> {
-        match e {
-            Expr::Call(c) if c.name == "generate_series" && (2..=4).contains(&c.args.len()) => Some(c),
-            Expr::Cast(inner, _) => series_call(inner),
-            _ => None,
-        }
+    let held: Vec<Expr> =
+        q.group.iter().chain(sets.iter().flat_map(|s| s.iter().flatten())).map(named).filter(has_srf).collect();
+    if held.is_empty() {
+        return Ok(vec![]);
     }
-    fn put_column(e: &mut Expr, column: Expr) {
-        match e {
-            Expr::Cast(inner, _) => put_column(inner, column),
-            e => *e = column,
-        }
+    let st = SrfLevels::new("?pre", false);
+    for e in &held {
+        srf_placement(e)?;
+        place_srfs(e, &st);
     }
-    let series: Vec<usize> = q
-        .items
+    let st = st.into_inner();
+    let known: Vec<(String, Expr)> = st
+        .levels
         .iter()
         .enumerate()
-        .filter(|(_, it)| matches!(it, Item::Expr(e, _) if series_call(e).is_some()))
-        .map(|(i, _)| i)
+        .flat_map(|(l, calls)| calls.iter().enumerate().map(move |(i, (k, c))| (k.clone(), (l, i, c.name.clone()))))
+        .map(|(k, (l, i, name))| (k, st.column(l + 1, i, &name)))
         .collect();
-    if let [i] = series[..]
-        && arrays.is_empty()
-        && q.group.is_empty()
-        && q.having.is_none()
-        && let Item::Expr(e, alias) = &q.items[i]
-        && let Some(c) = series_call(e)
-    {
-        let (args, alias) = (c.args.clone(), alias.clone());
-        let src = Source {
-            table: "?gs".into(),
-            alias: "?gs".into(),
-            sub: None,
-            names: vec!["generate_series".into()],
+    for it in &mut q.items {
+        if let Item::Expr(e, alias) = it {
+            let figured = figure_name(e);
+            let swapped = swap_srfs(e, &known);
+            if alias.is_none() && has_srf(e) && !has_srf(&swapped) {
+                *alias = Some(figured.unwrap_or_else(|| "?column?".into()));
+            }
+            *e = swapped;
+        }
+    }
+    for g in &mut q.group {
+        *g = swap_srfs(g, &known);
+    }
+    if let Some(h) = &mut q.having {
+        *h = swap_srfs(h, &known);
+    }
+    if let Some(sets) = sets {
+        for e in sets.iter_mut().flatten() {
+            *e = swap_srfs(e, &known);
+        }
+    }
+    st.add_to(q);
+    Ok(known)
+}
+
+/// The set-returning functions of a select list (and its ORDER BY and DISTINCT ON), as Postgres runs them: after the
+/// query's rows are found, grouped and their window functions run, for each row a row per value they give, those of
+/// one level side by side (see `SrfLevels`), before DISTINCT, ORDER BY and LIMIT. Without grouping, aggregates or
+/// window functions they are LATERAL sources of the query itself; with them, of an outer query over it, the inner
+/// query giving the values the select list reads (and, for a GROUP BY by place or alias, its items as written).
+/// `pre`: the calls `grouped_srfs` put as columns, for the ORDER BY read after them.
+fn project_srfs(mut q: Select, pre: &[(String, Expr)]) -> Result<Select> {
+    for (e, _) in &mut q.order {
+        *e = swap_srfs(e, pre);
+    }
+    for e in &mut q.distinct_on {
+        *e = swap_srfs(e, pre);
+    }
+    if q.limit.as_ref().is_some_and(has_srf) {
+        return err(UNSUPPORTED, "set-returning functions are not allowed in LIMIT");
+    }
+    if q.offset.as_ref().is_some_and(has_srf) {
+        return err(UNSUPPORTED, "set-returning functions are not allowed in OFFSET");
+    }
+    let item_exprs = || q.items.iter().filter_map(|it| if let Item::Expr(e, _) = it { Some(e) } else { None });
+    let any = item_exprs().any(has_srf) || q.order.iter().any(|(e, _)| has_srf(e)) || q.distinct_on.iter().any(has_srf);
+    if !any {
+        return Ok(q);
+    }
+    for e in item_exprs().chain(q.order.iter().map(|(e, _)| e)).chain(&q.distinct_on) {
+        srf_placement(e)?;
+    }
+    // an ORDER BY or DISTINCT ON naming an output column (by alias or place) reads it as the select list gives it
+    let aliases: Vec<String> =
+        q.items.iter().filter_map(|it| if let Item::Expr(_, Some(a)) = it { Some(a.clone()) } else { None }).collect();
+    let output = |e: &Expr| match e {
+        Expr::Lit(Value::Int(_)) => true,
+        Expr::Col(None, n) => aliases.contains(n),
+        _ => false,
+    };
+    // whether a key reads what a set-returning function gives (itself, or the output column of an item that calls one)
+    let item_srf = |n: usize| matches!(q.items.get(n), Some(Item::Expr(e, _)) if has_srf(e));
+    let reads_srf = |e: &Expr| match e {
+        Expr::Lit(Value::Int(n)) => *n >= 1 && item_srf(*n as usize - 1),
+        Expr::Col(None, n) if aliases.contains(n) => {
+            q.items.iter().any(|it| matches!(it, Item::Expr(x, Some(a)) if a == n && has_srf(x)))
+        }
+        e => has_srf(e),
+    };
+    // DISTINCT ON with an ORDER BY, neither reading a set-returning function: Postgres's Unique comes first, below
+    // the ProjectSet, so the functions run for the rows it keeps (in its order)
+    let distinct_first = !q.distinct_on.is_empty()
+        && !q.order.is_empty()
+        && !q.order.iter().any(|(e, _)| reads_srf(e))
+        && !q.distinct_on.iter().any(reads_srf);
+    let grouped = !q.group.is_empty()
+        || q.having.is_some()
+        || distinct_first
+        || item_exprs().chain(q.order.iter().map(|(e, _)| e)).any(|e| has_agg(e) || has_window(e));
+    let starred = q.items.iter().any(|it| !matches!(it, Item::Expr(..)));
+    let st = SrfLevels::new("?srf", grouped && !starred);
+    let items: Vec<Item> = q
+        .items
+        .iter()
+        .map(|it| match it {
+            Item::Expr(e, alias) if has_srf(e) || grouped && !starred => {
+                let name = alias.clone().or_else(|| figure_name(e)).unwrap_or_else(|| "?column?".into());
+                Item::Expr(place_srfs(e, &st), Some(name))
+            }
+            it => it.clone(),
+        })
+        .collect();
+    let (order, distinct_on): (Vec<(Expr, Dir)>, Vec<Expr>) = if distinct_first && !starred {
+        (vec![], vec![])
+    } else {
+        (
+            q.order.iter().map(|(e, d)| (if output(e) { e.clone() } else { place_srfs(e, &st) }, *d)).collect(),
+            q.distinct_on.iter().map(|e| if output(e) { e.clone() } else { place_srfs(e, &st) }).collect(),
+        )
+    };
+    if !grouped || starred {
+        (q.items, q.order, q.distinct_on) = (items, order, distinct_on);
+        st.into_inner().add_to(&mut q);
+        return Ok(q);
+    }
+    let mut st = st.into_inner();
+    let lifted = st.lifted.take().unwrap_or_default();
+    // (a GROUP BY, ORDER BY or DISTINCT ON by place or by alias reads the items as they were written, so the inner
+    // query keeps them first)
+    let by_item = q
+        .group
+        .iter()
+        .chain(if distinct_first { q.order.iter().map(|(e, _)| e).chain(&q.distinct_on).collect() } else { vec![] })
+        .any(|g| matches!(g, Expr::Lit(Value::Int(_)) | Expr::Col(None, _)));
+    let mut inner_items: Vec<Item> = if by_item {
+        q.items
+            .iter()
+            .map(|it| match it {
+                Item::Expr(e, _) if has_srf(e) => Item::Expr(Expr::Lit(Value::Null), None),
+                it => it.clone(),
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    inner_items.extend(lifted.into_iter().enumerate().map(|(k, (_, e))| Item::Expr(e, Some(format!("?c{k}")))));
+    let (inner_order, inner_distinct_on) = if distinct_first {
+        (std::mem::take(&mut q.order), std::mem::take(&mut q.distinct_on))
+    } else {
+        (vec![], vec![])
+    };
+    let inner = Select {
+        set: vec![],
+        distinct: distinct_first && q.distinct,
+        distinct_on: inner_distinct_on,
+        items: inner_items,
+        from: q.from,
+        joins: q.joins,
+        filter: q.filter,
+        group: q.group,
+        having: q.having,
+        order: inner_order,
+        limit: None,
+        offset: None,
+        locking: q.locking,
+    };
+    let mut outer = Select {
+        set: vec![],
+        distinct: q.distinct && !distinct_first,
+        distinct_on,
+        items,
+        from: Some(Source {
+            table: SRF_INNER.into(),
+            alias: SRF_INNER.into(),
+            sub: Some(Box::new(inner)),
+            names: vec![],
             rec: None,
             working: false,
             at: None,
-            lateral: true,
-            srf: Some(Box::new(("generate_series".into(), args))),
+            lateral: false,
+            srf: None,
             cte: 0,
             only: false,
             hier: false,
             policed: false,
             bound: false,
-        };
-        let column = Expr::Col(Some("?gs".into()), "generate_series".into());
-        if let Item::Expr(e, a) = &mut q.items[i] {
-            put_column(e, column);
-            *a = Some(alias.unwrap_or_else(|| "generate_series".into()));
-        }
-        match q.from {
-            None => q.from = Some(src),
-            Some(_) => q.joins.push(Join {
-                kind: JoinKind::Cross,
-                src,
-                on: None,
-                using: vec![],
-                natural: false,
-                using_as: None,
-            }),
-        }
-        return Ok(());
-    }
-    if arrays.is_empty() || !q.group.is_empty() || q.having.is_some() {
-        return Ok(());
-    }
-    let scalar = |f, args| Expr::Func(Func::Scalar(f), args);
-    let k = Expr::Col(Some(AT.into()), "k".into());
-    let at =
-        |a: &Expr, d: &Expr| bin(scalar(funcs::Scalar::ArrayLower, vec![a.clone(), d.clone()]), Op::Add, k.clone());
-    for it in &mut q.items {
-        let Item::Expr(e, alias) = it else { continue };
-        let Some((name, a, dim)) = srf(e) else { continue };
-        let dim = dim.unwrap_or(Expr::Lit(Value::Int(1)));
-        let len = Expr::Func(
-            Func::Coalesce,
-            vec![scalar(funcs::Scalar::ArrayLength, vec![a.clone(), dim.clone()]), Expr::Lit(Value::Int(0))],
-        );
-        *e = match name.as_str() {
-            // (the k-th element in order, whatever the array's dimensions: see `funcs::Scalar::ArrayFlat`)
-            "unnest" => {
-                let flat = scalar(funcs::Scalar::ArrayFlat, vec![a.clone()]);
-                scalar(funcs::Scalar::ArrayAt, vec![flat, bin(k.clone(), Op::Add, Expr::Lit(Value::Int(1)))])
-            }
-            _ => Expr::Case(None, vec![(bin(k.clone(), Op::Lt, len), at(&a, &dim))], None),
-        };
-        alias.get_or_insert(name);
-    }
-    let longest = match &arrays[..] {
-        [n] => n.clone(),
-        all => scalar(funcs::Scalar::Greatest, all.to_vec()),
+        }),
+        joins: vec![],
+        filter: None,
+        group: vec![],
+        having: None,
+        order,
+        limit: q.limit,
+        offset: q.offset,
+        locking: vec![],
     };
-    let last = bin(longest, Op::Sub, Expr::Lit(Value::Int(1)));
-    let src = Source {
-        table: AT.into(),
-        alias: AT.into(),
-        sub: None,
-        names: vec!["k".into()],
-        rec: None,
-        working: false,
-        at: None,
-        lateral: true,
-        srf: Some(Box::new(("generate_series".into(), vec![Expr::Lit(Value::Int(0)), last]))),
-        cte: 0,
-        only: false,
-        hier: false,
-        policed: false,
-        bound: false,
-    };
-    match q.from {
-        None => q.from = Some(src),
-        Some(_) => {
-            q.joins.push(Join { kind: JoinKind::Cross, src, on: None, using: vec![], natural: false, using_as: None })
-        }
+    st.add_to(&mut outer);
+    Ok(outer)
+}
+
+/// A query's set-returning functions once it is read whole (see `project_srfs`): a plain query's with its ORDER BY,
+/// DISTINCT ON and LIMIT; a UNION's (INTERSECT's, EXCEPT's) in each part, the ORDER BY and LIMIT being the union's.
+fn finish_srfs(mut s: Select, pre: &[(String, Expr)]) -> Result<Select> {
+    if s.set.is_empty() {
+        return project_srfs(s, pre);
+    }
+    let set = std::mem::take(&mut s.set);
+    let (order, limit, offset) = (std::mem::take(&mut s.order), s.limit.take(), s.offset.take());
+    if order.iter().any(|(e, _)| has_srf(e)) {
+        return srf_refused("set-returning functions are not allowed in ORDER BY of a UNION");
+    }
+    let mut first = project_srfs(s, &[])?;
+    first.set = set
+        .into_iter()
+        .map(|(op, all, part)| finish_srfs(*part, &[]).map(|p| (op, all, Box::new(p))))
+        .collect::<Result<_>>()?;
+    (first.order, first.limit, first.offset) = (order, limit, offset);
+    if first.limit.as_ref().is_some_and(has_srf) {
+        return srf_refused("set-returning functions are not allowed in LIMIT");
+    }
+    Ok(first)
+}
+
+/// The set-returning functions a query's own clauses can't run (WHERE, HAVING, JOIN ... ON): Postgres's errors.
+fn srf_clauses(q: &Select) -> Result<()> {
+    if q.filter.as_ref().is_some_and(has_srf) {
+        return err(UNSUPPORTED, "set-returning functions are not allowed in WHERE");
+    }
+    if q.joins.iter().filter_map(|j| j.on.as_ref()).any(has_srf) {
+        return err(UNSUPPORTED, "set-returning functions are not allowed in JOIN conditions");
     }
     Ok(())
 }
@@ -4008,6 +4170,8 @@ pub fn coerce(v: Value, ty: Type) -> Result<Value> {
         (Null, _) => Null,
         // void reads anything as the void value
         (_, Type::Void) => Text(String::new()),
+        // a base type made with CREATE TYPE reads (and is) what its representation does
+        (v, Type::Base(i)) => coerce(v, userdefs::base_repr(i))?,
         // json keeps its text (checked); jsonb is made json as its text, and json jsonb by reading it as jsonb
         (Text(s), Type::JsonText) => {
             jsontext::check(&s)?;
@@ -4088,7 +4252,12 @@ pub fn coerce(v: Value, ty: Type) -> Result<Value> {
             if (f.is_infinite() && !word) || (f == 0.0 && nonzero) {
                 return err(RANGE, format!("\"{s}\" is out of range for type real"));
             }
-            Float(f4(f, Some(&s))?)
+            // (read straight to 32 bits, as strtof reads it: read as a double first, a value near halfway between
+            // two reals can round twice, to the wrong one: '7038531e-32')
+            match t.parse::<f32>() {
+                Ok(r) if r.is_finite() && r != 0.0 => Float(f64::from(r)),
+                _ => Float(f4(f, Some(&s))?),
+            }
         }
         (Int(n), Type::Float) => Float(n as f64),
         (Float(f), Type::Float) => Float(f),
@@ -4187,7 +4356,7 @@ pub fn coerce(v: Value, ty: Type) -> Result<Value> {
         (Text(s), Type::Hstore) => Text(hstore::canonical(&s)?),
         (Text(s), Type::Ltree) => Text(ltree::canonical(&s)?),
         (Text(s), Type::Lquery) => Text(ltree::lquery_canonical(&s)?),
-        (Text(s), Type::PgLsn) => Text(s),
+        (Text(s), Type::PgLsn) => Text(lsn_text(lsn_value(&s)?)),
         // numeric_pg_lsn: a whole number of 64 bits, written as its two halves in hex
         (Numeric(d), Type::PgLsn) => {
             if d.is_special() {
@@ -4196,7 +4365,7 @@ pub fn coerce(v: Value, ty: Type) -> Result<Value> {
             }
             let n = d.rescale(0).ok().and_then(|r| r.to_string().parse::<u64>().ok());
             let n = n.ok_or_else(|| SqlError { code: RANGE, message: "pg_lsn out of range".into(), info: None })?;
-            Text(format!("{:X}/{:X}", n >> 32, n & 0xffff_ffff))
+            Text(lsn_text(n))
         }
         (Text(s), Type::TsQuery) => Text(tsearch::Query::text(&tsearch::parse_tsquery(&s).map_err(|e| SqlError {
             code: tsearch::query_error_code(&e),
@@ -4775,13 +4944,12 @@ fn lex_at(sql: &str) -> Result<(Vec<Tok>, Vec<usize>)> {
                 i += 1;
             }
             if !any {
-                return err(SYNTAX, format!("invalid {kind} integer"));
+                // (the prefix and an underscore after it, as scan.l's hexfail and its kin match them)
+                let end = if at(i) == '_' { i + 1 } else { i };
+                return Err(junk(format!("invalid {kind} integer"), &c[s..end], s));
             }
-            if at(i).is_alphanumeric() || at(i) == '_' {
-                return err(
-                    SYNTAX,
-                    format!("trailing junk after numeric literal at \"{}\"", c[s..=i].iter().collect::<String>()),
-                );
+            if ident_start(at(i)) {
+                return Err(junk("trailing junk after numeric literal".into(), &c[s..ident_end(&c, i)], s));
             }
             out.push(Tok::Num(v.to_string()));
         } else if ch.is_ascii_digit() || (ch == '.' && at(i + 1).is_ascii_digit()) {
@@ -4805,12 +4973,12 @@ fn lex_at(sql: &str) -> Result<(Vec<Tok>, Vec<usize>)> {
                 && (at(i + 1).is_ascii_digit() || (matches!(at(i + 1), '+' | '-') && at(i + 2).is_ascii_digit()))
             {
                 i = digits(i + 2);
+            } else if matches!(at(i), 'e' | 'E') && matches!(at(i + 1), '+' | '-') {
+                // (an exponent's sign with no digit after it: scan.l's realfail)
+                return Err(junk("trailing junk after numeric literal".into(), &c[s..i + 2], s));
             }
-            if at(i) == '_' || at(i).is_alphabetic() {
-                return err(
-                    SYNTAX,
-                    format!("trailing junk after numeric literal at \"{}\"", c[s..=i].iter().collect::<String>()),
-                );
+            if ident_start(at(i)) {
+                return Err(junk("trailing junk after numeric literal".into(), &c[s..ident_end(&c, i)], s));
             }
             out.push(Tok::Num(c[s..i].iter().filter(|&&ch| ch != '_').collect()));
         } else if ch == '\'' || ch == '"' {
@@ -4874,6 +5042,9 @@ fn lex_at(sql: &str) -> Result<(Vec<Tok>, Vec<usize>)> {
             i += 1;
             while at(i).is_ascii_digit() {
                 i += 1;
+            }
+            if ident_start(at(i)) {
+                return Err(junk("trailing junk after parameter".into(), &c[s - 1..ident_end(&c, i)], s - 1));
             }
             // as in Postgres, whose protocol counts parameters in 16 bits
             match c[s..i].iter().collect::<String>().parse::<usize>() {
@@ -5049,6 +5220,9 @@ enum ListAgg {
     /// rank, dense_rank, percent_rank and cume_dist (0 to 3) as hypothetical-set aggregates: where the direct
     /// arguments, as a row, would stand among the rows ordered by the keys
     Hypo(u8),
+    /// range_agg (false) and range_intersect_agg (true) of ranges or multiranges, of the type with this oid (set when
+    /// bound: a range's, or a multirange's): the union of the values as a multirange, or their intersection
+    Range(bool, u32),
 }
 
 /// An aggregate's own ORDER BY: how many keys, and bit i set for key i descending / nulls first.
@@ -5279,6 +5453,17 @@ enum CtxFn {
     LargeObject(&'static str),
     /// the cumulative statistics' functions, by name: pg_stat_get_live_tuples, pg_stat_reset, ... (see `pgstat`)
     PgStat(&'static str),
+    /// pg_current_xact_id (xid8) and txid_current (bigint), `_if_assigned` or not: (as xid8, if assigned)
+    XactId(bool, bool),
+    /// pg_split_walfile_name(name): the segment number and timeline a WAL file's name says
+    SplitWalfile,
+    /// pg_current_snapshot (true) and txid_current_snapshot
+    CurrentSnapshot(bool),
+    /// pg_xact_status(xid8) (true) and txid_status(bigint)
+    XactStatus(bool),
+    /// ts_rewrite(query, target, substitute), and ts_rewrite(query, select) whose rows are the targets and
+    /// substitutes: a query run, so a function of the session (the three-argument form needs none)
+    TsRewrite,
 }
 
 impl CtxFn {
@@ -5383,6 +5568,14 @@ impl CtxFn {
         ("pg_terminate_backend", CtxFn::TerminateBackend, 1..=2),
         ("pg_blocking_pids", CtxFn::BlockingPids, 1..=1),
         ("txid_current", CtxFn::TxidCurrent, 0..=0),
+        ("pg_current_xact_id", CtxFn::XactId(true, false), 0..=0),
+        ("pg_current_xact_id_if_assigned", CtxFn::XactId(true, true), 0..=0),
+        ("txid_current_if_assigned", CtxFn::XactId(false, true), 0..=0),
+        ("pg_current_snapshot", CtxFn::CurrentSnapshot(true), 0..=0),
+        ("txid_current_snapshot", CtxFn::CurrentSnapshot(false), 0..=0),
+        ("pg_xact_status", CtxFn::XactStatus(true), 1..=1),
+        ("pg_split_walfile_name", CtxFn::SplitWalfile, 1..=1),
+        ("txid_status", CtxFn::XactStatus(false), 1..=1),
         ("has_table_privilege", CtxFn::HasPrivilege("table"), 2..=3),
         ("has_sequence_privilege", CtxFn::HasPrivilege("sequence"), 2..=3),
         ("has_schema_privilege", CtxFn::HasPrivilege("schema"), 2..=3),
@@ -5405,6 +5598,7 @@ impl CtxFn {
         ("pg_indexes_size", CtxFn::RelationSize("indexes"), 1..=1),
         ("pg_database_size", CtxFn::DatabaseSize, 1..=1),
         ("gin_clean_pending_list", CtxFn::GinCleanPendingList, 1..=1),
+        ("ts_rewrite", CtxFn::TsRewrite, 2..=3),
     ];
 
     fn name(self) -> &'static str {
@@ -5448,6 +5642,13 @@ impl CtxFn {
             | CtxFn::RelationIsUpdatable => Type::Int,
             CtxFn::NotifyQueueUsage => Type::Float,
             CtxFn::InetNull(false) => Type::Inet,
+            CtxFn::TsRewrite => Type::TsQuery,
+            CtxFn::XactId(true, _) => Type::Xid8,
+            CtxFn::XactId(false, _) => Type::BigInt,
+            CtxFn::CurrentSnapshot(_) => Type::PgSnapshot,
+            CtxFn::SplitWalfile => {
+                Type::record(vec![("segment_number".into(), Type::Numeric), ("timeline_id".into(), Type::BigInt)])
+            }
             CtxFn::RegNames(_) => Type::Array(25),
             CtxFn::BlockingPids => Type::Array(23),
             CtxFn::PostmasterStart => Type::TimestampTz,
@@ -5660,6 +5861,21 @@ fn builtin_call(
         false => named_arguments(w, args, names)?,
     };
     if !arity.contains(&args.len()) {
+        // (called with none, it is a function there is none of, as Postgres finds it: none takes no arguments)
+        if args.is_empty() {
+            return Err(SqlError {
+                code: NO_FUNCTION,
+                message: format!("function {w}() does not exist"),
+                info: Some(Box::new(Violation {
+                    hint: Some(
+                        "No function matches the given name and argument types. You might need to add explicit \
+                         type casts."
+                            .into(),
+                    ),
+                    ..Violation::default()
+                })),
+            });
+        }
         return no_op(format!("function {w}() doesn't take {} arguments", args.len()));
     }
     // pgcrypto's arguments whose types show already (a number, a cast): INSERT's VALUES and a default run
@@ -5735,6 +5951,7 @@ fn ext_marked(e: &Expr) -> bool {
                             | funcs::Scalar::Ltree(_)
                             | funcs::Scalar::JsonFn(_)
                             | funcs::Scalar::JsonCtor
+                            | funcs::Scalar::JsonFormatted
                     ),
                     _
                 )
@@ -7291,6 +7508,14 @@ enum Stmt {
     },
     ShowPath,
     /// CREATE TYPE name AS ENUM (labels)
+    /// CREATE TYPE name (INPUT = f, OUTPUT = g, LIKE = t, ...): a base type whose input and output functions are a
+    /// built-in type's (LANGUAGE internal), its values that type's (see `Type::Base`)
+    CreateBaseType {
+        name: String,
+        input: String,
+        output: String,
+        like: Option<String>,
+    },
     CreateType {
         name: String,
         labels: Vec<String>,
@@ -7989,6 +8214,7 @@ const SRFS: &[&str] = &[
     "generate_series",
     "generate_subscripts",
     "unnest",
+    UNNEST_ROW,
     "jsonb_array_elements",
     "json_array_elements",
     "jsonb_path_query",
@@ -8009,6 +8235,7 @@ const SRFS: &[&str] = &[
     "xmltable",
     "ts_token_type",
     "ts_parse",
+    "ts_stat",
     "ts_debug",
     "jsonb_populate_record",
     "json_populate_record",
@@ -8190,6 +8417,26 @@ fn system_column(name: &str) -> Option<i64> {
 
 /// A tid's place in tid order, from its text `(page,item)`: by page, then item, as Postgres compares them (its text
 /// doesn't sort so: `(0,10)` comes after `(0,9)`).
+/// A pg_lsn's text read as Postgres's pg_lsn_in reads it: 1 to 8 hex digits, `/`, 1 to 8 more, nothing else.
+fn lsn_value(text: &str) -> Result<u64> {
+    let half = |h: &str| -> Option<u64> {
+        if h.is_empty() || h.len() > 8 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        u64::from_str_radix(h, 16).ok()
+    };
+    text.split_once('/').and_then(|(hi, lo)| Some((half(hi)? << 32) | half(lo)?)).ok_or_else(|| SqlError {
+        code: BAD_INPUT,
+        message: format!("invalid input syntax for type pg_lsn: \"{text}\""),
+        info: None,
+    })
+}
+
+/// An LSN as pg_lsn_out writes it: its two halves in hex.
+fn lsn_text(n: u64) -> String {
+    format!("{:X}/{:X}", n >> 32, n & 0xffff_ffff)
+}
+
 fn tid_key(text: &str) -> i64 {
     let inner = text.trim().trim_start_matches('(').trim_end_matches(')');
     let (b, o) = inner.split_once(',').unwrap_or((inner, "0"));
@@ -8334,13 +8581,18 @@ fn srf_columns(full: &str, tys: &[Type], alias: &str) -> Result<Vec<(String, Typ
             need(2..=3)?;
             vec![(alias.into(), Type::Int)]
         }
+        "unnest" if tys == [Type::TsVector] => tsvector_fields(),
+        UNNEST_ROW if tys == [Type::TsVector] => vec![(alias.into(), Type::record(tsvector_fields()))],
+        UNNEST_ROW => return srf_columns("unnest", tys, alias),
         "unnest" => {
             need(1..=64)?;
             // the elements' own type where it is a plain one, so `unnest(ids) AS x(id)` joins on numbers;
-            // several arrays give a column each (all named unnest, as in Postgres), side by side
+            // several arrays give a column each (all named unnest, as in Postgres), side by side; a multirange's
+            // ranges are of its range type
             tys.iter()
                 .map(|t| {
                     let ty = match t {
+                        Type::Multirange(m) => Some(range::of_multi(*m).map_or(Type::Text, Type::Range)),
                         t @ Type::Array(_) => t.elem().filter(|t| {
                             t.whole() || matches!(t, Type::Bool | Type::Reg(_)) || net::kind_of(*t).is_some()
                         }),
@@ -8362,6 +8614,10 @@ fn srf_columns(full: &str, tys: &[Type], alias: &str) -> Result<Vec<(String, Typ
         "ts_parse" => {
             need(2..=2)?;
             vec![("tokid".into(), Type::Int), ("token".into(), Type::Text)]
+        }
+        "ts_stat" => {
+            need(1..=2)?;
+            vec![("word".into(), Type::Text), ("ndoc".into(), Type::Int), ("nentry".into(), Type::Int)]
         }
         "ts_debug" => {
             need(1..=2)?;
@@ -9736,6 +9992,9 @@ struct Parser {
     /// that query as it was written, with its sets: made again under an outer query where the union can't do
     /// (window functions, ORDER BY an expression: see `grouping_sets_under`)
     gs_src: Option<(Select, Vec<Vec<Expr>>)>,
+    /// the set-returning functions the GROUP BY of the query just read runs before grouping, as their columns (see
+    /// `grouped_srfs`): its ORDER BY, read next, puts the same calls as the same columns
+    srf_pre: Vec<(String, Expr)>,
     ctes: Vec<String>,              // the WITH queries' names in reach, which aren't the world's tables
     depth: usize,                   // how deep the tree being read nests here (see `deeper`)
     peak: usize,                    // the deepest `depth` since it was last reset
@@ -9821,6 +10080,7 @@ impl Parser {
             calls: false,
             expanded: false,
             gs_src: None,
+            srf_pre: vec![],
             ctes: vec![],
             depth: 0,
             peak: 0,
@@ -9899,6 +10159,17 @@ impl Parser {
 
     /// The tokens of `toks` (copied by `ahead` at `start`) read since: an error, not a panic,
     /// where reading went past the copy's end.
+    /// `since`, where reading may have put other tokens in place of some it read (a SQL/JSON constructor is read as
+    /// the calls it is made of, see `sqljson`): `len` is how many tokens there were at `start`, so the count read is
+    /// of those written.
+    fn since_spliced<'a>(&self, toks: &'a [Tok], start: usize, len: usize) -> Result<&'a [Tok]> {
+        let read = (self.i - start) as isize - (self.t.len() as isize - len as isize);
+        match usize::try_from(read).ok().and_then(|n| toks.get(..n)) {
+            Some(t) => Ok(t),
+            None => self.fail("unexpected end of expression"),
+        }
+    }
+
     fn since<'a>(&self, toks: &'a [Tok], start: usize) -> Result<&'a [Tok]> {
         match toks.get(..self.i - start) {
             Some(t) => Ok(t),
@@ -10359,6 +10630,9 @@ impl Parser {
             if rows.first().is_some_and(|r: &Vec<Expr>| r.len() != row.len()) {
                 return err(SYNTAX, "VALUES lists must all be the same length");
             }
+            if row.iter().any(has_srf) {
+                return err(UNSUPPORTED, "set-returning functions are not allowed in VALUES");
+            }
             rows.push(row);
             if !self.sym(",") {
                 break;
@@ -10448,7 +10722,8 @@ impl Parser {
 
     /// `VARIADIC ARRAY[a, b]` in a call's arguments: the array's elements, which the call takes as if written one
     /// after another (a function made with a VARIADIC parameter puts them in its array again).
-    /// With `spread` (concat, concat_ws, format: see `Parser::spread`), the array is taken whole, behind
+    /// With `spread` (concat, concat_ws, format, num_nulls, num_nonnulls: see `Parser::spread`), the array is taken
+    /// whole, behind
     /// `funcs::SPREAD`, as Postgres's functions of a VARIADIC "any" take it: a null one is none.
     fn variadic_items(&mut self, spread: bool) -> Result<Option<Vec<Expr>>> {
         if !self.is_kw("variadic") || matches!(self.t.get(self.i + 1), Some(Tok::Sym("," | ")" | "." | "(")) | None) {
@@ -10702,12 +10977,15 @@ impl Parser {
                     }
                     // one row with a set-returning function, `VALUES (generate_series(1, 10))`: a row for each of
                     // its values, as Postgres's ProjectSet gives them, as the SELECT of those expressions would
+                    if rows.len() > 1 && rows.iter().flatten().any(has_srf) {
+                        return err(UNSUPPORTED, "set-returning functions are not allowed in VALUES");
+                    }
                     let srf_row = rows.len() == 1
-                        && rows[0].iter().any(|e| matches!(e, Expr::Call(c) if one_column_srf(c)))
+                        && rows[0].iter().any(has_srf)
                         && !rows[0].iter().any(|e| matches!(e, Expr::Default));
                     if srf_row {
                         let items = rows.remove(0).into_iter().map(|e| Item::Expr(e, None)).collect();
-                        let mut q = Select {
+                        let q = Select {
                             set: vec![],
                             distinct: false,
                             distinct_on: vec![],
@@ -10722,8 +11000,7 @@ impl Parser {
                             offset: None,
                             locking: vec![],
                         };
-                        select_srfs(&mut q)?;
-                        query = Some(Box::new(q));
+                        query = Some(Box::new(project_srfs(q, &[])?));
                     }
                 }
                 let conflict = if self.is_kw("on") {
@@ -10784,6 +11061,9 @@ impl Parser {
                 let alias = explicit.or_else(|| own_alias(&table));
                 self.expect_kw("set")?;
                 let mut sets = self.sets()?;
+                if sets.iter().any(|(_, e)| has_srf(e)) {
+                    return err(UNSUPPORTED, "set-returning functions are not allowed in UPDATE");
+                }
                 // UPDATE ... FROM other tables: each SET value and the WHERE as correlated
                 // subqueries over them (with several matches, the first one's values)
                 let (start, copied) = (self.i, self.copied.get());
@@ -12231,6 +12511,7 @@ impl Parser {
     fn query_after(&mut self, first: Select) -> Result<Select> {
         let expanded = std::mem::take(&mut self.expanded);
         let gs_src = std::mem::take(&mut self.gs_src);
+        let srf_pre = std::mem::take(&mut self.srf_pre);
         let parts = first.set.len();
         let mut s = self.intersect(first)?;
         let mut joined = s.set.len() != parts;
@@ -12342,7 +12623,7 @@ impl Parser {
             }
         }
         (s.order, s.limit, s.offset) = (order, limit, offset);
-        Ok(s)
+        finish_srfs(s, &srf_pre)
     }
 
     /// `s` INTERSECT the parts that follow, which bind tighter than UNION and EXCEPT.
@@ -12484,6 +12765,14 @@ impl Parser {
         // (a GROUPING() in a subquery may be this query's)
         let grouping = q.items.iter().any(|it| matches!(it, Item::Expr(e, _) if calls_grouping(e)))
             || q.having.as_ref().is_some_and(calls_grouping);
+        // set-returning functions: none where Postgres refuses them, and those a GROUP BY holds run before it (the
+        // rest run once the whole query is read: see `finish_srfs`)
+        srf_clauses(&q)?;
+        let mut sets = sets;
+        self.srf_pre = grouped_srfs(&mut q, sets.as_mut())?;
+        if q.having.as_ref().is_some_and(has_srf) {
+            return err(UNSUPPORTED, "set-returning functions are not allowed in HAVING");
+        }
         self.expanded = false;
         self.gs_src = None;
         if let Some(sets) = sets {
@@ -12494,7 +12783,6 @@ impl Parser {
             let sets = vec![q.group.clone()];
             q = expand_grouping_sets(q, sets)?;
         }
-        select_srfs(&mut q)?;
         Ok(q)
     }
 
@@ -12887,6 +13175,10 @@ impl Parser {
                 };
                 (name, args)
             };
+            // (a set-returning function among a FROM function's arguments: Postgres runs those in a select list only)
+            if args.iter().any(has_srf) {
+                return err(UNSUPPORTED, "set-returning functions must appear at top level of FROM");
+            }
             // a function that gives one value, in FROM: one row, its column named as the alias (or the function)
             if schema.is_none() && !rows_from && !SRFS.contains(&name.as_str()) && !name.contains(['.', '/']) {
                 let bare = written(&name).to_string();
@@ -16484,11 +16776,50 @@ impl Parser {
             if matches!(self.peek(), None | Some(Tok::Sym(";"))) {
                 return Ok(Stmt::CreateType { name, labels: vec![], range: None, composite: Some(vec![]) });
             }
-            if self.peek() == Some(&Tok::Sym("(")) {
-                return err(
-                    UNSUPPORTED,
-                    "base types (CREATE TYPE name (INPUT = ..., OUTPUT = ...)) need functions in C, which can't be loaded here",
-                );
+            // CREATE TYPE name (INPUT = f, OUTPUT = g, LIKE = t, ...): a base type, of a built-in type's I/O functions
+            if self.sym("(") {
+                let (mut input, mut output, mut like) = (None, None, None);
+                loop {
+                    // (LIKE, DEFAULT and the like are keywords elsewhere: here each is an option's name)
+                    let opt = match self.next() {
+                        Some(Tok::Word(w) | Tok::Ident(w)) => w.to_lowercase(),
+                        t => {
+                            self.put_back(t);
+                            return self.fail("expected a type option");
+                        }
+                    };
+                    // (a flag such as PASSEDBYVALUE has no value; the others are a name, a type, a number or a string)
+                    let value = if self.sym("=") {
+                        let (_, text) = self.text_of(|p| {
+                            let mut depth = 0;
+                            while depth > 0 || !matches!(p.peek(), None | Some(Tok::Sym("," | ")"))) {
+                                match p.next() {
+                                    Some(Tok::Sym("(")) => depth += 1,
+                                    Some(Tok::Sym(")")) => depth -= 1,
+                                    _ => {}
+                                }
+                            }
+                            Ok(())
+                        })?;
+                        Some(text)
+                    } else {
+                        None
+                    };
+                    match opt.as_str() {
+                        "input" => input = value,
+                        "output" => output = value,
+                        "like" => like = value,
+                        _ => {}
+                    }
+                    if !self.sym(",") {
+                        break;
+                    }
+                }
+                self.expect_sym(")")?;
+                let (Some(input), Some(output)) = (input, output) else {
+                    return err("42P17", "type input function must be specified");
+                };
+                return Ok(Stmt::CreateBaseType { name, input, output, like });
             }
             self.expect_kw("as")?;
             if self.kw("range") {
@@ -17697,6 +18028,8 @@ impl Parser {
             n if range::multi_by_name(n).is_some() => Type::Multirange(range::multi_by_name(n).unwrap_or(0)),
             "money" => Type::Money,
             "pg_lsn" => Type::PgLsn,
+            // (the pseudo-type of a type's input and output functions' text: text here)
+            "cstring" => Type::Text,
             "tid" => Type::Tid,
             "timetz" => Type::TimeTz,
             "hstore" => Type::Hstore,
@@ -17785,8 +18118,8 @@ impl Parser {
             other => {
                 self.bind(self.i - 1, other, Kind::Type)?;
                 let stored = find_named(other, Kind::Type);
-                // (a composite type of a schema on the search_path)
-                if let Some(c) = userdefs::composite(&stored) {
+                // (a composite type of a schema on the search_path; a base type made of a built-in type's functions)
+                if let Some(c) = userdefs::composite(&stored).or_else(|| userdefs::base_named(&stored)) {
                     return Ok(c);
                 }
                 return self.enum_by_name(&stored);
@@ -18484,30 +18817,33 @@ impl Parser {
         Ok(())
     }
 
-    /// `FORMAT JSON [ENCODING name]` after a value, which says what it already is: whether it was there.
-    fn sqljson_format(&mut self) -> bool {
-        if self.is_kw("format") && matches!(self.t.get(self.i + 1), Some(Tok::Word(x)) if x == "json") {
-            self.i += 2;
-            if self.kw("encoding") {
-                self.i += 1;
-            }
-            return true;
+    /// A SQL/JSON value `v` (its text, read from token `at`) and the `FORMAT JSON [ENCODING name]` after it, which says
+    /// what it already is: as the call that checks it and reads it as json once its type is known (see
+    /// `funcs::Scalar::JsonFormatted`), or as it is where there is no FORMAT.
+    fn sqljson_format(&mut self, v: String, at: usize) -> String {
+        if !(self.is_kw("format") && matches!(self.t.get(self.i + 1), Some(Tok::Word(x)) if x == "json")) {
+            return v;
         }
-        false
+        let place = |p: &Self, k: usize| p.starts.get(k).map_or(0, |s| *s as i64 + 1);
+        let (value_at, format_at) = (place(self, at), place(self, self.i));
+        self.i += 2;
+        let encoding = self.kw("encoding");
+        if encoding {
+            self.i += 1;
+        }
+        format!("__json_format(({v}), {encoding}, {value_at}, {format_at})")
     }
 
-    /// The FILTER of a SQL/JSON aggregate: the one written after it (taken), and that `skip` is not null (ABSENT ON
-    /// NULL), as one clause.
-    fn sqljson_filter(&mut self, skip: Option<&String>) -> Result<String> {
-        let mut conds: Vec<String> = skip.map(|v| format!("({v}) is not null")).into_iter().collect();
-        if self.is_kw("filter") && matches!(self.t.get(self.i + 1), Some(Tok::Sym("("))) {
-            self.i += 2;
-            self.expect_kw("where")?;
-            let (_, c) = self.text_of(|p| p.expr().map(drop))?;
-            self.expect_sym(")")?;
-            conds.push(format!("({c})"));
+    /// The FILTER of a SQL/JSON aggregate written after it (taken), as text.
+    fn sqljson_filter(&mut self) -> Result<String> {
+        if !(self.is_kw("filter") && matches!(self.t.get(self.i + 1), Some(Tok::Sym("(")))) {
+            return Ok(String::new());
         }
-        Ok(if conds.is_empty() { String::new() } else { format!(" filter (where {})", conds.join(" and ")) })
+        self.i += 2;
+        self.expect_kw("where")?;
+        let (_, c) = self.text_of(|p| p.expr().map(drop))?;
+        self.expect_sym(")")?;
+        Ok(format!(" filter (where ({c}))"))
     }
 
     /// The OVER of a SQL/JSON aggregate written after it (taken), as text: the window goes inside the cast that
@@ -18550,10 +18886,10 @@ impl Parser {
             if !p.sym(":") {
                 p.expect_kw("value")?;
             }
+            let at = p.i;
             let (_, v) = p.text_of(|p| p.expr().map(drop))?;
             // (a value said to be JSON already is json: its text taken as it is)
-            let v = if p.sqljson_format() { format!("({v})::json") } else { v };
-            Ok((k, v))
+            Ok((k, p.sqljson_format(v, at)))
         };
         // (they make json; RETURNING another type is a cast of it, bytea its text's UTF8 bytes)
         let cast = |call: String, returning: Option<String>| match returning {
@@ -18583,18 +18919,23 @@ impl Parser {
                 cast(format!("__json_ctor({flags}{list})"), returning)
             }
             "json_array" if self.is_kw("select") || self.is_kw("with") || self.is_kw("values") => {
-                let (_, q) = self.text_of(|p| p.subquery().map(drop))?;
-                self.sqljson_format();
+                let ctor = self.i.saturating_sub(2); // (JSON_ARRAY itself, where its error points)
+                let (sub, q) = self.text_of(|p| p.subquery())?;
+                if sub.is_some_and(|s| s.set.is_empty() && s.items.len() != 1) {
+                    return self.err_at(ctor, SYNTAX, "subquery must return only one column");
+                }
+                let _ = self.sqljson_format(String::new(), 0);
                 // (ABSENT ON NULL, the default: the query's nulls are left out)
                 let (absent, _, returning) = self.sqljson_clauses(true)?;
-                let filter = if absent { " filter (where q.c is not null)" } else { "" };
-                cast(format!("(select coalesce(json_agg(q.c){filter}, '[]'::json) from ({q}) as q(c))"), returning)
+                let agg = if absent { "json_agg_strict" } else { "json_agg" };
+                cast(format!("(select coalesce({agg}(q.c), '[]'::json) from ({q}) as q(c))"), returning)
             }
             "json_array" => {
                 let mut args = vec![];
                 while !ends(self) {
+                    let at = self.i;
                     let (_, v) = self.text_of(|p| p.expr().map(drop))?;
-                    let v = if self.sqljson_format() { format!("({v})::json") } else { v };
+                    let v = self.sqljson_format(v, at);
                     args.push(format!(", ({v})"));
                     if !self.sym(",") {
                         break;
@@ -18608,7 +18949,7 @@ impl Parser {
                 let (k, v) = pair(self)?;
                 let (absent, unique, returning) = self.sqljson_clauses(false)?;
                 self.expect_sym(")")?;
-                let filter = self.sqljson_filter(None)?;
+                let filter = self.sqljson_filter()?;
                 let over = self.sqljson_over()?;
                 // json_object_agg[_unique][_strict], or jsonb's for RETURNING jsonb, as Postgres picks them
                 let jsonb = returning.as_deref().is_some_and(|t| t.trim() == "jsonb");
@@ -18621,8 +18962,9 @@ impl Parser {
                 return Ok(cast(format!("{name}(({k}), ({v})){filter}{over}"), returning));
             }
             _ => {
+                let at = self.i;
                 let (_, v) = self.text_of(|p| p.expr().map(drop))?;
-                let v = if self.sqljson_format() { format!("({v})::json") } else { v };
+                let v = self.sqljson_format(v, at);
                 let order = if self.is_kw("order") {
                     let (_, o) = self.text_of(|p| {
                         p.expect_kw("order")?;
@@ -18641,9 +18983,11 @@ impl Parser {
                 };
                 let (absent, _, returning) = self.sqljson_clauses(true)?;
                 self.expect_sym(")")?;
-                let filter = self.sqljson_filter(absent.then_some(&v))?;
+                let filter = self.sqljson_filter()?;
                 let over = self.sqljson_over()?;
-                return Ok(cast(format!("json_agg(({v}){order}){filter}{over}"), returning));
+                // (ABSENT ON NULL: json_agg_strict, which gives `[]` where every value was null)
+                let agg = if absent { "json_agg_strict" } else { "json_agg" };
+                return Ok(cast(format!("{agg}(({v}){order}){filter}{over}"), returning));
             }
         };
         self.expect_sym(")")?;
@@ -18757,6 +19101,9 @@ impl Parser {
         let items = self.items()?;
         if items.iter().any(|it| matches!(it, Item::Expr(e, _) if has_window(e))) {
             return err("42P20", "window functions are not allowed in RETURNING");
+        }
+        if items.iter().any(|it| matches!(it, Item::Expr(e, _) if has_srf(e))) {
+            return err(UNSUPPORTED, "set-returning functions are not allowed in RETURNING");
         }
         Ok(Some(items))
     }
@@ -19685,9 +20032,15 @@ impl Parser {
             {
                 self.zone_literal(w)?
             }
-            // bool 't', int4 '7', text 'x', float8 'NaN': a type name before a string is a cast of it
+            // bool 't', int4 '7', text 'x', float8 'NaN': a type name before a string is a cast of it (with its
+            // modifier, `char(20) 'x'`, too)
             Some(Tok::Word(w))
-                if matches!(self.peek(), Some(Tok::Str(_)))
+                if (matches!(self.peek(), Some(Tok::Str(_)))
+                    || (matches!(w.as_str(), "char" | "varchar" | "bit" | "numeric" | "decimal")
+                        && self.peek() == Some(&Tok::Sym("("))
+                        && matches!(self.t.get(self.i + 1), Some(Tok::Num(_)))
+                        && self.t.get(self.i + 2) == Some(&Tok::Sym(")"))
+                        && matches!(self.t.get(self.i + 3), Some(Tok::Str(_)))))
                     && (range::by_name(&w).is_some()
                         || range::multi_by_name(&w).is_some()
                         || matches!(
@@ -19721,6 +20074,13 @@ impl Parser {
                                 | "circle"
                                 | "line"
                                 | "money"
+                                | "pg_lsn"
+                                | "pg_snapshot"
+                                | "txid_snapshot"
+                                | "xid8"
+                                | "tsvector"
+                                | "tsquery"
+                                | "jsonpath"
                                 | "xml"
                                 | "varchar"
                                 | "char"
@@ -19967,8 +20327,25 @@ impl Parser {
             }
             // ARRAY[a, b]: an array, as Postgres array text ({a,b})
             Some(Tok::Word(w)) if w == "array" && matches!(self.peek(), Some(Tok::Sym("["))) => {
+                let at = self.i - 1;
                 self.i += 1;
-                self.array_items()?
+                let e = self.array_items()?;
+                // ARRAY[] has no element type to be an array of unless a cast gives it one, as Postgres has it
+                if matches!(&e, Expr::Func(Func::Scalar(funcs::Scalar::ArrayOf), items) if items.is_empty())
+                    && !matches!(self.peek(), Some(Tok::Sym("::")))
+                    && !self.is_kw("as")
+                {
+                    return Err(SqlError {
+                        code: "42P18",
+                        message: "cannot determine type of empty array".into(),
+                        info: Some(Box::new(Violation {
+                            hint: Some("Explicitly cast to the desired type, for example ARRAY[]::integer[].".into()),
+                            position: self.starts.get(at).map(|s| *s as u32 + 1),
+                            ..Violation::default()
+                        })),
+                    });
+                }
+                e
             }
             Some(Tok::Word(w)) if w == "case" => {
                 let operand = if self.is_kw("when") { None } else { Some(Box::new(self.expr()?)) };
@@ -20005,11 +20382,13 @@ impl Parser {
                         w == "json_array" && (self.is_kw("select") || self.is_kw("with") || self.is_kw("values"));
                     let text = self.sqljson(&w)?;
                     let end = self.i;
+                    let bytes = text.starts_with("convert_to(");
                     self.t.splice(at..end, lex(&text)?);
                     self.i = at;
                     let e = self.primary()?;
-                    // (JSON_ARRAY of a query and the aggregates are called as written, made of other calls)
-                    return Ok(if query || w.ends_with("agg") { spelled_call(&w, e) } else { e });
+                    // (JSON_ARRAY of a query, the aggregates and a RETURNING bytea are called as written, made of
+                    // other calls)
+                    return Ok(if query || bytes || w.ends_with("agg") { spelled_call(&w, e) } else { e });
                 }
                 self.i += 1;
                 if matches!(w.as_str(), "percentile_cont" | "percentile_disc" | "mode") {
@@ -20040,6 +20419,8 @@ impl Parser {
                     "jsonb_agg" => Some((ListAgg::Json, 1)),
                     "json_agg" => Some((ListAgg::JsonText(false), 1)),
                     "array_agg" => Some((ListAgg::Array, 1)),
+                    "jsonb_agg_strict" => Some((ListAgg::Json, 1)),
+                    "json_agg_strict" => Some((ListAgg::JsonText(false), 1)),
                     "jsonb_object_agg"
                     | "jsonb_object_agg_unique"
                     | "jsonb_object_agg_strict"
@@ -20048,6 +20429,8 @@ impl Parser {
                     | "json_object_agg_unique"
                     | "json_object_agg_strict"
                     | "json_object_agg_unique_strict" => Some((ListAgg::ObjectText, 2)),
+                    "range_agg" => Some((ListAgg::Range(false, 0), 1)),
+                    "range_intersect_agg" => Some((ListAgg::Range(true, 0), 1)),
                     _ => stats::Stat::parse(&w)
                         .map(|st| (ListAgg::Stat(st), st.arity()))
                         .or_else(|| userdefs::aggregate(&w).map(|(i, n)| (ListAgg::User(i), n))),
@@ -20085,6 +20468,10 @@ impl Parser {
                     let mut keys = Keys { n: 0, desc: 0, nulls_first: 0, filtered: false, arrays: false, object: 0 };
                     if matches!(kind, ListAgg::Object | ListAgg::ObjectText) {
                         keys.object = u8::from(w.contains("_unique")) | (2 * u8::from(w.ends_with("_strict")));
+                    }
+                    // (json_agg_strict and jsonb_agg_strict: their nulls left out, `[]` where all were)
+                    if matches!(kind, ListAgg::Json | ListAgg::JsonText(_)) && w.ends_with("_strict") {
+                        keys.object = 2;
                     }
                     let mut key_at = vec![]; // (where each ORDER BY key starts: the token)
                     if self.kw("order") {
@@ -20170,7 +20557,7 @@ impl Parser {
                     }
                     return Ok(match kind {
                         _ if w == "xmlagg" => spelled_call(&w, Expr::Cast(Box::new(agg), Type::Xml)),
-                        ListAgg::Stat(_) => spelled_call(&w, agg),
+                        ListAgg::Stat(_) | ListAgg::Range(..) => spelled_call(&w, agg),
                         _ => agg,
                     });
                 }
@@ -20267,7 +20654,7 @@ impl Parser {
                     self.bind(at, &w, Kind::Func)?;
                     return self.call(func_named(&w));
                 };
-                self.spread = matches!(w.as_str(), "concat" | "concat_ws" | "format");
+                self.spread = matches!(w.as_str(), "concat" | "concat_ws" | "format" | "num_nulls" | "num_nonnulls");
                 let (args, names) = self.call_args()?;
                 // functions made with CREATE FUNCTION of its name on the search_path: the arguments' types choose
                 // between them and the built-in (see `functions::means_builtin`) when the call is bound or run, or
@@ -20606,14 +20993,15 @@ impl Parser {
                 }
                 self.expect_kw("as")?;
                 // copied first: parsing takes the text out of the tokens it reads
-                let (start, toks) = (self.i, self.ahead(false));
+                let (start, toks, len) = (self.i, self.ahead(false), self.t.len());
                 if !matches!(self.peek(), Some(Tok::Word(w)) if w == "select" || w == "with" || w == "values") {
                     return self.fail("expected SELECT");
                 }
                 let Stmt::Select(query) = self.stmt()? else { return self.fail("expected SELECT") };
-                // (its tokens as written: a WITH query's SEARCH or CYCLE is read as the query it is rewritten to,
-                // which has more tokens, so then those written up to its WITH CHECK OPTION or WITH DATA, if any)
-                let written: Vec<Tok> = match self.since(&toks, start) {
+                // (its tokens as written: `since_spliced` takes off what a rewrite put in, as a set-returning function in
+                // the select list is; when that can't say, a WITH query's SEARCH or CYCLE, read as the query it is
+                // rewritten to, those written up to its WITH CHECK OPTION or WITH DATA, if any)
+                let written: Vec<Tok> = match self.since_spliced(&toks, start, len) {
                     Ok(t) => t.to_vec(),
                     Err(_) => {
                         let tail = ["with", "check", "option", "cascaded", "local", "no", "data"];
@@ -21246,6 +21634,110 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
 
 /// A syntax error's word as the text writes it, as Postgres quotes it (`"RANDOMWORD"`): the lexer
 /// lowercases words, and the error's position says where the word is.
+/// The token a COLLATE clause's error points to (see `Script::locate`): the second of two explicit collations that
+/// disagree, the one of a type that has no collations (in a table's column or an expression; not a domain's or an
+/// index column's own, which Postgres reads without a place).
+fn collate_error_at(message: &str, toks: &[Tok]) -> Option<usize> {
+    let quoted = |m: &str, n: usize| m.split('"').nth(2 * n + 1).map(str::to_string);
+    let collate_of = |name: Option<String>| -> Vec<usize> {
+        (0..toks.len())
+            .filter(|&k| {
+                toks[k] == Tok::Word("collate".into())
+                    && name
+                        .as_deref()
+                        .is_none_or(|n| matches!(toks.get(k + 1), Some(Tok::Ident(x) | Tok::Word(x)) if x == n))
+            })
+            .collect()
+    };
+    let word = |k: usize, w: &str| matches!(toks.get(k), Some(Tok::Word(x)) if x == w);
+    if message.starts_with("collation mismatch between explicit collations ") {
+        return collate_of(quoted(message, 1)).first().copied();
+    }
+    // (an array of a collatable type has its element's collation here too: what Chronos refuses of it has no place)
+    if message.starts_with("collations are not supported by type ") && !message.ends_with("[]") {
+        if word(0, "create") && (word(1, "domain") || word(1, "index") || word(2, "index")) {
+            // (an index's expression column, `((a COLLATE "C"))`, has the clause's place)
+            return collate_of(None).into_iter().find(|&k| {
+                k >= 3 && toks[k - 2] == Tok::Sym("(") && toks[k - 3] == Tok::Sym("(") && word(1, "index")
+                    || k >= 3 && toks[k - 2] == Tok::Sym("(") && toks[k - 3] == Tok::Sym("(") && word(2, "index")
+            });
+        }
+        return collate_of(None).first().copied();
+    }
+    None
+}
+
+/// `function f() does not exist` found as a statement is read: at the call of `f` (from token `from` of `toks`, whose
+/// places are `starts`), as Postgres points to it.
+fn no_call_at(toks: &[Tok], starts: &[usize], from: usize, mut e: SqlError) -> SqlError {
+    let Some(name) = e.message.strip_prefix("function ").and_then(|m| m.strip_suffix("() does not exist")) else {
+        return e;
+    };
+    if e.info.as_ref().is_some_and(|i| i.position.is_some()) {
+        return e;
+    }
+    let at = (from..toks.len()).find(|&k| {
+        matches!(&toks[k], Tok::Word(w) | Tok::Ident(w) if w == name) && toks.get(k + 1) == Some(&Tok::Sym("("))
+    });
+    if let Some(at) = at.and_then(|k| starts.get(k)) {
+        let mut v = e.info.take().map(|b| *b).unwrap_or_default();
+        v.position = Some(*at as u32 + 1);
+        e.info = Some(Box::new(v));
+    }
+    e
+}
+
+/// Whether `c` can start an identifier, as scan.l's ident_start has it: a letter, `_`, or any character past ASCII.
+fn ident_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_' || !c.is_ascii()
+}
+
+/// Where the identifier characters from `at` in `c` end (scan.l's ident_cont: a letter, a digit, `_`, `$`).
+fn ident_end(c: &[char], at: usize) -> usize {
+    let mut i = at;
+    while c.get(i).is_some_and(|&x| x.is_ascii_alphanumeric() || x == '_' || x == '$' || !x.is_ascii()) {
+        i += 1;
+    }
+    i
+}
+
+/// A lexer's error about the text `text` that starts at character `at`, as scan.l reports it: `at or near` it, and
+/// pointing at it.
+fn junk(message: String, text: &[char], at: usize) -> SqlError {
+    SqlError {
+        code: SYNTAX,
+        message: format!("{message} at or near \"{}\"", text.iter().collect::<String>()),
+        info: Some(Box::new(Violation { position: Some(at as u32 + 1), ..Violation::default() })),
+    }
+}
+
+/// Whether `e` is one of Postgres's errors about a set-returning function where it can't run, without a place yet.
+fn srf_error(e: &SqlError) -> bool {
+    (e.message.starts_with("set-returning functions ")
+        || e.message.ends_with("cannot contain set-returning function calls"))
+        && e.info.as_ref().is_none_or(|i| i.position.is_none())
+}
+
+/// Such an error (see `srf_error`) pointing at the function's name, the first from token `from` of `toks` (whose
+/// places are `starts`): in FROM, the one among a function's arguments, not the function itself.
+fn srf_error_at(toks: &[Tok], starts: &[usize], from: usize, mut e: SqlError) -> SqlError {
+    if !srf_error(&e) {
+        return e;
+    }
+    let in_from = e.message.ends_with("at top level of FROM");
+    let at = (from..toks.len()).find(|&k| {
+        matches!(&toks[k], Tok::Word(w) if srf_name(w))
+            && toks.get(k + 1) == Some(&Tok::Sym("("))
+            && !(in_from && matches!(k.checked_sub(1).map(|j| &toks[j]), Some(Tok::Word(w)) if w == "from"))
+    });
+    if let Some(at) = at.and_then(|k| starts.get(k)) {
+        let mut v = e.info.take().map(|b| *b).unwrap_or_default();
+        v.position = Some(*at as u32 + 1);
+        e.info = Some(Box::new(v));
+    }
+    e
+}
+
 fn as_written(sql: &str, mut e: SqlError) -> SqlError {
     let Some(pos) = e.info.as_ref().and_then(|i| i.position) else { return e };
     // (`syntax error at or near "x"`, and the grammar's others: `duplicate trigger events specified at or near "x"`)
@@ -21332,7 +21824,13 @@ impl Script {
             }
             p.calls = false;
             let start = p.i;
-            let s = p.stmt().map_err(|e| as_written(sql, e))?;
+            let s = p.stmt().map_err(|e| as_written(sql, e)).map_err(|e| {
+                // (reading took the tokens it read: the text's own, from where the statement starts, for the place)
+                let Ok((toks, starts)) = lex_at(sql) else { return e };
+                let at = p.starts.get(start).copied().unwrap_or(0);
+                let from = starts.iter().position(|s| *s >= at).unwrap_or(starts.len());
+                no_call_at(&toks, &starts, from, srf_error_at(&toks, &starts, from, e))
+            })?;
             stmts.push(Statement(s, PlanCache::pinned(std::mem::take(&mut p.pins)), p.calls));
             // (its own text, as pg_stat_statements keeps it: where its first token starts to where the next does;
             // the whole text when parsing put tokens in that the text hasn't)
@@ -21393,6 +21891,22 @@ impl Script {
                     e.info = Some(Box::new(v));
                 }
             }
+        }
+        if srf_error(&e)
+            && let Ok((toks, starts)) = lex_at(&self.sql)
+        {
+            return srf_error_at(&toks, &starts, 0, e);
+        }
+        // a COLLATE clause's error: at the clause (a column's, or one in an expression), as Postgres points to it
+        if e.info.as_ref().is_none_or(|i| i.position.is_none())
+            && let Ok((toks, starts)) = lex_at(&self.sql)
+            && let Some(k) = collate_error_at(&e.message, &toks)
+            && let Some(at) = starts.get(k)
+        {
+            let mut v = e.info.take().map(|b| *b).unwrap_or_default();
+            v.position = Some(*at as u32 + 1);
+            e.info = Some(Box::new(v));
+            return e;
         }
         // x[lo:hi] of a jsonb: at hi, or at lo where there is no hi (none for `[:]`), as Postgres points to it
         if e.message == "jsonb subscript does not support slices"
@@ -23635,6 +24149,7 @@ fn named_arguments(function: &str, args: Vec<Expr>, names: &[String]) -> Result<
         ],
         "jsonb_insert" => vec![given("jsonb_in"), given("path"), given("replacement"), ("insert_after", no.clone())],
         "parse_ident" => vec![given("str"), ("strict", yes.clone())],
+        "random_normal" => vec![("mean", Expr::Lit(Value::Float(0.0))), ("stddev", Expr::Lit(Value::Float(1.0)))],
         _ => {
             let given = names.iter().filter(|n| !n.is_empty()).map(|n| format!("{n} => ...")).collect::<Vec<_>>();
             return err(
@@ -27352,8 +27867,10 @@ fn par_run_on<T: Send>(
     let (world, path, home) =
         (catalog::world_state(), PATH.with_borrow(Clone::clone), SESSION.with_borrow(Clone::clone));
     let who = roles::current();
+    let ts_config = tsearch::default_config();
     let work = || {
         STOP.set(stop.clone()); // helper threads stop with the statement too
+        tsearch::set_default(ts_config); // and search text as its session does
         roles::enter(who.clone()); // and run as its role
         time::restore_zone(zone.clone()); // and read times in its session's zone
         // and its world's catalog along its search_path (a regproc's name)
@@ -28455,10 +28972,10 @@ fn call_varies(c: &Call) -> bool {
 /// Whether expression node `x` (not its arguments) can give a different value, or do something, each time it runs:
 /// a call `varies` says may change something, random() and setseed(), and the volatile functions of pgcrypto.
 fn node_varies(x: &Expr, varies: &dyn Fn(&Call) -> bool) -> bool {
-    use funcs::Scalar::{Random, SetSeed};
+    use funcs::Scalar::{Random, RandomNormal, SetSeed};
     match x {
         Expr::Call(c) => varies(c),
-        Expr::Func(Func::Scalar(Random | SetSeed), _) => true,
+        Expr::Func(Func::Scalar(Random | RandomNormal | SetSeed), _) => true,
         Expr::Func(Func::Scalar(f), _) => pgcrypto::volatile(*f),
         _ => false,
     }
@@ -29011,8 +29528,8 @@ fn new_id() -> String {
 fn new_row_ids(n: usize) -> impl Iterator<Item = String> {
     let n = n as u64;
     let (t, first) = match funcs::SEEDED.get() {
-        Some((x, c)) => {
-            funcs::SEEDED.set(Some((x, c + n)));
+        Some((s0, s1, c)) => {
+            funcs::SEEDED.set(Some((s0, s1, c + n)));
             (time::now() as u128 * 1000, c)
         }
         None => {
@@ -29033,8 +29550,8 @@ fn new_row_ids(n: usize) -> impl Iterator<Item = String> {
 /// (fixed in a simulation) and a count of the generator's own, so the same seed gives the same keys.
 fn new_row_id() -> String {
     match funcs::SEEDED.get() {
-        Some((x, n)) => {
-            funcs::SEEDED.set(Some((x, n + 1)));
+        Some((s0, s1, n)) => {
+            funcs::SEEDED.set(Some((s0, s1, n + 1)));
             format!("{:032x}{:08x}", time::now() as u128 * 1000, n as u32)
         }
         None => new_id(),
@@ -30736,13 +31253,21 @@ fn binop(op: Op, a: Value, b: Value) -> Result<Value> {
                 }
                 (x, y) => {
                     let (x, y) = (as_f64(&x), as_f64(&y));
-                    Float(match op {
+                    let r = match op {
                         Op::Add => x + y,
                         Op::Sub => x - y,
                         Op::Mul => x * y,
                         Op::Div => x / y,
                         _ => x % y,
-                    })
+                    };
+                    // (as for two floats above: a float with a literal read as one overflows and underflows alike)
+                    if r.is_infinite() && x.is_finite() && (y.is_finite() || op == Op::Div) {
+                        return err(RANGE, "value out of range: overflow");
+                    }
+                    if r == 0.0 && x != 0.0 && ((op == Op::Mul && y != 0.0) || (op == Op::Div && y.is_finite())) {
+                        return err(RANGE, "value out of range: underflow");
+                    }
+                    Float(r)
                 }
             });
         }
@@ -31435,6 +31960,11 @@ fn ty_in(e: &Expr, cols: &[Col], params: &[Option<Type>], aggs: &[Expr]) -> Resu
             (Agg::List(ListAgg::Text, _), Some(a)) if matches!(&**a, Expr::Func(Func::Row, args) if args.first().is_some_and(|x| ty(x).ok() == Some(Type::Bytea))) => {
                 Type::Bytea
             }
+            (Agg::List(ListAgg::Range(intersect, o), _), _) => match (range::of_multi(*o), *intersect) {
+                (Some(_), _) => Type::Multirange(*o),
+                (None, true) => Type::Range(*o),
+                (None, false) => Type::Multirange(range::multi_of(*o).unwrap_or(*o)),
+            },
             (Agg::List(ListAgg::Text | ListAgg::Array, _), _) => Type::Text,
             (Agg::List(ListAgg::JsonText(_) | ListAgg::ObjectText, _), _) => Type::JsonText,
             (Agg::List(..), _) => Type::Json,
@@ -31922,6 +32452,7 @@ fn func_name(f: &Func) -> String {
             return if *mc { "uuid_generate_v1mc" } else { "uuid_generate_v1" }.into();
         }
         Func::Scalar(funcs::Scalar::NumNode) => return "numnode".into(),
+        Func::Scalar(funcs::Scalar::SetSeed) => return "setseed".into(),
         Func::Scalar(funcs::Scalar::RegexpSplit) => return "regexp_split_to_array".into(),
         Func::Scalar(funcs::Scalar::FloatSend(four)) => return if *four { "float4send" } else { "float8send" }.into(),
         Func::Scalar(funcs::Scalar::XmlElement) => return "xmlelement".into(),
@@ -31957,7 +32488,22 @@ fn func_name(f: &Func) -> String {
             return ["get_bit", "set_bit", "bit_count", "bit_length", "octet_length", "position"][*k as usize % 6]
                 .into();
         }
-        Func::Scalar(funcs::Scalar::MoneyOp(_)) => return "?column?".into(),
+        Func::Scalar(funcs::Scalar::MoneyOp(_) | funcs::Scalar::LsnFn(_)) => return "?column?".into(),
+        Func::Scalar(funcs::Scalar::XidFn(k)) => {
+            return [
+                "xid8cmp",
+                "pg_snapshot_xmin",
+                "pg_snapshot_xmax",
+                "pg_visible_in_snapshot",
+                "txid_snapshot_xmin",
+                "txid_snapshot_xmax",
+                "txid_visible_in_snapshot",
+            ]
+            .get(*k as usize)
+            .copied()
+            .unwrap_or("?column?")
+            .into();
+        }
         Func::Scalar(funcs::Scalar::MoneyFn(k)) => {
             return ["cashlarger", "cashsmaller", "cash_words", "numeric"][*k as usize % 4].into();
         }
@@ -32416,12 +32962,14 @@ fn agg_name(f: &Agg) -> &'static str {
         Agg::BitXor => "bit_xor",
         Agg::AnyValue => "any_value",
         Agg::List(ListAgg::Text, _) => "string_agg",
+        Agg::List(ListAgg::Json, k) if k.object & 2 != 0 => "jsonb_agg_strict",
         Agg::List(ListAgg::Json, _) => "jsonb_agg",
         Agg::List(ListAgg::Array, _) => "array_agg",
         Agg::List(ListAgg::Object, k) => {
             ["jsonb_object_agg", "jsonb_object_agg_unique", "jsonb_object_agg_strict", "jsonb_object_agg_unique_strict"]
                 [usize::from(k.object & 3)]
         }
+        Agg::List(ListAgg::JsonText(_), k) if k.object & 2 != 0 => "json_agg_strict",
         Agg::List(ListAgg::JsonText(_), _) => "json_agg",
         Agg::List(ListAgg::ObjectText, k) => {
             ["json_object_agg", "json_object_agg_unique", "json_object_agg_strict", "json_object_agg_unique_strict"]
@@ -32432,6 +32980,13 @@ fn agg_name(f: &Agg) -> &'static str {
         Agg::List(ListAgg::Mode, _) => "mode",
         Agg::List(ListAgg::Hypo(k), _) => ["rank", "dense_rank", "percent_rank", "cume_dist"][usize::from(*k)],
         Agg::List(ListAgg::Stat(st), _) => st.name(),
+        Agg::List(ListAgg::Range(intersect, _), _) => {
+            if *intersect {
+                "range_intersect_agg"
+            } else {
+                "range_agg"
+            }
+        }
         Agg::List(ListAgg::User(i), _) => {
             userdefs::aggregate_at(*i).map_or("aggregate", |a| Box::leak(a.name.into_boxed_str()))
         }
@@ -32484,6 +33039,176 @@ pub fn run(db: &Db, branch: &str, sql: &str, params: &[Value]) -> Result<Vec<Out
     let out = s.run(db, sql, params);
     s.close(db);
     out
+}
+
+/// ts_rewrite(query, select): each row of the select (a target and its substitute, both tsquery) rewrites the
+/// query in turn, as Postgres's tsquery_rewrite_query runs them; a row with a null in it is passed over.
+fn ts_rewrite_rows(a: &[Value]) -> Result<Value> {
+    let q = ts_query(&a[0].to_text())?;
+    if q.is_none() {
+        return Ok(a[0].clone());
+    }
+    let out = inner_query(&a[1].to_text(), "ts_rewrite")?;
+    if !matches!(out.columns.as_deref(), Some([(_, Type::TsQuery), (_, Type::TsQuery)])) {
+        return err("22023", "ts_rewrite query must return two tsquery columns");
+    }
+    let mut rules = vec![];
+    for row in &out.rows {
+        if let [t, s] = &row[..]
+            && *t != Value::Null
+            && *s != Value::Null
+        {
+            rules.push((ts_query(&t.to_text())?, ts_query(&s.to_text())?));
+        }
+    }
+    Ok(Value::Text(tsearch::Query::text(&tsearch::rewrite(q, &rules, false))))
+}
+
+/// ts_stat(select [, weights]): each lexeme of the select's tsvectors, in how many of them it is (ndoc) and
+/// how often (nentry: its positions, or 1 where it has none), in byte order as Postgres's tree walks them.
+/// With weights (letters a to d), only positions of those weights count, and a lexeme without positions none.
+fn ts_stat_rows(a: &[Value]) -> Result<Vec<Vec<Value>>> {
+    if a.contains(&Value::Null) {
+        return Ok(vec![]);
+    }
+    let weights = a.get(1).map_or(0u8, |w| {
+        w.to_text().chars().fold(0, |m, c| {
+            m | match c.to_ascii_uppercase() {
+                'A' => 8,
+                'B' => 4,
+                'C' => 2,
+                'D' => 1,
+                _ => 0,
+            }
+        })
+    });
+    let out = inner_query(&a[0].to_text(), "ts_stat")?;
+    if !matches!(out.columns.as_deref(), Some([(_, Type::TsVector)])) {
+        return err("22023", "ts_stat query must return one tsvector column");
+    }
+    let mut stat: std::collections::BTreeMap<String, (i64, i64)> = Default::default();
+    for row in &out.rows {
+        let Some(v) = row.first().filter(|v| **v != Value::Null) else { continue };
+        for (lex, ps) in ts_vector(&v.to_text())?.0 {
+            let n = match (weights, ps.is_empty()) {
+                (0, true) => 1,
+                (0, false) => ps.len(),
+                (_, true) => 0,
+                (w, false) => ps.iter().filter(|p| w & (1 << (**p >> 14)) != 0).count(),
+            };
+            if n > 0 {
+                let e = stat.entry(lex).or_default();
+                e.0 += 1;
+                e.1 += n as i64;
+            }
+        }
+    }
+    Ok(stat.into_iter().map(|(w, (d, e))| vec![Value::Text(w), Value::Int(d), Value::Int(e)]).collect())
+}
+
+/// pg_split_walfile_name: a WAL segment file's name (24 hex digits, any case: timeline, log, segment) as its segment
+/// number (of 16 MB segments, 256 to a log) and timeline; 22023 for a name that isn't one, a null for a null.
+fn split_walfile_name(v: &Value) -> Result<Value> {
+    if *v == Value::Null {
+        return Ok(Value::Text(composite_text(&[Value::Null, Value::Null])));
+    }
+    let name = v.to_text();
+    let hex = |at: usize| u64::from_str_radix(&name[at..at + 8], 16).ok();
+    let parts = (name.len() == 24 && name.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| Some((hex(0)?, hex(8)?, hex(16)?)))
+        .flatten();
+    let Some((timeline, log, seg)) = parts else {
+        return err("22023", format!("invalid WAL file name \"{name}\""));
+    };
+    let number = decimal::Dec::new(i128::from(log) * 256 + i128::from(seg), 0);
+    Ok(Value::Text(composite_text(&[Value::Numeric(number), Value::Int(timeline as i64)])))
+}
+
+/// The columns unnest(tsvector) gives.
+fn tsvector_fields() -> Vec<(String, Type)> {
+    vec![("lexeme".into(), Type::Text), ("positions".into(), Type::Array(21)), ("weights".into(), Type::Array(25))]
+}
+
+/// unnest(tsvector): a row for each lexeme, in order: the lexeme, its positions and their weights (both null for
+/// one stored without positions), as tsvector_unnest gives them.
+fn unnest_tsvector(v: &Value) -> Result<Vec<Vec<Value>>> {
+    if *v == Value::Null {
+        return Ok(vec![]);
+    }
+    let list = |vals: Vec<Value>| Value::Text(array_text(vals.iter()));
+    Ok(ts_vector(&v.to_text())?
+        .0
+        .into_iter()
+        .map(|(lex, ps)| {
+            let (positions, weights) = match ps.is_empty() {
+                true => (Value::Null, Value::Null),
+                false => (
+                    list(ps.iter().map(|p| Value::Int(i64::from(p & 0x3fff))).collect()),
+                    list(ps.iter().map(|p| Value::Text(["D", "C", "B", "A"][usize::from(p >> 14)].into())).collect()),
+                ),
+            };
+            vec![Value::Text(lex), positions, weights]
+        })
+        .collect())
+}
+
+/// The built-in type whose `in` (or `out`) function the function named `func` is, made LANGUAGE internal (its body
+/// the call of that symbol, `pg_catalog.int4in($1)`): what a base type of it holds. 0A000 for any other function, whose
+/// code Chronos can't run as a type's.
+fn base_representation(v: &View, func: &str, which: &str) -> Result<Type> {
+    let fs = functions::named(v, &func_named(func.trim()))?;
+    let symbol = fs.iter().find_map(|f| {
+        let call = f.body.trim().strip_prefix("select pg_catalog.")?;
+        let symbol = call.split('(').next()?;
+        symbol.ends_with(which).then(|| symbol.to_string())
+    });
+    let ty = symbol.as_deref().and_then(|s| {
+        Some(match s.strip_suffix(which)? {
+            "int2" => Type::SmallInt,
+            "int4" => Type::Int,
+            "int8" => Type::BigInt,
+            "float4" => Type::Float4,
+            "float8" => Type::Float,
+            "numeric" => Type::Numeric,
+            "text" => Type::Text,
+            "bool" => Type::Bool,
+            "date" => Type::Date,
+            "timestamp" => Type::Timestamp,
+            "timestamptz" => Type::TimestampTz,
+            "interval" => Type::Interval,
+            "oid" => Type::Oid,
+            _ => return None,
+        })
+    });
+    ty.ok_or_else(|| SqlError {
+        code: UNSUPPORTED,
+        message: format!(
+            "base types need {which}put functions in C, which can't be loaded here; {func} isn't a built-in type's"
+        ),
+        info: None,
+    })
+}
+
+/// The rows of a query a function is given as text (ts_rewrite's and ts_stat's, run as Postgres runs
+/// them through SPI): in a session of its own on the running statement's world, which is left as it
+/// was (its zone, catalog, search path and session) once the query is done.
+fn inner_query(sql: &str, who: &str) -> Result<Output> {
+    let Some(ctx) = STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.clone())) else {
+        return err(UNSUPPORTED, format!("{who}() needs a session"));
+    };
+    let Some(db) = ctx.core.db() else { return err(UNSUPPORTED, format!("{who}() needs a running database")) };
+    let (zone, world, path, home) =
+        (time::zone_state(), catalog::world_state(), PATH.with_borrow(Clone::clone), SESSION.with_borrow(Clone::clone));
+    let ran = run(&db, &ctx.world, sql, &[]);
+    time::restore_zone(zone);
+    catalog::restore_world(world);
+    PATH.set(path);
+    SESSION.set(home);
+    ran?.pop().filter(|o| o.columns.is_some()).ok_or_else(|| SqlError {
+        code: "42601",
+        message: format!("{who}() was given a statement that returns no rows"),
+        info: None,
+    })
 }
 
 /// Runs merge check `query` on world `world` in a session of its own, within `timeout` ms, and
@@ -33381,10 +34106,100 @@ pub(crate) fn note_start() {
     time::started();
 }
 
+/// The next transaction number to give out (see `next_txid`).
+static NEXT_TXID: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1000);
+
 /// The next number txid_current() gives (a transaction's, or a statement's outside one).
 fn next_txid() -> i64 {
-    static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1000);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    NEXT_TXID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A transaction's state, as pg_xact_status and the snapshot functions read it (Postgres's clog and proc array).
+#[derive(Clone, Copy, PartialEq)]
+enum XactState {
+    /// begun, not ended; `true` once it asked for its number (Postgres assigns one only then, or at a write)
+    Running(bool),
+    Committed,
+    Aborted,
+}
+
+/// The transactions begun with BEGIN, by number, and how they stand. A number not here that was given out is a
+/// statement's of its own, committed (or the oldest ones, let go of past `XACTS_KEPT`).
+static XACTS: Mutex<std::collections::BTreeMap<i64, XactState>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// How many ended transactions `XACTS` keeps.
+const XACTS_KEPT: usize = 100_000;
+
+/// Notes how transaction `txid` stands now.
+fn xact_state(txid: i64, state: XactState) {
+    let mut all = XACTS.lock().unwrap_or_else(|p| p.into_inner());
+    all.insert(txid, state);
+    while all.len() > XACTS_KEPT {
+        let Some(oldest) = all.iter().find(|(_, s)| !matches!(s, XactState::Running(_))).map(|(k, _)| *k) else {
+            break;
+        };
+        all.remove(&oldest);
+    }
+}
+
+/// pg_xact_status (txid_status): `committed`, `aborted` or `in progress`; NULL for a number older than any
+/// transaction (but 1 and 2, the bootstrap and frozen ones, always committed); 22023 for one not given out yet.
+fn xact_status(txid: i64) -> Result<Value> {
+    if txid >= NEXT_TXID.load(std::sync::atomic::Ordering::Relaxed) {
+        return err("22023", format!("transaction ID {txid} is in the future"));
+    }
+    if txid == 1 || txid == 2 {
+        return Ok(Value::Text("committed".into()));
+    }
+    if txid < 1000 {
+        return Ok(Value::Null);
+    }
+    Ok(Value::Text(
+        match XACTS.lock().unwrap_or_else(|p| p.into_inner()).get(&txid) {
+            Some(XactState::Running(_)) => "in progress",
+            Some(XactState::Aborted) => "aborted",
+            _ => "committed",
+        }
+        .into(),
+    ))
+}
+
+/// pg_current_snapshot (txid_current_snapshot): the transactions running now (`xip`, this one, `own`, among them),
+/// the oldest of them (`xmin`) and the next number to be given out (`xmax`).
+fn current_snapshot(own: i64) -> String {
+    let xmax = NEXT_TXID.load(std::sync::atomic::Ordering::Relaxed);
+    let mut running: Vec<i64> = XACTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(k, s)| matches!(s, XactState::Running(_)) && **k < xmax)
+        .map(|(k, _)| *k)
+        .collect();
+    // (the statement's own, outside a transaction, runs too)
+    if !running.contains(&own) {
+        running.push(own);
+        running.sort_unstable();
+    }
+    let xmin = running.first().copied().unwrap_or(xmax);
+    let xip: Vec<String> = running.iter().map(i64::to_string).collect();
+    format!("{xmin}:{xmax}:{}", xip.join(","))
+}
+
+/// pg_current_xact_id (txid_current): the transaction's number, which it now has as Postgres would assign it; with
+/// `if_assigned`, only if it has one already (else NULL).
+fn current_xact_id(txid: i64, in_tx: bool, if_assigned: bool) -> Option<i64> {
+    if !in_tx {
+        return (!if_assigned).then_some(txid);
+    }
+    let mut all = XACTS.lock().unwrap_or_else(|p| p.into_inner());
+    match all.get_mut(&txid) {
+        Some(XactState::Running(assigned)) if if_assigned => assigned.then_some(txid),
+        Some(XactState::Running(assigned)) => {
+            *assigned = true;
+            Some(txid)
+        }
+        _ => (!if_assigned).then_some(txid),
+    }
 }
 
 /// Postgres's settings that SHOW and current_setting() report, with Chronos's values: (name as
@@ -34721,7 +35536,7 @@ impl Session {
     pub fn use_zone(&self) {
         time::set_zone(self.zone.as_ref());
         // (one look at the settings, under one lock: the transaction's SET LOCALs, else the session's)
-        let (interval, digits, date_style, escape) = {
+        let (interval, digits, date_style, escape, ts_config) = {
             let st = self.state.lock().unwrap();
             let get = |name: &str| st.local.get(name).or_else(|| st.settings.get(name));
             (
@@ -34729,8 +35544,10 @@ impl Session {
                 get("extra_float_digits").and_then(|v| v.parse::<i32>().ok()),
                 get("datestyle").map(|v| v.to_lowercase()),
                 get("bytea_output").is_some_and(|v| v.eq_ignore_ascii_case("escape")),
+                get("default_text_search_config").cloned(),
             )
         };
+        tsearch::set_default_config(ts_config.as_deref());
         time::set_interval_style(interval.unwrap_or_default());
         FLOAT_DIGITS.with(|d| d.set(digits.unwrap_or(1)));
         let words: Vec<&str> =
@@ -34742,6 +35559,7 @@ impl Session {
 
     pub fn close(&mut self, db: &Db) {
         if let Some(mut t) = self.tx.take() {
+            xact_state(t.txid, XactState::Aborted);
             self.cursors.retain(|_, c| !c.tx); // its cursors close, WITH HOLD ones too
             let snap = t.snaps.first().cloned();
             t.drop_saves(db, 0);
@@ -36381,10 +37199,12 @@ impl Session {
                         d.fork(crate::MAIN, "tx")?;
                     }
                     let snaps = vec![self.set_snap()];
+                    let txid = next_txid();
+                    xact_state(txid, XactState::Running(false));
                     self.tx = Some(Tx {
                         branch,
                         started: time::real_now(),
-                        txid: next_txid(),
+                        txid,
                         failed: false,
                         saves: vec![],
                         temps: vec![],
@@ -36464,6 +37284,7 @@ impl Session {
             Stmt::Commit if self.tx.as_ref().is_some_and(|t| t.imported && !t.failed) => {
                 // it wrote nothing of its own, only what made it read the snapshot: dropped, not merged
                 let mut t = self.tx.take().unwrap();
+                xact_state(t.txid, XactState::Committed);
                 db.core.release_intents(self.id);
                 t.drop_saves(db, 0);
                 let _ = db.discard(&t.branch);
@@ -36478,6 +37299,7 @@ impl Session {
                     tag("COMMIT")
                 }
                 Some(mut t) if t.failed => {
+                    xact_state(t.txid, XactState::Aborted);
                     db.core.release_intents(self.id);
                     self.cursors.retain(|_, c| !c.tx); // (it rolls back: its cursors close, WITH HOLD ones too)
                     let snap = t.snaps.first().cloned();
@@ -36517,6 +37339,7 @@ impl Session {
                             Ok(db.merge_with(&t.branch, &crate::MergeOptions { picks, ..Default::default() })?)
                         });
                     self.temp_end(&mut t, done.is_ok());
+                    xact_state(t.txid, if done.is_ok() { XactState::Committed } else { XactState::Aborted });
                     // (committed or not, its rows are free: what it wrote is in the world now, or gone)
                     db.core.release_intents(self.id);
                     let (restarts, fresh) = {
@@ -37376,7 +38199,7 @@ fn changing_tag(s: &Stmt) -> Option<String> {
         Stmt::DropIndex { .. } => "DROP INDEX".into(),
         Stmt::CreateSequence { .. } => "CREATE SEQUENCE".into(),
         Stmt::AlterSequence { .. } => "ALTER SEQUENCE".into(),
-        Stmt::CreateType { .. } => "CREATE TYPE".into(),
+        Stmt::CreateType { .. } | Stmt::CreateBaseType { .. } => "CREATE TYPE".into(),
         Stmt::DropType { .. } => "DROP TYPE".into(),
         Stmt::CreateDomain { .. } => "CREATE DOMAIN".into(),
         Stmt::CreateSchema { .. } => "CREATE SCHEMA".into(),
@@ -39525,6 +40348,36 @@ impl Statement {
                 })?;
                 Ok(Output::tag("CREATE TYPE"))
             }
+            Stmt::CreateBaseType { name, input, output, like } => {
+                db.batch_with(branch, |v| {
+                    need_schema(v, name)?;
+                    // (a shell type, `CREATE TYPE name`, is filled in; another type of the name is there already)
+                    match v.get(&type_key(name))? {
+                        Some(r)
+                            if serde_json::from_str::<Json>(&r)
+                                .is_ok_and(|j| j["composite"] == serde_json::json!([])) => {}
+                        Some(_) => return err("42710", format!("type \"{name}\" already exists")),
+                        None => no_relation_named(v, name)?,
+                    }
+                    // the type whose input and output functions these run, LANGUAGE internal (`int4in`, `int4out`)
+                    let repr = base_representation(v, input, "in")?;
+                    if base_representation(v, output, "out")? != repr {
+                        return err(
+                            UNSUPPORTED,
+                            "a base type's input and output functions must be one built-in type's here",
+                        );
+                    }
+                    userdefs::forget_composite(name);
+                    userdefs::register_base(name, repr);
+                    let row = serde_json::json!({ "base": {
+                        "repr": repr.name(), "input": input, "output": output, "like": like,
+                    } });
+                    Ok((vec![(type_key(name), Some(row.to_string()))], ()))
+                })?;
+                // (the functions made over its shell were parsed with the shell's type: read again, they take it)
+                functions::forget_parsed();
+                Ok(Output::tag("CREATE TYPE"))
+            }
             Stmt::CreateDomain { name, base, not_null, default, checks, names } => {
                 if Type::from_name(name).is_some() {
                     return err("42710", format!("type \"{name}\" already exists"));
@@ -40419,6 +41272,10 @@ fn ctx_call(f: CtxFn, a: &[Value]) -> Result<Value> {
             return Ok(if a[0] == Null { Null } else { Int(advisory::hashtext(&a[0].to_text()) as i64) });
         }
         CtxFn::GetExpr => return Ok(a[0].clone()),
+        CtxFn::SplitWalfile => return split_walfile_name(&a[0]),
+        CtxFn::TsRewrite if a.contains(&Null) => return Ok(Null),
+        CtxFn::TsRewrite if a.len() == 3 => return funcs::call(funcs::Scalar::TsRewrite, a),
+        CtxFn::TsRewrite => return ts_rewrite_rows(a),
         // bound to its answer where the type is known (see `Binder::go`)
         CtxFn::TypeOf => return Ok(a[0].ty().map_or(Value::Reg(705, self::Reg::Type), catalog::regtype_of)),
         _ => {}
@@ -41653,7 +42510,7 @@ fn seq_default(e: &Expr) -> Option<String> {
 /// default out afresh for each row. Chronos does too for the ones `Auto` and `seq_default`
 /// stand for; it keeps any other default as one value, worked out when the default is set.
 fn per_row(e: &Expr) -> bool {
-    use funcs::Scalar::{Age, Random, SetSeed};
+    use funcs::Scalar::{Age, Random, RandomNormal, SetSeed};
     let mut found = false;
     walk(e, &mut |x| {
         found |= match x {
@@ -41663,7 +42520,7 @@ fn per_row(e: &Expr) -> bool {
                 | Func::StatementTs
                 | Func::ClockTs
                 | Func::CurrentDate
-                | Func::Scalar(Random | SetSeed),
+                | Func::Scalar(Random | RandomNormal | SetSeed),
                 _,
             ) => true,
             Expr::Func(Func::Scalar(Age), args) => args.len() == 1, // age(x): from today
@@ -41691,11 +42548,11 @@ fn per_row(e: &Expr) -> bool {
 /// sequence, the wall clock, a function of the user's), where the transaction's clock and today's
 /// date give them all the same.
 fn each_row_differs(e: &Expr) -> bool {
-    use funcs::Scalar::{Random, SetSeed};
+    use funcs::Scalar::{Random, RandomNormal, SetSeed};
     let mut found = false;
     walk(e, &mut |x| {
         found |= match x {
-            Expr::Func(Func::GenRandomUuid | Func::ClockTs | Func::Scalar(Random | SetSeed), _) => true,
+            Expr::Func(Func::GenRandomUuid | Func::ClockTs | Func::Scalar(Random | RandomNormal | SetSeed), _) => true,
             Expr::Func(Func::Scalar(f), _) => pgcrypto::volatile(*f),
             Expr::Func(Func::Ctx(f), _) => {
                 matches!(f, CtxFn::NextVal | CtxFn::CurrVal | CtxFn::SetVal | CtxFn::LastVal | CtxFn::Notify)
@@ -43230,8 +44087,10 @@ fn not_updatable(q: &Select) -> Option<&'static str> {
         "Views that return aggregate functions are not automatically updatable."
     } else if exprs.iter().any(|e| has_window(e)) {
         "Views that return window functions are not automatically updatable."
-    } else if srcs.iter().any(|s| s.srf.is_some() && matches!(s.alias.as_str(), "?srf" | "?gs")) {
-        // (set-returning functions in the select list: a LATERAL function the parser made of them, see `select_srfs`)
+    } else if srcs.iter().any(|s| s.srf.is_some() && (s.alias.starts_with("?srf") || s.alias.starts_with("?pre")))
+        || srcs.iter().any(|s| s.alias == SRF_INNER)
+    {
+        // (set-returning functions in the select list: LATERAL functions the parser made of them, see `project_srfs`)
         "Views that return set-returning functions are not automatically updatable."
     } else if !q.joins.is_empty()
         || !q.from.as_ref().is_some_and(|s| s.sub.is_none() && s.srf.is_none() && s.at.is_none())
@@ -47828,6 +48687,28 @@ impl Exec<'_> {
         if !is_srf(name) {
             return self.call_srf(name, written, cols, a.to_vec()); // made with CREATE FUNCTION
         }
+        if name == "ts_stat" {
+            return ts_stat_rows(a);
+        }
+        // unnest of a multirange: its ranges (its text isn't an array's); of a tsvector, its lexemes
+        if (name == "unnest" || name == UNNEST_ROW)
+            && let [arg] = written
+        {
+            match Binder::plain(cols, Some(v)).bind(arg).and_then(|e| ty_in(&e, cols, &[], &[])) {
+                Ok(Type::Multirange(m)) => return range::unnest_multi(&a[0], m),
+                Ok(Type::TsVector) if name == UNNEST_ROW => {
+                    return Ok(unnest_tsvector(&a[0])?
+                        .into_iter()
+                        .map(|r| vec![Value::Text(composite_text(&r))])
+                        .collect());
+                }
+                Ok(Type::TsVector) => return unnest_tsvector(&a[0]),
+                _ => {}
+            }
+        }
+        if name == UNNEST_ROW {
+            return self.srf(v, "unnest", written, cols, a);
+        }
         if name.contains("_populate_record") {
             let fields = Binder::plain(cols, Some(v))
                 .bind(&written[0])
@@ -48492,7 +49373,13 @@ impl Exec<'_> {
             let unkept = |t: Type| {
                 matches!(
                     t,
-                    Type::Enum(_) | Type::Money | Type::TimeTz | Type::Ltree | Type::Range(_) | Type::Multirange(_)
+                    Type::Enum(_)
+                        | Type::Money
+                        | Type::TimeTz
+                        | Type::Ltree
+                        | Type::PgLsn
+                        | Type::Range(_)
+                        | Type::Multirange(_)
                 )
             };
             let Some(c) = t.cols.iter().find(|c| c.name == *n && !unkept(c.ty)) else { break };
@@ -51152,7 +52039,19 @@ impl Exec<'_> {
         // rows') go straight to a sorter, which spills past CHRONOS_WORK_MEM, instead of the table's
         // rows being read into memory first
         let order_exprs = p.order.iter().filter_map(|(o, _)| if let Order::Expr(e) = o { Some(e) } else { None });
+        // (an output column ORDER BY names that may differ each time it is worked out, random(): sorted by the
+        // value the row shows, so worked out once, with the row's other columns, below)
+        let once = p.distinct_on.is_empty()
+            && p.order.iter().any(|(o, _)| match o {
+                Order::Out(j) => {
+                    let mut varies = false;
+                    walk(&p.proj[*j].1, &mut |x| varies |= node_varies(x, &|_| true));
+                    varies
+                }
+                Order::Expr(_) => false,
+            });
         let sorted = tables.len() == 1
+            && !once
             && s.distinct_on.is_empty()
             && p.group.is_none()
             && p.wins.is_empty()
@@ -51221,7 +52120,7 @@ impl Exec<'_> {
 
         // a plain query (no GROUP BY or windows): the ORDER BY keys first, then the output only of
         // rows that make the cut; many rows are split across cores
-        if p.group.is_none() && p.wins.is_empty() {
+        if p.group.is_none() && p.wins.is_empty() && !once {
             let order_exprs = p.order.iter().filter_map(|(o, _)| if let Order::Expr(e) = o { Some(e) } else { None });
             let par = rows.len >= PAR_MIN && no_subs(p.proj.iter().map(|(_, e)| e).chain(order_exprs));
             let key = |i: usize, sub: Option<&dyn Runner>| -> Result<Vec<Value>> {
@@ -51912,6 +52811,8 @@ impl Exec<'_> {
             Func(Arc<functions::Function>),
             /// a typed table (`CREATE TABLE ... OF type`)
             Table(String),
+            /// a cast made from or to a base type (its from and to types)
+            Cast(Type, Type),
         }
         /// What goes with type `n` (into `out`, each with the type it is made of, after what goes with it): the types
         /// made over it, then its columns, then the functions using it. `seen`: the types found already.
@@ -51941,6 +52842,19 @@ impl Exec<'_> {
                 for c in t.cols.iter().filter(uses) {
                     out.push((Gone::Column(t, c.name.clone()), n.to_string()));
                 }
+            }
+            // a base type's functions and casts are said in the order they were made (its I/O functions first, as the
+            // type needs them; said backwards, so put here backwards)
+            if let Some(t) = userdefs::base_named(n) {
+                for (from, to) in userdefs::casts_of(t).into_iter().rev() {
+                    out.push((Gone::Cast(from, to), n.to_string()));
+                }
+                let mut fs = functions::using_type(v, n)?;
+                fs.sort_by_key(|f| f.oid);
+                for f in fs.into_iter().rev() {
+                    out.push((Gone::Func(f), n.to_string()));
+                }
+                return Ok(());
             }
             for f in functions::using_type(v, n)? {
                 out.push((Gone::Func(f), n.to_string()));
@@ -51976,6 +52890,7 @@ impl Exec<'_> {
                         Gone::Column(t, c) => format!("column {c} of table {}", t.name),
                         Gone::Func(f) => format!("function {}", f.sig()),
                         Gone::Table(t) => format!("table {}", shown_name(t)),
+                        Gone::Cast(from, to) => format!("cast from {} to {}", from.name(), to.name()),
                     };
                     (what, format!("type {}", shown_type(on)))
                 })
@@ -52039,8 +52954,14 @@ impl Exec<'_> {
                     Gone::Column(t, c) => cols.entry(&t.name).or_default().push(Alter::DropColumn(c, false, false)),
                     Gone::Func(f) => writes.push((f.key(), None)),
                     Gone::Table(_) => {}
+                    Gone::Cast(from, to) => {
+                        let k = userdefs::cast_key(from, to);
+                        userdefs::forget(&k);
+                        writes.push((k, None));
+                    }
                 }
             }
+            userdefs::forget_base(n);
             writes.push((type_key(n), None));
             gone.push(n.clone());
         }
@@ -54758,7 +55679,7 @@ impl Exec<'_> {
                         }
                         let e = index_expr(&t, text)?;
                         let mut ok = no_subs([&e]);
-                        walk(&e, &mut |x| ok &= !matches!(x, Expr::Agg(..) | Expr::Window(_) | Expr::Func(Func::Now | Func::StatementTs | Func::ClockTs | Func::CurrentDate | Func::GenRandomUuid | Func::Ctx(_) | Func::Scalar(funcs::Scalar::Random), _)) && !matches!(x, Expr::Func(Func::Scalar(f), _) if pgcrypto::volatile(*f)));
+                        walk(&e, &mut |x| ok &= !matches!(x, Expr::Agg(..) | Expr::Window(_) | Expr::Func(Func::Now | Func::StatementTs | Func::ClockTs | Func::CurrentDate | Func::GenRandomUuid | Func::Ctx(_) | Func::Scalar(funcs::Scalar::Random | funcs::Scalar::RandomNormal), _)) && !matches!(x, Expr::Func(Func::Scalar(f), _) if pgcrypto::volatile(*f)));
                         if !ok {
                             return err("42P17", "an index expression can't use subqueries, aggregates or functions that change (now, random)");
                         }
@@ -56960,6 +57881,10 @@ impl<'a> Binder<'a> {
         if ty_in(&e, self.cols, &[], &self.aggs) == Ok(Type::Tid) {
             return Ok(Expr::Func(Func::Scalar(funcs::Scalar::SortKey), vec![e, Expr::Lit(Value::Int(-4))]));
         }
+        // (an LSN: as the number it is)
+        if ty_in(&e, self.cols, &[], &self.aggs) == Ok(Type::PgLsn) {
+            return Ok(Expr::Func(Func::Scalar(funcs::Scalar::SortKey), vec![e, Expr::Lit(Value::Int(-7))]));
+        }
         // (money, a time with time zone, a range: by more than their text, as a query's ORDER BY sorts them; an enum
         // by its labels' places)
         let kind = match ty_in(&e, self.cols, &[], &self.aggs) {
@@ -57199,10 +58124,21 @@ impl<'a> Binder<'a> {
             }
         }
         for (e, other) in [(a, tb), (b, ta)] {
-            // (and against an hstore, an ltree or an lquery, which are compared by their text too; against a real, as
-            // a real: `f1 = '1004.3'` compares single precision; against a name, as a name, cut to 63 bytes)
-            if let Some(t @ (Type::Uuid | Type::Hstore | Type::Ltree | Type::Lquery | Type::Float4 | Type::Name)) =
-                other
+            // (and against an hstore, an ltree, an lquery, a tsvector or a tsquery, which are compared by their
+            // canonical text too; against a real, as a real: `f1 = '1004.3'` compares single precision; against a name,
+            // as a name, cut to 63 bytes)
+            if let Some(
+                t @ (Type::Uuid
+                | Type::Hstore
+                | Type::Ltree
+                | Type::Lquery
+                | Type::TsVector
+                | Type::TsQuery
+                | Type::Range(_)
+                | Type::Multirange(_)
+                | Type::Float4
+                | Type::Name),
+            ) = other
                 && let Expr::Lit(l @ Value::Text(_)) = e
             {
                 *l = coerce(std::mem::take(l), t)?;
@@ -58233,6 +59169,9 @@ impl<'a> Binder<'a> {
         if let Some(call) = self.tid_rewrite(e, in_agg)? {
             return Ok(Some(call));
         }
+        if let Some(call) = self.lsn_rewrite(e, in_agg)? {
+            return Ok(Some(call));
+        }
         if let Some(call) = self.hstore_rewrite(e, in_agg)? {
             return Ok(Some(call));
         }
@@ -58440,6 +59379,55 @@ impl<'a> Binder<'a> {
             Expr::Col(t, c) => resolve(self.cols, t.as_deref(), c).is_ok_and(|i| self.cols[i].ty == Type::Tid),
             _ => false,
         }
+    }
+
+    /// Whether `e` gives a pg_lsn.
+    fn is_lsn(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Cast(_, Type::PgLsn) | Expr::Func(Func::Scalar(funcs::Scalar::LsnFn(1 | 2)), _) => true,
+            Expr::Col(t, c) => resolve(self.cols, t.as_deref(), c).is_ok_and(|i| self.cols[i].ty == Type::PgLsn),
+            _ => false,
+        }
+    }
+
+    /// pg_lsn's operators: `<`, `<=`, `>` and `>=` by the numbers the LSNs are (their text doesn't sort so), `=` and
+    /// `<>` with the other side read as an LSN, `lsn - lsn` (a numeric), `lsn + numeric`, `numeric + lsn` and
+    /// `lsn - numeric` (an LSN); min and max of the numbers, given back as LSNs.
+    #[inline(never)]
+    fn lsn_rewrite(&mut self, e: &Expr, in_agg: bool) -> Result<Option<Expr>> {
+        use funcs::Scalar::{LsnFn, SortKey};
+        let lsn = |x: &Expr| match x {
+            Expr::Cast(_, Type::PgLsn) => x.clone(),
+            x => Expr::Cast(Box::new(x.clone()), Type::PgLsn),
+        };
+        let key = |x: &Expr| Expr::Func(Func::Scalar(SortKey), vec![lsn(x), Expr::Lit(Value::Int(-7))]);
+        let untyped = |x: &Expr| matches!(x, Expr::Lit(Value::Text(_)) | Expr::Param(_));
+        let rewritten = match e {
+            Expr::Agg(f @ (Agg::Min | Agg::Max), Some(x), d) if self.is_lsn(x) => {
+                let number = Expr::Func(Func::Scalar(LsnFn(3)), vec![(**x).clone()]);
+                Expr::Cast(Box::new(Expr::Agg(*f, Some(Box::new(number)), *d)), Type::PgLsn)
+            }
+            Expr::Bin(a, op @ (Op::Lt | Op::Le | Op::Gt | Op::Ge), b) if self.is_lsn(a) || self.is_lsn(b) => {
+                Expr::Bin(Box::new(key(a)), *op, Box::new(key(b)))
+            }
+            Expr::Bin(a, op @ (Op::Eq | Op::Ne), b)
+                if (self.is_lsn(a) && untyped(b)) || (self.is_lsn(b) && untyped(a)) =>
+            {
+                Expr::Bin(Box::new(lsn(a)), *op, Box::new(lsn(b)))
+            }
+            Expr::Bin(a, Op::Sub, b) if self.is_lsn(a) && (self.is_lsn(b) || untyped(b)) => {
+                Expr::Func(Func::Scalar(LsnFn(0)), vec![(**a).clone(), lsn(b)])
+            }
+            Expr::Bin(a, op @ (Op::Add | Op::Sub), b) if self.is_lsn(a) => Expr::Func(
+                Func::Scalar(LsnFn(if matches!(op, Op::Add) { 1 } else { 2 })),
+                vec![(**a).clone(), (**b).clone()],
+            ),
+            Expr::Bin(a, Op::Add, b) if self.is_lsn(b) => {
+                Expr::Func(Func::Scalar(LsnFn(1)), vec![(**b).clone(), (**a).clone()])
+            }
+            _ => return Ok(None),
+        };
+        self.go(&rewritten, in_agg).map(Some)
     }
 
     /// Tids compared: `<`, `<=`, `>` and `>=` by page, then item (see `tid_key`), not as their text; `=`, `<>` and
@@ -59658,6 +60646,42 @@ impl<'a> Binder<'a> {
                 });
                 Expr::Func(Func::Enum(*f, i.unwrap_or(NO_ENUM)), args)
             }
+            // a SQL/JSON value written FORMAT JSON: json and jsonb as they are, a string or bytea (its UTF8) read as
+            // json, anything else refused, as transformJsonValueExpr has it
+            Expr::Func(Func::Scalar(funcs::Scalar::JsonFormatted), args) if args.len() == 4 => {
+                let v = self.go(&args[0], in_agg)?;
+                let place = |a: &Expr| match a {
+                    Expr::Lit(Value::Int(n)) if *n > 0 => Some(*n as u32),
+                    _ => None,
+                };
+                let refused = |message: &str, at: Option<u32>| SqlError {
+                    code: WRONG_TYPE,
+                    message: message.into(),
+                    info: Some(Box::new(Violation { position: at, ..Violation::default() })),
+                };
+                let ty = ty_in(&v, self.cols, self.params, &self.aggs).ok();
+                let encoded = matches!(args[1], Expr::Lit(Value::Bool(true)));
+                if encoded && ty != Some(Type::Bytea) {
+                    return Err(refused("JSON ENCODING clause is only allowed for bytea input type", place(&args[3])));
+                }
+                match ty {
+                    Some(Type::Json | Type::JsonText) => v,
+                    Some(Type::Bytea) => {
+                        let text = Expr::Func(
+                            Func::Scalar(funcs::Scalar::ConvertFrom),
+                            vec![v, Expr::Lit(Value::Text("UTF8".into()))],
+                        );
+                        Expr::Cast(Box::new(text), Type::JsonText)
+                    }
+                    None | Some(Type::Text | Type::Name) => Expr::Cast(Box::new(v), Type::JsonText),
+                    Some(_) => {
+                        return Err(refused(
+                            "cannot use non-string types with explicit FORMAT JSON clause",
+                            place(&args[3]).or(place(&args[2])),
+                        ));
+                    }
+                }
+            }
             // json's functions that write their arguments as JSON: each as its type writes it
             Expr::Func(Func::Scalar(f @ (funcs::Scalar::JsonFn(_) | funcs::Scalar::JsonCtor)), args)
                 if match f {
@@ -59965,6 +60989,21 @@ impl<'a> Binder<'a> {
                 };
                 keys.arrays = matches!(ty_in(value, self.cols, self.params, &self.aggs), Ok(Type::Array(_)));
             }
+            // range_agg and range_intersect_agg: of the type of their values, a range's or a multirange's
+            if let (Agg::List(ListAgg::Range(intersect, oid), _), Some(a)) = (&mut f, arg.as_deref()) {
+                let value = match a {
+                    Expr::Func(Func::Row, args) if !args.is_empty() => &args[0],
+                    other => other,
+                };
+                match ty_in(value, self.cols, self.params, &self.aggs) {
+                    Ok(Type::Range(o) | Type::Multirange(o)) => *oid = o,
+                    Ok(t) => {
+                        let name = if *intersect { "range_intersect_agg" } else { "range_agg" };
+                        return err(NO_FUNCTION, format!("function {name}({}) does not exist", t.pg_name()));
+                    }
+                    Err(_) => {}
+                }
+            }
             // sum(real) adds in 32 bits (float4pl): its argument marked, so that the total is rounded as it grows
             if matches!(f, Agg::Sum)
                 && let Some(a) = arg.as_deref_mut()
@@ -60147,6 +61186,21 @@ impl<'a> Binder<'a> {
                 self.char_pads(std::slice::from_mut(&mut *a));
             }
             let [from] = self.operand_types(&[&a])[..] else { unreachable!() };
+            // a cast WITHOUT FUNCTION between a base type and another (`xfloat4 AS real`): the value's bits read as
+            // the other's, where their representations differ
+            if let Ok(ft) = ty_in(&a, self.cols, &[], &self.aggs)
+                && (matches!(ft, Type::Base(_)) || matches!(*t, Type::Base(_)))
+                && let Some(c) = userdefs::cast(ft, *t).filter(|c| c.func.is_none() && c.binary)
+            {
+                let repr = |t: Type| if let Type::Base(i) = t { userdefs::base_repr(i) } else { t };
+                let (fr, tr) = (repr(c.from), repr(c.to));
+                if fr == tr {
+                    return Ok(Expr::Cast(a, *t));
+                }
+                let oid = |t: Type| Expr::Lit(Value::Int(i64::from(t.oid())));
+                let bits = Expr::Func(Func::Scalar(funcs::Scalar::BinaryCast), vec![*a, oid(fr), oid(tr)]);
+                return Ok(Expr::Cast(Box::new(bits), *t));
+            }
             if let Some(Some(f)) =
                 ty_in(&a, self.cols, &[], &self.aggs).ok().and_then(|ft| userdefs::cast(ft, *t)).map(|c| c.func)
             {
@@ -60397,6 +61451,21 @@ impl<'a> Binder<'a> {
                         ..Violation::default()
                     })),
                 });
+            }
+            // to_char of a real: its digits as float4_to_char has them (FLT_DIG, 6, not a double's 15), told by a
+            // third argument
+            if let (Func::Scalar(funcs::Scalar::ToChar), [a, _]) = (f, &args[..])
+                && let Ok(Type::Float4) = ty_in(a, self.cols, self.params, &self.aggs)
+            {
+                args.push(Expr::Lit(Value::Int(6)));
+                return Ok(Expr::Func(*f, args));
+            }
+            // length of a tsvector: how many lexemes it holds (Postgres's tsvector_length)
+            if let (Func::Length, [a]) = (f, &args[..])
+                && let Ok(Type::TsVector) = ty_in(a, self.cols, self.params, &self.aggs)
+            {
+                let lexemes = Expr::Func(Func::Scalar(funcs::Scalar::TsvectorToArray), vec![a.clone()]);
+                return Ok(Expr::Func(Func::Scalar(funcs::Scalar::Cardinality), vec![lexemes]));
             }
             // width_bucket(operand, thresholds): the thresholds are of the operand's type (numbers of any kind
             // compare), else Postgres has no such function
@@ -61277,6 +62346,7 @@ impl Plan {
                         | Type::TimeTz
                         | Type::Ltree
                         | Type::Tid
+                        | Type::PgLsn
                         | Type::Range(_)
                         | Type::Multirange(_)),
                     ) => {
@@ -61285,6 +62355,7 @@ impl Plan {
                             Type::TimeTz => -2,
                             Type::Ltree => -3,
                             Type::Tid => -4,
+                            Type::PgLsn => -7,
                             Type::Range(o) | Type::Multirange(o) => i64::from(o),
                             _ => 0,
                         };
@@ -62951,6 +64022,13 @@ impl Acc {
                     return Ok(());
                 }
                 ListAgg::Text if vals[0] == Value::Null => return Ok(()), // string_agg skips nulls
+                // json_agg_strict: a null is left out, but the row counts (its result is `[]`, not null)
+                ListAgg::Json | ListAgg::JsonText(_) if keys.object & 2 != 0 => {
+                    self.n += 1;
+                    if vals[0] == Value::Null {
+                        return Ok(());
+                    }
+                }
                 ListAgg::Object if vals[0] == Value::Null => return err("22023", "field name must not be null"),
                 ListAgg::ObjectText if vals[0] == Value::Null => {
                     return err("22004", "null value not allowed for object key");
@@ -62959,7 +64037,7 @@ impl Acc {
                     return Ok(()); // nulls aren't in the distribution
                 }
                 // a row with a null in any argument is left out
-                ListAgg::Stat(_) if vals.contains(&Value::Null) => return Ok(()),
+                ListAgg::Stat(_) | ListAgg::Range(..) if vals.contains(&Value::Null) => return Ok(()),
                 _ => {}
             }
             if *distinct {
@@ -63303,9 +64381,13 @@ impl Acc {
                     return userdefs::fold_rows(*i, rows.into_iter().map(|(_, vals)| vals), &env);
                 }
                 if self.items.is_empty() {
-                    // (regr_count of no rows is 0; the others are null)
+                    // (regr_count of no rows is 0; the others are null; json_agg_strict of rows all null `[]`)
                     return Ok(if matches!(kind, ListAgg::Stat(stats::Stat::RegrCount)) {
                         Value::Int(0)
+                    } else if keys.object & 2 != 0 && self.n > 0 && *kind == ListAgg::Json {
+                        Value::Json(Json::Array(vec![]))
+                    } else if keys.object & 2 != 0 && self.n > 0 && matches!(kind, ListAgg::JsonText(_)) {
+                        Value::JsonText("[]".into())
                     } else {
                         Value::Null
                     });
@@ -63329,6 +64411,20 @@ impl Acc {
                     ListAgg::Stat(st) => {
                         let rows: Vec<&Vec<Value>> = items.iter().map(|(_, v)| v).collect();
                         stats::finish(*st, &rows)?
+                    }
+                    // the union of ranges or multiranges: the multirange of them all (normalized as it is made)
+                    ListAgg::Range(false, o) => {
+                        let values: Vec<Value> = items.iter().map(|(_, v)| v[0].clone()).collect();
+                        funcs::call(funcs::Scalar::MultiNew(range::of_multi(*o).unwrap_or(*o)), &values)?
+                    }
+                    // the intersection: `*` of each value with what came before
+                    ListAgg::Range(true, o) => {
+                        let mut it = items.iter().map(|(_, v)| v[0].clone());
+                        let first = it.next().unwrap_or(Value::Null);
+                        it.try_fold(first, |acc, v| {
+                            let sym = Value::Text("*".into());
+                            funcs::call(funcs::Scalar::RangeSetOp, &[acc, v, sym, Value::Int(i64::from(*o))])
+                        })?
                     }
                     // bytea: the bytes, one after another, with the separators between
                     ListAgg::Text if items.iter().any(|(_, v)| matches!(v[0], Value::Bytea(_))) => {

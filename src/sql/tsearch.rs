@@ -62,6 +62,28 @@ pub enum Config {
     User(u16),
 }
 
+thread_local! {
+    /// The running session's default_text_search_config: what to_tsvector and its kin use when given no
+    /// configuration (english, unless the session SET it to simple).
+    static DEFAULT: std::cell::Cell<Config> = const { std::cell::Cell::new(Config::English) };
+}
+
+/// Takes the session's default_text_search_config (see `DEFAULT`); None: not set, english.
+pub fn set_default_config(name: Option<&str>) {
+    let simple = name.is_some_and(|n| n.trim_start_matches("pg_catalog.").eq_ignore_ascii_case("simple"));
+    DEFAULT.set(if simple { Config::Simple } else { Config::English });
+}
+
+/// Takes another thread's default configuration (a helper thread of a statement takes its session's).
+pub fn set_default(cfg: Config) {
+    DEFAULT.set(cfg);
+}
+
+/// The configuration a text search function uses when given none.
+pub fn default_config() -> Config {
+    DEFAULT.get()
+}
+
 pub fn config(name: &str) -> Result<Config, String> {
     let n = name.trim().to_ascii_lowercase();
     let n = n.trim_start_matches("pg_catalog.").trim_start_matches("public.");
@@ -1305,7 +1327,11 @@ type Operand<'a> = &'a dyn Fn(&str, bool, u8) -> Result<Option<Query>, String>;
 
 /// Parses tsquery syntax; `operand` turns each operand into its query (normalized or not).
 fn parse_query(s: &str, operand: Operand) -> Result<Option<Query>, String> {
-    let toks = lex_query(s)?;
+    parse_tokens(s, lex_query(s)?, operand)
+}
+
+/// Parses tokens of tsquery syntax (see `parse_query`); `s` is the text they came from, for errors.
+fn parse_tokens(s: &str, toks: Vec<Tok>, operand: Operand) -> Result<Option<Query>, String> {
     let bad = || format!("syntax error in tsquery: \"{s}\"");
     if toks.is_empty() {
         return Err(bad());
@@ -1498,62 +1524,326 @@ pub fn phraseto_tsquery(cfg: Config, s: &str) -> Result<Option<Query>, String> {
     phrase(lexemes(cfg, s), false, 0)
 }
 
-/// websearch_to_tsquery: words joined by &, "quoted phrases", `or`, and -word for not.
-pub fn websearch_to_tsquery(cfg: Config, s: &str) -> Result<Option<Query>, String> {
-    enum Item {
-        Q(Query),
-        Or,
-    }
+/// websearch_to_tsquery: Postgres's gettoken_query_websearch. Words (read as the tsvector parser
+/// reads them in web mode: an operator character or `:` ends one, quotes and backslashes are plain)
+/// are joined by an implied &, `"quoted text"` is one operand, `-` before an operand is not, and
+/// `or` between operands is |; other operator characters are skipped. Each operand's lexemes make a
+/// phrase, as pushval_morph joins them with OP_PHRASE. The bool: the query lost operands that were
+/// only stop words and came out empty, which Postgres's cleanup_tsquery_stopwords says in a notice.
+pub fn websearch_to_tsquery(cfg: Config, s: &str) -> Result<(Option<Query>, bool), String> {
+    let is_operator = |c: char| matches!(c, '!' | '&' | '|' | '(' | ')' | '<');
     let c: Vec<char> = s.chars().collect();
-    let (mut items, mut i) = (vec![], 0);
-    while i < c.len() {
-        if c[i].is_whitespace() || (!c[i].is_alphanumeric() && c[i] != '"' && c[i] != '-') {
-            i += 1;
-            continue;
-        }
-        let neg = c[i] == '-';
-        if neg {
-            i += 1;
-        }
-        let q = if c.get(i) == Some(&'"') {
-            let end = c[i + 1..].iter().position(|&x| x == '"').map_or(c.len(), |e| i + 1 + e);
-            let text: String = c[i + 1..end].iter().collect();
-            i = end + 1;
-            phrase(lexemes(cfg, &text), false, 0)?
-        } else {
-            let from = i;
-            while i < c.len() && !c[i].is_whitespace() && c[i] != '"' {
-                i += 1;
+    // parse_or_operator: `or` not part of a word, with some operand after it
+    let or_at = |i: usize| {
+        let word = c.get(i).is_some_and(|x| x.eq_ignore_ascii_case(&'o'))
+            && c.get(i + 1).is_some_and(|x| x.eq_ignore_ascii_case(&'r'));
+        match c.get(i + 2) {
+            Some(&x) if word && x != '-' && x != '_' && !x.is_alphanumeric() => {
+                c[i + 3..].iter().any(|x| !x.is_whitespace())
             }
-            let word: String = c[from..i].iter().collect();
-            if !neg && word.eq_ignore_ascii_case("or") {
-                items.push(Item::Or);
-                continue;
-            }
-            phrase(lexemes(cfg, &word), false, 0)?
-        };
-        if let Some(q) = q {
-            items.push(Item::Q(if neg { Query::Not(Box::new(q)) } else { q }));
+            _ => false,
         }
-    }
-    // & binds tighter than or; an or with nothing on one side is dropped
-    let mut ors: Vec<Query> = vec![];
-    let mut and: Vec<Query> = vec![];
-    let mut pending_or = false;
-    for it in items {
-        match it {
-            Item::Or => pending_or = !and.is_empty(),
-            Item::Q(q) => {
-                if pending_or {
-                    ors.extend(chain(std::mem::take(&mut and), Query::And));
-                    pending_or = false;
+    };
+    let (mut toks, mut i) = (vec![], 0);
+    // (waiting for an operand, and whether none came yet; else waiting for an operator)
+    let (mut want_operand, mut first) = (true, true);
+    loop {
+        if want_operand {
+            match c.get(i) {
+                Some('-') => {
+                    toks.push(Tok::Not);
+                    first = false;
+                    i += 1;
                 }
-                and.push(q);
+                Some('"') => {
+                    let end = c[i + 1..].iter().position(|&x| x == '"').map_or(c.len(), |e| i + 1 + e);
+                    toks.push(Tok::Val(c[i + 1..end].iter().collect(), false, 0));
+                    i = (end + 1).min(c.len());
+                    want_operand = false;
+                }
+                Some(&x) if is_operator(x) => {
+                    first = false;
+                    i += 1;
+                }
+                Some(x) if x.is_whitespace() => i += 1,
+                Some(_) => {
+                    // the tsvector parser's word: its first character whatever it is, then up to a
+                    // space, an operator character, a quote or a colon
+                    let from = i;
+                    i += 1;
+                    while let Some(&x) = c.get(i) {
+                        if x.is_whitespace() || is_operator(x) || x == '"' || x == ':' {
+                            break;
+                        }
+                        i += 1;
+                    }
+                    toks.push(Tok::Val(c[from..i].iter().collect(), false, 0));
+                    want_operand = false;
+                }
+                // the end where an operand should be: a stop word's place, so the operator before it
+                // has its operand (nothing at all, when no operand ever came)
+                None if first => break,
+                None => {
+                    toks.push(Tok::Val(String::new(), false, 0));
+                    break;
+                }
+            }
+        } else {
+            match c.get(i) {
+                None => break,
+                Some(_) if or_at(i) => {
+                    toks.push(Tok::Or);
+                    want_operand = true;
+                    i += 2;
+                }
+                Some(&x) if is_operator(x) || x.is_whitespace() => i += 1,
+                Some(_) => {
+                    toks.push(Tok::And);
+                    want_operand = true;
+                }
+            }
+            first = false;
+        }
+    }
+    if toks.is_empty() {
+        return Ok((None, false));
+    }
+    let stopped = std::cell::Cell::new(false);
+    let q = parse_tokens(s, toks, &|l, _, _| {
+        let q = phrase(lexemes(cfg, l), false, 0)?;
+        if q.is_none() {
+            stopped.set(true);
+        }
+        Ok(q)
+    })?;
+    let empty = q.is_none() && stopped.get();
+    Ok((q, empty))
+}
+
+// ---- ts_rewrite: Postgres's QTNode trees (tsquery_util.c, tsquery_rewrite.c) ----
+
+/// A query as Postgres rewrites it: an operator's operands in a list (flattened, for & and |, and
+/// sorted), each node marked once it is a substitute, which later searches leave alone.
+#[derive(Clone)]
+struct Qtn {
+    /// None: an operand; else the operator, as Postgres numbers it (1 !, 2 &, 3 |, 4 phrase) and its distance
+    op: Option<(u8, u16)>,
+    val: Option<(String, bool, u8)>,
+    /// the operands, in Postgres's item order: the right one first
+    kids: Vec<Qtn>,
+    nochange: bool,
+}
+
+impl Qtn {
+    fn of(q: &Query) -> Qtn {
+        let node = |op, kids| Qtn { op: Some(op), val: None, kids, nochange: false };
+        match q {
+            Query::Val { lex, prefix, weights } => {
+                Qtn { op: None, val: Some((lex.clone(), *prefix, *weights)), kids: vec![], nochange: false }
+            }
+            Query::Not(a) => node((1, 0), vec![Qtn::of(a)]),
+            Query::And(a, b) => node((2, 0), vec![Qtn::of(b), Qtn::of(a)]),
+            Query::Or(a, b) => node((3, 0), vec![Qtn::of(b), Qtn::of(a)]),
+            Query::Phrase(a, b, d) => node((4, *d), vec![Qtn::of(b), Qtn::of(a)]),
+        }
+    }
+
+    /// Back to a query; every operator has one or two operands by now (see `binary`).
+    fn query(self) -> Query {
+        let mut kids = self.kids.into_iter().map(Qtn::query);
+        match self.op {
+            None => {
+                let (lex, prefix, weights) = self.val.unwrap_or_default();
+                Query::Val { lex, prefix, weights }
+            }
+            Some((1, _)) => Query::Not(Box::new(kids.next().expect("an operand"))),
+            Some((op, d)) => {
+                let (right, left) = (Box::new(kids.next().expect("an operand")), Box::new(kids.next().expect("two")));
+                match op {
+                    2 => Query::And(left, right),
+                    3 => Query::Or(left, right),
+                    _ => Query::Phrase(left, right, d),
+                }
             }
         }
     }
-    ors.extend(chain(and, Query::And));
-    Ok(chain(ors, Query::Or))
+
+    /// QTNodeCompare: operators before operands, a higher operator first, more operands first, then the
+    /// operands in turn and a longer distance first; operands by the legacy CRC of their text (higher
+    /// first), then their bytes. Weights and prefixes are not compared.
+    fn compare(a: &Qtn, b: &Qtn) -> std::cmp::Ordering {
+        match (&a.op, &b.op, &a.val, &b.val) {
+            (Some(_), None, ..) => std::cmp::Ordering::Less,
+            (None, Some(_), ..) => std::cmp::Ordering::Greater,
+            (Some((x, xd)), Some((y, yd)), ..) => y
+                .cmp(x)
+                .then_with(|| b.kids.len().cmp(&a.kids.len()))
+                .then_with(|| {
+                    a.kids
+                        .iter()
+                        .zip(&b.kids)
+                        .map(|(p, q)| Qtn::compare(p, q))
+                        .find(|o| o.is_ne())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| if *x == 4 { yd.cmp(xd) } else { std::cmp::Ordering::Equal }),
+            (None, None, Some((x, ..)), Some((y, ..))) => {
+                let crc = |s: &str| super::textext::legacy_crc32(s.as_bytes()) as i32;
+                crc(y).cmp(&crc(x)).then_with(|| x.as_bytes().cmp(y.as_bytes()))
+            }
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+
+    /// QTNTernary: an & under an & (an | under an |) has its operands taken up into its parent's.
+    fn ternary(&mut self) {
+        for k in &mut self.kids {
+            k.ternary();
+        }
+        let Some((op @ (2 | 3), _)) = self.op else { return };
+        let mut flat = Vec::with_capacity(self.kids.len());
+        for k in std::mem::take(&mut self.kids) {
+            if k.op.is_some_and(|(o, _)| o == op) { flat.extend(k.kids) } else { flat.push(k) }
+        }
+        self.kids = flat;
+    }
+
+    /// QTNSort: the operands of every & and | in QTNodeCompare's order.
+    fn sort(&mut self) {
+        for k in &mut self.kids {
+            k.sort();
+        }
+        if self.kids.len() > 1 && self.op.is_some_and(|(o, _)| o != 4) {
+            self.kids.sort_by(Qtn::compare);
+        }
+    }
+
+    /// QTNBinary: an operator of more than two operands made a chain of them, two at a time.
+    fn binary(&mut self) {
+        for k in &mut self.kids {
+            k.binary();
+        }
+        while self.kids.len() > 2 {
+            let last = self.kids.pop().expect("operands");
+            let (k0, k1) = (self.kids.remove(0), self.kids.remove(0));
+            let pair = Qtn { op: self.op, val: None, kids: vec![k0, k1], nochange: false };
+            self.kids.insert(0, last);
+            self.kids.insert(0, pair);
+        }
+    }
+
+    fn sorted(q: &Query) -> Qtn {
+        let mut t = Qtn::of(q);
+        t.ternary();
+        t.sort();
+        t
+    }
+
+    fn clear(&mut self) {
+        self.nochange = false;
+        for k in &mut self.kids {
+            k.clear();
+        }
+    }
+}
+
+/// A copy of the substitute, marked so the search goes no further into it (None: the target goes).
+fn substitute(subs: Option<&Qtn>) -> Option<Qtn> {
+    subs.map(|s| Qtn { nochange: true, ..s.clone() })
+}
+
+/// findeq: `node` itself the target (or, for & and |, holding all the target's operands among its own).
+fn find_at(mut node: Qtn, ex: &Qtn, subs: Option<&Qtn>, found: &mut bool) -> Option<Qtn> {
+    if node.nochange || node.op.is_some() != ex.op.is_some() {
+        return Some(node);
+    }
+    match (node.op, ex.op) {
+        (Some((a, _)), Some((b, _))) if a != b => Some(node),
+        (Some(_), Some(_)) if node.kids.len() == ex.kids.len() => {
+            if Qtn::compare(&node, ex).is_eq() {
+                *found = true;
+                return substitute(subs);
+            }
+            Some(node)
+        }
+        (Some(_), Some(_)) if node.kids.len() > ex.kids.len() && !ex.kids.is_empty() => {
+            // both sorted: one pass finds whether every operand of the target is among the node's
+            let mut matched = vec![false; node.kids.len()];
+            let (mut i, mut j, mut n) = (0, 0, 0);
+            while i < node.kids.len() && j < ex.kids.len() {
+                match Qtn::compare(&node.kids[i], &ex.kids[j]) {
+                    std::cmp::Ordering::Equal => {
+                        matched[i] = true;
+                        n += 1;
+                        i += 1;
+                        j += 1;
+                    }
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => break,
+                }
+            }
+            if n == ex.kids.len() {
+                let kids = std::mem::take(&mut node.kids);
+                node.kids = kids.into_iter().zip(matched).filter(|(_, m)| !m).map(|(k, _)| k).collect();
+                node.kids.extend(substitute(subs));
+                node.sort();
+                *found = true;
+            }
+            Some(node)
+        }
+        (Some(_), Some(_)) => Some(node),
+        _ if Qtn::compare(&node, ex).is_eq() => {
+            *found = true;
+            substitute(subs)
+        }
+        _ => Some(node),
+    }
+}
+
+/// dofindsubquery: the target replaced at the node, else under it; an operator left with no operand
+/// goes, and one left with one (but a !) is that operand.
+fn find_under(root: Qtn, ex: &Qtn, subs: Option<&Qtn>, found: &mut bool) -> Option<Qtn> {
+    let mut root = find_at(root, ex, subs, found)?;
+    if root.nochange || root.op.is_none() {
+        return Some(root);
+    }
+    let kids = std::mem::take(&mut root.kids);
+    root.kids = kids.into_iter().filter_map(|k| find_under(k, ex, subs, found)).collect();
+    match root.kids.len() {
+        0 => None,
+        1 if root.op.is_some_and(|(o, _)| o != 1) => root.kids.pop(),
+        _ => Some(root),
+    }
+}
+
+/// ts_rewrite(query, target, substitute), and its form over a query's rows: each (target, substitute)
+/// in turn replaces the target wherever the query holds it (Postgres's tsquery_rewrite and
+/// tsquery_rewrite_query: the query is flattened and sorted first, so the result comes out in its
+/// sorted order). `one`: the three-argument form, where an empty target leaves the query as it is;
+/// over rows (whose nulls the caller leaves out), an empty target skips its row.
+pub fn rewrite(q: Option<Query>, rules: &[(Option<Query>, Option<Query>)], one: bool) -> Option<Query> {
+    let q = q?;
+    if one && rules.iter().any(|(t, _)| t.is_none()) {
+        return Some(q);
+    }
+    let mut tree = Some(Qtn::sorted(&q));
+    for (target, subs) in rules {
+        let Some(t) = target else { continue };
+        let Some(at) = tree.take() else { break };
+        let ex = Qtn::sorted(t);
+        let subs = subs.as_ref().map(Qtn::of);
+        let mut found = false;
+        tree = find_under(at, &ex, subs.as_ref(), &mut found);
+        if !one && let Some(t) = &mut tree {
+            t.clear();
+            t.ternary();
+            t.sort();
+        }
+    }
+    tree.map(|mut t| {
+        t.binary();
+        t.query()
+    })
 }
 
 // ---- matching and ranking ----

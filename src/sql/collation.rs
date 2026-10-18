@@ -100,12 +100,35 @@ const FIXED: [(i64, &str, char, Option<&str>, i64); 6] = [
     (13990, "C.UTF-8", 'c', None, 6),
 ];
 
-/// What a libc collation of bytes says it is (`collcollate`, `collctype`).
-pub(super) fn libc_locale(name: &str) -> &str {
+/// What a libc collation says it is (`collcollate`, `collctype`): a locale's (see `LIBC`) its UTF-8 locale, one of
+/// bytes C or POSIX.
+pub(super) fn libc_locale(name: &str) -> String {
     match name {
-        "POSIX" | "C.UTF-8" => name,
-        _ => "C",
+        "POSIX" | "C.UTF-8" => name.into(),
+        n if libc_name(n) => format!("{}.utf8", n.split('.').next().unwrap_or(n)),
+        _ => "C".into(),
     }
+}
+
+/// Where the libc collations' oids begin: those of the locales Chronos takes by their libc names (`en_US`,
+/// `en_US.utf8`), as a Postgres on Linux has one of each locale its system has, both ways (see `libc_rows`). They
+/// sort as the ICU collation of their locale (see `libc_as_icu`).
+const LIBC_OIDS: i64 = 12_000;
+
+/// The libc collations pg_collation lists: for each predefined ICU locale of a language and a region (`en-US`), its
+/// libc names, `en_US.utf8` and `en_US`, as Postgres's initdb imports a system's locales.
+fn libc_rows() -> impl Iterator<Item = (i64, String)> {
+    PREDEFINED
+        .iter()
+        .filter_map(|l| {
+            let name = l.replace('-', "_");
+            (libc_name(&name) && libc_as_icu(&name).is_some()).then_some(name)
+        })
+        .enumerate()
+        .flat_map(|(i, name)| {
+            let at = LIBC_OIDS + 2 * i as i64;
+            [(at, format!("{name}.utf8")), (at + 1, name)]
+        })
 }
 
 /// A built-in collation by its name: its oid and its ICU locale (None: bytes).
@@ -124,7 +147,7 @@ pub(super) fn builtin(name: &str) -> Option<(i64, Option<&'static str>)> {
 /// Every built-in collation, as pg_collation lists them: oid, name, provider, ICU locale, collencoding.
 pub(super) fn builtins() -> impl Iterator<Item = (i64, String, char, Option<&'static str>, i64)> {
     let fixed = FIXED.iter().map(|(o, n, p, l, e)| (*o, n.to_string(), *p, *l, *e));
-    fixed.chain(
+    fixed.chain(libc_rows().map(|(o, n)| (o, n, 'c', None, 6))).chain(
         PREDEFINED.iter().enumerate().map(|(i, l)| (ICU_OIDS + i as i64, format!("{l}-x-icu"), 'i', Some(*l), -1)),
     )
 }

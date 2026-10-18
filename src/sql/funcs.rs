@@ -45,6 +45,11 @@ pub(super) enum Scalar {
     BitToInt,
     BitFn(u8),
     MoneyFn(u8),
+    /// pg_lsn's arithmetic, as `lsn_call` numbers it
+    LsnFn(u8),
+    /// a cast WITHOUT FUNCTION between types of different representations: (value, from's oid, to's oid), its bits
+    /// read as the other's (see `binary_cast`)
+    BinaryCast,
     DateBin,
     /// x::timestamp(p), and the other time types' casts with a precision: (value, p), its fraction rounded to p digits
     TimePrec,
@@ -187,6 +192,8 @@ pub(super) enum Scalar {
     Greatest,
     Least,
     Random,
+    /// random_normal(mean, stddev): a number of that normal distribution (see `random_normal`)
+    RandomNormal,
     /// uuid_generate_v1() (false) and uuid_generate_v1mc() (true): a time-based UUID, of a random node
     UuidV1(bool),
     SetSeed,
@@ -204,6 +211,9 @@ pub(super) enum Scalar {
     /// JSON_OBJECT and JSON_ARRAY as SQL has them: a number of flags (1 an array, 2 ABSENT ON NULL, 4 WITH UNIQUE
     /// KEYS), then the keys and values, or the elements
     JsonCtor,
+    /// a SQL/JSON value written `FORMAT JSON [ENCODING UTF8]`: (value, whether ENCODING was written, where the value
+    /// and the FORMAT are in the statement's text), checked and read as json once its type is known (see `Binder::go`)
+    JsonFormatted,
     /// x IS JSON [VALUE | OBJECT | ARRAY | SCALAR]: whether text reads as JSON of that kind
     IsJson,
     /// json_object(text[]) and json_object(keys text[], values text[]): an object of text values
@@ -329,9 +339,6 @@ pub(super) enum Scalar {
     /// a[i][j]... = v and a[lo:hi][lo:hi]... = v (see `assigned_at`): the array, the value, whether a slice, then
     /// the subscripts (two for each range of a slice)
     ArraySetN,
-    /// An array's elements in order as one dimension from 1: how unnest in a select list reads the k-th (see
-    /// `general_srfs` and `select_srfs`)
-    ArrayFlat,
     SampleKeep,
     StringToArray,
     ArrayToString,
@@ -644,6 +651,7 @@ pub(super) fn lookup(name: &str) -> Option<(Scalar, std::ops::RangeInclusive<usi
         "greatest" => (Greatest, 1..=MANY),
         "least" => (Least, 1..=MANY),
         "random" => (Random, 0..=0),
+        "random_normal" => (RandomNormal, 0..=2),
         "setseed" => (SetSeed, 1..=1),
         "pi" => (Pi, 0..=0),
         "nullif" => (Nullif, 2..=2),
@@ -672,6 +680,7 @@ pub(super) fn lookup(name: &str) -> Option<(Scalar, std::ops::RangeInclusive<usi
         "jsonb_build_object" => (JsonBuildObject, 0..=MANY),
         "jsonb_build_array" => (JsonBuildArray, 0..=MANY),
         "__json_ctor" => (JsonCtor, 1..=MANY),
+        "__json_format" => (JsonFormatted, 4..=4),
         "jsonb_object" => (JsonObjectOf, 1..=2),
         "__is_json" => (IsJson, 2..=2),
         "to_jsonb" => (ToJson, 1..=1),
@@ -867,6 +876,8 @@ pub(super) const SPELLED: &[&str] = &[
     "json_array",
     "json_arrayagg",
     "json_objectagg",
+    // (JSON_OBJECT and JSON_ARRAY RETURNING bytea: their text's bytes, under the constructor's name)
+    "json_object",
 ];
 
 /// The place of `name` in `SPELLED`.
@@ -935,6 +946,9 @@ pub(super) fn result_type(f: Scalar, first: Option<Type>) -> Type {
         BitFn(1) => Type::Text,
         BitFn(_) => Type::Int,
         MoneyFn(_) => Type::Text,
+        BinaryCast => Type::Text, // (typed by the cast the binder made of it: see `Binder::go_cast`)
+        LsnFn(0 | 3) => Type::Numeric,
+        LsnFn(_) => Type::PgLsn,
         DateBin => Type::Timestamp,
         TimePrec => first.unwrap_or(Type::Timestamp),
         DateAdd(_) => Type::TimestampTz,
@@ -964,7 +978,7 @@ pub(super) fn result_type(f: Scalar, first: Option<Type>) -> Type {
         NetSet7bit | NetMacaddr8 => Type::MacAddr8,
         NetMacaddr => Type::MacAddr,
         Power | Sqrt | Exp | Ln | Log if first == Some(Type::Numeric) => Type::Numeric,
-        Sqrt | Cbrt | Erf | Erfc | Exp | Ln | Log | Power | Random | Pi => Type::Float,
+        Sqrt | Cbrt | Erf | Erfc | Exp | Ln | Log | Power | Random | RandomNormal | Pi => Type::Float,
         UuidV1(_) => Type::Uuid,
         Degrees | Radians | Sin | Cos | Tan | Cot | Asin | Acos | Atan | Atan2 | Sinh | Cosh | Tanh => Type::Float,
         Sind | Cosd | Tand | Cotd | Asind | Acosd | Atand | Atan2d | Asinh | Acosh | Atanh => Type::Float,
@@ -1005,7 +1019,7 @@ pub(super) fn result_type(f: Scalar, first: Option<Type>) -> Type {
         MakeInterval => Type::Interval,
         ToTimestamp => Type::TimestampTz,
         ToDate => Type::Date,
-        JsonCtor => Type::JsonText,
+        JsonCtor | JsonFormatted => Type::JsonText,
         JsonBuildObject | JsonBuildArray | JsonObjectOf | ToJson | ArrayJson | JsonExtractPath | JsonSet
         | JsonStripNulls | JsonSetLax | JsonInsert | JsonDelete | JsonDeleteKeys | JsonDeletePath => Type::Json,
         JsonArrayLength => Type::Int,
@@ -1029,9 +1043,8 @@ pub(super) fn result_type(f: Scalar, first: Option<Type>) -> Type {
         TsHeadline => Type::Text,
         QueryTree | TsqueryPhrase | TsqueryAnd | TsqueryOr | TsqueryNot | TsRewrite => Type::TsQuery,
         ToTsquery | PlaintoTsquery | PhrasetoTsquery | WebsearchToTsquery => Type::TsQuery,
-        // ponytail: Postgres's is real; typed so here the f64 holding its float4 text goes out as real's digits
-        // through a float8 column, as before (a Float4 column made the wire and the value disagree)
-        TsRank | TsRankCd => Type::Float,
+        // (real, as Postgres's: the f64 holds the float4's value, and goes out with a real's digits)
+        TsRank | TsRankCd => Type::Float4,
 
         StMakePoint | StPoint | StGeomFromText | StGeomFromGeoJson => Type::Geometry,
         StGeogFromText => Type::Geography,
@@ -1048,7 +1061,7 @@ pub(super) fn result_type(f: Scalar, first: Option<Type>) -> Type {
         ArrayPrepend | ArrayFill => Type::Array(first.unwrap_or(Type::Text).oid()),
         ArrayPosition | ArrayNdims => Type::Int,
         ArrayPositions => Type::Array(Type::Int.oid()),
-        ArraySet | ArraySetN | ArrayFlat => first.unwrap_or(Type::Text),
+        ArraySet | ArraySetN => first.unwrap_or(Type::Text),
         ArrayAtN => match first {
             Some(t @ Type::Array(_)) => t.elem().unwrap_or(Type::Text),
             _ => Type::Text,
@@ -1461,8 +1474,9 @@ pub(super) fn md5(data: &[u8]) -> String {
     [a0, b0, c0, d0].iter().flat_map(|x| x.to_le_bytes()).map(|b| format!("{b:02x}")).collect()
 }
 
-/// A seeded generator: its xorshift state, and how many row ids it has given (see `new_id`).
-pub(crate) type Seeded = (u64, u64);
+/// A seeded generator: its xoroshiro128** state (Postgres's pg_prng), and how many row ids it has given (see
+/// `new_id`).
+pub(crate) type Seeded = (u64, u64, u64);
 
 thread_local! {
     /// The running session's seeded generator (setseed, or a simulation world's seed), if any.
@@ -1471,9 +1485,20 @@ thread_local! {
     pub(crate) static SEEDED: std::cell::Cell<Option<Seeded>> = const { std::cell::Cell::new(None) };
 }
 
-/// A generator seeded with `seed`: the same seed gives the same numbers.
+/// A generator seeded with `seed` as Postgres's pg_prng_seed seeds one (splitmix64 twice): the same seed gives the
+/// same numbers, and setseed's the ones Postgres's random() gives.
 pub(crate) fn seeded(seed: u64) -> Seeded {
-    (mix(seed) | 1, 0) // xorshift never leaves 0
+    let mut at = seed;
+    let mut next = || {
+        at = at.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut x = at;
+        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        x ^ (x >> 31)
+    };
+    let (s0, s1) = (next(), next());
+    // (all zeroes is xoroshiro's fixed point: pg_prng_seed_check's replacement)
+    if s0 == 0 && s1 == 0 { (0x5851_f42d_4c95_7f2d, 0x1405_7b7e_f767_814f, 0) } else { (s0, s1, 0) }
 }
 
 /// splitmix64's finalizer: nearby seeds give unrelated states.
@@ -1484,51 +1509,61 @@ pub(crate) fn mix(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-fn xorshift(x: &mut u64) -> u64 {
-    *x ^= *x << 13;
-    *x ^= *x >> 7;
-    *x ^= *x << 17;
-    *x
+/// xoroshiro128**, as pg_prng has it: the next 64 bits, the state moved on.
+fn xoroshiro(s0: &mut u64, s1: &mut u64) -> u64 {
+    let (a, x) = (*s0, *s1 ^ *s0);
+    let v = a.wrapping_mul(5).rotate_left(7).wrapping_mul(9);
+    *s0 = a.rotate_left(24) ^ x ^ (x << 16);
+    *s1 = x.rotate_left(37);
+    v
 }
 
-/// 64 random bits: from the session's seeded generator, else from a per-thread xorshift seeded by
-/// the clock and the thread.
+/// 64 random bits: from the session's seeded generator, else from a per-thread one seeded by the clock and the thread.
 pub(crate) fn random_bits() -> u64 {
     use std::cell::Cell;
     thread_local! {
-        static STATE: Cell<u64> = Cell::new({
+        static STATE: Cell<(u64, u64)> = Cell::new({
             use std::hash::{BuildHasher, Hasher};
             let mut h = std::collections::hash_map::RandomState::new().build_hasher();
             h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
-            h.finish() | 1
+            let (s0, s1, _) = seeded(h.finish());
+            (s0, s1)
         });
     }
     match SEEDED.get() {
-        Some((mut x, n)) => {
-            let r = xorshift(&mut x);
-            SEEDED.set(Some((x, n)));
+        Some((mut s0, mut s1, n)) => {
+            let r = xoroshiro(&mut s0, &mut s1);
+            SEEDED.set(Some((s0, s1, n)));
             r
         }
         None => STATE.with(|s| {
-            let mut x = s.get();
-            let r = xorshift(&mut x);
-            s.set(x);
+            let (mut s0, mut s1) = s.get();
+            let r = xoroshiro(&mut s0, &mut s1);
+            s.set((s0, s1));
             r
         }),
     }
 }
 
-/// A random number in [0, 1).
+/// A random number in [0, 1), as pg_prng_double makes one of 64 bits: their top 52.
 pub(super) fn random() -> f64 {
-    (random_bits() >> 11) as f64 / (1u64 << 53) as f64
+    (random_bits() >> 12) as f64 / (1u64 << 52) as f64
 }
 
-/// setseed(x): seeds the session's random(), as in Postgres (x from -1 to 1).
+/// random_normal(mean, stddev): pg_prng_double_normal's Box-Muller transform of two of random()'s numbers.
+fn random_normal(mean: f64, stddev: f64) -> f64 {
+    let (u1, u2) = (1.0 - random(), 1.0 - random());
+    let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).sin();
+    stddev * z + mean
+}
+
+/// setseed(x): seeds the session's random(), as Postgres's pg_prng_fseed does (x from -1 to 1).
 fn setseed(x: f64) -> Result<Value> {
     if !(-1.0..=1.0).contains(&x) {
-        return err("22003", format!("setseed parameter {x} is out of allowed range [-1,1]"));
+        return err("22023", format!("setseed parameter {} is out of allowed range [-1,1]", float_g(x)));
     }
-    SEEDED.set(Some(seeded(x.to_bits())));
+    let seed = (((1u64 << 52) - 1) as f64 * x) as i64;
+    SEEDED.set(Some(seeded(seed as u64)));
     Ok(Value::Text(String::new())) // void
 }
 
@@ -1690,6 +1725,59 @@ fn spread_call(f: Scalar, a: &[Value]) -> Result<Value> {
     call(f, &args)
 }
 
+/// A value's bits as another type of the same width reads them (a binary-coercible cast's): integer and real are 4
+/// bytes, bigint and double precision 8; a type of another representation is taken as it is.
+fn binary_cast(a: &[Value]) -> Result<Value> {
+    use Value::*;
+    let (Some(v), Some(Int(from)), Some(Int(to))) = (a.first(), a.get(1), a.get(2)) else { return Ok(Null) };
+    let bits: u64 = match (v, from) {
+        (Null, _) => return Ok(Null),
+        (Int(n), 23) => u64::from(*n as i32 as u32),
+        (Int(n), 20) => *n as u64,
+        (Float(f), 700) => u64::from((*f as f32).to_bits()),
+        (Float(f), 701) => f.to_bits(),
+        (v, _) => return Ok(v.clone()),
+    };
+    Ok(match to {
+        23 => Int(i64::from(bits as u32 as i32)),
+        20 => Int(bits as i64),
+        700 => Float(f64::from(f32::from_bits(bits as u32))),
+        701 => Float(f64::from_bits(bits)),
+        _ => v.clone(),
+    })
+}
+
+/// pg_lsn's arithmetic (pg_lsn_mi, pg_lsn_pli, pg_lsn_mii), and an LSN as the number it is: 0 `lsn - lsn`, a
+/// numeric; 1 `lsn + numeric` and 2 `lsn - numeric`, an LSN (out of range below 0 or past 64 bits, refused for NaN);
+/// 3 the LSN as a numeric (what min and max compare).
+fn lsn_call(k: u8, a: &[Value]) -> Result<Value> {
+    use Value::*;
+    if a.contains(&Null) {
+        return Ok(Null);
+    }
+    use super::decimal::Dec;
+    let number = |v: &Value| -> Result<Dec> { Ok(Dec::new(i128::from(super::lsn_value(&v.to_text())?), 0)) };
+    let exact = |r: std::result::Result<Dec, &'static str>| {
+        r.map_err(|m| super::SqlError { code: super::decimal::sqlstate(m), message: m.into(), info: None })
+    };
+    match k {
+        0 => Ok(Numeric(exact(Dec::sub(number(&a[0])?, number(&a[1])?))?)),
+        3 => Ok(Numeric(number(&a[0])?)),
+        _ => {
+            let Numeric(d) = super::coerce(a[1].clone(), Type::Numeric)? else {
+                return Ok(Null);
+            };
+            if d.is_nan() {
+                let what = if k == 1 { "cannot add NaN to pg_lsn" } else { "cannot subtract NaN from pg_lsn" };
+                return err("0A000", what);
+            }
+            let lsn = number(&a[0])?;
+            let moved = exact(if k == 1 { Dec::add(lsn, d) } else { Dec::sub(lsn, d) })?;
+            super::coerce(Numeric(moved), Type::PgLsn)
+        }
+    }
+}
+
 pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
     use Scalar::*;
     use Value::*;
@@ -1699,7 +1787,9 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
         Substring => Substr,
         f => f,
     };
-    if matches!(f, Concat | ConcatWs | Format) && a.iter().any(|v| matches!(v, Text(s) if s == SPREAD)) {
+    if matches!(f, Concat | ConcatWs | Format | NumNulls | NumNonnulls)
+        && a.iter().any(|v| matches!(v, Text(s) if s == SPREAD))
+    {
         return spread_call(f, a);
     }
     // these take nulls in stride; every other function is null if any argument is
@@ -1708,6 +1798,8 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
         | ArrayFill => return array_function(f, a),
         Overlaps => return overlaps(a),
         MoneyOp(_) | MoneyFn(_) => return super::money::call(f, a),
+        LsnFn(k) => return lsn_call(k, a),
+        BinaryCast => return binary_cast(a),
         XidFn(_) => return super::xid::call(f, a),
         TimeTzFn(_) => return super::timetz::call(f, a),
         StatReset => return super::stmtstats::reset(a, super::stmtstats::world_oids),
@@ -1743,6 +1835,8 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
                 Int(-2) => super::timetz::sort_key(&a[0].to_text()).map(Int),
                 Int(-3) => Ok(Text(super::ltree::sort_key(&a[0].to_text()))),
                 Int(-4) => Ok(Int(super::tid_key(&a[0].to_text()))),
+                // (an LSN: its 64 bits in hex, 16 digits, which sort as the numbers do)
+                Int(-7) => super::lsn_value(&a[0].to_text()).map(|n| Text(format!("{n:016X}"))),
                 Int(-5) => Ok(super::array_sort_key(&a[0], true)),
                 Int(-6) => Ok(super::array_sort_key(&a[0], false)),
                 Int(o) => super::range::sort_key(&a[0].to_text(), *o as u32).map(Text),
@@ -1852,6 +1946,8 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
         JsonBuildArray => {
             return Ok(Json(super::jsonb::shallow(serde_json::Value::Array(a.iter().map(Value::to_json).collect()))?));
         }
+        // (bound away where its type is known; read unbound, json of its text)
+        JsonFormatted => return super::coerce(a[0].clone(), Type::JsonText),
         JsonCtor => {
             let flags = match a.first() {
                 Some(Int(f)) => *f,
@@ -1956,6 +2052,14 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
             return Ok(Bool(draw * 100.0 < pct));
         }
         Random => return Ok(Float(random())),
+        // (strict: a null mean or deviation is a null; left out, 0 and 1)
+        RandomNormal => {
+            if a.contains(&Null) {
+                return Ok(Null);
+            }
+            let arg = |i: usize, d: f64| a.get(i).map_or(Ok(d), float);
+            return Ok(Float(random_normal(arg(0, 0.0)?, arg(1, 1.0)?)));
+        }
         UuidV1(_) => return Ok(Text(super::new_uuid_v1())),
         Pi => return Ok(Float(std::f64::consts::PI)),
         // (these say what a null does themselves)
@@ -2249,8 +2353,10 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
         }
         ArrayToString | NumNulls | NumNonnulls | HashFn(..) | GeoOp | GeoOpF | GeoOpV | GeoFn(_) | SortKey
         | TimeTzFn(_) | StatReset | ArrayNest | TablespaceLocation | RecordImage | IntArr(_) | Hstore(_) | Ltree(_)
-        | JsonFn(_) | XidFn(_) | BitOp(_) | BitFit | BitToInt | BitFn(_) | MoneyOp(_) | MoneyFn(_) | RangeNew(_)
-        | MultiNew(_) | RangeOp | RangeSetOp | RangeBound(_) | RangeFlag(_) | RangeMerge => Null,
+        | JsonFn(_) | XidFn(_) | BitOp(_) | BitFit | BitToInt | BitFn(_) | MoneyOp(_) | MoneyFn(_) | LsnFn(_)
+        | BinaryCast | RangeNew(_) | MultiNew(_) | RangeOp | RangeSetOp | RangeBound(_) | RangeFlag(_) | RangeMerge => {
+            Null
+        }
         // (the network functions: answered by `net_call`)
         NetHost | NetAbbrev | NetBroadcast | NetNetmask | NetHostmask | NetNetwork | NetMasklen | NetFamily
         | NetSetMasklen | NetSameFamily | NetMerge | NetSet7bit | NetInet | NetCidr | NetMacaddr | NetMacaddr8 => Null,
@@ -3137,7 +3243,11 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
                 },
                 Timestamp(t) | Time(t) => *t,
                 TimestampTz(t) => t.saturating_add(time::offset_at(*t)), // in the session's zone
-                v @ (Int(_) | Float(_) | Numeric(_)) => return Ok(Text(num_to_char(v, &text(&a[1]))?)),
+                v @ (Int(_) | Float(_) | Numeric(_)) => {
+                    // (a real's digits: 6, as the binder says with a third argument; else a double's 15)
+                    let digits = if matches!(a.get(2), Some(Int(6))) { 6 } else { 15 };
+                    return Ok(Text(num_to_char(v, &text(&a[1]), digits)?));
+                }
                 v => {
                     return err(
                         super::UNSUPPORTED,
@@ -3183,7 +3293,6 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
                 super::mdarray::read(v)?.map_or(Null, |x| x.get(&[i]))
             }
         },
-        ArrayFlat => super::mdarray::read(&a[0])?.map_or(Null, |x| super::mdarray::Arr::one(x.elems).value()),
         // a[i][j]...: an element of an array of that many dimensions (null for one of another number, or a subscript
         // out of range); of a jsonb not typed as one when bound, each step of the one before
         ArrayAtN => match &a[0] {
@@ -3224,7 +3333,7 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
         JsonToTsvector => {
             use super::tsearch as ts;
             let (cfg, json, filter) = match a {
-                [_, f] => (ts::Config::English, &a[0], f),
+                [_, f] => (ts::default_config(), &a[0], f),
                 [c, _, f] => (
                     ts::config(&text(c)).map_err(|e| super::SqlError { code: "42704", message: e, info: None })?,
                     &a[1],
@@ -3320,7 +3429,7 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
                     ts::config(&text(c)).map_err(|e| super::SqlError { code: "42704", message: e, info: None })?,
                     text(d),
                 ),
-                [d] => (ts::Config::English, text(d)), // Postgres's default_text_search_config
+                [d] => (ts::default_config(), text(d)), // the session's default_text_search_config
                 _ => unreachable!(),
             };
             ts::size_ok(&doc).map_err(|e| super::SqlError { code: "54000", message: e, info: None })?;
@@ -3342,11 +3451,20 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
                     message: e,
                     info: None,
                 })?,
-                _ => ts::websearch_to_tsquery(cfg, &doc).map_err(|e| super::SqlError {
-                    code: "54000",
-                    message: e,
-                    info: None,
-                })?,
+                _ => {
+                    let (q, emptied) = ts::websearch_to_tsquery(cfg, &doc).map_err(|e| super::SqlError {
+                        code: "54000",
+                        message: e,
+                        info: None,
+                    })?;
+                    if emptied {
+                        super::notice(
+                            "NOTICE",
+                            "text-search query contains only stop words or doesn't contain lexemes, ignored".into(),
+                        );
+                    }
+                    q
+                }
             };
             Text(ts::Query::text(&q))
         }
@@ -3397,7 +3515,7 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
                     &a[1..],
                 )
             } else {
-                (ts::Config::English, a)
+                (ts::default_config(), a)
             };
             let (doc, query) = (text(&rest[0]), super::ts_query(&text(&rest[1]))?);
             let options = rest.get(2).map(text).unwrap_or_default();
@@ -3537,60 +3655,9 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
                 }
                 _ => {
                     // ts_rewrite(query, target, substitute): the target's place in the query taken by the substitute
-                    use ts::Query::*;
-                    fn operands_of(q: &ts::Query, and: bool, out: &mut Vec<ts::Query>) {
-                        match (q, and) {
-                            (And(a, b), true) | (Or(a, b), false) => {
-                                operands_of(a, and, out);
-                                operands_of(b, and, out);
-                            }
-                            (q, _) => out.push(q.clone()),
-                        }
-                    }
-                    fn join(items: Vec<ts::Query>, and: bool) -> Option<ts::Query> {
-                        items.into_iter().reduce(|x, y| {
-                            if and { And(Box::new(x), Box::new(y)) } else { Or(Box::new(x), Box::new(y)) }
-                        })
-                    }
-                    fn rewrite(q: ts::Query, target: &ts::Query, sub: &Option<ts::Query>) -> Option<ts::Query> {
-                        if &q == target {
-                            return sub.clone();
-                        }
-                        match q {
-                            And(..) | Or(..) => {
-                                let and = matches!(q, And(..));
-                                let mut items = vec![];
-                                operands_of(&q, and, &mut items);
-                                // the target an AND/OR of operands that all are among these: they go, the substitute stays
-                                let mut tgt = vec![];
-                                if matches!((target, and), (And(..), true) | (Or(..), false)) {
-                                    operands_of(target, and, &mut tgt);
-                                    if tgt.len() > 1 && tgt.iter().all(|t| items.contains(t)) {
-                                        items.retain(|i| !tgt.contains(i));
-                                        if let Some(s) = sub {
-                                            items.push(s.clone());
-                                        }
-                                        return join(items, and);
-                                    }
-                                }
-                                let items: Vec<ts::Query> =
-                                    items.into_iter().filter_map(|i| rewrite(i, target, sub)).collect();
-                                join(items, and)
-                            }
-                            Not(a) => rewrite(*a, target, sub).map(|x| Not(Box::new(x))),
-                            Phrase(a, b, n) => match (rewrite(*a, target, sub), rewrite(*b, target, sub)) {
-                                (Some(x), Some(y)) => Some(Phrase(Box::new(x), Box::new(y), n)),
-                                (x, y) => x.or(y),
-                            },
-                            v => Some(v),
-                        }
-                    }
                     let (q, target, sub) =
                         (super::ts_query(&s())?, super::ts_query(&text(&a[1]))?, super::ts_query(&text(&a[2]))?);
-                    match (q, target) {
-                        (Some(q), Some(t)) => Text(ts::Query::text(&rewrite(q, &t, &sub))),
-                        (q, _) => Text(ts::Query::text(&q)),
-                    }
+                    Text(ts::Query::text(&ts::rewrite(q, &[(target, sub)], true)))
                 }
             }
         }
@@ -3732,9 +3799,9 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
             Bytea(b) => b.len() as i64 + 4,
             v => v.to_text().len() as i64 + 4,
         }),
-        Overlaps | Concat | ConcatWs | Greatest | Least | Nullif | Random | UuidV1(_) | Pi | JsonBuildObject
-        | JsonBuildArray | JsonCtor | ArrayOf | BigintOid | StringToArray | Format | QuoteNullable | Spelled(_)
-        | JsonOpFn(_) => {
+        Overlaps | Concat | ConcatWs | Greatest | Least | Nullif | Random | RandomNormal | UuidV1(_) | Pi
+        | JsonBuildObject | JsonBuildArray | JsonCtor | JsonFormatted | ArrayOf | BigintOid | StringToArray
+        | Format | QuoteNullable | Spelled(_) | JsonOpFn(_) => {
             unreachable!("handled above")
         }
     })
@@ -4301,7 +4368,7 @@ fn num_roman(v: &Value, fmt: &str) -> Result<String> {
 /// NUM_numpart_to_char, ported step by step): digits `9` and `0`, `.`/`D`, `,`/`G`, `S`, `MI`, `PL`,
 /// `SG`, `PR`, `FM`, `TH`, `V`, `RN`, `EEEE`, `L` (the C locale's blank currency) and text, quoted
 /// (a backslash quoting the next character) or not (a backslash only before a quote).
-fn num_to_char(v: &Value, fmt: &str) -> Result<String> {
+fn num_to_char(v: &Value, fmt: &str, digits: i64) -> Result<String> {
     #[derive(Clone, Copy, PartialEq)]
     enum K {
         Comma,
@@ -4587,11 +4654,12 @@ fn num_to_char(v: &Value, fmt: &str) -> Result<String> {
                         format!("{x:.p$}")
                     }
                 };
+                // (as many digits as the type holds: DBL_DIG, or FLT_DIG for a real)
                 let whole = fixed(0, x.abs()).len() as i64;
-                if whole >= 15 {
+                if whole >= digits {
                     post = 0;
-                } else if whole + post > 15 {
-                    post = 15 - whole;
+                } else if whole + post > digits {
+                    post = digits - whole;
                 }
                 fixed(post as usize, x)
             }

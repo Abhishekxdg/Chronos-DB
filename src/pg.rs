@@ -2519,6 +2519,8 @@ impl Conn<'_> {
                 Type::Timestamp | Type::TimestampTz | Type::Time => 8,
                 Type::Interval | Type::Uuid => 16,
                 Type::Reg(_) | Type::Void | Type::Poly(_) => 4,
+                // (a base type made with CREATE TYPE: its representation's size, which it was made LIKE)
+                Type::Base(_) => -1,
                 Type::MacAddr => 6,
                 Type::MacAddr8 => 8,
                 Type::Inet
@@ -2694,6 +2696,8 @@ fn decode(b: &[u8], format: i16, ty: Type) -> Result<Value, Fail> {
         Type::Text => Value::Text(text()?),
         // void's binary form is nothing
         Type::Void | Type::Poly(_) => Value::Text(String::new()),
+        // (a base type made with CREATE TYPE is sent as text)
+        Type::Base(_) => return Err(bad()),
         // jsonb's binary form is a version byte, 1, then the text
         Type::Json => sql::coerce(Value::Text(String::from_utf8_lossy(b.strip_prefix(&[1]).unwrap_or(b)).into()), ty)?,
         // (infinity and -infinity are the largest and smallest values, on the wire as in memory)

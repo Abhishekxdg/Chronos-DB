@@ -412,6 +412,19 @@ pub fn format_timestamptz(us: i64) -> String {
     stamp(us.saturating_add(off), &format_offset((off / SECOND) as i32), ' ')
 }
 
+/// A timestamptz as JSON writes it (Postgres's XSD form): ISO 8601 with a `T`, in the session's zone, its offset as
+/// `+HH:MM` (seconds too where it has them).
+pub fn json_timestamptz(us: i64) -> String {
+    if infinite(us) {
+        return format_timestamp(us, true, 'T');
+    }
+    let off = (offset_at(us) / SECOND) as i32;
+    let sign = if off < 0 { '-' } else { '+' };
+    let (h, m, s) = (off.abs() / 3600, off.abs() % 3600 / 60, off.abs() % 60);
+    let zone = if s == 0 { format!("{sign}{h:02}:{m:02}") } else { format!("{sign}{h:02}:{m:02}:{s:02}") };
+    iso(|| stamp(us.saturating_add(i64::from(off) * SECOND), &zone, 'T'))
+}
+
 /// Text as a timestamptz: in its own zone if it names one, else in the session's.
 pub fn parse_timestamptz(s: &str) -> Result<i64, Bad> {
     decode::timestamp(s, true)

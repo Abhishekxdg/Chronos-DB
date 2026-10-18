@@ -42,6 +42,8 @@ object_store = { version = "0.14.2", features = ["aws"], optional = true }
 ring = "0.17.14"
 ripemd = "0.2.0"
 roaring = "0.11.5"
+# float4 and float8 output: Postgres writes their shortest digits with Ryu, ties to even (see sql::pg_shortest)
+ryu = "1.0.23"
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 rustyline = "18.0.1"
 serde = "1.0.229"

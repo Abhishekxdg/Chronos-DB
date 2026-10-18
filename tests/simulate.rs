@@ -236,7 +236,7 @@ fn setseed_makes_random_repeatable() {
     let (row, _) = draw("0.5");
     assert!(matches!(row[0], Value::Float(f) if (0.0..1.0).contains(&f)) && row[0] != row[1]);
     let e = sql::run(&db, MAIN, "select setseed(2)", &[]).unwrap_err();
-    assert_eq!(e.code, "22003");
+    assert_eq!(e.code, "22023");
     // unseeded, random() differs run to run
     let r = || sql::run(&db, MAIN, "select random()", &[]).unwrap()[0].rows[0][0].clone();
     assert_ne!(r(), r());

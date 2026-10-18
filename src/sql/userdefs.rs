@@ -19,6 +19,9 @@ pub(super) struct CastDef {
     pub(super) to: Type,
     /// None: WITHOUT FUNCTION or WITH INOUT: the value is read as the target type
     pub(super) func: Option<String>,
+    /// WITHOUT FUNCTION: the value's bits taken as the target type's (where their representations differ: an int4
+    /// base type's as a real's), as Postgres's binary-coercible casts take a datum
+    pub(super) binary: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -36,6 +39,52 @@ pub(super) struct AggDef {
     pub(super) variadic: bool,
     /// its row's key (see `agg_key`)
     pub(super) key: String,
+}
+
+/// The base types made with CREATE TYPE name (INPUT = ..., OUTPUT = ...) of a built-in type's I/O functions: each one's
+/// name and the type its values are (see `Type::Base`).
+static BASES: Mutex<Vec<(String, Type)>> = Mutex::new(vec![]);
+
+/// Base type `name`, its values `repr`'s: made known (or its representation changed, made anew).
+pub(super) fn register_base(name: &str, repr: Type) -> Type {
+    let mut all = BASES.lock().unwrap();
+    let i = match all.iter().position(|(n, _)| n == name) {
+        Some(i) => {
+            all[i].1 = repr;
+            i
+        }
+        None => {
+            all.push((name.to_string(), repr));
+            all.len() - 1
+        }
+    };
+    Type::Base(i as u16)
+}
+
+/// Base type `i`'s name.
+pub(super) fn base_name(i: u16) -> String {
+    BASES.lock().unwrap().get(usize::from(i)).map_or_else(|| "unknown".into(), |(n, _)| n.clone())
+}
+
+/// The type base type `i`'s values are.
+pub(super) fn base_repr(i: u16) -> Type {
+    BASES.lock().unwrap().get(usize::from(i)).map_or(Type::Text, |(_, t)| *t)
+}
+
+/// The base type called `name`, if there is one.
+pub(super) fn base_named(name: &str) -> Option<Type> {
+    BASES.lock().unwrap().iter().position(|(n, _)| n == name).map(|i| Type::Base(i as u16))
+}
+
+/// Base type `name`, dropped: its name no longer finds it (its number keeps its place, as the others are known by
+/// theirs).
+pub(super) fn forget_base(name: &str) {
+    BASES.lock().unwrap().iter_mut().filter(|(n, _)| n == name).for_each(|(n, _)| n.clear());
+}
+
+/// The casts made from or to `t` (each as its from and to types), in the order they were made.
+pub(super) fn casts_of(t: Type) -> Vec<(Type, Type)> {
+    DEFS.lock().unwrap().casts.iter().filter(|c| c.from == t || c.to == t).map(|c| (c.from, c.to)).collect()
 }
 
 /// Composite types made with CREATE TYPE name AS (...): by name, and the name of each one's record shape.
@@ -277,7 +326,12 @@ pub(super) fn hydrate() {
                     });
                 }
             } else if let (Some(from), Some(to)) = (ty(&j["from"]), ty(&j["to"])) {
-                d.casts.push(CastDef { from, to, func: j["func"].as_str().map(String::from) });
+                d.casts.push(CastDef {
+                    from,
+                    to,
+                    func: j["func"].as_str().map(String::from),
+                    binary: j["binary"] == true,
+                });
             }
         }
         d
@@ -878,7 +932,7 @@ impl Parser {
     /// After CREATE CAST.
     pub(super) fn create_cast(&mut self) -> Result<Stmt> {
         let (from, to) = self.cast_pair()?;
-        let mut func = None;
+        let (mut func, mut binary) = (None, false);
         if self.kw("with") {
             if self.kw("function") {
                 func = Some(self.qualified(false, Kind::Func)?);
@@ -895,11 +949,12 @@ impl Parser {
         } else {
             self.expect_kw("without")?;
             self.expect_kw("function")?;
+            binary = true;
         }
         if self.kw("as") && !(self.kw("assignment") || self.kw("implicit")) {
             return self.fail("expected ASSIGNMENT or IMPLICIT");
         }
-        let json = serde_json::json!({ "from": from.name(), "to": to.name(), "func": func });
+        let json = serde_json::json!({ "from": from.name(), "to": to.name(), "func": func, "binary": binary });
         Ok(Stmt::UserDef {
             needs: None,
             key: cast_key(from, to),

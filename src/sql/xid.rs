@@ -83,10 +83,11 @@ pub(super) fn parse_snap(s: &str, ty: &str) -> Result<Snap> {
         if t.is_empty() || !t.chars().all(|c| c.is_ascii_digit()) {
             return Err(fail());
         }
-        t.parse::<u64>().ok().filter(|n| *n != 0).ok_or_else(fail)
+        t.parse::<u64>().map_err(|_| fail())
     };
     let (xmin, xmax) = (num(a)?, num(b)?);
-    if xmin > xmax {
+    // (xmin and xmax must be valid transaction ids: their low 32 bits, the epoch's xid, not 0)
+    if xmin & 0xffff_ffff == 0 || xmax & 0xffff_ffff == 0 || xmin > xmax {
         return Err(fail());
     }
     let mut xip: Vec<u64> = vec![];
@@ -110,7 +111,7 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
         return Ok(Null);
     }
     let Scalar::XidFn(k) = f else { return err("XX000", "not an xid function") };
-    let snap = |v: &Value| parse_snap(&v.to_text(), if k >= 4 { "txid_snapshot" } else { "pg_snapshot" });
+    let snap = |v: &Value| parse_snap(&v.to_text(), "pg_snapshot");
     Ok(match k {
         0 => {
             let (x, y) = (as_u64(&a[0]).unwrap_or(0), as_u64(&a[1]).unwrap_or(0));

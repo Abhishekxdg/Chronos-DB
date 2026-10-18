@@ -693,7 +693,7 @@ pub(super) fn not_immutable(e: &Expr, cols: &[Col]) -> bool {
 /// generated uuid, and a function of a time with a zone (whose answer depends on the session's TimeZone), as read
 /// over columns `cols`.
 pub(super) fn mutable_here(x: &Expr, cols: &[Col]) -> bool {
-    use funcs::Scalar::{Random, SetSeed, ToChar};
+    use funcs::Scalar::{Random, RandomNormal, SetSeed, ToChar};
     let zoned =
         |a: &Expr| matches!(a, Expr::Col(_, n) if cols.iter().any(|c| c.name == *n && c.ty == Type::TimestampTz));
     match x {
@@ -703,7 +703,7 @@ pub(super) fn mutable_here(x: &Expr, cols: &[Col]) -> bool {
             | Func::StatementTs
             | Func::ClockTs
             | Func::CurrentDate
-            | Func::Scalar(Random | SetSeed),
+            | Func::Scalar(Random | RandomNormal | SetSeed),
             _,
         ) => true,
         Expr::Func(Func::Scalar(f), _) if super::pgcrypto::volatile(*f) => true,
