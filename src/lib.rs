@@ -131,6 +131,9 @@ pub struct Open {
     /// The most the folder may hold, in bytes (0: no cap; see `Core::disk_bytes`). None reads
     /// CHRONOS_MAX_DISK_BYTES.
     pub max_disk_bytes: Option<u64>,
+    /// The most resident memory the process may hold before new statements are refused (0: no cap;
+    /// see `Core::guard_memory`). None reads CHRONOS_MAX_MEMORY_BYTES.
+    pub max_memory_bytes: Option<u64>,
     /// Ceilings over the database's settings that its admin can't raise. None reads the file
     /// CHRONOS_LIMITS names, if it's set.
     pub ceilings: Option<limits::Ceilings>,
@@ -604,6 +607,9 @@ pub struct Core {
     folder: Folder,
     /// the operator's ceilings over `settings` and the history retention (see `setting`)
     ceilings: limits::Ceilings,
+    /// CHRONOS_MAX_MEMORY_BYTES: resident memory past which new statements are refused (0: no cap;
+    /// see `guard_memory`). Process-wide in effect, held per database so tests stay isolated.
+    mem_limit: AtomicU64,
 }
 
 /// What `Core::disk_bytes` needs besides the running counts of pages and the log.
@@ -1267,6 +1273,7 @@ impl Core {
             attached: None,
             folder: Folder::default(),
             ceilings: limits::Ceilings::default(),
+            mem_limit: AtomicU64::new(0),
         }
     }
 
@@ -1300,6 +1307,10 @@ impl Core {
         let limit = match o.max_disk_bytes {
             Some(n) => n,
             None => limits::max_disk_bytes_from_env()?,
+        };
+        let mem_limit = match o.max_memory_bytes {
+            Some(n) => n,
+            None => limits::max_memory_bytes_from_env()?,
         };
         let lock = disk::lock(dir)?;
         // what big statements under way when the last process stopped had spilled (see `spill_dir`)
@@ -1395,6 +1406,7 @@ impl Core {
         }
         db.ceilings = ceilings;
         db.folder.limit = limit;
+        db.mem_limit.store(mem_limit, Ordering::Relaxed);
         db.folder.spills = spills_inside(dir);
         db.measure_folder(std::time::Duration::ZERO);
         if !dir.join("manifest").exists() && disk::history(dir)?.is_empty() {
@@ -2210,6 +2222,36 @@ impl Core {
             return Ok(());
         }
         Err(disk_full(limit))
+    }
+
+    /// The process-wide resident-memory cap in bytes (CHRONOS_MAX_MEMORY_BYTES, or the `Open`
+    /// field); 0 is no cap. Set it for one database (tests, embedding).
+    pub fn set_max_memory_bytes(&self, bytes: u64) {
+        self.mem_limit.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Refuses a statement when the process already holds more resident memory than its cap
+    /// (`out_of_memory`, 53200). A soft, process-wide gate checked before a statement starts work,
+    /// so one over-cap moment refuses new work rather than letting the process grow without bound;
+    /// a statement already running is not interrupted (an agent's `max_memory_mb` bounds that). Off
+    /// with no cap, while replaying the log, or if the resident size can't be read.
+    pub(crate) fn guard_memory(&self) -> Result<()> {
+        let limit = self.mem_limit.load(Ordering::Relaxed);
+        if limit == 0 || self.me.get().is_none() || RECOVERING.get() {
+            return Ok(());
+        }
+        match limits::process_rss_bytes() {
+            Some(rss) if rss > limit => Err(Error::Constraint {
+                code: "53200",
+                message: format!(
+                    "the server is using {} of memory, over its {} cap (CHRONOS_MAX_MEMORY_BYTES): \
+                     this statement is refused until memory frees up",
+                    limits::show_bytes(rss),
+                    limits::show_bytes(limit)
+                ),
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// `guard_disk` for writing `rows` (key, and the value's length; None deletes). Deletes, and the

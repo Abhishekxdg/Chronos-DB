@@ -37743,6 +37743,8 @@ impl Session {
             return self.execute(db, &Statement(st, PlanCache::default(), s.2), params, types);
         }
         let at = std::time::Instant::now();
+        // refuse a new statement while the process is over its resident-memory cap (53200)
+        db.guard_memory()?;
         // the cursors DECLAREd here and the ones PL/pgSQL opens are one namespace, as Postgres's portals are: the
         // session's cursors are the statement's portals while it runs, where a function (its OPEN, FETCH, MOVE and
         // CLOSE, cursor_to_xml) reaches them, and come back after; not for the statements that work on them here

@@ -127,6 +127,10 @@ person approves by merging the queued world.
 
 ## Limits in Stage 1
 
+- Postgres 12 or later: attach reads catalog columns 12 added (`attgenerated`, `relispartition`). Tested on 16 and
+  17 (and Neon's 17); 12 to 15 and 18 aren't tested yet. On 11 or older the check and attach fail with Postgres's own
+  error ("column attgenerated does not exist") rather than saying the version is too old; a clear refusal and a run
+  across versions come after the 10 Nov launch.
 - Each table needs a primary key, and no generated column or row-level security. Partitioned and inheriting tables
   aren't attached.
 - Serial and identity columns take their new values from Postgres's own sequence, reserved 1,000 at a time, so an
