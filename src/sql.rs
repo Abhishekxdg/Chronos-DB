@@ -35552,6 +35552,26 @@ const READ_ONLY: &[&str] = &[
 /// A setting's value for a session (`name` lowercased): SET LOCAL's in its transaction, then
 /// SET's, then `live` (what the session's own statements set: search_path, statement_timeout),
 /// then Postgres's with Chronos's values. Returns the name as Postgres shows it too.
+/// Parses a `log_min_duration_statement`-style value to milliseconds: a bare integer is ms, and a
+/// unit suffix (ms, s, min, h, d) is honored, as Postgres accepts. None if it doesn't parse.
+fn log_duration_ms(v: &str) -> Option<i64> {
+    let v = v.trim();
+    if let Ok(n) = v.parse::<i64>() {
+        return Some(n);
+    }
+    let split = v.find(|c: char| c.is_ascii_alphabetic())?;
+    let n: i64 = v[..split].trim().parse().ok()?;
+    let mult = match v[split..].trim() {
+        "ms" => 1,
+        "s" => 1_000,
+        "min" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return None,
+    };
+    Some(n * mult)
+}
+
 fn setting(st: &SessState, live: &[(&str, String)], name: &str) -> Option<(String, String)> {
     if let Some(v) = st.local.get(name).or_else(|| st.settings.get(name)) {
         return Some((setting_name_shown(name), v.clone()));
@@ -37766,7 +37786,26 @@ impl Session {
         if let Ok((who, _)) = self.who_shared(db) {
             let by = stmtstats::Ran { core: db.core.uid, userid: who.oid, user: &who.name, world: &self.branch };
             let ms = at.elapsed().as_secs_f64() * 1000.0;
-            stmtstats::record(&by, &sql, ms, stmtstats::rows_of(&o.tag, o.rows.len()));
+            let rows = stmtstats::rows_of(&o.tag, o.rows.len());
+            stmtstats::record(&by, &sql, ms, rows);
+            // Slow-query log: a statement at least as long as `log_min_duration_statement` (a
+            // session GUC, off at -1) is logged as one structured line, as Postgres does.
+            if let Some(min) = self.var("log_min_duration_statement").as_deref().and_then(log_duration_ms)
+                && min >= 0
+                && ms >= min as f64
+            {
+                crate::obs::log_line(
+                    "WARN",
+                    "slow_query",
+                    &[
+                        ("ms", format!("{ms:.3}")),
+                        ("user", who.name.clone()),
+                        ("world", self.branch.clone()),
+                        ("rows", rows.to_string()),
+                        ("sql", sql.to_string()),
+                    ],
+                );
+            }
         }
     }
 

@@ -21,6 +21,7 @@ mod index;
 pub mod limits;
 pub mod metrics;
 mod migrate;
+pub mod obs;
 mod outbox;
 mod pages;
 pub mod pgclient;
