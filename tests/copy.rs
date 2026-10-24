@@ -318,6 +318,28 @@ fn driver_copy_in_after_a_failed_start() {
     assert_eq!(c.query_one("select count(*) from x", &[]).unwrap().get::<_, i64>(0), 2);
 }
 
+/// COPY FREEZE into a table this transaction didn't make or truncate is refused once the COPY has begun, as
+/// Postgres's CopyFrom refuses it after its CopyInResponse: the client sends its data, which is dropped, and a psql
+/// script's data lines aren't read as statements.
+#[test]
+fn copy_freeze_is_refused_once_the_copy_has_begun() {
+    let (_server, port) = start("freeze");
+    let mut c = Client::connect(&format!("host=127.0.0.1 port={port} user=tester dbname=main"), NoTls).unwrap();
+    c.batch_execute("create table f (a int)").unwrap();
+    let mut w = c.copy_in("copy f from stdin csv freeze").unwrap();
+    w.write_all(b"1\n2\n").unwrap();
+    let e = w.finish().unwrap_err();
+    assert_eq!(e.code().map(|c| c.code()), Some("55000"));
+    assert_eq!(c.query_one("select count(*) from f", &[]).unwrap().get::<_, i64>(0), 0);
+    // truncated in this transaction: frozen in
+    c.batch_execute("begin; truncate f").unwrap();
+    let mut w = c.copy_in("copy f from stdin csv freeze").unwrap();
+    w.write_all(b"3\n").unwrap();
+    assert_eq!(w.finish().unwrap(), 1);
+    c.batch_execute("commit").unwrap();
+    assert_eq!(c.query_one("select count(*) from f", &[]).unwrap().get::<_, i64>(0), 1);
+}
+
 /// A COPY holds its world's writes while it reads, so a client that goes silent mid-COPY is
 /// dropped after CHRONOS_COPY_IDLE: its rows are undone and other writers go on.
 #[test]

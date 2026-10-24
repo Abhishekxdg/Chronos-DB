@@ -609,6 +609,9 @@ pub struct CopyIn {
     /// of it being read as its column's value
     rec: Vec<u8>,
     field: Option<String>,
+    /// a refusal Postgres makes once the COPY has begun (FREEZE's: see `Session::copy_in`), which `run` gives after
+    /// dropping the client's data
+    late: Option<SqlError>,
 }
 
 /// What COPY's DEFAULT marker gives column `c` (see `CopyIn::defaults`).
@@ -732,22 +735,28 @@ impl Session {
                 });
             }
         }
-        if c.format.freeze && t.hier.part.is_some() {
-            return Err(feature("cannot perform COPY FREEZE on a partitioned table"));
-        }
-        // FREEZE: only into a table this transaction made or truncated, at the savepoint level it is at (its rows
-        // would otherwise show to transactions that shouldn't see them, in Postgres)
-        if c.format.freeze {
-            let made_here = self.tx.as_ref().is_some_and(|tx| {
-                tx.fresh.iter().any(|(n, depth)| *n == rel_part(&t.name) && *depth == tx.saves.len())
-            });
-            if !made_here {
-                return err(
-                    "55000",
-                    "cannot perform COPY FREEZE because the table was not created or truncated in the current subtransaction",
-                );
-            }
-        }
+        // FREEZE: not into a partitioned table, and only into a table this transaction made or truncated, at the
+        // savepoint level it is at (its rows would otherwise show to transactions that shouldn't see them, in
+        // Postgres). Refused once the COPY has begun, as Postgres's CopyFrom refuses it after the CopyInResponse: the
+        // client sends its data, which is dropped, rather than reading it as statements
+        let made_here = || {
+            self.tx
+                .as_ref()
+                .is_some_and(|tx| tx.fresh.iter().any(|(n, depth)| *n == rel_part(&t.name) && *depth == tx.saves.len()))
+        };
+        let late = if !c.format.freeze {
+            None
+        } else if t.hier.part.is_some() {
+            Some(feature("cannot perform COPY FREEZE on a partitioned table"))
+        } else if !made_here() {
+            Some(SqlError {
+                code: "55000",
+                message: "cannot perform COPY FREEZE because the table was not created or truncated in the current subtransaction".into(),
+                info: None,
+            })
+        } else {
+            None
+        };
         // the defaults it may take, worked out before any data comes, as Postgres's are (a constant that doesn't fit
         // its column fails the COPY then): those of the columns it leaves out, and with DEFAULT those of all
         let mut defaults = vec![];
@@ -827,6 +836,7 @@ impl Session {
             defaults,
             rec: vec![],
             field: None,
+            late,
         })
     }
 
@@ -1149,11 +1159,18 @@ impl CopyIn {
     /// while it runs: statement_timeout and cancels are checked as data arrives, and the caller
     /// bounds a wait for data that doesn't come (pg.rs drops a client silent for COPY_IDLE).
     pub fn run(
-        self,
+        mut self,
         s: &mut Session,
         db: &Db,
         mut next: Box<dyn FnMut() -> Result<Option<Vec<u8>>>>,
     ) -> Result<Output> {
+        // a refusal made once the COPY has begun: the client's data up to its CopyDone (or CopyFail) is read and
+        // dropped first, as when a row fails partway, so the client gets the error, and one ReadyForQuery, after it
+        if let Some(e) = self.late.take() {
+            while let Ok(Some(_)) = next() {}
+            s.abort();
+            return Err(e);
+        }
         let insert = Stmt::Insert {
             table: self.table.clone(),
             alias: None,
@@ -1760,6 +1777,7 @@ mod tests {
             defaults: vec![],
             rec: vec![],
             field: None,
+            late: None,
         }
     }
 
