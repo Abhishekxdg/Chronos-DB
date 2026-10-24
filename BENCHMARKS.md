@@ -1005,7 +1005,7 @@ BranchBench drives each database through one git-like API (branch, commit, diff,
 - **Recovery after the bad deploy (S5)** took 18.8 s on Chronos (`RESTORE WORLD ... TO` the commit's moment), 195 s on file_copy (drop and re-clone) and 208 s on Doltgres.
 - **S4 is Doltgres's.** 563 s to 663 s. Chronos's S4 also needed #257 first (below).
 - **The background TPC-C load ran slower on Chronos** while the agents worked: 28 transactions/s in S4 (Doltgres 30, file_copy 73) and 21/s in S5 (Doltgres 30, file_copy 24).
-- **Conflict counts don't compare.** Chronos reports a row both sides changed as a conflict even when they changed different columns or wrote the same value (its default whole-row merge; `BY COLUMNS` would combine the different-column ones, and the adapter leaves it off). Doltgres merges cell by cell. S3: 35,503 rows in conflict on Chronos, 508 on Doltgres, 1,261 on file_copy; every merge succeeded and every invariant held on all three.
+- **Conflict counts don't compare.** Chronos reports a row both sides changed as a conflict even when they changed different columns or wrote the same value (its default whole-row merge; `BY COLUMNS` would combine the different-column ones, and the adapter left it off in this run). Doltgres's count is `dolt_merge()`'s `conflicts` result, about one per merge, not a count of rows. S3: 35,503 rows in conflict on Chronos, 508 on Doltgres (over 512 merges), 1,261 on file_copy; every merge succeeded and every invariant held on all three. See 16.1 for the run with `BY COLUMNS`.
 - **Storage** isn't compared: file_copy's number is the sum of its databases' sizes (a reflinked clone counted whole), and Doltgres's directory wasn't measured in this setup. Chronos's folder went from 1.6 GB after seeding to 2.2–3.9 GB at the end of S1, S4, S5 and S6 (with a day of history kept, for the commits).
 
 **Found and fixed on the way.** The first runs, on 0.4.1, did much worse. BranchBench's consistency checks join TPC-C tables on three key columns and S4's spine runs CH Q3 and Q18. On 0.4.1 those joins ran as nested loops and S1 made no progress; with #241, Q3 took the server to 55 GB and the OOM killer two minutes into S4; with #242, S4's Q18 still took 17 minutes. Each became its own change, with a test:
@@ -1041,6 +1041,26 @@ BranchBench drives each database through one git-like API (branch, commit, diff,
 | reset, undoing 1 / 10,000 rows | 7 / 33 ms |
 
 Throughput (`run_throughput_bench.sh --sweep-proportional --mode sync`, 4 threads per branch, 1 to 128 branches, no failures): point reads 6,532 ops/s at 4 threads and 4,946 at 512; range reads 365–395 ops/s throughout. **That's BranchBench's client, not Chronos:** in sync mode it is one Python process, flat from 4 threads to 512 while the VM's load stayed at 2–6 of 16. A throughput comparison needs its async mode (`--mode async`, which the backend supports), not run here.
+
+### 16.1 Rerun with Chronos's own merge, diff and revert statements
+
+*2026-10-25, same VM and harness, Chronos only. Engine: main with #257 and #260 (`MERGE ... BY COLUMNS` counting its conflicts in a NOTICE, `DIFF ... SUMMARY`, `UNDO DIFF`). Adapter `f3ce02f`: merges run `BY COLUMNS USING OURS|THEIRS` in one statement, `diff` reads `DIFF ... SUMMARY`, and `revert` is `UNDO DIFF ... EXCEPT TABLES (_bb_commits)`, which fails on a row changed since the commit (as git's and Dolt's revert do) where the old one overwrote it. Raw stats: [`bench/results/2026-10-24-branchbench/rerun-0.4.2/`](bench/results/2026-10-24-branchbench/rerun-0.4.2).*
+
+| scenario | Chronos before | Chronos now | file_copy | Doltgres |
+|---|---:|---:|---:|---:|
+| S1 RL environment | 1,130 s, 560/560 | **994 s**, 560/560 | 2,529 s | 2 h cap |
+| S2 context management | 2.2 s, 3/3 | **2.0 s**, 3/3 | 53 s | 13 s |
+| S3 multi-agent | 3.9 s, 8/8 | **4.7 s**, 8/8 | 149 s | 19 s |
+| S4 dev agent | 663 s, 122/122 | 580 s, 124/124 | 4,987 s | **563 s** |
+| S5 ops agent | 515 s, 10/10 | **505 s**, 10/10; recovery 10.4 s (was 18.8) | 1,817 s; 195 s | 634 s; 208 s |
+| S6 data agent | 2,275 s, 128/128 | 2,221 s, **128/128** | 2,817 s, 128/128 | 1,493 s, 64/128 |
+
+- **S4 is still Doltgres's, by 3%** (580 s to 563 s, from 18%).
+- **Conflicts, by columns.** S4's rebase conflicts went from 2,174 rows to 254 (Doltgres 117, file_copy 30,886). S3's stayed at 35,533: there the spine and the agents change the same columns of the same task rows (`status`, `version`), which conflict cell by cell too.
+- **The first `BY COLUMNS` run found a bug**, fixed in #260 before these numbers: a row both sides changed, in a table both sides changed the columns of (S4's `c_tier` added as two types), failed the merge with that row's error (22P02) instead of the clash itself, so 4 of S4's invariants failed.
+- **Microbenchmarks** (W=1, medians, 97 of 97 points ok): `diff` of 1,000 / 10,000 rows 47 / 495 ms → **1.8 / 14 ms**; `revert` of 1,000 / 10,000 rows 211 / 2,051 ms → **23 / 120 ms**; a merge of 1,000 rows with 10–100% of them in conflict 101–131 ms → **14–49 ms** (one statement instead of three). Merge and rebase without conflicts unchanged (1 / 10 / 94 ms at 1 / 1,000 / 10,000 rows).
+
+**Why the spine's TPC-C stays at about 30 transactions/s** (S4: 29.6/s, Doltgres 30, file_copy 73). Two CH queries the spine runs among its transactions, Q3 and Q18, took 4.2 and 4.0 s each (file_copy's Postgres: 0.8 and 1.6 s): 73% of the spine's time. It isn't the agents beside them. At W=1 six Q3s at once take 0.5 s each against 0.19 s alone, and a fair split of the helper threads between running queries (tried, #261) changed nothing. It's the data size: on a W=5 copy of the CH tables, Q3 takes 3.0 s and Q18 5.3 s alone, because their hash joins outgrow `CHRONOS_WORK_MEM` (256 MB) and go to disk. With `CHRONOS_WORK_MEM=4GB` they take 0.75 s and 1.3 s, but Q18 then holds 2.7 GB. A joined row holds every column of its tables, not only the ones the query reads; holding only those is the fix, not done yet.
 
 ## Rerun everything
 
