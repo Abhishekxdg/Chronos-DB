@@ -293,6 +293,7 @@ fn access(s: &Stmt) -> Reach {
         | Stmt::ShowReviews
         | Stmt::CheckReads(_)
         | Stmt::ShowMergeOutcomes { .. }
+        | Stmt::ShowSecurityAudit { .. }
         | Stmt::ShowOutbox
         | Stmt::ShowAudit { .. }
         | Stmt::Diff(..)

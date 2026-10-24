@@ -30,6 +30,7 @@ mod reads;
 mod remote;
 mod scope;
 pub mod search;
+pub mod secaudit;
 mod simulate;
 pub mod sql;
 mod stale;
@@ -607,6 +608,8 @@ pub struct Core {
     folder: Folder,
     /// the operator's ceilings over `settings` and the history retention (see `setting`)
     ceilings: limits::Ceilings,
+    /// privileged, security-relevant actions since this process started (see `secaudit`)
+    secaudit: secaudit::Log,
     /// CHRONOS_MAX_MEMORY_BYTES: resident memory past which new statements are refused (0: no cap;
     /// see `guard_memory`). Process-wide in effect, held per database so tests stay isolated.
     mem_limit: AtomicU64,
@@ -1273,6 +1276,7 @@ impl Core {
             attached: None,
             folder: Folder::default(),
             ceilings: limits::Ceilings::default(),
+            secaudit: secaudit::Log::default(),
             mem_limit: AtomicU64::new(0),
         }
     }
@@ -1658,6 +1662,8 @@ impl Core {
             disk::set_settings(&log.dir, m)?;
         }
         *all = next;
+        drop(all);
+        self.record_security("alter system", &format!("{} = {v}", s.name()));
         Ok(())
     }
 
@@ -2222,6 +2228,21 @@ impl Core {
             return Ok(());
         }
         Err(disk_full(limit))
+    }
+
+    /// Records a privileged, security-relevant action in the security audit (see `secaudit`), by
+    /// the agent acting now, or the database's own user when none is. Skipped while replaying the
+    /// log (recovery re-applies the rows directly, not through these calls).
+    pub(crate) fn record_security(&self, action: &str, target: &str) {
+        if RECOVERING.get() {
+            return;
+        }
+        self.secaudit.record(&disk::actor(), action, target);
+    }
+
+    /// The most recent `limit` security-audit events, newest first (see `secaudit`).
+    pub fn security_events(&self, limit: usize) -> Vec<secaudit::Event> {
+        self.secaudit.recent(limit)
     }
 
     /// The process-wide resident-memory cap in bytes (CHRONOS_MAX_MEMORY_BYTES, or the `Open`

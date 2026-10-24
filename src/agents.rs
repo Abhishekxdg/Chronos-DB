@@ -578,6 +578,7 @@ impl Core {
         };
         a.apply(spec)?;
         self.put_agent(&a)?;
+        self.record_security("create agent", name);
         Ok((a, token))
     }
 
@@ -607,6 +608,7 @@ impl Core {
         let mut a = self.agent(name)?;
         a.apply(spec)?;
         self.put_agent(&a)?;
+        self.record_security("alter agent", name);
         Ok(a)
     }
 
@@ -632,6 +634,7 @@ impl Core {
         a.scram = Some(scram);
         a.rotated = disk::now_ms();
         self.put_agent(&a)?;
+        self.record_security("rotate token", name);
         Ok(token)
     }
 
@@ -690,6 +693,7 @@ impl Core {
     pub fn drop_agent(&self, name: &str) -> Result<()> {
         self.agent(name)?;
         self.write(MAIN, &[(&format!("{AGENTS}/{name}"), None)])?;
+        self.record_security("drop agent", name);
         Ok(())
     }
 
@@ -1643,6 +1647,7 @@ impl Core {
             Some(_) => Err(Error::Exists(format!("merge policy {name}"))),
             None => Ok((vec![(key.clone(), Some(p.to_json()))], ())),
         })?;
+        self.record_security("create merge policy", name);
         Ok(p)
     }
 
@@ -1657,6 +1662,7 @@ impl Core {
             p.apply(j)?;
             Ok::<_, Error>((vec![(key.clone(), Some(p.to_json()))], p))
         })?;
+        self.record_security("alter merge policy", name);
         Ok(p)
     }
 
@@ -1692,6 +1698,7 @@ impl Core {
             }
             Ok((rows, names))
         })?;
+        self.record_security("drop merge policy", name);
         Ok(released)
     }
 

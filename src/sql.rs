@@ -8377,6 +8377,10 @@ enum Stmt {
         agent: Option<String>,
         limit: Option<usize>,
     },
+    /// SHOW SECURITY AUDIT [LIMIT n]: privileged actions since the server started (see `secaudit`)
+    ShowSecurityAudit {
+        limit: Option<usize>,
+    },
     /// CHECKPOINT WORLD name AS 'label'; with no world (an empty name), Postgres's CHECKPOINT: the database's log
     /// folded into its trees
     Checkpoint {
@@ -12182,6 +12186,25 @@ impl Parser {
                 let name = self.branch_name()?;
                 self.expect_kw("set")?;
                 Ok(Stmt::AlterPolicy { name, spec: self.meta_pairs()? })
+            }
+            "show" if self.kw("security") => {
+                self.expect_kw("audit")?;
+                let limit = if self.kw("limit") {
+                    match self.peek().cloned() {
+                        Some(Tok::Num(n)) => {
+                            self.i += 1;
+                            Some(n.parse().map_err(|_| SqlError {
+                                code: BAD_INPUT,
+                                message: format!("bad LIMIT {n}"),
+                                info: None,
+                            })?)
+                        }
+                        _ => return self.fail("expected a number after LIMIT"),
+                    }
+                } else {
+                    None
+                };
+                Ok(Stmt::ShowSecurityAudit { limit })
             }
             "show" if self.kw("audit") => {
                 let agent = if self.kw("for") {
@@ -36684,6 +36707,8 @@ impl Session {
             },
             Stmt::ShowReviews => me.may_list_all("SHOW REVIEWS")?,
             Stmt::ShowAudit { .. } => me.may_list_all("SHOW AUDIT")?,
+            // the security trail is owner/admin only: it names agents and policies across the database
+            Stmt::ShowSecurityAudit { .. } => me.may_admin()?,
             // its own; another's is for those who manage agents
             Stmt::ShowAgentPrivileges { agent, world: w } => {
                 me.may_read(w.as_deref().unwrap_or(&self.branch))?;
@@ -40676,6 +40701,14 @@ impl Statement {
                     ("run", Type::Json),
                 ]);
             }
+            Stmt::ShowSecurityAudit { .. } => {
+                return fixed(&[
+                    ("at", Type::TimestampTz),
+                    ("actor", Type::Text),
+                    ("action", Type::Text),
+                    ("target", Type::Text),
+                ]);
+            }
             Stmt::MergeBranch { dry: true, .. } => {
                 return fixed(&[
                     ("table", Type::Text),
@@ -41914,6 +41947,22 @@ impl Statement {
                             Value::Text(e.action),
                             Value::Int(e.rows as i64),
                             e.run.map_or(Value::Null, Value::Json),
+                        ]
+                    })
+                    .collect();
+                let columns = self.columns(db, branch, &[])?;
+                Ok(Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows })
+            }
+            Stmt::ShowSecurityAudit { limit } => {
+                let rows: Vec<Vec<Value>> = db
+                    .security_events(limit.unwrap_or(100))
+                    .into_iter()
+                    .map(|e| {
+                        vec![
+                            Value::TimestampTz(e.at as i64 * 1000),
+                            Value::Text(if e.actor.is_empty() { "owner".into() } else { e.actor }),
+                            Value::Text(e.action),
+                            Value::Text(e.target),
                         ]
                     })
                     .collect();
