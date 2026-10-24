@@ -21,6 +21,37 @@ pub(crate) fn work_mem() -> usize {
     super::mem_limit().map_or(all, |m| all.min(m.cap / 4))
 }
 
+/// Working memory any one statement may hold: CHRONOS_QUERY_MEM, by default a quarter of the
+/// machine's memory; `0` for no limit (as before 0.4.2). A statement past it fails with 53200
+/// rather than taking the server's memory from every other session.
+pub(crate) fn query_mem() -> Option<usize> {
+    static MEM: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MEM.get_or_init(|| match std::env::var("CHRONOS_QUERY_MEM") {
+        Ok(s) if s.trim() == "0" => None,
+        Ok(s) => parse_size(&s).or_else(physical_quarter),
+        Err(_) => physical_quarter(),
+    })
+}
+
+/// Working memory all statements may hold together: twice CHRONOS_QUERY_MEM (by default half the
+/// machine's memory); none with CHRONOS_QUERY_MEM=0.
+pub(crate) fn total_mem() -> Option<usize> {
+    query_mem().map(|q| q.saturating_mul(2))
+}
+
+/// A quarter of the machine's memory, if it can be told.
+fn physical_quarter() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        // SAFETY: sysconf reads system constants and has no preconditions
+        let (pages, size) = unsafe { (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE)) };
+        if pages > 0 && size > 0 {
+            return Some((pages as usize).saturating_mul(size as usize) / 4);
+        }
+    }
+    None
+}
+
 /// `64MB`, `2GB`, `512kB` or plain bytes.
 fn parse_size(s: &str) -> Option<usize> {
     let s = s.trim();

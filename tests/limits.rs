@@ -137,11 +137,13 @@ fn max_memory_mb_refuses_a_big_join_while_another_agents_query_completes() {
         assert!(message.contains("max_memory_mb"), "{message}");
         assert_eq!(big.join().unwrap(), Ok(200_000));
     });
-    // a query within its limit runs; so does the next one (what the refused one held is let go)
+    // a query within its limit runs; so does the next one (what the refused one held is let go).
+    // (A count over the 200,000-row join holds those rows while it counts, now checked as the
+    // probe goes: past 8 MB or not depending on how many cores share it.)
     let mut s = session("small");
     assert_eq!(
-        s.run(&db, "select count(*) from a join b on a.k = b.k", &[]).unwrap()[0].rows[0][0].to_text(),
-        "200000"
+        s.run(&db, "select count(*) from a join b on a.id = b.id", &[]).unwrap()[0].rows[0][0].to_text(),
+        "2000"
     );
     assert_eq!(s.run(&db, "select id from a where k = 3 order by id limit 2", &[]).unwrap()[0].rows.len(), 2);
 }

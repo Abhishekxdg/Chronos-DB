@@ -4096,16 +4096,67 @@ pub fn take_notices_split() -> (Vec<Notice>, Vec<Notice>) {
 struct Mem {
     cap: usize,
     used: std::sync::atomic::AtomicUsize,
+    agent: bool, // the agent's max_memory_mb, not CHRONOS_QUERY_MEM
 }
 
-/// SQLSTATE out_of_memory: past an agent's max_memory_mb.
+/// Working memory every statement holds now, together (see `Mem`): past `spill::total_mem` the
+/// statements holding a big share of it fail, so concurrent queries that each fit can't add up to
+/// more than the machine has.
+static HELD_ALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl Mem {
+    fn add(&self, n: usize) -> usize {
+        HELD_ALL.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        self.used.fetch_add(n, std::sync::atomic::Ordering::Relaxed) + n
+    }
+
+    fn sub(&self, n: usize) {
+        HELD_ALL.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+        self.used.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The error when this statement holds more than its limit, or the statements together hold
+    /// more than the server's and this one at least a sixteenth of that (a small one goes on).
+    fn over(&self, used: usize) -> Result<()> {
+        if used > self.cap {
+            return out_of_memory(self);
+        }
+        match spill::total_mem() {
+            Some(all) if used >= all / 16 && HELD_ALL.load(std::sync::atomic::Ordering::Relaxed) > all => err(
+                OUT_OF_MEMORY,
+                format!(
+                    "out of memory: queries running together hold more than {} MB of working memory \
+                     (half of this machine's memory unless CHRONOS_QUERY_MEM is set), and this one {} MB of it; \
+                     run it again when fewer run, narrow it, or add a LIMIT",
+                    all >> 20,
+                    used >> 20
+                ),
+            ),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl Drop for Mem {
+    fn drop(&mut self) {
+        // what the statement still holds when it ends (its result, see `hold`)
+        HELD_ALL.fetch_sub(*self.used.get_mut(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// SQLSTATE out_of_memory: past an agent's max_memory_mb, or CHRONOS_QUERY_MEM.
 const OUT_OF_MEMORY: &str = "53200";
 
 fn out_of_memory(m: &Mem) -> Result<()> {
+    let whose = if m.agent {
+        "the agent's max_memory_mb"
+    } else {
+        "CHRONOS_QUERY_MEM, a quarter of this machine's memory unless set"
+    };
     err(
         OUT_OF_MEMORY,
         format!(
-            "out of memory: this query needs more than {} MB of working memory (the agent's max_memory_mb); \
+            "out of memory: this query needs more than {} MB of working memory ({whose}); \
              narrow it, add a LIMIT, or raise the limit",
             m.cap >> 20
         ),
@@ -4141,12 +4192,8 @@ fn too_big(what: &str) -> SqlError {
 fn hold(vals: &[Value]) -> Result<()> {
     STOP.with_borrow(|s| match s.as_ref().and_then(|s| s.mem.as_ref()) {
         Some(m) => {
-            let n = spill::size_of(vals);
-            if m.used.fetch_add(n, std::sync::atomic::Ordering::Relaxed) + n > m.cap {
-                out_of_memory(m)
-            } else {
-                Ok(())
-            }
+            let used = m.add(spill::size_of(vals));
+            m.over(used)
         }
         _ => Ok(()),
     })
@@ -4211,7 +4258,7 @@ impl Stop {
                 err(CANCELED, "canceling statement due to statement timeout")
             }
             Stop { gone: Some(gone), .. } if gone() => err("08006", "connection to client lost"),
-            Stop { mem: Some(m), .. } if m.used.load(std::sync::atomic::Ordering::Relaxed) > m.cap => out_of_memory(m),
+            Stop { mem: Some(m), .. } => m.over(m.used.load(std::sync::atomic::Ordering::Relaxed)),
             _ => Ok(()),
         }
     }
@@ -28570,7 +28617,7 @@ struct Batch {
 impl Drop for Batch {
     fn drop(&mut self) {
         if let Some(m) = &self.mem {
-            m.used.fetch_sub(self.counted, std::sync::atomic::Ordering::Relaxed);
+            m.sub(self.counted);
         }
     }
 }
@@ -28585,7 +28632,7 @@ impl Batch {
         if let Some(m) = &self.mem {
             let now = self.vals.capacity() * std::mem::size_of::<Value>();
             if now > self.counted {
-                m.used.fetch_add(now - self.counted, std::sync::atomic::Ordering::Relaxed);
+                m.add(now - self.counted);
                 self.counted = now;
             }
         }
@@ -29062,6 +29109,9 @@ fn no_subs<'a>(es: impl IntoIterator<Item = &'a Expr>) -> bool {
 
 /// Whether every condition holds for `row`, where subqueries can't appear (see `no_subs`).
 fn holds(conds: &[&Expr], cols: &[Col], row: &[Value], params: &[Value]) -> Result<bool> {
+    // called for every pair a hash join's probe makes, on any core: where a big join notices a
+    // timeout, a cancel or its memory limit (a probe's part can make millions of rows)
+    tick()?;
     if conds.is_empty() {
         return Ok(true);
     }
@@ -37969,10 +38019,18 @@ impl Session {
         self.cancel.store(false, std::sync::atomic::Ordering::Relaxed); // a cancel stops the statement it came during
         let ms = self.timeout(db, agent.as_ref());
         let deadline = (ms > 0).then(|| t + std::time::Duration::from_millis(ms));
-        let mem = agent.as_ref().filter(|a| a.max_memory_mb > 0).map(|a| {
-            let cap = usize::try_from(a.max_memory_mb).unwrap_or(usize::MAX).saturating_mul(1 << 20);
-            Arc::new(Mem { cap, used: Default::default() })
-        });
+        // the agent's max_memory_mb, or CHRONOS_QUERY_MEM for everyone, whichever is less: one
+        // query with a runaway join fails alone rather than taking every session's memory
+        let of_agent = agent
+            .as_ref()
+            .filter(|a| a.max_memory_mb > 0)
+            .map(|a| usize::try_from(a.max_memory_mb).unwrap_or(usize::MAX).saturating_mul(1 << 20));
+        let mem = match (of_agent, spill::query_mem()) {
+            (Some(a), Some(q)) if q < a => Some((q, false)),
+            (Some(a), _) => Some((a, true)),
+            (None, q) => q.map(|q| (q, false)),
+        }
+        .map(|(cap, agent)| Arc::new(Mem { cap, used: Default::default(), agent }));
         // who it runs as: what current_user says and the privilege checks check
         let (current, session_who) = self.who_shared(db)?;
         let ctx = Arc::new(Ctx {
@@ -59613,12 +59671,12 @@ impl Exec<'_> {
     /// that takes longer, or is stopped from changing something, is explained by what it read so far (0 rows).
     fn select_briefly(&self, s: &Select) -> Result<usize> {
         let limit = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let cap = || Some(Arc::new(Mem { cap: 256 << 20, used: Default::default() }));
+        let cap = || Some(Arc::new(Mem { cap: 256 << 20, used: Default::default(), agent: false }));
         let (had, old) = STOP.with_borrow_mut(|st| match st {
             Some(x) => {
                 let old = (x.deadline, x.mem.clone());
                 x.deadline = Some(old.0.map_or(limit, |o| o.min(limit)));
-                if x.mem.is_none() {
+                if x.mem.as_ref().is_none_or(|m| m.cap > 256 << 20) {
                     x.mem = cap();
                 }
                 (true, old)

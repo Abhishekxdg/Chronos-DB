@@ -70,6 +70,7 @@ An empty `--token`, `--admin-token`, `--tls-cert` or `--tls-key` (or its variabl
 | `CHRONOS_KEY` | none | the database key, 64 hex digits (from `chronos keygen`). A new folder is encrypted with it; an encrypted one needs it to open. Also needed to `restore` an encrypted backup |
 | `CHRONOS_KEY_FILE` | none | a file holding the key; used when `CHRONOS_KEY` is unset or empty |
 | `CHRONOS_WORK_MEM` | `256MB` | memory a query may hold in one grouping or sort before it spills to disk: `512kB`, `64MB`, `2GB` (units `b`, `k`/`kb`, `m`/`mb`, `g`/`gb`, any case) or plain bytes. An agent's `max_memory_mb` lowers it to a quarter of that for its queries. See [memory and spilling to disk](../operations.md#memory-and-spilling-to-disk) |
+| `CHRONOS_QUERY_MEM` | a quarter of the machine's memory | working memory one statement may hold before it fails with 53200 (an agent's lower `max_memory_mb` wins); all statements together may hold twice it. `0` for no limit; units as for `CHRONOS_WORK_MEM`. See [memory and spilling to disk](../operations.md#memory-and-spilling-to-disk) |
 | `CHRONOS_SPILL_DIR` | the system's temporary folder | where query spill files go (`sonos-spill-<pid>-<random>`, `0600`, unlinked as soon as they're opened, sealed with the database's key if it has one) |
 | `CHRONOS_CACHE_MB` | `256` | the page cache: megabytes of decoded pages kept in memory, per process |
 | `CHRONOS_THREADS` | the number of cores | threads queries may use together (the caller plus `CHRONOS_THREADS - 1` helpers, shared by all running queries) |
