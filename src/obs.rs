@@ -8,10 +8,90 @@
 //! and the rows, as Postgres's slow-query logging does.
 
 use std::cell::RefCell;
+use std::sync::Once;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 thread_local! {
     /// When `Some`, log lines emitted on this thread are pushed here instead of written to stderr.
     static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    /// The ids of the spans open on this thread, innermost last, so a new span knows its parent.
+    static SPANS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Whether request/statement tracing is on. Off unless turned on (see `tracing_enabled`).
+static TRACING: AtomicBool = AtomicBool::new(false);
+static TRACING_INIT: Once = Once::new();
+/// The next span id; spans are numbered so a child can name its parent.
+static NEXT_SPAN: AtomicU64 = AtomicU64::new(1);
+
+/// Whether tracing is on: off unless `CHRONOS_TRACE` is set to something truthy, or `set_tracing`
+/// turned it on. Read once from the environment, then only `set_tracing` changes it.
+pub fn tracing_enabled() -> bool {
+    TRACING_INIT.call_once(|| {
+        let on = std::env::var("CHRONOS_TRACE")
+            .map(|v| !matches!(v.trim(), "" | "0" | "off" | "false" | "no"))
+            .unwrap_or(false);
+        TRACING.store(on, Ordering::Relaxed);
+    });
+    TRACING.load(Ordering::Relaxed)
+}
+
+/// Turns tracing on or off (for embedding and tests); overrides the environment from now on.
+pub fn set_tracing(on: bool) {
+    TRACING_INIT.call_once(|| {}); // so the env can't flip it back later
+    TRACING.store(on, Ordering::Relaxed);
+}
+
+/// A tracing span: opened around a unit of work and closed when it is dropped, when it emits one
+/// `event=span` line with its name, id, parent (if nested) and duration, plus any fields given at
+/// the start. When tracing is off, opening a span does nothing and costs an atomic load.
+pub struct Span {
+    id: Option<u64>,
+    name: &'static str,
+    parent: Option<u64>,
+    start: Instant,
+    fields: Vec<(String, String)>,
+}
+
+/// Opens a span named `name` with `fields`, if tracing is on (see `tracing_enabled`); otherwise a
+/// no-op span that emits nothing. Nests under any span already open on this thread.
+pub fn span(name: &'static str, fields: &[(&str, String)]) -> Span {
+    if !tracing_enabled() {
+        return Span { id: None, name, parent: None, start: Instant::now(), fields: Vec::new() };
+    }
+    let id = NEXT_SPAN.fetch_add(1, Ordering::Relaxed);
+    let parent = SPANS.with(|s| s.borrow().last().copied());
+    SPANS.with(|s| s.borrow_mut().push(id));
+    Span {
+        id: Some(id),
+        name,
+        parent,
+        start: Instant::now(),
+        fields: fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+    }
+}
+
+impl Drop for Span {
+    fn drop(&mut self) {
+        let Some(id) = self.id else { return };
+        SPANS.with(|s| {
+            let mut st = s.borrow_mut();
+            if st.last() == Some(&id) {
+                st.pop();
+            }
+        });
+        let dur = self.start.elapsed().as_secs_f64() * 1000.0;
+        let mut fields: Vec<(&str, String)> = vec![("name", self.name.to_string()), ("id", id.to_string())];
+        if let Some(p) = self.parent {
+            fields.push(("parent", p.to_string()));
+        }
+        fields.push(("dur_ms", format!("{dur:.3}")));
+        for (k, v) in &self.fields {
+            fields.push((k.as_str(), v.clone()));
+        }
+        log_line("INFO", "span", &fields);
+    }
 }
 
 /// Emit one structured log line: `level=<level> event=<event>` followed by each field as

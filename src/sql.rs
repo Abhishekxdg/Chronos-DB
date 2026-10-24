@@ -37752,6 +37752,9 @@ impl Session {
         let at = std::time::Instant::now();
         // refuse a new statement while the process is over its resident-memory cap (53200)
         db.guard_memory()?;
+        // a tracing span around the statement (off unless tracing is on; see `obs`): it closes with
+        // the statement's duration when this call returns
+        let _span = crate::obs::span("statement", &[("world", self.branch.clone())]);
         // the cursors DECLAREd here and the ones PL/pgSQL opens are one namespace, as Postgres's portals are: the
         // session's cursors are the statement's portals while it runs, where a function (its OPEN, FETCH, MOVE and
         // CLOSE, cursor_to_xml) reaches them, and come back after; not for the statements that work on them here
