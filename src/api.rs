@@ -871,11 +871,8 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
             // per table, with what it deletes, updates and inserts ("kinds"), tables that delete most first
             // ("summary"): what a review leads with
             let total = |db: &Db| -> Result<Value, Error> {
-                // one diff walk: the per-table totals ("tables") are the sum of the kinds, so there
-                // is no need to walk the change a second time with diff_count
+                let tables = db.diff_count(b, s("to"))?;
                 let kinds = chronos::sql::by_deletes(db.diff_kinds(b, s("to"))?);
-                let tables: std::collections::BTreeMap<String, usize> =
-                    kinds.iter().map(|(t, c)| (t.clone(), c.total())).collect();
                 let summary: Vec<Value> = kinds
                     .iter()
                     .map(|(t, c)| json!({ "table": t, "deleted": c.deleted, "updated": c.updated, "inserted": c.inserted }))

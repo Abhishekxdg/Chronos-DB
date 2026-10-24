@@ -154,56 +154,6 @@ pub fn max_disk_bytes_from_env() -> std::io::Result<u64> {
     }
 }
 
-/// CHRONOS_MAX_MEMORY_BYTES: the most resident memory the process may hold before it refuses new
-/// statements (0 or unset: no cap). A soft, process-wide cap — a statement already running is not
-/// interrupted; the next one is refused while the process is over (see `Core::guard_memory`).
-pub fn max_memory_bytes_from_env() -> std::io::Result<u64> {
-    match std::env::var("CHRONOS_MAX_MEMORY_BYTES") {
-        Err(_) => Ok(0),
-        Ok(v) => v.trim().parse().map_err(|_| {
-            std::io::Error::other(format!("CHRONOS_MAX_MEMORY_BYTES must be a number of bytes, not {v:?}"))
-        }),
-    }
-}
-
-/// The process's current resident set size in bytes, or None if it can't be read. Linux reads
-/// `/proc/self/statm` (its second field is resident pages); macOS asks the Mach kernel for the
-/// task's `resident_size`. Cheap enough to call once per statement.
-#[cfg(target_os = "linux")]
-pub fn process_rss_bytes() -> Option<u64> {
-    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-    // SAFETY: sysconf is a pure lookup of a system constant.
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    (page > 0).then(|| pages * page as u64)
-}
-
-/// See the Linux variant. macOS: `task_info(MACH_TASK_BASIC_INFO)`. (`libc`'s mach bindings are
-/// deprecated in favour of the `mach2` crate; a single `task_info` call doesn't warrant the extra
-/// dependency, so the deprecation is allowed here.)
-#[cfg(target_os = "macos")]
-#[allow(deprecated)]
-pub fn process_rss_bytes() -> Option<u64> {
-    let mut info = std::mem::MaybeUninit::<libc::mach_task_basic_info>::zeroed();
-    let mut count = (std::mem::size_of::<libc::mach_task_basic_info>() / std::mem::size_of::<libc::integer_t>())
-        as libc::mach_msg_type_number_t;
-    // SAFETY: mach_task_self() is the current task; task_info fills `info`, writing at most
-    // `count` integer_t words into the struct we own, and reports how many it wrote.
-    let rc = unsafe {
-        libc::task_info(
-            libc::mach_task_self(),
-            libc::MACH_TASK_BASIC_INFO as libc::task_flavor_t,
-            info.as_mut_ptr() as libc::task_info_t,
-            &mut count,
-        )
-    };
-    if rc != libc::KERN_SUCCESS {
-        return None;
-    }
-    // SAFETY: task_info returned KERN_SUCCESS, so `info` is initialised.
-    Some(unsafe { info.assume_init() }.resident_size)
-}
-
 /// Bytes as people read them: `512 MB`, `1.5 GB`, `64 kB`.
 pub fn show_bytes(n: u64) -> String {
     let (unit, name) = match n {
