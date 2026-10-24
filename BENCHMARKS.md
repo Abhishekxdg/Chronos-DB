@@ -27,6 +27,9 @@
 | **Weaviate, Redis** | one-user (1%) vector search p99, 76k | 2.1–2.3 ms | **1.46 ms, 1.23 ms** | [6](#6-vector-search-vs-other-vector-databases-on-real-embeddings) |
 | **Postgres 17** | one order joined to its row by key, over the protocol | 52 µs | **50 µs** | [4](#4-sql-over-the-postgres-protocol) |
 | **Redis, Weaviate** | server memory after the 76k run | 1.14 GB (2.3 GB at its peak) | 1.05 GB, 1.10 GB | [6](#6-vector-search-vs-other-vector-databases-on-real-embeddings) |
+| **Doltgres 1.4.0** | BranchBench S4: dev worlds rebasing off a busy spine, W=5 | 663 s | **563 s** | [16](#16-branchbench-six-agent-workflows-against-doltgres-and-postgres-copies) |
+| **Postgres 18** | CH-benCHmark Q3 and Q18, W=1 | 0.32 s, 0.27 s | **0.08 s** each | [16](#16-branchbench-six-agent-workflows-against-doltgres-and-postgres-copies) |
+| **Doltgres, Postgres copies** | the spine's TPC-C throughput while BranchBench's agents work (S4) | 28 txn/s | **30, 73** txn/s | [16](#16-branchbench-six-agent-workflows-against-doltgres-and-postgres-copies) |
 
 The merge row's cause is found and its fix is being built (section 1, TODOS.md). No longer losses: server memory at 1M real embeddings, 7.7 GB after the run before and 3.1 GB since (section 6, "Memory at 1M"), under Milvus's 5.2 GB and Qdrant's 6.6 GB; unfiltered vector search at 1M, 4.69 ms before and 1.36 ms since (section 6, "Where the 1M search's time went"), now faster than every system that finds more than 75% of the true top 10; the 8.6 ms vector p99 of this rerun's first runs was a readiness bug, fixed in the same change (section 6); the protocol join + `GROUP BY` is 4.4 ms against Postgres's 6.9 ms since #22 (section 4); and the slow checkpoint and reopen at 100,000 worlds came from the loaded laptop (section 9).
 
@@ -981,12 +984,72 @@ A world forked `WITH (check_reads = true)` records what it reads ([src/stale.rs]
 - **Past 10,000 keys of one table, the read counts as the whole table** (by design: the read set stays small), so *any* change to that table holds the merge, as in the third row. An agent that reads that many rows of a table main is busy with will be held often; a filter (`where ...`) keeps the check precise.
 - **The merge-time check for filters grows with filters × changed rows**, about 1.7 µs per pair here: 1,000 filters × 1,000 changed rows took 1.8 s, and 100 × 1,000 or 1,000 × 100 about 0.18 s. Two causes, both fixable ([issue #29](https://github.com/Abhishekxdg/chronosdb/issues/29)): identical filters aren't kept once (25 conditions were kept as 1,000 filters), and each changed row is decoded again for each filter. Both fixed in 0.3.0: the 1,000-scan merge takes 2.7 ms there (same script, from the 0.3.0 release notes).
 
+## 16. BranchBench: six agent workflows against Doltgres and Postgres copies
+
+*2026-10-24. GCP `c2d-standard-16` (16 vCPUs, AMD EPYC 7B13; 62 GB; 400 GB pd-ssd; Ubuntu 24.04; us-west1-a): a c2d-standard-32 didn't fit the project's CPU quota. One job at a time on an otherwise idle VM, page cache dropped between jobs, each run on a fresh database. Chronos served over the Postgres protocol with `CHRONOS_CACHE_MB=8192`: S4 on `be3f4cfc` (main with #237–#244) plus #257, the other five on `07c25646` (main with #237–#243; #244 only acts on a query past its memory limit, #257 only where both sides change one table's columns, and neither happens there); Postgres 18.6 with `shared_buffers = 8GB` on an XFS volume with reflinks (`file_copy_method = clone`); Doltgres 1.4.0. Harness: BranchBench (Columbia DAP Lab, [arXiv 2604.17180](https://arxiv.org/abs/2604.17180)) at `1ca34a3` plus the `chronosdb` backend ([Abhishekxdg/db-fork `chronosdb-backend`](https://github.com/Abhishekxdg/db-fork/tree/chronosdb-backend)). Raw stats and logs: [`bench/results/2026-10-24-branchbench/`](bench/results/2026-10-24-branchbench).*
+
+BranchBench drives each database through one git-like API (branch, commit, diff, log, merge, rebase, revert, reset, delete) in six agent workflows over TPC-C / CH-benCHmark data, and checks after each step that what the workflow expects of the data holds (its "invariants"). Each backend is an adapter: Chronos DB's maps every verb to one or two of its own statements (`CREATE WORLD ... FROM`, `DIFF WORLD a TO b`, `MERGE WORLD`, `REBASE WORLD`, `RESTORE WORLD ... TO`, `DROP WORLD`; a commit is a moment, read back as `'world@time'`). Native: branch, diff, merge, rebase, reset, delete and commit refs. Composed: commit (a log row plus the moment) and revert (the engine's inverse `DIFF ... AS SQL`, run by the adapter). Simulated: log (a bookkeeping table). Unsupported: one statement over several branches, so cross-branch reads run once per branch. `file_copy` is plain Postgres where a branch is a reflinked copy of the database and merge is SQL the adapter writes; `dolt` is Doltgres. The full configurations at W=5 (five warehouses, 2.6 million rows seeded), with the paper's two-hour cap per run; one run each.
+
+| scenario | Chronos DB | file_copy (Postgres 18) | Doltgres 1.4.0 |
+|---|---:|---:|---:|
+| S1 RL environment: 16 tasks, 256 rollout leaves forked from commits | **1,130 s**, 560/560 | 2,529 s, 560/560 | stopped at 2 h (12 of 16 tasks), 420/420, 12 operations stalled |
+| S2 context management: candidates, compaction, revert and rebase | **2.2 s**, 3/3 | 53 s, 3/3 | 13 s, 3/3 |
+| S3 multi-agent: 512 merges into a moving spine | **3.9 s**, 8/8 | 149 s, 8/8 | 19 s, 8/8 |
+| S4 dev agent: rebases off a busy spine, a schema clash | 663 s, 122/122 | 4,987 s, 123/123 | **563 s**, 121/121 |
+| S5 ops agent: bad deploy, investigation branches, point-in-time reset | **515 s**, 10/10 | 1,817 s, 10/10 | 634 s, 10/10 |
+| S6 data agent: 32 ingest batches rebased and merged, resets | **2,275 s**, 128/128 | 2,817 s, 128/128 | 1,493 s, **64/128** |
+
+(seconds of the workflow, then invariants passed; setup and seeding not counted. A run's invariant count follows the path it took, so it varies a little between backends.)
+
+- **Chronos was fastest in five of six, and the one whose answers held in all six.** Doltgres finished S6 sooner, but half its invariants failed: its `dolt_reset('--hard', ...)` returned success and left the rows loaded after the commit (`S6.2 batch 5 reset to step 1 restores its rows: expected 200, got 400`). That may be this Doltgres version or our setup; the BranchBench authors' own runs are the reference for it.
+- **Recovery after the bad deploy (S5)** took 18.8 s on Chronos (`RESTORE WORLD ... TO` the commit's moment), 195 s on file_copy (drop and re-clone) and 208 s on Doltgres.
+- **S4 is Doltgres's.** 563 s to 663 s. Chronos's S4 also needed #257 first (below).
+- **The background TPC-C load ran slower on Chronos** while the agents worked: 28 transactions/s in S4 (Doltgres 30, file_copy 73) and 21/s in S5 (Doltgres 30, file_copy 24).
+- **Conflict counts don't compare.** Chronos reports a row both sides changed as a conflict even when they changed different columns or wrote the same value (its default whole-row merge; `BY COLUMNS` would combine the different-column ones, and the adapter leaves it off). Doltgres merges cell by cell. S3: 35,503 rows in conflict on Chronos, 508 on Doltgres, 1,261 on file_copy; every merge succeeded and every invariant held on all three.
+- **Storage** isn't compared: file_copy's number is the sum of its databases' sizes (a reflinked clone counted whole), and Doltgres's directory wasn't measured in this setup. Chronos's folder went from 1.6 GB after seeding to 2.2–3.9 GB at the end of S1, S4, S5 and S6 (with a day of history kept, for the commits).
+
+**Found and fixed on the way.** The first runs, on 0.4.1, did much worse. BranchBench's consistency checks join TPC-C tables on three key columns and S4's spine runs CH Q3 and Q18. On 0.4.1 those joins ran as nested loops and S1 made no progress; with #241, Q3 took the server to 55 GB and the OOM killer two minutes into S4; with #242, S4's Q18 still took 17 minutes. Each became its own change, with a test:
+
+| | what BranchBench hit | fix |
+|---|---|---|
+| #241 | hash joins keyed on the first equality only: `order_line JOIN orders` on (w, d, o) > 120 s at W=1 (Postgres 74 ms) | key on every equality: 56 ms |
+| #242 | CH Q3 joined customer to new_order first (each new order × each customer of its district): > 12 GB at W=1 | the equalities the ON clauses imply decide the join order: 0.35 s, 850 MB |
+| #243 | the on-disk (grace) join, past `CHRONOS_WORK_MEM`, still keyed on one column: Q3 and Q18 17 min at W=5 | key on every equality there too: 0.6 s |
+| #244 | no memory limit outside an agent's `max_memory_mb`; and a join's probe never checked limits, so a 120 s `statement_timeout` landed at 161–205 s | `CHRONOS_QUERY_MEM` for every statement (a quarter of RAM), all statements to half; the probe checks as it goes: a 51 GB runaway join now fails in 1 s with the server up |
+| #257 | a merge or rebase where both sides changed one table's columns was refused even for different columns: 4 of S4's invariants (114/118) | merge the definitions column by column: 122/122 |
+| #237 | `USE WORLD 'name@when'` was documented but refused | works (BranchBench's commit refs use it) |
+| #239 | `DIFF` missed a column's new size (`varchar(5)` to `varchar(10)`) | it shows, and `DIFF ... AS SQL` carries it |
+
+**Where Chronos still loses here.**
+- **Analytical joins are about 4× Postgres.** CH Q3 0.32 s and Q18 0.27 s at W=1, against 0.08 s each on Postgres 18 (same VM; Chronos held to 2 threads, Postgres at its defaults, so this flatters Postgres somewhat).
+- **Memory.** Chronos peaked at 23 GB RSS in S4 (eight CH queries at a time over W=5, before #244). Rows a query holds are decoded values, several times their size on disk; the limit now fails a runaway query alone, but doesn't make the others smaller.
+- **Diff and revert of many rows.** `diff` returns every changed row: 47 ms at 1,000 rows, 495 ms at 10,000. `revert` runs the engine's inverse statements one at a time: 211 ms at 1,000 rows, 2.05 s at 10,000.
+
+**Microbenchmarks** (Chronos only, CH-benCHmark at W=1, 16 branches; BranchBench's `run_single_thread_bench.sh` and `run_micro_verbs.sh`, medians):
+
+| operation | Chronos DB |
+|---|---|
+| point read / insert / update, one thread | 0.25 / 1.9 / 1.9 ms per operation (incl. the harness) |
+| range read / range update (200 rows) | 3.7 ms / 38 ms |
+| connect (switch to a branch) | 0.1 ms |
+| branch, from main / from a commit 1–128 commits back | 0 ms / 4–8 ms |
+| commit (1–10,000 rows written since the last) | 1–3 ms |
+| delete a branch (any history, any size) | 0–2 ms |
+| merge 1 / 1,000 / 10,000 rows | 1 / 10 / 90 ms |
+| merge with conflicts (10–100% of 1,000 rows) | 101–131 ms |
+| rebase 1 / 1,000 / 10,000 rows | 1 / 9 / 88 ms |
+| reset, undoing 1 / 10,000 rows | 7 / 33 ms |
+
+Throughput (`run_throughput_bench.sh --sweep-proportional --mode sync`, 4 threads per branch, 1 to 128 branches, no failures): point reads 6,532 ops/s at 4 threads and 4,946 at 512; range reads 365–395 ops/s throughout. **That's BranchBench's client, not Chronos:** in sync mode it is one Python process, flat from 4 threads to 512 while the VM's load stayed at 2–6 of 16. A throughput comparison needs its async mode (`--mode async`, which the backend supports), not run here.
+
 ## Rerun everything
 
 ```bash
 cargo run --release --example bench -- 10 100 1000                 # needs Postgres at host=/tmp
 WORKERS=25 cargo run --release --example bench -- 1000             # Chronos at Postgres's 25 workers (TIMINGS=1: its own timings)
 python bench/rivals/forks.py dolt 10 100 1000                       # Dolt sql-server; also: postgres, neon (NEON_API_KEY), duckdb
+# BranchBench (section 16): in a clone of Abhishekxdg/db-fork on branch chronosdb-backend, with chronos serve on :5433
+./scripts/run_macrobench.sh --outdir run_stats --max-runtime-sec 7200 dev_agent chronosdb 5   # each of rl_env context_mgmt multi_agent dev_agent ops_agent data_agent; also file_copy, dolt
 N=500000 OVERSAMPLE=100 EF=300 cargo run --release --example search  # needs pgvector; N=1000000 for 1M x 384
 N=1000000 cargo run --release --example find
 CRASH_RUNS=10000 cargo test --release --test durability crash_suite
