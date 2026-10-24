@@ -1377,3 +1377,78 @@ fn a_merge_bigger_than_one_part_is_written_in_one_transaction() {
     drop(pg);
     drop_db(&name);
 }
+
+/// The pids of the connections to database `name` that say they are `chronos attach`'s, once there are `n` of them
+/// (a process that just ended may take a moment to let its go), or as they are after 10 s.
+fn backends(pg: &mut postgres::Client, name: &str, n: usize) -> Vec<String> {
+    let sql = format!(
+        "select pid from pg_stat_activity where datname = '{name}' and application_name = 'chronos attach' order by pid"
+    );
+    let mut got = vec![];
+    for _ in 0..100 {
+        got = pg
+            .simple_query(&sql)
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m {
+                postgres::SimpleQueryMessage::Row(r) => r.get(0).map(String::from),
+                _ => None,
+            })
+            .collect();
+        if got.len() == n {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    got
+}
+
+/// Merges into main keep one connection to Postgres between them (one backend, the same pid), and a refresh and a dry
+/// run use it too: no connect, TLS handshake and login per merge. One the server closed meanwhile
+/// (`pg_terminate_backend`) fails at the merge's first statement, before anything is written, and the merge makes a
+/// new one and goes through, written once.
+#[test]
+fn merges_keep_one_connection_and_make_a_new_one_when_it_is_gone() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("keep") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute("create table t (id int primary key, v int); insert into t values (1, 0), (2, 0)").unwrap();
+    let dir = folder("keep");
+    let (ok, out) = attach(&dir, &["--tables", "t"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    assert!(change(&db, "a", "update t set v = 1 where id = 1").is_none());
+    let first = backends(&mut pg, &name, 1);
+    assert_eq!(first.len(), 1, "one connection after a merge: {first:?}");
+    let pid = first[0].clone();
+    let e = change(&db, "b", "update t set v = 2 where id = 1");
+    assert!(e.is_none(), "{:?}", e.map(|e| e.message));
+    assert_eq!(backends(&mut pg, &name, 1), vec![pid.clone()], "the second merge used the first's connection");
+    chronos::attach::refresh(&db).unwrap();
+    run(&db, MAIN, "create world d", &[]).unwrap();
+    run(&db, "d", "update t set v = 9 where id = 2", &[]).unwrap();
+    run(&db, MAIN, "merge world d dry run", &[]).unwrap();
+    assert_eq!(backends(&mut pg, &name, 1), vec![pid.clone()], "a refresh and a dry run use it too");
+    assert_eq!(pg_cell(&mut pg, "select v from t where id = 2"), "0", "the dry run wrote nothing");
+
+    // the server ends it between merges: the next merge connects again, and is written once
+    assert_eq!(pg_cell(&mut pg, &format!("select pg_terminate_backend({pid})")), "t");
+    assert!(backends(&mut pg, &name, 0).is_empty(), "the connection is gone");
+    let e = change(&db, "c", "update t set v = 3 where id = 1");
+    assert!(e.is_none(), "{:?}", e.map(|e| e.message));
+    assert_eq!(pg_cell(&mut pg, "select v from t where id = 1"), "3");
+    assert_eq!(cell(&db, MAIN, "select v from t where id = 1"), "3");
+    assert_eq!(pg_cell(&mut pg, "select count(*) from chronos.merges where id like 'merge:%'"), "3");
+    let now = backends(&mut pg, &name, 1);
+    assert!(now.len() == 1 && now[0] != pid, "a new connection, kept in turn: {now:?} (was {pid})");
+    // and kept again for the merge after
+    let e = change(&db, "e", "update t set v = 4 where id = 1");
+    assert!(e.is_none(), "{:?}", e.map(|e| e.message));
+    assert_eq!(backends(&mut pg, &name, 1), now);
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}

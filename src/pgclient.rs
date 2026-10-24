@@ -16,7 +16,7 @@ use std::net::TcpStream;
 use std::sync::Arc;
 
 /// Where to connect, from `postgres://user:password@host:port/database?sslmode=...`.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Url {
     pub host: String,
     pub port: u16,
@@ -155,16 +155,20 @@ pub fn text_array<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Stri
 trait Stream: Read + Write {}
 impl<T: Read + Write> Stream for T {}
 
-/// A connection, logged in and ready for queries.
+/// A connection, logged in and ready for queries. Send: `chronos attach` keeps one between merges (see
+/// `attach::Lease`), and whichever thread merges next uses it.
 pub struct Client {
-    r: BufReader<Box<dyn Stream>>,
-    w: BufWriter<Box<dyn Stream>>,
+    r: BufReader<Box<dyn Stream + Send>>,
+    w: BufWriter<Box<dyn Stream + Send>>,
     /// in a COPY ... TO STDOUT, until its CopyDone
     copying: bool,
     /// over TLS: (the certificate's channel binding data, if it can be made)
     tls: Option<Option<Vec<u8>>>,
     /// the last ReadyForQuery's transaction status: `I` idle, `T` in a transaction, `E` in a failed one
     pub status: u8,
+    /// a query failed other than by the server's answer (the connection lost, a reply cut short or garbled): where
+    /// the conversation stands isn't known, so the connection is good for nothing more
+    pub broken: bool,
 }
 
 /// An ErrorResponse from the server: its SQLSTATE, message and detail. `chronos attach` tells a lock timeout or a
@@ -554,6 +558,7 @@ impl Client {
             copying: false,
             tls: tls_binding,
             status: b'I',
+            broken: false,
         };
         let mut body = vec![0, 3, 0, 0]; // protocol 3.0
         for (k, v) in [("user", url.user.as_str()), ("database", &url.database), ("application_name", app)] {
@@ -698,8 +703,23 @@ impl Client {
         }
     }
 
+    /// Notes `out`'s failure if it isn't the server's answer (see `broken`).
+    fn note<T>(&mut self, out: io::Result<T>) -> io::Result<T> {
+        if let Err(e) = &out
+            && pg_error(e).is_none()
+        {
+            self.broken = true;
+        }
+        out
+    }
+
     /// Runs `sql` (one statement), and returns its rows as text.
     pub fn query(&mut self, sql: &str) -> io::Result<Rows> {
+        let out = self.simple_query(sql);
+        self.note(out)
+    }
+
+    fn simple_query(&mut self, sql: &str) -> io::Result<Rows> {
         let mut q = sql.as_bytes().to_vec();
         q.push(0);
         self.send(b'Q', &q)?;
@@ -724,6 +744,11 @@ impl Client {
     /// is ever quoted into SQL and nothing outlives the call (a pooler in transaction mode may hand the next one to
     /// another server connection).
     pub fn query_params(&mut self, sql: &str, params: &[Option<&str>]) -> io::Result<Rows> {
+        let out = self.extended_query(sql, params);
+        self.note(out)
+    }
+
+    fn extended_query(&mut self, sql: &str, params: &[Option<&str>]) -> io::Result<Rows> {
         if params.len() > u16::MAX as usize {
             return Err(err(format!("{} parameters, more than one statement takes", params.len())));
         }
@@ -764,6 +789,11 @@ impl Client {
 
     /// Starts `COPY ... TO STDOUT`: then `copy_chunk` until it gives None.
     pub fn copy_out(&mut self, sql: &str) -> io::Result<()> {
+        let out = self.start_copy(sql);
+        self.note(out)
+    }
+
+    fn start_copy(&mut self, sql: &str) -> io::Result<()> {
         let mut q = sql.as_bytes().to_vec();
         q.push(0);
         self.send(b'Q', &q)?;
@@ -793,6 +823,11 @@ impl Client {
 
     /// The COPY's next CopyData; None once it's done (and the connection ready again).
     pub fn copy_chunk(&mut self) -> io::Result<Option<Vec<u8>>> {
+        let out = self.next_chunk();
+        self.note(out)
+    }
+
+    fn next_chunk(&mut self) -> io::Result<Option<Vec<u8>>> {
         if !self.copying {
             return Ok(None);
         }
@@ -901,6 +936,7 @@ mod tests {
                 copying: false,
                 tls: tls.then_some(None),
                 status: b'I',
+                broken: false,
             };
             let e = c.login(&url, &|| Ok(())).expect_err("the stream ends").to_string();
             let sent = sent.lock().unwrap().clone();

@@ -36,7 +36,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
+use std::time::{Duration, Instant};
 
 /// The folder's file saying it is attached, and to what (no secret in it).
 pub(crate) const FILE: &str = "attached";
@@ -69,6 +71,11 @@ pub const SETTINGS: &str = "set local timezone = 'UTC'; set local datestyle = 'I
      set local search_path = public";
 /// What pg_stat_activity shows for Chronos's connections.
 const APP: &str = "chronos attach";
+/// How long the connection kept to the source (see `Lease`) may go unused before it is closed, so a Postgres that
+/// scales to zero (Neon, Supabase) can; the next use connects again.
+const KEEP_IDLE: Duration = Duration::from_secs(300);
+/// How often a kept connection is looked at for having gone unused that long.
+const KEEP_CHECK: Duration = Duration::from_secs(30);
 
 /// A table of the folder, attached.
 #[derive(Clone, Debug, PartialEq)]
@@ -132,6 +139,150 @@ pub struct Attached {
     /// columns a refresh added to main whose default or NOT NULL waits for their values: made so once main has
     /// Postgres's values (see `settle`), at the end of that refresh or, if it failed, the next
     unsettled: Mutex<Vec<Unsettled>>,
+    /// the connection to the source kept between write-backs, refreshes and dry runs (see `Lease`)
+    conn: Arc<Conn>,
+}
+
+/// The connection to the source kept from its last use (see `Lease`): taken out for a use and put back after, never
+/// used in place, so its mutex is held only for that and orders with no other lock. Two uses at once (a dry run
+/// beside a merge) each have one; the second put back closes the first.
+#[derive(Default)]
+struct Conn {
+    kept: Mutex<Option<Kept>>,
+    /// a thread closes the kept connection once unused for `KEEP_IDLE` (see `close_idle`)
+    watched: AtomicBool,
+}
+
+/// A connection kept, the URL it was made to, and since when it is unused.
+struct Kept {
+    pg: Client,
+    url: Url,
+    since: Instant,
+}
+
+impl std::fmt::Debug for Conn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Conn")
+    }
+}
+
+impl Conn {
+    fn take(&self) -> Option<Kept> {
+        self.kept.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+
+    /// Keeps `pg` for the next use, closing any other kept meanwhile, and has a thread watch it for going unused.
+    fn put(self: &Arc<Conn>, pg: Client, url: Url) {
+        let old = {
+            let mut kept = self.kept.lock().unwrap_or_else(|p| p.into_inner());
+            let old = kept.replace(Kept { pg, url, since: Instant::now() });
+            // (under the lock: the watcher stops only when it finds none kept, under it too)
+            if !self.watched.swap(true, Ordering::SeqCst) {
+                let conn = Arc::downgrade(self);
+                let started =
+                    std::thread::Builder::new().name("chronos-attach-idle".into()).spawn(move || close_idle(conn));
+                if started.is_err() {
+                    self.watched.store(false, Ordering::SeqCst);
+                }
+            }
+            old
+        };
+        drop(old); // (outside the lock: closing it says goodbye to the server)
+    }
+}
+
+/// Closes the connection `conn` keeps once unused for `KEEP_IDLE`; ends when none is kept, or the folder is closed.
+fn close_idle(conn: Weak<Conn>) {
+    loop {
+        std::thread::sleep(KEEP_CHECK);
+        let Some(conn) = conn.upgrade() else { return };
+        let idle = {
+            let mut kept = conn.kept.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(since) = kept.as_ref().map(|k| k.since) else {
+                conn.watched.store(false, Ordering::SeqCst);
+                return;
+            };
+            if since.elapsed() >= KEEP_IDLE { kept.take() } else { None }
+        };
+        drop(idle);
+    }
+}
+
+/// A connection to the source for one use (a write-back, a refresh, a dry run, a check of reads, ids reserved): the
+/// one kept from the last use (see `Conn`) when it is to the URL `source_url` gives now, unused for less than
+/// `KEEP_IDLE`, and whole; else a new one. A merge then costs its statements alone, not a connect, a TLS handshake
+/// and a login too (a third of a small merge's round trips). Nothing of one use is left for the next: each use
+/// starts a transaction (`begin`) and settings are SET LOCAL, or it is one statement on its own; let go, the
+/// connection is kept only with no transaction open (an error path rolls back first) and nothing broken, else closed.
+pub(crate) struct Lease {
+    /// Some until dropped
+    pg: Option<Client>,
+    url: Url,
+    /// kept from an earlier use: the server may have closed it since (see `first`)
+    reused: bool,
+    conn: Arc<Conn>,
+}
+
+impl Attached {
+    /// A connection to the source for one use (see `Lease`).
+    fn lease(&self) -> std::result::Result<Lease, String> {
+        let url = source_url()?;
+        let (pg, reused) = match self.conn.take() {
+            Some(k) if k.url == url && k.since.elapsed() < KEEP_IDLE && k.pg.status == b'I' && !k.pg.broken => {
+                (k.pg, true)
+            }
+            other => {
+                drop(other);
+                (open(&url)?, false)
+            }
+        };
+        Ok(Lease { pg: Some(pg), url, reused, conn: self.conn.clone() })
+    }
+}
+
+impl Lease {
+    /// Runs `f`, the use's first statement. On a kept connection the server closed while it was unused (a restart, a
+    /// pooler's or `idle_session_timeout`, `pg_terminate_backend`), the connection fails then, and `f` runs once
+    /// more on a new one: only the first statement, which nothing was sent before on this connection and which
+    /// writes nothing (or, reserving ids, only leaves a gap). After it, a lost connection is the use's own error,
+    /// never retried: a write may have been sent.
+    fn first<T>(&mut self, mut f: impl FnMut(&mut Client) -> io::Result<T>) -> io::Result<T> {
+        match f(self) {
+            Err(e) if self.reused && pg_error(&e).is_none() => {
+                self.reused = false;
+                let url = &self.url;
+                let fresh = Client::connect_as(url, APP)
+                    .map_err(|e| io::Error::new(e.kind(), format!("Postgres at {}:{}: {e}", url.host, url.port)))?;
+                self.pg = Some(fresh); // (the dead one closed)
+                f(self)
+            }
+            out => out,
+        }
+    }
+}
+
+impl std::ops::Deref for Lease {
+    type Target = Client;
+    fn deref(&self) -> &Client {
+        self.pg.as_ref().expect("a lease holds its connection until dropped")
+    }
+}
+
+impl std::ops::DerefMut for Lease {
+    fn deref_mut(&mut self) -> &mut Client {
+        self.pg.as_mut().expect("a lease holds its connection until dropped")
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if let Some(pg) = self.pg.take()
+            && pg.status == b'I'
+            && !pg.broken
+        {
+            self.conn.put(pg, self.url.clone());
+        }
+    }
 }
 
 /// A column a refresh added whose default or NOT NULL waits for its values (see `Attached::unsettled`): its table,
@@ -297,6 +448,7 @@ impl Attached {
             ids: Mutex::new(Ids::default()),
             refreshed: Default::default(),
             unsettled: Mutex::default(),
+            conn: Arc::default(),
         }
     }
 
@@ -329,6 +481,7 @@ impl Attached {
             unsettled: Mutex::default(),
             dir: dir.to_path_buf(),
             lock: Mutex::new(()),
+            conn: Arc::default(),
         }))
     }
 
@@ -449,10 +602,14 @@ pub fn source_url() -> std::result::Result<Url, String> {
     pgclient::parse(&text)
 }
 
-/// A connection to the source, as `source_url` gives it.
+/// A new connection to the source, as `source_url` gives it (most uses take the kept one: see `Lease`).
 fn connect() -> std::result::Result<Client, String> {
-    let url = source_url()?;
-    Client::connect_as(&url, APP).map_err(|e| format!("Postgres at {}:{}: {e}", url.host, url.port))
+    open(&source_url()?)
+}
+
+/// A new connection to `url`.
+fn open(url: &Url) -> std::result::Result<Client, String> {
+    Client::connect_as(url, APP).map_err(|e| format!("Postgres at {}:{}: {e}", url.host, url.port))
 }
 
 /// A Postgres failure as the merge's error. `retry`: nothing was written, and the same merge may simply be run again
@@ -501,9 +658,10 @@ fn refused(m: impl Into<String>) -> Error {
     Error::Constraint { code: "55000", message: m.into() }
 }
 
-/// Rolls back what `pg` has open, if anything.
+/// Rolls back what `pg` has open, if anything (on a broken connection, nothing can be sent: the server rolls it back
+/// as the connection closes).
 fn rollback(pg: &mut Client) {
-    if pg.status != b'I' {
+    if pg.status != b'I' && !pg.broken {
         let _ = pg.query("rollback");
     }
 }
@@ -540,7 +698,7 @@ impl Attached {
         let mut ids = self.ids.lock().unwrap_or_else(|p| p.into_inner());
         let have = ids.pool.get(counter).map_or(0, |p| p.len());
         if have < n {
-            let got = reserve(seq, (n - have).max(BLOCK))?;
+            let got = reserve(self, seq, (n - have).max(BLOCK))?;
             ids.add(seq, &got);
             let runs = serde_json::to_string(&ids.runs).map_err(|e| e.to_string())?;
             // on disk before any is handed out: a merge after a restart still knows them
@@ -558,13 +716,16 @@ impl Attached {
 }
 
 /// `n` values of Postgres's sequence `seq`, taken in one statement (gaps in the sequence are the cost).
-fn reserve(seq: &str, n: usize) -> std::result::Result<Vec<i64>, String> {
-    let mut pg = connect()?;
+fn reserve(att: &Attached, seq: &str, n: usize) -> std::result::Result<Vec<i64>, String> {
+    let mut pg = att.lease()?;
+    let n = n.to_string();
     let rows = pg
-        .query_params(
-            "select nextval($1::regclass) from generate_series(1, $2::int)",
-            &[Some(seq), Some(&n.to_string())],
-        )
+        .first(|pg| {
+            pg.query_params(
+                "select nextval($1::regclass) from generate_series(1, $2::int)",
+                &[Some(seq), Some(n.as_str())],
+            )
+        })
         .map_err(|e| format!("reserving ids from Postgres's sequence {seq}: {e}"))?;
     rows.iter()
         .map(|r| r[0].as_deref().and_then(|v| v.parse().ok()).ok_or_else(|| format!("{seq} gave no value")))
@@ -779,7 +940,7 @@ pub(crate) fn write_back(
     if rows.is_empty() {
         return Ok(None);
     }
-    let mut pg = connect().map_err(|e| refused(format!("{e}; nothing was merged")))?;
+    let mut pg = att.lease().map_err(|e| refused(format!("{e}; nothing was merged")))?;
     let out = transaction(core, &mut pg, att, world, world_id, &rows, reads, checks);
     if out.is_err() {
         rollback(&mut pg);
@@ -798,7 +959,7 @@ pub(crate) fn check_reads(
     base: &State,
     wrote: &HashSet<String>,
 ) -> std::result::Result<Vec<String>, String> {
-    let mut pg = connect()?;
+    let mut pg = att.lease()?;
     let r = Reads { set, base, wrote };
     let out = begin(&mut pg, att, true).and_then(|()| live_reads(core, &mut pg, att, &r));
     rollback(&mut pg);
@@ -848,7 +1009,7 @@ pub(crate) fn dry_run(core: &Core, att: &Attached, dry: Dry) -> crate::LiveCheck
     if rows.is_empty() {
         return live; // writes nothing to Postgres: nothing there to check
     }
-    let mut pg = match connect() {
+    let mut pg = match att.lease() {
         Ok(pg) => pg,
         Err(e) => {
             live.error = Some(e);
@@ -868,7 +1029,7 @@ pub(crate) fn dry_run(core: &Core, att: &Attached, dry: Dry) -> crate::LiveCheck
 
 fn dry_transaction(
     core: &Core,
-    pg: &mut Client,
+    pg: &mut Lease,
     att: &Attached,
     rows: &[Row],
     reads: Option<&Reads>,
@@ -1003,7 +1164,7 @@ fn run(pg: &mut Client, what: &str, sql: &str, params: &[String]) -> Result<pgcl
 #[allow(clippy::too_many_arguments)]
 fn transaction(
     core: &Core,
-    pg: &mut Client,
+    pg: &mut Lease,
     att: &Attached,
     world: &str,
     world_id: &str,
@@ -1301,8 +1462,9 @@ fn live_checks(pg: &mut Client, checks: &[crate::checks::MergeCheck]) -> Vec<Str
 }
 
 /// Starts a transaction on the source (see `SETTINGS`, the timeouts) and checks it is the database this folder was
-/// attached to, in the same round trip. `dry`: a dry run's (read only, one snapshot), which writes nothing.
-fn begin(pg: &mut Client, att: &Attached, dry: bool) -> Result<()> {
+/// attached to, in the same round trip. `dry`: a dry run's (read only, one snapshot), which writes nothing. The use's
+/// first statement: on a kept connection found gone, run again on a new one (see `Lease::first`).
+fn begin(pg: &mut Lease, att: &Attached, dry: bool) -> Result<()> {
     let (how, what, nothing) = match dry {
         true => ("isolation level repeatable read, read only", "starting the dry run", "nothing was checked"),
         false => ("isolation level read committed", "starting the write-back", "nothing was merged"),
@@ -1314,7 +1476,7 @@ fn begin(pg: &mut Client, att: &Attached, dry: bool) -> Result<()> {
          select count(*) from chronos.merges where id = {}",
         lit(&att.marker())
     );
-    let found = pg.query(&start).map_err(|e| failed(what, &e))?;
+    let found = pg.first(|pg| pg.query(&start)).map_err(|e| failed(what, &e))?;
     if found.last().and_then(|r| r[0].as_deref()) != Some("1") {
         return Err(refused(format!(
             "the Postgres CHRONOS_SOURCE_URL names isn't the one this folder was attached to ({}): its chronos.merges \
@@ -1989,9 +2151,10 @@ fn refresh_with(core: &Core, only: Option<&[usize]>) -> std::result::Result<Refr
 
 /// `refresh_with`, with the write-back lock held and no write-back left pending (or settling one: see `resolve`).
 fn refresh_now(core: &Core, att: &Attached, only: Option<&[usize]>) -> std::result::Result<Refreshed, String> {
-    let mut pg = connect()?;
+    let mut pg = att.lease()?;
     let out = refresh_read(core, att, &mut pg, only);
     rollback(&mut pg);
+    drop(pg);
     let mut done = out.map_err(|e| e.to_string())?;
     let rows: Vec<Stored> = std::mem::take(&mut done.1);
     store(core, att, &rows)?;
@@ -2007,7 +2170,7 @@ fn refresh_now(core: &Core, att: &Attached, only: Option<&[usize]>) -> std::resu
 fn refresh_read(
     core: &Core,
     att: &Attached,
-    pg: &mut Client,
+    pg: &mut Lease,
     only: Option<&[usize]>,
 ) -> Result<(Refreshed, Vec<Stored>)> {
     let start = format!(
@@ -2015,7 +2178,7 @@ fn refresh_read(
          {SETTINGS}; select count(*) from chronos.merges where id = {}",
         lit(&att.marker())
     );
-    let found = pg.query(&start).map_err(|e| failed("starting the refresh", &e))?;
+    let found = pg.first(|pg| pg.query(&start)).map_err(|e| failed("starting the refresh", &e))?;
     if found.last().and_then(|r| r[0].as_deref()) != Some("1") {
         return Err(refused(format!(
             "the Postgres CHRONOS_SOURCE_URL names isn't the one this folder was attached to ({}): nothing was refreshed",
@@ -2090,10 +2253,10 @@ fn refresh_read(
             keys.push(row.key_texts(t));
             held.push(row);
             if held.len() >= REFRESH_BATCH {
-                flush(&mut held, &mut *pg)?;
+                flush(&mut held, pg)?;
             }
         }
-        flush(&mut held, &mut *pg)?;
+        flush(&mut held, pg)?;
         // rows Postgres has that main hasn't: inserted there since
         let mut params = vec![];
         for k in 0..t.key.len() {
@@ -2212,9 +2375,10 @@ fn settle(core: &Core, att: &Attached) -> Vec<String> {
 /// a pending write-back settled. A line to print either way; merges into main are refused while it fails.
 pub fn check(core: &Core) -> std::result::Result<String, String> {
     let Some(att) = core.attached.as_deref() else { return Ok(String::new()) };
-    let mut pg = connect()?;
+    let mut pg = att.lease()?;
+    let marker = att.marker();
     let found = pg
-        .query_params("select count(*) from chronos.merges where id = $1", &[Some(&att.marker())])
+        .first(|pg| pg.query_params("select count(*) from chronos.merges where id = $1", &[Some(&marker)]))
         .map_err(|e| format!("reading chronos.merges: {e}"))?;
     if found.first().and_then(|r| r[0].as_deref()) != Some("1") {
         return Err(format!(

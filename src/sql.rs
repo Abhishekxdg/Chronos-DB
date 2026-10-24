@@ -29701,6 +29701,13 @@ impl Counts {
             (false, false) => {}
         }
     }
+
+    /// All the rows this table changed: deletes, updates and inserts together. Equals the
+    /// per-table count `Core::diff_count` returns, so a caller that has the kinds needs no second
+    /// diff walk to get the totals.
+    pub fn total(&self) -> usize {
+        self.deleted + self.updated + self.inserted
+    }
 }
 
 /// A number as people read it: `4,812`.

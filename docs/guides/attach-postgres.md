@@ -153,6 +153,10 @@ person approves by merging the queued world.
   it. With `track_counts` off, they wait for the next refresh.
 - Tested on Neon, both straight to the database and through its pooler (PgBouncer, transaction mode): a merge of
   1,000 rows took about 1.2 s from a machine 60 ms away, mostly round trips ([BENCHMARKS.md §14](https://github.com/Abhishekxdg/chronosdb/blob/main/BENCHMARKS.md#14-attach-writing-merges-back-to-a-managed-postgres-neon)).
+- The folder keeps one connection to Postgres between merges (refreshes and dry runs use it too), so a merge doesn't
+  connect, handshake TLS and log in each time. It closes after 5 minutes unused, so Neon or Supabase can scale to
+  zero; one closed by the server is replaced at the next merge's first statement, before anything is written. A
+  changed `CHRONOS_SOURCE_URL` or `CHRONOS_SOURCE_FILE` is used from the next merge on.
 
 ## Keeping main up to date (refresh)
 
