@@ -18,7 +18,7 @@ merging a world.
 
 ```bash
 curl -fsSL https://github.com/Abhishekxdg/chronosdb/releases/latest/download/install.sh | sh
-chronos serve crm-trial &               # HTTP on 127.0.0.1:7070, Postgres on 127.0.0.1:5433
+CHRONOS_PROTECT_MAIN=off chronos serve crm-trial &   # the trial seeds main directly; HTTP on 127.0.0.1:7070, Postgres on 127.0.0.1:5433
 git clone https://github.com/Abhishekxdg/chronosdb && cd chronosdb/examples/trial
 python3 trial.py                        # Python 3.9+, nothing to install
 ```

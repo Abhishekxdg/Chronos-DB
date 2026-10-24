@@ -275,6 +275,58 @@ fn memory_doesnt_grow_with_the_table() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The same with SET TABLESPACE in the statement, which moves the table as the rest of it is written: the rewrite still
+/// goes on in parts, and a unique constraint is still built as it is by itself.
+#[test]
+fn with_set_tablespace_memory_doesnt_grow_either() {
+    let _one = setup();
+    let dir = tmp("tablespace");
+    let db = Db::open(&dir).unwrap();
+    sql(&db, "set allow_in_place_tablespaces = true; create tablespace ts location ''");
+    let measure = |q: &str| {
+        let base = NOW.load(Relaxed);
+        PEAK.store(base, Relaxed);
+        sql(&db, q);
+        PEAK.load(Relaxed) - base
+    };
+    let in_ts = || {
+        let q = "select c.relname from pg_class c join pg_tablespace s on s.oid = c.reltablespace \
+                 where s.spcname = 'ts' order by 1";
+        sql(&db, q).into_iter().map(|r| r[0].clone()).collect::<Vec<_>>()
+    };
+    let grew: Vec<usize> = [("a", 20_000), ("b", 80_000)]
+        .into_iter()
+        .map(|(t, n)| {
+            table(&db, t, "", 1, n);
+            sql(&db, "select count(*) from generate_series(1, 10)");
+            let before = spilled(&db);
+            let grew = measure(&format!("alter table {t} add primary key (id), set tablespace ts"));
+            assert!(spilled(&db) > before, "in parts");
+            assert_eq!(in_ts(), [t]);
+            sql(&db, &format!("alter table {t} set tablespace pg_default"));
+            grew
+        })
+        .collect();
+    eprintln!(
+        "add primary key, set tablespace: heap growth 20,000 rows {} kB, 80,000 rows {} kB",
+        grew[0] >> 10,
+        grew[1] >> 10
+    );
+    // (held in memory: 27 MB for 20,000 rows, 108 MB for 80,000)
+    assert!(grew[1] < grew[0] + (4 << 20), "{grew:?}: four times the rows, about the same memory");
+    assert!(grew[1] < 48 << 20, "{grew:?}");
+    let alone = measure("alter table b add unique (g, id)");
+    let moved = measure("alter table b add unique (id, g), set tablespace ts");
+    eprintln!("add unique on 80,000 rows: heap growth {} kB, with set tablespace {} kB", alone >> 10, moved >> 10);
+    assert!(moved < alone + (4 << 20), "{moved} vs {alone}: as much memory as by itself");
+    assert_eq!(in_ts(), ["b"]);
+    assert_eq!(one(&db, "select count(*) from b where id between 100 and 199"), "100");
+    assert_eq!(one(&db, "select count(*) from pg_constraint where conname in ('b_pkey', 'b_id_g_key')"), "2");
+    db.verify().unwrap();
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 const CHILD: &str = "CHRONOS_REWRITE_CHILD";
 
 /// The child process of `a_kill_mid_rewrite_leaves_the_table_whole` (a no-op otherwise).

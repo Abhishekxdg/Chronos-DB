@@ -94,8 +94,8 @@ pub(super) fn routines(world: &str, cat: &Catalog) -> Vec<Vec<Value>> {
                 returns.map_or(Value::Null, Value::Text),
                 udt.map_or(Value::Null, Value::Text),
                 t(if sql { "SQL" } else { "EXTERNAL" }),
-                t(&f.body),
-                t(if sql { "SQL" } else { "PLPGSQL" }),
+                t(f.src()),
+                t(&f.lang_name().to_uppercase()),
                 t(if f.volatility == Volatility::Immutable { "YES" } else { "NO" }),
                 t(if f.definer { "DEFINER" } else { "INVOKER" }),
                 t("MODIFIES"),
@@ -270,6 +270,10 @@ impl Catalog {
             elems.iter().map(|(_, n)| (schema_part(n).to_string(), rel_part(n).to_string())).collect();
         let mut out = HashMap::new();
         for (oid, name) in elems {
+            // (a shell type has none: the name is left for another's)
+            if self.enum_at(oid, false).is_some_and(|k| self.is_shell(k)) {
+                continue;
+            }
             let (schema, base) = (schema_part(name).to_string(), rel_part(name));
             let mut n = 0;
             let made = loop {
@@ -428,7 +432,7 @@ impl Catalog {
         if let Some(r) = self.function_result(f) {
             d.push_str(&format!(" RETURNS {r}\n"));
         }
-        d.push_str(&format!(" LANGUAGE {}\n", if f.lang == Lang::Sql { "sql" } else { "plpgsql" }));
+        d.push_str(&format!(" LANGUAGE {}\n", f.lang_name()));
         let mut flags = vec![];
         match f.volatility {
             Volatility::Immutable => flags.push("IMMUTABLE"),
@@ -450,8 +454,9 @@ impl Catalog {
         if f.tuning.leakproof {
             flags.push("LEAKPROOF".into());
         }
-        // (COST and ROWS where they aren't the defaults, as %g writes them)
-        if let Some(c) = f.cost.filter(|c| *c != 100.0) {
+        // (COST and ROWS where they aren't the defaults, the cost its language's (see `Function::default_cost`), as
+        // %g writes them)
+        if let Some(c) = f.cost.filter(|c| *c != f.default_cost()) {
             flags.push(format!("COST {}", Value::Float(c).to_text()));
         }
         if let Some(r) = f.tuning.rows.filter(|r| *r > 0.0 && *r != 1000.0) {
@@ -473,6 +478,11 @@ impl Catalog {
             return d;
         }
         let tag = if f.procedure { "$procedure$" } else { "$function$" };
+        // (a C function's library, then its symbol as the source)
+        if let Some((file, _)) = &f.c_trigger {
+            d.push_str(&format!("AS '{}', {tag}{}{tag}\n", file.replace('\'', "''"), f.src()));
+            return d;
+        }
         d.push_str(&format!("AS {tag}{}{tag}\n", f.body));
         d
     }
@@ -633,8 +643,8 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
     let t = |s: &str| Value::Text(s.into());
     let row = |fields: Vec<(&str, Value)>| catalog_schema::named_row(name, fields);
     let rows: Vec<Vec<Value>> = match name {
-        "pg_class" => class_rows(cat),
-        "pg_attribute" => attribute_rows(cat),
+        "pg_class" => class_rows(cat).into_iter().chain(composite_class_rows(cat)).collect(),
+        "pg_attribute" => attribute_rows(cat).into_iter().chain(composite_attribute_rows(cat)).collect(),
         // the built-in functions whose privileges initdb set (pg_proc's built-in rows are added by `catalog_query`)
         "pg_init_privs" => catalog_schema::builtin_init_privs(),
         "pg_attrdef" => cat
@@ -696,6 +706,8 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
         | "pg_user_mapping"
         | "pg_user_mappings"
         | "pg_foreign_table" => super::foreign::catalog_rows(name, cat),
+        // tablespaces: Postgres's two and the world's (see `tablespace`)
+        "pg_tablespace" => super::tablespace::catalog_rows(cat),
         // publications (see `publication`)
         "pg_publication" | "pg_publication_rel" | "pg_publication_namespace" | "pg_publication_tables" => {
             super::publication::catalog_rows(name, cat)
@@ -756,21 +768,37 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
                 };
                 // (a domain is a type of its own kind, over its base type: its NOT NULL is the type's)
                 let domain = cat.domains.get(k).and_then(Option::as_ref);
+                // (a composite type is a row of its relation's columns, as a table's row type is)
+                let comp = cat.comp_oid(k).filter(|_| domain.is_none());
+                // (a shell type, `CREATE TYPE name`, is a placeholder, as Postgres's is: no relation, no array type, and
+                // shell_in and shell_out, which refuse every value)
+                let shell = cat.is_shell(k);
+                let (kind, category, io) = match (domain, comp) {
+                    (Some(_), _) => ("d", "U", "enum"),
+                    (None, Some(_)) => ("c", "C", "record"),
+                    (None, None) if shell => ("p", "P", "shell"),
+                    (None, None) => ("e", "E", "enum"),
+                };
                 let mut e = common(vec![
                     ("oid", int(oid)),
-                    ("typlen", int(4)),
-                    ("typbyval", b(true)),
-                    ("typtype", t(if domain.is_some() { "d" } else { "e" })),
-                    ("typcategory", t(if domain.is_some() { "U" } else { "E" })),
+                    ("typlen", int(if comp.is_some() { -1 } else { 4 })),
+                    ("typbyval", b(comp.is_none())),
+                    ("typtype", t(kind)),
+                    ("typcategory", t(category)),
                     ("typsubscript", t("-")),
-                    ("typinput", t("enum_in")),
-                    ("typoutput", t("enum_out")),
-                    ("typreceive", t("enum_recv")),
-                    ("typsend", t("enum_send")),
+                    ("typinput", t(&format!("{io}_in"))),
+                    ("typoutput", t(&format!("{io}_out"))),
+                    ("typreceive", t(&format!("{io}_recv"))),
+                    ("typsend", t(&format!("{io}_send"))),
                     ("typelem", int(0)),
                     ("typarray", int(oid + 1)),
-                    ("typstorage", t("p")),
+                    ("typstorage", t(if comp.is_some() { "x" } else { "p" })),
                 ]);
+                if let Some(rel) = comp {
+                    // (the first of a field `common` gives is the one taken)
+                    e.insert(0, ("typrelid", int(rel)));
+                    e.insert(0, ("typalign", t("d")));
+                }
                 let mut a = common(vec![
                     ("oid", int(oid + 1)),
                     ("typlen", int(-1)),
@@ -789,15 +817,28 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
                     // `common`'s `-`, and named_row takes the first)
                     ("typanalyze", t("array_typanalyze")),
                 ]);
+                if comp.is_some() {
+                    // (an array is aligned as its elements are)
+                    a.insert(0, ("typalign", t("d")));
+                }
                 if let Some((not_null, _)) = domain {
                     // (the first of a field `common` gives is the one taken)
                     e.insert(0, ("typnotnull", b(*not_null)));
                 }
+                if shell {
+                    // (the first of a field is the one taken)
+                    e.splice(
+                        0..0,
+                        [("typisdefined", b(false)), ("typarray", int(0)), ("typreceive", t("-")), ("typsend", t("-"))],
+                    );
+                }
                 e.push(("typname", t(rel_part(name))));
                 e.push(("typacl", acl));
-                a.push(("typname", t(&arrays[&oid])));
                 rows.push(row(e));
-                rows.push(row(a));
+                if !shell {
+                    a.push(("typname", t(&arrays[&oid])));
+                    rows.push(row(a));
+                }
             }
             // the hstore and ltree extensions' types and their arrays: what a driver looks up by name to read and
             // write them. In pg_catalog, as they are built in (in public, pg_dump would write a CREATE TYPE for each)
@@ -1012,8 +1053,15 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
                     ("proname", t(rel_part(&f.name))),
                     ("pronamespace", int(cat.schema_oid(schema_part(&f.name)))),
                     ("proowner", int(acl.0)),
-                    ("prolang", int(if f.lang == Lang::Sql { 14 } else { 13612 })),
-                    ("procost", Value::Float(f.cost.unwrap_or(100.0))),
+                    (
+                        "prolang",
+                        int(match f.lang_name() {
+                            "c" => 13,
+                            "sql" => 14,
+                            _ => 13612,
+                        }),
+                    ),
+                    ("procost", Value::Float(f.cost.unwrap_or(f.default_cost()))),
                     ("prorows", Value::Float(f.tuning.rows.unwrap_or(if f.ret.sets() { 1000.0 } else { 0.0 }))),
                     ("provariadic", int(0)),
                     ("prosupport", t("-")),
@@ -1038,7 +1086,9 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
                     ("proallargtypes", if all.is_empty() { Null } else { braces(all) }),
                     ("proargmodes", if modes.is_empty() { Null } else { braces(modes) }),
                     ("proargnames", if named { braces(names) } else { Null }),
-                    ("prosrc", t(&f.body)),
+                    ("prosrc", t(f.src())),
+                    // (a C trigger function's library: see `Function::c_trigger`)
+                    ("probin", f.c_trigger.as_ref().map_or(Null, |(file, _)| t(file))),
                     // (its SET clauses, `name=value`, a list's values joined as Postgres's GUC flattening joins them)
                     (
                         "proconfig",
@@ -1169,8 +1219,8 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
                     .collect()
             }
         }
-        // the advisory locks held and waited for in this database, every session's (Chronos takes
-        // no other locks a client can see), with the pid of the connection holding or waiting:
+        // the querying session's own locks (its transaction's, the relations it locked), and the advisory locks
+        // held and waited for in this database, every session's, with the pid of the connection holding or waiting:
         // pg_stat_activity's, or the querying session's own. A session that isn't a connection
         // (an embedding program's) has none to show.
         "pg_locks" => {
@@ -1194,8 +1244,26 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
                     })
                     .collect::<Vec<Value>>()
             });
-            // the relations LOCK TABLE locked in the running session's transaction
-            let rel_locks: Vec<(String, &'static str)> = ctx
+            // its transaction's number, once it has one (pg_current_xact_id gives it one, and so does a change to the
+            // catalogs: see `hold_ddl_locks`), which it holds ExclusiveLock on as Postgres's does
+            let xid = ctx.as_ref().filter(|c| c.tx.is_some()).and_then(|c| current_xact_id(c.txid, true, true));
+            let xact = here.as_ref().zip(xid).map(|(h, xid)| {
+                (cols.iter())
+                    .map(|(c, _)| match c.as_str() {
+                        "locktype" => t("transactionid"),
+                        "transactionid" => int(xid),
+                        "virtualtransaction" => t(&format!("{}/{}", h.1, h.2)),
+                        "pid" => int(h.2.into()),
+                        "mode" => t("ExclusiveLock"),
+                        "granted" => b(true),
+                        "fastpath" => b(false),
+                        _ => Null,
+                    })
+                    .collect::<Vec<Value>>()
+            });
+            // the relations LOCK TABLE and DDL statements locked in the running session's transaction (an index's
+            // name finds its pg_class oid too), and the TOAST tables of those whose storage parameters it changed
+            let rel_locks: Vec<(String, &'static str, bool)> = ctx
                 .as_ref()
                 .map(|c| {
                     c.state
@@ -1203,14 +1271,20 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
                         .unwrap_or_else(|p| p.into_inner())
                         .rel_locks
                         .iter()
-                        .map(|(n, m, _)| (n.clone(), *m))
+                        .map(|(n, m, _, toast)| (n.clone(), *m, *toast))
                         .collect()
                 })
                 .unwrap_or_default();
             let relations: Vec<Vec<Value>> = rel_locks
                 .iter()
-                .filter_map(|(n, mode)| {
-                    let oid = cat.oid_of(n)?;
+                .filter_map(|(n, mode, toast)| {
+                    let oid = match toast {
+                        false => cat.oid_of(n)?,
+                        true => {
+                            let i = cat.rels.iter().position(|r| r.name == *n)?;
+                            toasted(cat, &cat.rels[i]).then(|| cat.rel_oid(i) | (1 << 31))?
+                        }
+                    };
                     let h = here.as_ref()?;
                     Some(
                         (cols.iter())
@@ -1230,6 +1304,7 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
                 })
                 .collect();
             own.into_iter()
+                .chain(xact)
                 .chain(relations)
                 .chain(
                     advisory::listed()
@@ -1492,6 +1567,21 @@ const PG_CONFIG_NAMES: [&str; 23] = [
     "VERSION",
 ];
 
+/// Whether a table (or materialized view) has a TOAST table in Postgres, as needs_toast_table decides: a column whose
+/// values may be TOASTed (of a type of no fixed length, stored other than PLAIN). Chronos has none to show, but
+/// numbers it apart from every relation (the table's oid with the top bit set).
+fn toasted(cat: &Catalog, r: &TableInfo) -> bool {
+    matches!(r.kind, 'r' | 'm')
+        && r.columns.iter().enumerate().any(|(j, (_, ty, ..))| {
+            let (own, _) = r.typmods.get(j).copied().unwrap_or((0, -1));
+            let oid = if own != 0 { own } else { cat.type_oid(*ty) };
+            let (len, storage) = catalog_schema::type_facts(oid)
+                .map_or_else(|| (if matches!(ty, Type::Enum(_)) { 4 } else { -1 }, "x".to_string()), |f| (f.0, f.3));
+            let storage = r.attopts.get(j).map_or(storage, |o| o.0.to_string());
+            len == -1 && storage != "p"
+        })
+}
+
 /// pg_class: tables, views, materialized views, sequences and indexes.
 fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
     use Value::{Bool as b, Int as int};
@@ -1504,20 +1594,7 @@ fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
         // a sequence is one page holding one row, as Postgres counts it; a table or index that was never
         // analyzed has none counted (-1), as in Postgres (Chronos keeps no statistics)
         let (pages, tuples) = if r.kind == 'S' { (1, 1.0) } else { (0, -1.0) };
-        // a table (or materialized view) with a column whose values may be TOASTed (of a type of no fixed length,
-        // stored other than PLAIN) has a TOAST table in Postgres, as needs_toast_table decides; Chronos has none to
-        // show, but numbers it apart from every relation (the table's oid with the top bit set)
-        let toasted = matches!(r.kind, 'r' | 'm')
-            && r.columns.iter().enumerate().any(|(j, (_, ty, ..))| {
-                let (own, _) = r.typmods.get(j).copied().unwrap_or((0, -1));
-                let oid = if own != 0 { own } else { cat.type_oid(*ty) };
-                let (len, storage) = catalog_schema::type_facts(oid).map_or_else(
-                    || (if matches!(ty, Type::Enum(_)) { 4 } else { -1 }, "x".to_string()),
-                    |f| (f.0, f.3),
-                );
-                let storage = r.attopts.get(j).map_or(storage, |o| o.0.to_string());
-                len == -1 && storage != "p"
-            });
+        let toasted = toasted(cat, r);
         row(vec![
             ("oid", int(cat.rel_oid(i))),
             ("relname", t(rel_part(&r.name))),
@@ -1527,8 +1604,14 @@ fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             ("relowner", int(owner)),
             ("relam", int(if table { 2 } else { 0 })),
             // (a view, a partitioned table and a foreign table have no storage of their own)
-            ("relfilenode", int(if matches!(r.kind, 'v' | 'p' | 'f') { 0 } else { cat.rel_oid(i) })),
-            ("reltablespace", int(0)),
+            (
+                "relfilenode",
+                int(match r.kind {
+                    'v' | 'p' | 'f' => 0,
+                    _ => super::tablespace::filenode(cat.rel_oid(i), r.hier.filenode),
+                }),
+            ),
+            ("reltablespace", int(r.hier.tablespace)),
             ("relpages", int(pages)),
             ("reltuples", Value::Float(tuples)),
             ("relallvisible", int(0)),
@@ -1569,16 +1652,12 @@ fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             ),
             ("relispartition", b(r.hier.of.is_some())),
             ("relpartbound", r.hier.of.as_ref().map_or(Value::Null, |(_, text, _)| t(text))),
-            ("reloptions", super::reloptions::shown(&r.hier.reloptions)),
-            ("relrewrite", int(0)),
-            ("relfrozenxid", int(0)),
-            ("relminmxid", int(0)),
-            ("relacl", acl),
+            // (a view's are its own options, security_barrier and the like; the others', their storage parameters)
             (
                 "reloptions",
-                match r.reloptions.is_empty() {
-                    true => Value::Null,
-                    false => t(&format!(
+                match r.kind {
+                    'v' if r.reloptions.is_empty() => Value::Null,
+                    'v' => t(&format!(
                         "{{{}}}",
                         r.reloptions
                             .iter()
@@ -1586,8 +1665,13 @@ fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
                             .collect::<Vec<_>>()
                             .join(",")
                     )),
+                    _ => super::reloptions::shown(&r.hier.reloptions),
                 },
             ),
+            ("relrewrite", int(0)),
+            ("relfrozenxid", int(0)),
+            ("relminmxid", int(0)),
+            ("relacl", acl),
         ])
     });
     let indexes = cat.idx.iter().enumerate().map(|(k, (i, x))| {
@@ -1601,8 +1685,12 @@ fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             // (an index is its table's owner's)
             ("relowner", int(cat.rel_acl(r).0)),
             ("relam", int(super::catalog::am_oid(x.method))),
-            ("relfilenode", int(cat.idx_oid(k))),
-            ("reltablespace", int(0)),
+            // (a partitioned table's index has no storage of its own)
+            (
+                "relfilenode",
+                int(if r.kind == 'p' { 0 } else { super::tablespace::filenode(cat.idx_oid(k), x.filenode) }),
+            ),
+            ("reltablespace", int(x.tablespace)),
             ("relpages", int(0)),
             ("reltuples", Value::Float(-1.0)),
             ("relallvisible", int(0)),
@@ -1821,6 +1909,14 @@ fn attribute_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             }
             names.push(name.clone());
             let oid = if own != 0 { own } else { cat.type_oid(ty) };
+            // (a column holds its operator class's key type where that isn't its table column's, as Postgres's
+            // opckeytype says: a gin index on an array its elements, a btree on a name C strings)
+            let keyed = match (x.method, ty) {
+                ("gin", Type::Array(e)) if at.is_some() => Some(i64::from(e)),
+                ("btree", Type::Name) if at.is_some() => Some(2275),
+                _ => None,
+            };
+            let (oid, typmod) = keyed.map_or((oid, typmod), |k| (k, -1));
             let (len, byval, align, storage, collation) = catalog_schema::type_facts(oid).unwrap_or_else(|| match ty {
                 Type::Enum(_) => (4, true, "i".into(), "p".into(), 0),
                 _ => (-1, false, "i".into(), "x".into(), 0),
@@ -1834,7 +1930,7 @@ fn attribute_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             };
             set(&mut row, "atttypmod", int(typmod));
             // (a plain column's storage and compression are its table column's, as SET STORAGE keeps them)
-            let opts = at.and_then(|c| r.attopts.get(c));
+            let opts = at.and_then(|c| r.attopts.get(c)).filter(|_| keyed.is_none());
             set(&mut row, "attstorage", t(&opts.map_or(storage, |o| o.0.to_string())));
             if let Some(m) = opts.and_then(|o| o.2) {
                 set(&mut row, "attcompression", t(&m.to_string()));
@@ -1842,7 +1938,7 @@ fn attribute_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             // (an index's column has the index's collation, as pg_index.indcollation has it)
             let collation = x.colls.get(n).copied().flatten().map_or(collation, |c| cat.collation_oid(c));
             set(&mut row, "attcollation", int(collation));
-            set(&mut row, "attndims", int(i64::from(matches!(ty, Type::Array(_)))));
+            set(&mut row, "attndims", int(i64::from(matches!(ty, Type::Array(_)) && keyed.is_none())));
             rows.push(row);
         }
     }
@@ -1915,6 +2011,130 @@ fn attribute_rows(cat: &Catalog) -> Vec<Vec<Value>> {
                             .and_then(|e| e.acl.as_ref())
                             .map_or(Value::Null, |a| t(&super::acl::text(&cat.reg, a))),
                     ),
+                ],
+            ));
+        }
+    }
+    rows
+}
+
+/// pg_class's rows of the composite types made with CREATE TYPE ... AS (relkind `c`): each type's relation, which
+/// its attributes are pg_attribute's columns of and its pg_type row's typrelid names.
+fn composite_class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
+    use Value::{Bool as b, Int as int};
+    let t = |s: &str| Value::Text(s.into());
+    let mut rows = vec![];
+    for (k, (name, _)) in cat.enums.iter().enumerate() {
+        let (Some(oid), Some(Some(fields))) = (cat.comp_oid(k), cat.composites.get(k)) else { continue };
+        // (the type's owner's, as Postgres's relation of a composite type is)
+        let (owner, _) = super::acl::shown(&cat.reg, cat.acls.get(&format!("type/{name}")), 10);
+        rows.push(catalog_schema::named_row(
+            "pg_class",
+            vec![
+                ("oid", int(oid)),
+                ("relname", t(rel_part(name))),
+                ("relnamespace", int(cat.schema_oid(schema_part(name)))),
+                ("reltype", int(cat.enum_oid(k))),
+                ("reloftype", int(0)),
+                ("relowner", int(owner)),
+                ("relam", int(0)),
+                ("relfilenode", int(0)),
+                ("reltablespace", int(0)),
+                ("relpages", int(0)),
+                ("reltuples", Value::Float(-1.0)),
+                ("relallvisible", int(0)),
+                ("reltoastrelid", int(0)),
+                ("relhasindex", b(false)),
+                ("relisshared", b(false)),
+                ("relpersistence", t("p")),
+                ("relkind", t("c")),
+                ("relnatts", int(fields.len() as i64)),
+                ("relchecks", int(0)),
+                ("relhasrules", b(false)),
+                ("relhastriggers", b(false)),
+                ("relhassubclass", b(false)),
+                ("relrowsecurity", b(false)),
+                ("relforcerowsecurity", b(false)),
+                ("relispopulated", b(true)),
+                ("relreplident", t("n")),
+                ("relispartition", b(false)),
+                ("relrewrite", int(0)),
+                ("relfrozenxid", int(0)),
+                ("relminmxid", int(0)),
+            ],
+        ));
+    }
+    rows
+}
+
+/// The type an attribute of a composite type is, as pg_attribute has it, of its type as written (`varchar(5)`,
+/// `numeric(8,2)`, `int`, a domain's, an enum's or another composite type's name): its oid and typmod.
+fn attribute_type(cat: &Catalog, text: &str) -> (i64, i64) {
+    let Ok(c) = lex(&format!("x {text}")).and_then(|t| Parser::new(t).column()) else { return (25, -1) };
+    if matches!(c.ty, Type::Text | Type::Array(25))
+        && let Some((oid, typmod)) = chars_oid(c.chars, c.ty != Type::Text)
+    {
+        return (i64::from(oid), i64::from(typmod));
+    }
+    if let Some((p, s)) = c.numeric {
+        return (1700, (i64::from(p) << 16 | (i64::from(s) & 0x7ff)) + 4);
+    }
+    if c.small {
+        return (21, -1);
+    }
+    // (a type made here is its own: by its stored name)
+    let made = |n: &str| cat.enums.iter().position(|(e, _)| e == n).map(|k| cat.enum_oid(k));
+    let oid = match c.ty {
+        Type::Enum(i) => made(&enum_name(i)).unwrap_or(25),
+        t @ Type::Record(_) => t.composite_of().and_then(|n| made(&n)).unwrap_or(2249),
+        t => cat.type_oid(t),
+    };
+    (oid, -1)
+}
+
+/// pg_attribute's rows of the composite types' relations (see `composite_class_rows`): their attributes, numbered
+/// from 1, typed as Postgres types them.
+fn composite_attribute_rows(cat: &Catalog) -> Vec<Vec<Value>> {
+    use Value::{Bool as b, Int as int};
+    let t = |s: &str| Value::Text(s.into());
+    let mut rows = vec![];
+    for k in 0..cat.enums.len() {
+        let (Some(rel), Some(Some(fields))) = (cat.comp_oid(k), cat.composites.get(k)) else { continue };
+        for (n, (name, ty)) in fields.iter().enumerate() {
+            let (oid, typmod) = attribute_type(cat, ty);
+            // (a type made here has the facts of its kind: an enum's or a domain's of an enum's, a composite's
+            // a row's)
+            let (len, byval, align, storage, collation) =
+                catalog_schema::type_facts(oid).unwrap_or_else(|| match cat.enum_at(oid, false) {
+                    Some(e) if cat.comp_oid(e).is_none() => (4, true, "i".into(), "p".into(), 0),
+                    Some(_) => (-1, false, "d".into(), "x".into(), 0),
+                    None => (-1, false, "i".into(), "x".into(), 0),
+                });
+            rows.push(catalog_schema::named_row(
+                "pg_attribute",
+                vec![
+                    ("attrelid", int(rel)),
+                    ("attname", t(name)),
+                    ("atttypid", int(oid)),
+                    ("attlen", int(len)),
+                    ("attnum", int(n as i64 + 1)),
+                    ("attcacheoff", int(-1)),
+                    ("atttypmod", int(typmod)),
+                    ("attndims", int(i64::from(ty.trim_end().ends_with(']')))),
+                    ("attbyval", b(byval)),
+                    ("attalign", t(&align)),
+                    ("attstorage", t(&storage)),
+                    ("attcompression", t("")),
+                    ("attnotnull", b(false)),
+                    ("atthasdef", b(false)),
+                    ("atthasmissing", b(false)),
+                    ("attidentity", t("")),
+                    ("attgenerated", t("")),
+                    ("attisdropped", b(false)),
+                    ("attislocal", b(true)),
+                    ("attinhcount", int(0)),
+                    ("attstattarget", int(-1)),
+                    ("attcollation", int(collation)),
                 ],
             ));
         }

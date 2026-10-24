@@ -153,16 +153,24 @@ fn mcp_over_http_is_only_ever_an_agent() {
     s.read_to_string(&mut raw).unwrap();
     assert!(raw.starts_with("HTTP/1.1 403"), "{raw}");
 
-    // without --safe: the server's token is the database's own user, which MCP over HTTP isn't
+    // no token at all (loopback): every client is the database's own user, which MCP over HTTP isn't
     let (_s2, port) = start("owner", &[]);
     let (status, _) = rpc(port, None, "initialize", json!({}));
     assert_eq!(status, 403, "loopback without a token is the database's own user");
-    let (_s3, port) = start("token", &["--token", SERVER]);
-    assert_eq!(rpc(port, Some(SERVER), "initialize", json!({})).0, 403);
+    // the default with a server token: the server's token is the guest's, so MCP takes it; --unsafe makes it the
+    // database's own user again, which MCP refuses
+    let (_s3, port) = start("token", &["--token", SERVER, "--admin-token", ADMIN]);
+    assert_eq!(rpc(port, Some(SERVER), "initialize", json!({})).0, 200, "the server token is the guest");
+    let (out, err) = tool(port, Some(SERVER), "fork", json!({ "name": "server_w" }));
+    assert!(!err, "{out}");
+    assert!(tool(port, Some(SERVER), "put", json!({ "table": "t", "id": "1", "record": {} })).1, "not main");
+    assert_eq!(rpc(port, Some(ADMIN), "initialize", json!({})).0, 403);
     assert_eq!(rpc(port, None, "initialize", json!({})).0, 401, "a server with a token wants one");
-    let v = post(port, Some(SERVER), "sql", json!({ "sql": "create agent helper" }));
+    let v = post(port, Some(ADMIN), "sql", json!({ "sql": "create agent helper" }));
     let helper = v["results"][0]["rows"][0]["token"].as_str().unwrap().to_string();
     assert_eq!(rpc(port, Some(&helper), "initialize", json!({})).0, 200);
+    let (_s4, port) = start("unsafe", &["--token", SERVER, "--unsafe"]);
+    assert_eq!(rpc(port, Some(SERVER), "initialize", json!({})).0, 403, "--unsafe: the database's own user");
 }
 
 /// What the review of `/mcp` found it must keep as `/v1/` does: an agent's `max_concurrent` counts every tool call,
@@ -211,9 +219,10 @@ fn mcp_over_http_keeps_an_agents_limits() {
 }
 
 #[test]
-fn the_admin_token_is_refused_without_safe_mode_too() {
-    let (_s, port) = start("admin", &["--token", SERVER, "--admin-token", ADMIN]);
+fn the_admin_token_is_refused_with_unsafe_too() {
+    let (_s, port) = start("admin", &["--token", SERVER, "--admin-token", ADMIN, "--unsafe"]);
     assert_eq!(rpc(port, Some(ADMIN), "initialize", json!({})).0, 403);
+    assert_eq!(rpc(port, Some(SERVER), "initialize", json!({})).0, 403);
 }
 
 /// A message past 8 MB is refused from its header (413), before its body is read; `find` and `history` give a model

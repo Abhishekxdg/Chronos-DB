@@ -45,9 +45,10 @@ Flags may go anywhere on the line. A flag that takes a value and has none prints
 | `--takeover` | off | with `--remote` | replace a dead owner's lease on the prefix |
 | `--listen <addr>` | `127.0.0.1:7070` | `serve` | the HTTP API's address |
 | `--pg <addr>\|off` | `127.0.0.1:5433` | `serve` | the Postgres protocol's address; `off` turns it off |
-| `--token <T>` | `CHRONOS_TOKEN` | `serve` | the server's bearer token (HTTP) and password (Postgres), at least 24 characters (`openssl rand -hex 24`; `change-me` is refused). Needed for any address that isn't loopback: without one, `serve` refuses to start. Prefer the variable: a flag shows in `ps` |
-| `--safe` | off | `serve` | clients without an agent's token act as the agent `guest`; see [security](../security.md) |
-| `--admin-token <A>` | `CHRONOS_ADMIN_TOKEN` | `serve --safe` | the token that is the database's own user in safe mode; at least 24 characters |
+| `--token <T>` | `CHRONOS_TOKEN` | `serve` | the server's bearer token (HTTP) and password (Postgres), at least 24 characters (`openssl rand -hex 24`; `change-me` is refused): a client that sends it is the agent `guest` (since 0.4; the database's own user with `--unsafe`). Needed for any address that isn't loopback: without one, `serve` refuses to start. Prefer the variable: a flag shows in `ps` |
+| `--admin-token <A>` | `CHRONOS_ADMIN_TOKEN` | `serve` | the token that is the database's own user over the network; at least 24 characters. Keep it away from agents |
+| `--safe` | off | `serve` | every client that isn't an agent or the admin token is the agent `guest`, loopback without a token too; see [security](../security.md) |
+| `--unsafe` | off | `serve` | the server token is the database's own user, as before 0.4; not with `--safe`. `serve` warns at start on an address other machines can reach unless `protect_main` is on |
 | `--tls-cert <file>` | `CHRONOS_TLS_CERT` | `serve` | PEM certificate; with `--tls-key`, HTTPS only and TLS on the Postgres port. One without the other fails: `TLS needs both --tls-cert and --tls-key`. Needed for any address that isn't loopback, unless `--insecure-no-tls` |
 | `--tls-key <file>` | `CHRONOS_TLS_KEY` | `serve` | PEM private key |
 | `--insecure-no-tls` | off | `serve` | listen on an address that isn't loopback without TLS (with a warning): only where something else encrypts the connection |
@@ -63,8 +64,8 @@ An empty `--token`, `--admin-token`, `--tls-cert` or `--tls-key` (or its variabl
 
 | Variable | Default | Effect |
 |---|---|---|
-| `CHRONOS_TOKEN` | none | `serve`'s `--token` |
-| `CHRONOS_ADMIN_TOKEN` | none | `serve`'s `--admin-token` |
+| `CHRONOS_TOKEN` | none | `serve`'s `--token` (the guest's) |
+| `CHRONOS_ADMIN_TOKEN` | none | `serve`'s `--admin-token` (the database's own user) |
 | `CHRONOS_TLS_CERT`, `CHRONOS_TLS_KEY` | none | `serve`'s `--tls-cert` and `--tls-key` |
 | `CHRONOS_KEY` | none | the database key, 64 hex digits (from `chronos keygen`). A new folder is encrypted with it; an encrypted one needs it to open. Also needed to `restore` an encrypted backup |
 | `CHRONOS_KEY_FILE` | none | a file holding the key; used when `CHRONOS_KEY` is unset or empty |
@@ -124,6 +125,8 @@ Settings the database keeps in its folder, across restarts. Setting one needs an
 | `world_idle_ttl` | `0` (never) | `ALTER SYSTEM SET world_idle_ttl = '7 days'` (or `0`) | the background worker discards worlds unused this long |
 | `history_retention` | `1 hour` (a database made before 0.2.0: `30 days`) | `ALTER SYSTEM SET history_retention = '7 days'` (or `'0'`) | how far back time travel reaches; see [worlds](worlds.md#history-retention) |
 | `synchronous_commit` | `full` | `ALTER SYSTEM SET synchronous_commit = full \| normal \| off` (`on` means `full`) | how far a commit pushes the log before it returns: `full` through the drive's cache to stable storage (`F_FULLFSYNC` on macOS, `fdatasync` elsewhere); `normal` a plain `fsync` (on macOS the drive may still cache it; elsewhere the same as `full`); `off` handed to the OS only, which survives a process crash but not a machine crash |
+| `wal_shipping` | `async` (with a remote) | `ALTER SYSTEM SET wal_shipping = off \| async \| sync` (`on` means `sync`); `CHRONOS_WAL_SHIPPING` overrides | with [cloud storage](../operations.md#cloud-storage---features-s3), how the log reaches the bucket: `async` within `wal_shipping_delay` of being written, `sync` before a commit to `main` or a merge returns, `off` only at checkpoints. Between `async` and `sync` it changes at once; to or from `off`, at the next open |
+| `wal_shipping_delay` | `1000` (ms) | `ALTER SYSTEM SET wal_shipping_delay = 250`; `CHRONOS_WAL_SHIPPING_DELAY_MS` overrides | in `async` mode, how long written log may wait before it is shipped: about what losing the machine loses |
 
 `=` or `TO` both work. `SHOW <setting>` reads each one (`statement_timeout` shows the session's, below).
 

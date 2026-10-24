@@ -619,9 +619,9 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
     })
 }
 
-/// Makes the database's own range and composite types known before a script is read (a restart forgets the
-/// registry). A type made over another that sorts after it by name is made in a later pass (a composite of
-/// composites, a range over a composite).
+/// Makes the database's own range types known before a script is read (a restart forgets the registry). One made
+/// over another that sorts after it by name is made in a later pass. (The composite types one may be over are the
+/// world's own, read in first: see `userdefs::hydrate_composites`.)
 pub(super) fn hydrate() {
     super::with_path_view(|v| {
         let Ok(rows) = v.prefix("_sonos_types/") else { return };
@@ -633,24 +633,13 @@ pub(super) fn hydrate() {
                     serde_json::from_str::<serde_json::Value>(&r.1).unwrap_or_default(),
                 )
             })
-            .filter(|(_, j)| j["composite"].is_array() || j["range"]["subtype"].is_string())
+            .filter(|(_, j)| j["range"]["subtype"].is_string())
             .collect();
-        // (each pass takes what resolves; a pass that takes nothing ends it: what's left has a field of a
-        // type that isn't there)
+        // (each pass takes what resolves; a pass that takes nothing ends it: what's left is over a type that isn't
+        // there)
         while !todo.is_empty() {
             let before = todo.len();
             todo.retain(|(name, j)| {
-                if let Some(fields) = j["composite"].as_array() {
-                    if super::userdefs::composite(name).is_some_and(|t| t != super::Type::record(vec![])) {
-                        return false;
-                    }
-                    let fs: Vec<(String, String)> = fields
-                        .iter()
-                        .filter_map(|f| Some((f[0].as_str()?.to_string(), f[1].as_str()?.to_string())))
-                        .collect();
-                    super::userdefs::register_composite(name, &fs);
-                    return super::userdefs::composite(name).is_none();
-                }
                 let Some(sub) = j["range"]["subtype"].as_str() else { return false };
                 if by_name(name).is_some() {
                     return false;

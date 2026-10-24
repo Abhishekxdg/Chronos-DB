@@ -361,3 +361,137 @@ fn the_row_apis_get_records_its_row_and_only_it() {
     let why = db.reads_changed("gap").unwrap();
     assert!(why.iter().any(|(_, w)| w.contains("notes/9")), "{why:?}");
 }
+
+/// A held merge that turns out to be "nothing changed" costs a reviewer as much as a real one: a row changed since
+/// only in columns no read used doesn't hold it. Issue #38.
+#[test]
+fn only_the_columns_a_read_used_hold_its_merge() {
+    let db = Db::new();
+    run(
+        &db,
+        MAIN,
+        "create table orders (id int primary key, status text, amount int, notes text);
+         insert into orders values (1, 'open', 10, ''), (2, 'open', 20, ''), (3, 'closed', 30, '')",
+        &[],
+    )
+    .unwrap();
+    // forks `w`, reads with `sql`, writes elsewhere, and main then runs `main`: the merge's error, if any
+    let attempt = |w: &str, sql: &str, main: &str| {
+        run(
+            &db,
+            MAIN,
+            &format!("create table if not exists out_{w} (v int); create world {w} with (check_reads = true)"),
+            &[],
+        )
+        .unwrap();
+        run(&db, w, sql, &[]).unwrap();
+        run(&db, w, &format!("insert into out_{w} values (1)"), &[]).unwrap();
+        run(&db, MAIN, main, &[]).unwrap();
+        run(&db, MAIN, &format!("merge world {w}"), &[]).err().map(|e| e.message)
+    };
+    let sum = "select sum(amount) from orders where status = 'open'";
+
+    // a column the read never looked at
+    assert_eq!(attempt("notes", sum, "update orders set notes = 'called' where id = 1"), None);
+    // one it did: in its select list, its WHERE, its ORDER BY
+    let e = attempt("amount", sum, "update orders set amount = 11 where id = 1").unwrap();
+    assert!(e.contains("read rows that changed since it forked: orders/1"), "{e}");
+    assert!(attempt("status", sum, "update orders set status = 'closed' where id = 2").is_some());
+    let ordered = "select id from orders order by notes limit 1";
+    assert!(attempt("ord", ordered, "update orders set notes = 'a' where id = 3").is_some());
+    let distinct = "select distinct on (notes) id from orders order by notes, id";
+    assert!(attempt("dist_on", distinct, "update orders set notes = 'g' where id = 2").is_some());
+    // a read of rows alone (a count) isn't held by any update in place
+    assert_eq!(attempt("counted", "select count(*) from orders", "update orders set amount = 99 where id = 3"), None);
+    // a row added or removed changes what any read of the table finds
+    assert!(attempt("added", sum, "insert into orders values (4, 'open', 5, '')").is_some());
+    assert!(attempt("removed", "select count(*) from orders", "delete from orders where id = 3").is_some());
+
+    // every column: *, a whole row, a key read outside SQL
+    assert!(
+        attempt("star", "select * from orders where id = 1", "update orders set notes = 'b' where id = 1").is_some()
+    );
+    assert!(
+        attempt("whole", "select o from orders o where id = 1", "update orders set notes = 'c' where id = 1").is_some()
+    );
+    // a function made with CREATE FUNCTION may read anything
+    run(
+        &db,
+        MAIN,
+        "create function note_of(i int) returns text language sql as $$ select notes from orders where id = i $$",
+        &[],
+    )
+    .unwrap();
+    let f = "select note_of(1)";
+    assert!(attempt("func", f, "update orders set notes = 'd' where id = 1").is_some());
+    // and so may one a view calls: the view is looked into
+    run(&db, MAIN, "create view order_notes as select id, note_of(id) as n from orders", &[]).unwrap();
+    let v = "select id from order_notes where id = 1";
+    assert!(attempt("viewfunc", v, "update orders set notes = 'f' where id = 1").is_some());
+    // and so may an aggregate made with CREATE AGGREGATE, in place or as a window function
+    run(
+        &db,
+        MAIN,
+        "create function note_sum(acc text, i int) returns text language sql as $$ select coalesce(acc, '') || (select notes from orders where id = i) $$;
+         create aggregate notes_of(int) (sfunc = note_sum, stype = text)",
+        &[],
+    )
+    .unwrap();
+    assert!(
+        attempt("user_agg", "select notes_of(id) from orders", "update orders set notes = 'j' where id = 2").is_some()
+    );
+    let w = "select notes_of(id) over () from orders";
+    assert!(attempt("user_win", w, "update orders set notes = 'k' where id = 1").is_some());
+    // a bare name a subquery's own table hasn't is the outer query's
+    run(
+        &db,
+        MAIN,
+        "create table order_comments (order_id int, body text); insert into order_comments values (1, 'x'), (2, 'y')",
+        &[],
+    )
+    .unwrap();
+    let c = "select o.amount from orders o where exists (select 1 from order_comments n where n.order_id = o.id and status = 'open')";
+    assert!(attempt("correlated", c, "update orders set status = 'held' where id = 1").is_some());
+    // a function that reads the table itself (its size): every column
+    let sized = "select amount, pg_table_size('orders') from orders limit 1";
+    assert!(attempt("sized", sized, "update orders set notes = repeat('n', 9000) where id = 2").is_some());
+    let d_sized =
+        "select distinct on (id / pg_table_size('orders')) id from orders order by id / pg_table_size('orders'), id";
+    assert!(attempt("dist_sized", d_sized, "update orders set notes = repeat('m', 9000) where id = 1").is_some());
+    // a qualified name is the source that shows it: here `orders` names the second source, not the hidden table
+    run(&db, MAIN, "create table audit (id int primary key, amount int); insert into audit values (1, 5)", &[])
+        .unwrap();
+    let hidden = "select orders.amount from orders as hidden cross join audit as orders";
+    assert!(attempt("aliased", hidden, "update audit set amount = 6 where id = 1").is_some());
+    let whole_hidden = "select orders from orders as hidden cross join audit as orders";
+    assert!(attempt("aliased_row", whole_hidden, "update audit set amount = 7 where id = 1").is_some());
+    // a function in DISTINCT ON, or a NATURAL JOIN's unnamed join columns: every column counts
+    let d = "select distinct on (note_of(id)) id from orders order by note_of(id), id";
+    assert!(attempt("dist_fn", d, "update orders set notes = 'h' where id = 1").is_some());
+    run(&db, MAIN, "create table order_tags (id int primary key, notes text)", &[]).unwrap();
+    let n = "select o.amount from orders o natural join order_tags";
+    assert!(attempt("nat_join", n, "update orders set notes = 'i' where id = 2").is_some());
+
+    // the columns of every read of a table count together
+    run(&db, MAIN, "create world two with (check_reads = true)", &[]).unwrap();
+    run(&db, "two", "select amount from orders where id = 1; select notes from orders where id = 2", &[]).unwrap();
+    run(&db, "two", "insert into out_notes values (2)", &[]).unwrap();
+    run(&db, MAIN, "update orders set notes = 'e' where id = 1", &[]).unwrap(); // notes, read only of row 2: counts
+    assert!(run(&db, MAIN, "merge world two", &[]).is_err());
+
+    // kept across a clean close and open
+    let dir = std::env::temp_dir().join(format!("chronos-stale-columns-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    {
+        let db = Db::open(&dir).unwrap();
+        run(&db, MAIN, "create table t (id int primary key, a int, b int); insert into t values (1, 1, 1)", &[])
+            .unwrap();
+        run(&db, MAIN, "create table o (v int); create world w with (check_reads = true)", &[]).unwrap();
+        run(&db, "w", "select a from t where id = 1; insert into o values (1)", &[]).unwrap();
+    }
+    let db = Db::open(&dir).unwrap();
+    run(&db, MAIN, "update t set b = 2 where id = 1", &[]).unwrap();
+    run(&db, MAIN, "merge world w", &[]).unwrap();
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

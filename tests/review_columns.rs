@@ -94,3 +94,41 @@ fn review_columns_must_name_columns() {
     run(&db, MAIN, "alter merge policy careful set (review_columns = null)", &[]).unwrap();
     assert!(db.policy("careful").unwrap().review_columns.is_empty());
 }
+
+/// A world that adds a column, and changes a listed column of a row main changed too, combined by columns: the
+/// combined row is read with the column it added, so the listed column's change still waits for a person, and a
+/// row whose listed column didn't change doesn't.
+#[test]
+fn a_row_combined_by_columns_with_a_column_the_world_added() {
+    let db = Db::new();
+    run(
+        &db,
+        MAIN,
+        "create table leads (id int primary key, status text, owner text);
+         insert into leads values (1, 'open', 'ada'), (2, 'open', 'bo');
+         create merge policy migrate with (schema = true, review_columns = 'leads.owner')",
+        &[],
+    )
+    .unwrap();
+    let can = "read,fork,write_own,write_main,merge_own";
+    run(&db, MAIN, &format!("create agent bot with (can = '{can}', policy = 'migrate')"), &[]).unwrap();
+    let mut bot = Session::new(MAIN);
+    bot.agent = Some("bot".into());
+    let fork = |bot: &mut Session, w: &str, sql: &str| {
+        bot.run(
+            &db,
+            &format!("create world {w}; use world {w}; alter table leads add column note text; {sql}; use world main"),
+            &[],
+        )
+        .unwrap();
+    };
+    fork(&mut bot, "owner", "update leads set owner = 'cy', note = 'vip' where id = 1");
+    fork(&mut bot, "note", "update leads set note = 'vip' where id = 2");
+    run(&db, MAIN, "update leads set status = 'won'", &[]).unwrap();
+
+    let e = bot.run(&db, "merge world owner by columns", &[]).unwrap_err();
+    assert!(e.code == "42501" && e.message.contains("owner"), "{}", e.message);
+    bot.run(&db, "merge world note by columns", &[]).unwrap();
+    let r = run(&db, MAIN, "select status, owner, note from leads where id = 2", &[]).unwrap().pop().unwrap();
+    assert_eq!(r.rows[0].iter().map(|v| v.to_text()).collect::<Vec<_>>(), ["won", "bo", "vip"]);
+}

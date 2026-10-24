@@ -2,7 +2,7 @@
 // blocking anyone, then merges. Agents that touched the same rows as an earlier merge get a
 // conflict back as data, and retry on a fresh fork.
 //
-//   chronos serve demo-db &
+//   CHRONOS_PROTECT_MAIN=off chronos serve demo-db &   (it seeds main directly)
 //   CHRONOS_URL=http://127.0.0.1:7070 node parallel.ts
 
 import { Chronos, ChronosError } from "../../clients/typescript/chronos.ts";

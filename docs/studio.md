@@ -63,6 +63,15 @@ chronos studio mydb --login --listen 0.0.0.0:8443 --host db.example.com \
 - **Where it listens:** 127.0.0.1 with `--port` by default, or `--listen ADDR:PORT`. Anywhere but loopback needs `--tls-cert` and `--tls-key` (PEM files, as `chronos serve` takes them) unless `--insecure-no-tls` says something else encrypts the connection (it warns). The Host must be one of the Studio's names: each `--host NAME[:PORT]` (the port listened on unless given; repeat it for several names) and the address it listens on; an `Origin` must be that same name over the same scheme. API bodies must be JSON. `--listen`, `--host` and TLS without `--login` are refused: the key's Studio is for 127.0.0.1 only.
 - **Beside a running server:** with `chronos serve` holding the folder, sign-ins and calls go to it over the folder's socket, and it checks the role on each call.
 
+## Behind another service: `serve --studio-api`
+
+A service that hosts the Studio's page itself (Chronos Cloud's dashboard) needs the Studio's calls without running `chronos studio` beside every database. `chronos serve <folder> --admin-token A --studio-api` also answers `POST /studio/api/<op>` on its HTTP port, with the same ops as the Studio (the `/v1` ops, plus `tables`, `status`, `sessions` and the imports), acting as the database's owner.
+
+- **Off by default.** Without `--studio-api` the path is a 404 that names the flag.
+- **The admin token only** (`Authorization: Bearer <admin token>`). The server's token (the guest's), an agent's token and no token are refused (403, 403, 401); a wrong token waits as everywhere else. The service that holds the admin token decides which person may call it.
+- `GET` is refused (405); the body is JSON; a call that names a path on the server's machine (`backup`) is refused (403), as in the Studio, and so is SQL's `BACKUP DATABASE TO '<path>'` (the server's own `/v1/backup` call, which a hosting service makes with a path of its own, is unaffected).
+- Web pages are still refused (an `Origin` header): the page talks to the service that holds the token, not to the database.
+
 ## Big data
 
 The grid never loads a whole table: it counts the rows, then fetches the pages in view as you scroll (a jump deep into 250,000 rows reads one page with `OFFSET`). A SQL table is shown in key order by default. The diff is paged 50 rows at a time, and a merge preview shows at most 200 rows, conflicts first, with how many rows had each outcome. A SQL query in the console returns its whole result: add a `LIMIT` to big ones.

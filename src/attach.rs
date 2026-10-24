@@ -36,14 +36,27 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 /// The folder's file saying it is attached, and to what (no secret in it).
 pub(crate) const FILE: &str = "attached";
 /// A write-back whose COMMIT may or may not have happened (see `resolve`).
 const PENDING: &str = "attached.pending";
-/// The most rows one merge writes to Postgres (Stage 1: no batching).
-pub const MAX_ROWS: usize = 10_000;
+/// The most rows one merge writes to Postgres by default (`CHRONOS_ATTACH_MAX_ROWS` sets it, up to `MAX_ROWS_CAP`):
+/// every one stays locked there until the merge commits.
+pub const MAX_ROWS: usize = 50_000;
+pub const MAX_ROWS_CAP: usize = 1_000_000;
+/// Rows of one table a write-back statement sends at once: a bigger merge is sent in parts, in the same transaction.
+const CHUNK: usize = 5_000;
+
+/// The most rows one merge writes to Postgres (see `MAX_ROWS`).
+pub fn max_rows() -> usize {
+    std::env::var("CHRONOS_ATTACH_MAX_ROWS")
+        .ok()
+        .and_then(|v| v.trim().replace('_', "").parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .map_or(MAX_ROWS, |n| n.min(MAX_ROWS_CAP))
+}
 /// How long a write-back waits for a row lock, a statement, or between its own statements.
 const LOCK_TIMEOUT: &str = "5s";
 const STATEMENT_TIMEOUT: &str = "60s";
@@ -106,14 +119,24 @@ pub struct Attached {
     pub database: String,
     /// when the copy was taken (ms since 1970)
     pub at: u64,
-    /// parents before children (foreign keys among them)
-    pub tables: Vec<Table>,
+    /// parents before children (foreign keys among them); a refresh widens a table Postgres added columns to (see
+    /// `widen`), under the write-back lock, so a write-back sees one shape from start to end
+    tables: RwLock<Arc<Vec<Table>>>,
     dir: PathBuf,
     /// held by a merge into main from its write-back until main holds what Postgres sent back: one at a time
     lock: Mutex<()>,
     /// values reserved from Postgres's sequences (see `values`)
     ids: Mutex<Ids>,
+    /// when main last took Postgres's rows (`refresh`; ms since 1970), 0: never since the attach
+    refreshed: std::sync::atomic::AtomicU64,
+    /// columns a refresh added to main whose default or NOT NULL waits for their values: made so once main has
+    /// Postgres's values (see `settle`), at the end of that refresh or, if it failed, the next
+    unsettled: Mutex<Vec<Unsettled>>,
 }
+
+/// A column a refresh added whose default or NOT NULL waits for its values (see `Attached::unsettled`): its table,
+/// its name, the default to set, and NOT NULL.
+type Unsettled = (usize, String, Option<String>, bool);
 
 /// The file of the values reserved from Postgres's sequences: what a merge may write back to their columns.
 const IDS: &str = "attached.ids";
@@ -181,6 +204,9 @@ pub(crate) struct After {
     rows: Vec<Stored>,
     /// the merge committed in Postgres: its pending record is removed once main has the rows
     committed: bool,
+    /// tables whose rows Postgres changed besides those `rows` hold (a trigger wrote or deleted some: see `others`):
+    /// main takes them by a refresh of those tables alone before the pending record goes
+    refresh: Vec<usize>,
 }
 
 /// A row as Postgres has it: its key and its columns' text (None: gone from Postgres).
@@ -265,10 +291,12 @@ impl Attached {
             port: url.port,
             database: url.database.clone(),
             at: crate::now_ms(),
-            tables,
+            tables: RwLock::new(Arc::new(tables)),
             dir: dir.to_path_buf(),
             lock: Mutex::new(()),
             ids: Mutex::new(Ids::default()),
+            refreshed: Default::default(),
+            unsettled: Mutex::default(),
         }
     }
 
@@ -287,30 +315,60 @@ impl Attached {
             port: j["port"].as_u64().unwrap_or(5432) as u16,
             database: j["database"].as_str().unwrap_or_default().into(),
             at: j["at"].as_u64().unwrap_or(0),
-            tables: j["tables"]
-                .as_array()
-                .ok_or_else(bad)?
-                .iter()
-                .map(Table::from_json)
-                .collect::<Option<_>>()
-                .ok_or_else(bad)?,
+            tables: RwLock::new(Arc::new(
+                j["tables"]
+                    .as_array()
+                    .ok_or_else(bad)?
+                    .iter()
+                    .map(Table::from_json)
+                    .collect::<Option<_>>()
+                    .ok_or_else(bad)?,
+            )),
             ids: Mutex::new(Ids::load(dir)?),
+            refreshed: j["refreshed"].as_u64().unwrap_or(0).into(),
+            unsettled: Mutex::default(),
             dir: dir.to_path_buf(),
             lock: Mutex::new(()),
         }))
     }
 
     pub fn save(&self) -> io::Result<()> {
-        let j = json!({
+        let mut j = json!({
             "id": self.id, "host": self.host, "port": self.port, "database": self.database, "at": self.at,
-            "tables": self.tables.iter().map(Table::to_json).collect::<Vec<_>>(),
+            "tables": self.tables().iter().map(Table::to_json).collect::<Vec<_>>(),
         });
+        let refreshed = self.refreshed_at();
+        if refreshed > 0 {
+            j["refreshed"] = refreshed.into();
+        }
         crate::disk::write_file(&self.dir.join(FILE), serde_json::to_string_pretty(&j)?.as_bytes())
+    }
+
+    /// When main last took Postgres's rows (see `refresh`), 0: not since the attach.
+    pub fn refreshed_at(&self) -> u64 {
+        self.refreshed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How old main's rows that no merge touched may be: since the last refresh, or the attach (ms since 1970).
+    pub fn as_of(&self) -> u64 {
+        self.refreshed_at().max(self.at)
+    }
+
+    /// Records a refresh that read Postgres at `at`.
+    fn refreshed(&self, at: u64) -> io::Result<()> {
+        self.refreshed.store(at, std::sync::atomic::Ordering::Relaxed);
+        self.save()
+    }
+
+    /// The attached tables, as recorded now: parents before children. A table's place never changes; its columns
+    /// may grow (see `widen`), so a caller reading several of them takes this once.
+    pub fn tables(&self) -> Arc<Vec<Table>> {
+        self.tables.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// The attached table rows of Chronos name `name` belong to.
     pub fn table(&self, name: &str) -> Option<usize> {
-        self.tables.iter().position(|t| t.name == name)
+        self.tables().iter().position(|t| t.name == name)
     }
 
     /// The source, as said at attach, for messages (no secret).
@@ -428,7 +486,8 @@ impl Error {
 
 /// For crash tests (tests/attach.rs), in debug builds: with CHRONOS_ATTACH_CRASH=<at>, the process aborts at that step
 /// of a write-back (`before_commit`: the pending record written, COMMIT not sent; `after_commit`: Postgres committed,
-/// nothing published here), as a kill -9 there would.
+/// nothing published here; `before_trigger_refresh`: the merge made here, the tables its triggers wrote not yet
+/// refreshed), as a kill -9 there would.
 fn crash_point(at: &str) {
     #[cfg(debug_assertions)]
     if std::env::var("CHRONOS_ATTACH_CRASH").is_ok_and(|v| v == at) {
@@ -458,8 +517,8 @@ fn rollback(pg: &mut Client) {
 /// None for any other counter. Err: Postgres couldn't be reached, or won't give values.
 pub(crate) fn values(core: &Core, counter: &str, n: usize) -> Option<std::result::Result<Vec<i64>, String>> {
     let att = core.attached.as_deref()?;
-    let (t, sq) = att
-        .tables
+    let tables = att.tables();
+    let (t, sq) = tables
         .iter()
         .find_map(|t| t.seqs.iter().find(|sq| sq.counter.as_deref() == Some(counter)).map(|sq| (t, sq)))?;
     let Some(seq) = &sq.pg else {
@@ -553,6 +612,12 @@ struct Row {
     table: usize,
     before: Option<Vec<Option<String>>>,
     after: Option<Vec<Option<String>>>,
+    /// `after` keeps main's values of columns the world's own table hasn't (see `rows_of`): main takes the row back
+    /// from Postgres once written, as the world's row there holds something else
+    kept: bool,
+    /// a row the world inserts: the columns its table hadn't (added in Postgres after its fork, see `widen`), left
+    /// out of the INSERT so Postgres fills them as it fills its own rows' (its default, now)
+    unseen: Vec<usize>,
 }
 
 impl Row {
@@ -580,6 +645,18 @@ fn texts(core: &Core, state: &State, t: &Table, key: &str, raw: &Val) -> Result<
         .collect()
 }
 
+/// `t` as its table is at `state`: without the columns a refresh added after it (see `widen`), so a world forked before
+/// reads and compares its rows as it saw them. (Added columns come last: the others keep their places, and the key's.)
+fn as_at(core: &Core, state: &State, t: &Table) -> Result<Table> {
+    let schema = core.val(state, &format!("{}/{}", crate::sql::SCHEMAS, t.name))?;
+    let had = schema.as_ref().and_then(crate::sql::column_names).unwrap_or_default();
+    let mut t = t.clone();
+    if !had.is_empty() {
+        t.cols.retain(|c| had.contains(&c.name));
+    }
+    Ok(t)
+}
+
 /// Whether merges into `name` in this database write back to Postgres now.
 pub(crate) fn writes_back(core: &Core, name: &str, tx: bool) -> bool {
     name == MAIN && !tx && core.attached.is_some() && core.me.get().is_some() && !crate::RECOVERING.get() && !SKIP.get()
@@ -596,7 +673,10 @@ fn rows_of(
     ours: &State,
     apply: &[crate::Change],
 ) -> Result<Vec<Row>> {
+    let tables = att.tables();
     let mut rows: Vec<Row> = vec![];
+    // per table, the columns the world's own table hasn't: added in Postgres after its fork (see `widen`)
+    let mut unseen: HashMap<usize, Vec<usize>> = HashMap::new();
     for c in apply {
         let table = c.key.split_once('/').map_or(c.key.as_str(), |(t, _)| t);
         if c.key.starts_with(&format!("{}/", crate::sql::SCHEMAS)) {
@@ -614,21 +694,40 @@ fn rows_of(
                 "{world} changes table {table}, which isn't attached to Postgres; nothing was merged"
             )));
         };
-        let t = &att.tables[ti];
+        let t = &tables[ti];
         let before = core.val(theirs, &c.key)?.map(|v| texts(core, theirs, t, &c.key, &v)).transpose()?;
-        let after = match &c.after {
+        let mut after = match &c.after {
             Some(v) => Some(texts(core, theirs, t, &c.key, v).or_else(|_| texts(core, ours, t, &c.key, v))?),
             None => None,
         };
+        if let std::collections::hash_map::Entry::Vacant(e) = unseen.entry(ti) {
+            let had = core.val(ours, &format!("{}/{}", crate::sql::SCHEMAS, t.name))?;
+            let had = had.as_ref().and_then(crate::sql::column_names).unwrap_or_default();
+            let missing = (0..t.cols.len()).filter(|&i| !had.is_empty() && !had.contains(&t.cols[i].name)).collect();
+            e.insert(missing);
+        }
+        // a world that never had a column can't have meant to change it: its row there decodes as the column's
+        // default (or NULL), and writing that back would wipe what Postgres holds. A row it updates keeps main's
+        let mut kept = false;
+        if let (Some(b), Some(a)) = (&before, &mut after) {
+            for &i in &unseen[&ti] {
+                if a[i] != b[i] {
+                    a[i] = b[i].clone();
+                    kept = true;
+                }
+            }
+        }
         if before == after {
             continue;
         }
         check_ids(att, world, t, before.as_deref(), after.as_deref())?;
-        rows.push(Row { key: c.key.clone(), table: ti, before, after });
+        let unseen = if before.is_none() { unseen[&ti].clone() } else { vec![] };
+        rows.push(Row { key: c.key.clone(), table: ti, before, after, kept, unseen });
     }
-    if rows.len() > MAX_ROWS {
+    let most = max_rows();
+    if rows.len() > most {
         return Err(refused(format!(
-            "{world} changes {} rows of attached tables, more than {MAX_ROWS} written to Postgres in one merge: \
+            "{world} changes {} rows of attached tables, more than {most} written to Postgres in one merge: \
              merge it a table at a time (MERGE WORLD {world} ONLY TABLES (...)); nothing was merged",
             rows.len()
         )));
@@ -777,15 +876,16 @@ fn dry_transaction(
 ) -> Result<()> {
     begin(pg, att, true)?;
     live.at = crate::now_ms();
+    let tables = att.tables();
     let by_table = by_table(rows);
     for &ti in by_table.keys() {
-        same_shape(pg, &att.tables[ti])?;
+        same_shape(pg, &tables[ti])?;
     }
     if let Some(r) = reads {
         live.stale_reads = live_reads(core, pg, att, r)?;
     }
     for (&ti, rs) in &by_table {
-        let t = &att.tables[ti];
+        let t = &tables[ti];
         for c in compare(pg, t, rs)? {
             live.rows.push(crate::LiveRow {
                 key: rs[c.at].key.clone(),
@@ -795,7 +895,7 @@ fn dry_transaction(
         }
     }
     // user triggers on the tables written: the dry run doesn't run the writes, so what they'd set isn't shown
-    let names = text_array(by_table.keys().map(|&ti| Some(att.tables[ti].pg.as_str())));
+    let names = text_array(by_table.keys().map(|&ti| Some(tables[ti].pg.as_str())));
     let sql = "select tgrelid::regclass::text, tgname from pg_trigger where tgrelid = any($1::text[]::regclass[]) \
                and not tgisinternal and tgenabled <> 'D' order by 1, 2";
     for r in run(pg, "reading the tables' triggers", sql, &[names])? {
@@ -819,6 +919,12 @@ pub(crate) fn dry_blocked(live: &crate::LiveCheck) -> Option<String> {
             live.source
         )
     })
+}
+
+/// Conditions `conds` (each a Postgres condition) joined by OR, as one condition: in parentheses whole, so what is
+/// ANDed to it after applies to all of them.
+fn any_of(conds: &[String]) -> String {
+    format!("(({}))", conds.join(") or ("))
 }
 
 /// A row of `t` as JSON: each column's text as Postgres writes it (null for NULL).
@@ -906,9 +1012,10 @@ fn transaction(
     checks: &[crate::checks::MergeCheck],
 ) -> Result<Option<Held>> {
     begin(pg, att, false)?;
+    let tables = att.tables();
     let by_table = by_table(rows);
     for &ti in by_table.keys() {
-        same_shape(pg, &att.tables[ti])?;
+        same_shape(pg, &tables[ti])?;
     }
     // what the world read, as Postgres has it now: before any row is locked or written
     if let Some(r) = reads {
@@ -924,8 +1031,7 @@ fn transaction(
     // per table, the key text Postgres gives each row (by its place in the table's rows)
     let mut canon: HashMap<usize, Vec<Vec<Option<String>>>> = HashMap::new();
     for (&ti, rs) in &by_table {
-        let t = &att.tables[ti];
-        let keys = arrays(rs, t, false, &[], false);
+        let t = &tables[ti];
         let tkeys: Vec<String> = t.key.iter().map(|&i| format!("t.{}", q(&t.cols[i].name))).collect();
         let kcast: Vec<String> = t.key.iter().enumerate().map(|(n, &i)| format!("k.k{n}::{}", t.cols[i].ty)).collect();
         let lock = format!(
@@ -935,12 +1041,15 @@ fn transaction(
             kcast.join(", "),
             unnest(t, false, &[], 1)
         );
-        run(pg, &format!("locking rows of {}", t.pg), &lock, &keys)?;
         let mut keys_here = vec![vec![]; rs.len()];
-        for c in compare(pg, t, rs)? {
-            keys_here[c.at] = c.key.clone();
-            if c.changed {
-                conflicts.push((ti, rs[c.at], c.now, c.key));
+        for (part, chunk) in rs.chunks(CHUNK).enumerate() {
+            let from = part * CHUNK;
+            run(pg, &format!("locking rows of {}", t.pg), &lock, &arrays(chunk, t, false, &[], false))?;
+            for c in compare(pg, t, chunk)? {
+                keys_here[from + c.at] = c.key.clone();
+                if c.changed {
+                    conflicts.push((ti, rs[from + c.at], c.now, c.key));
+                }
             }
         }
         canon.insert(ti, keys_here);
@@ -950,7 +1059,7 @@ fn transaction(
         let mut lines = vec![];
         let mut stored = vec![];
         for (ti, row, now, key) in &conflicts {
-            let t = &att.tables[*ti];
+            let t = &tables[*ti];
             let show = |r: &Option<Vec<Option<String>>>| r.as_ref().map_or("no row".to_string(), |r| row_json(t, r));
             if lines.len() < 10 {
                 lines.push(format!(
@@ -966,23 +1075,13 @@ fn transaction(
         if conflicts.len() > lines.len() {
             lines.push(format!("  ... and {} more", conflicts.len() - lines.len()));
         }
-        AFTER.set(Some(After { rows: stored, committed: false }));
-        return Err(Error::Constraint {
-            code: "40001",
-            message: format!(
-                "{} rows {world} changes changed in Postgres since main last had them (attached {}); nothing was \
-                 written to Postgres and nothing merged. main now holds Postgres's values for them: merge again, and \
-                 settle them as any conflict (OURS, THEIRS, or row by row).\n{}",
-                conflicts.len(),
-                att.source(),
-                lines.join("\n")
-            ),
-        });
+        AFTER.set(Some(After { rows: stored, committed: false, refresh: vec![] }));
+        return Err(conflict(conflicts.len(), world, &att.source(), &lines));
     }
     // writes: updates and inserts parents first, then deletes children first
     let mut sent_back: Vec<Stored> = vec![];
     for (&ti, rs) in &by_table {
-        let t = &att.tables[ti];
+        let t = &tables[ti];
         let all: Vec<usize> = (0..t.cols.len()).collect();
         let back: Vec<String> = t.cols.iter().map(|c| format!("t.{}::text", q(&c.name))).collect();
         let sent: Vec<String> = all.iter().map(|&i| format!("k.c{i}::{}::text", t.cols[i].ty)).collect();
@@ -1001,14 +1100,31 @@ fn transaction(
                 sent.join(", "),
                 back.join(", ")
             );
-            let got = run(pg, &format!("updating {}", t.pg), &sql, &arrays(&updates, t, false, &all, true))?;
-            count(t, "updated", updates.len(), got.len())?;
-            keep_changed(t, ti, got, &mut sent_back);
+            for chunk in updates.chunks(CHUNK) {
+                let got = run(pg, &format!("updating {}", t.pg), &sql, &arrays(chunk, t, false, &all, true))?;
+                count(t, "updated", chunk.len(), got.len())?;
+                // (first: a row Postgres then stored otherwise, as `keep_changed` finds, is taken as stored)
+                for r in chunk.iter().filter(|r| r.kept) {
+                    sent_back.push(Stored { table: ti, key: r.key_texts(t), row: r.after.clone() });
+                }
+                keep_changed(t, ti, got, &mut sent_back);
+            }
         }
         let inserts: Vec<&Row> = rs.iter().copied().filter(|r| r.before.is_none()).collect();
         if !inserts.is_empty() {
-            let cols: Vec<String> = t.cols.iter().map(|c| q(&c.name)).collect();
-            let given: Vec<String> = all.iter().map(|&i| format!("k.c{i}::{}", t.cols[i].ty)).collect();
+            // columns the world's table hadn't (one world's rows: the same for each) are Postgres's to fill, and
+            // compared as unknown, so main takes what Postgres put there
+            let unseen = &inserts[0].unseen;
+            let given_cols: Vec<usize> = all.iter().copied().filter(|i| !unseen.contains(i)).collect();
+            let cols: Vec<String> = given_cols.iter().map(|&i| q(&t.cols[i].name)).collect();
+            let given: Vec<String> = given_cols.iter().map(|&i| format!("k.c{i}::{}", t.cols[i].ty)).collect();
+            let sent: Vec<String> = all
+                .iter()
+                .map(|&i| match unseen.contains(&i) {
+                    true => "null::text".to_string(),
+                    false => format!("k.c{i}::{}::text", t.cols[i].ty),
+                })
+                .collect();
             let back_ins: Vec<String> = t.cols.iter().map(|c| format!("ins.{}::text", q(&c.name))).collect();
             let key_eq: Vec<String> = t
                 .key
@@ -1028,13 +1144,15 @@ fn transaction(
                 back_ins.join(", "),
                 key_eq.join(" and ")
             );
-            let got = run(pg, &format!("inserting into {}", t.pg), &sql, &arrays(&inserts, t, false, &all, true))?;
-            count(t, "inserted", inserts.len(), got.len())?;
-            keep_changed(t, ti, got, &mut sent_back);
+            for chunk in inserts.chunks(CHUNK) {
+                let got = run(pg, &format!("inserting into {}", t.pg), &sql, &arrays(chunk, t, false, &all, true))?;
+                count(t, "inserted", chunk.len(), got.len())?;
+                keep_changed(t, ti, got, &mut sent_back);
+            }
         }
     }
     for (&ti, rs) in by_table.iter().rev() {
-        let t = &att.tables[ti];
+        let t = &tables[ti];
         let deletes: Vec<&Row> = rs.iter().copied().filter(|r| r.after.is_none()).collect();
         if deletes.is_empty() {
             continue;
@@ -1045,9 +1163,16 @@ fn transaction(
             unnest(t, false, &[], 1),
             key_match(t, "t")
         );
-        let got = run(pg, &format!("deleting from {}", t.pg), &sql, &arrays(&deletes, t, false, &[], false))?;
-        count(t, "deleted", deletes.len(), got.len())?;
+        for chunk in deletes.chunks(CHUNK) {
+            let got = run(pg, &format!("deleting from {}", t.pg), &sql, &arrays(chunk, t, false, &[], false))?;
+            count(t, "deleted", chunk.len(), got.len())?;
+        }
     }
+    // deferred constraint triggers (and foreign key checks) run now, not at COMMIT: what they write is counted below,
+    // and the merge checks see it; one that fails rolls the write-back back here, as it would at COMMIT
+    run(pg, "running deferred triggers", "set constraints all immediate", &[])?;
+    // what else the writes made Postgres write (triggers, rules, foreign keys' actions): counted now, read after COMMIT
+    let others = others(pg, &tables, &by_table)?;
     // the merge checks, on Postgres as these writes leave it: rows added there straight since the attach count too
     let found = live_checks(pg, checks);
     if !found.is_empty() {
@@ -1064,9 +1189,11 @@ fn transaction(
     )?;
     let mut touched: BTreeMap<String, Vec<Vec<Option<String>>>> = BTreeMap::new();
     for (ti, keys) in &canon {
-        touched.entry(att.tables[*ti].name.clone()).or_default().extend(keys.iter().cloned());
+        touched.entry(tables[*ti].name.clone()).or_default().extend(keys.iter().cloned());
     }
-    let pending = json!({"merge": merge_id, "world": world, "world_id": world_id, "rows": touched});
+    // (and the tables written besides: after a crash, recovery refreshes them, as nothing else would say they changed)
+    let besides: Vec<&str> = others.iter().map(|&ti| tables[ti].name.as_str()).collect();
+    let pending = json!({"merge": merge_id, "world": world, "world_id": world_id, "rows": touched, "others": besides});
     crate::disk::write_file(&att.pending_path(), pending.to_string().as_bytes()).map_err(Error::Io)?;
     crash_point("before_commit");
     let outcome = pg.query("commit");
@@ -1101,8 +1228,37 @@ fn transaction(
             }
         }
     }
-    AFTER.set(Some(After { rows: sent_back, committed: true }));
+    // tables this transaction wrote besides the merge's own rows: main takes them by a refresh of those tables alone,
+    // on a connection of its own, once the merge is made (see `after_merge`); until it has, the pending record stays
+    // and names them, so recovery does it after a crash (see `resolve`)
+    let refresh = others;
+    AFTER.set(Some(After { rows: sent_back, committed: true, refresh }));
     Ok(None)
+}
+
+/// The attached tables the write-back's transaction wrote more rows of than the merge sent: a trigger, a rule or a
+/// foreign key's ON DELETE / ON UPDATE action wrote them, and main has no other way to hear of it. By place, from
+/// Postgres's counts of rows inserted, updated and deleted in this transaction
+/// (`pg_stat_xact_user_tables`, subtransactions included; with `track_counts` off they read 0, and nothing is found,
+/// as before). Which rows isn't asked: their `xmin` may be a subtransaction's, and finding them reads the table
+/// whole anyway, so main takes those tables by a refresh.
+fn others(pg: &mut Client, tables: &[Table], by_table: &BTreeMap<usize, Vec<&Row>>) -> Result<Vec<usize>> {
+    let names = text_array(tables.iter().map(|t| Some(t.pg.as_str())));
+    let sql = "select k.i, s.n_tup_ins, s.n_tup_upd, s.n_tup_del from unnest($1::text[]) with ordinality as k(t, i) \
+               join pg_stat_xact_user_tables s on s.relid = k.t::regclass";
+    let mut out = vec![];
+    for r in run(pg, "counting the rows the transaction wrote", sql, &[names])? {
+        let n = |i: usize| r[i].as_deref().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+        let ti = n(0).saturating_sub(1);
+        let sent = by_table.get(&ti).map_or(&[][..], |v| v.as_slice());
+        let ins = sent.iter().filter(|r| r.before.is_none()).count();
+        let upd = sent.iter().filter(|r| r.before.is_some() && r.after.is_some()).count();
+        let del = sent.iter().filter(|r| r.after.is_none()).count();
+        if n(1) > ins || n(2) > upd || n(3) > del {
+            out.push(ti);
+        }
+    }
+    Ok(out)
 }
 
 /// The merge checks `checks` (see `checks_for`) run in the write-back's transaction, after its writes, each within
@@ -1238,7 +1394,14 @@ const LIVE_ROWS: usize = 100_000;
 /// and COMMIT comes after the merge in time, a serial order the world's decision holds in. The reasons, said as
 /// changed in Postgres; none: what it read is as Postgres has it.
 fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result<Vec<String>> {
-    let tables = r.set.lock().unwrap_or_else(|p| p.into_inner()).by_table();
+    let (read_tables, filters) = {
+        let set = r.set.lock().unwrap_or_else(|p| p.into_inner());
+        let read_tables = set.by_table();
+        let filters: HashMap<String, Vec<crate::sql::RowFilter>> =
+            read_tables.keys().filter_map(|n| Some((n.clone(), set.only_filtered(n)?))).collect();
+        (read_tables, filters)
+    };
+    let tables = att.tables();
     let base = core.past_view(r.base);
     let mut live = r.base.clone();
     let (mut keys, mut out): (Vec<String>, Vec<String>) = (vec![], vec![]);
@@ -1249,9 +1412,10 @@ fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result
             crate::sql::shown_name(&t.name)
         )
     };
-    for (name, (read, mut whole)) in tables {
+    for (name, (read, mut whole)) in read_tables {
         let Some(ti) = att.table(&name) else { continue };
-        let t = &att.tables[ti];
+        // as the world saw it: columns Postgres added after its fork (see `widen`) weren't there to read
+        let t = &as_at(core, r.base, &tables[ti])?;
         // the fork point's rows the read covers: those read one by one, or every one of the table
         let mut rows: Vec<Row> = vec![];
         if !whole {
@@ -1262,20 +1426,51 @@ fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result
                         table: ti,
                         before: Some(texts(core, r.base, t, k, &v)?),
                         after: None,
+                        kept: false,
+                        unseen: vec![],
                     }),
                     // a key that found no row: its key as Postgres writes it isn't known here, so the table is read whole
                     None => whole = true,
                 }
             }
         }
+        // read only by filtered scans (and keys): Postgres is asked for the rows the filters can match, as the
+        // fork point's rows are, not for the table; written as Postgres compares them, else the table is read whole
+        let types: Vec<(String, String)> = t.cols.iter().map(|c| (c.name.clone(), c.ty.clone())).collect();
+        let mut narrow: Option<(Vec<&crate::sql::RowFilter>, String)> = filters.get(&name).and_then(|fs| {
+            let conds: Vec<String> = fs.iter().map(|f| f.to_postgres("t", &types)).collect::<Option<_>>()?;
+            Some((fs.iter().collect(), any_of(&conds)))
+        });
+        // a key looked up that found no row at the fork: Postgres may have that row now, with values no filter
+        // matches, and its key as Postgres writes it isn't known here, so the table is read whole
+        if narrow.is_some() {
+            for k in read.iter().filter(|k| !r.wrote.contains(k.as_str())) {
+                if core.val(r.base, k)?.is_none() {
+                    narrow = None;
+                    break;
+                }
+            }
+        }
+        let by_key: HashSet<&String> = read.iter().collect();
         if whole {
             rows.clear();
+            let matches = narrow.as_ref().map(|(fs, _)| crate::sql::Filters::new(&base, fs));
             for kv in base.prefix(&format!("{name}/"))? {
                 let (k, v) = kv?;
+                if matches.as_ref().is_some_and(|m| !m.any(&k, &v)) && !by_key.contains(&k) {
+                    continue;
+                }
                 if rows.len() == LIVE_ROWS {
                     break;
                 }
-                rows.push(Row { before: Some(texts(core, r.base, t, &k, &v)?), key: k, table: ti, after: None });
+                rows.push(Row {
+                    before: Some(texts(core, r.base, t, &k, &v)?),
+                    key: k,
+                    table: ti,
+                    after: None,
+                    kept: false,
+                    unseen: vec![],
+                });
             }
             if rows.len() == LIVE_ROWS {
                 out.push(too_broad(t));
@@ -1303,8 +1498,9 @@ fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result
         if whole {
             // and the rows Postgres has that the fork point didn't
             let back: Vec<String> = t.cols.iter().map(|c| format!("t.{}::text", q(&c.name))).collect();
+            let only = narrow.as_ref().map_or(String::new(), |(_, w)| format!("{w} and "));
             let sql = format!(
-                "select {} from {} t where not exists (select 1 from {} where {}) limit {}",
+                "select {} from {} t where {only}not exists (select 1 from {} where {}) limit {}",
                 back.join(", "),
                 t.pg,
                 unnest(t, false, &[], 1),
@@ -1378,45 +1574,104 @@ fn keep_changed(t: &Table, ti: usize, got: pgclient::Rows, out: &mut Vec<Stored>
     }
 }
 
-/// Refuses a write-back to a table whose shape in Postgres isn't as attached: its columns (names, types, generated
-/// or not), primary key, or row-level security (on, the role sees only some rows, and the rest would look gone).
-fn same_shape(pg: &mut Client, t: &Table) -> Result<()> {
+/// A table's shape in Postgres, against the folder's record of it (see `shape`).
+enum Shape {
+    Same,
+    /// only columns added after the recorded ones, each of which a refresh can add here too (see `widen`)
+    Added(Vec<Added>),
+    /// anything else, in words: a column dropped, renamed or retyped, the key, row-level security, a generated or
+    /// sequence-fed column added
+    Changed(Vec<String>),
+}
+
+/// A column Postgres added to an attached table: as the record keeps it, and its definition here.
+struct Added {
+    col: Col,
+    /// its default in Postgres, if Chronos can run it
+    default: Option<String>,
+    /// NOT NULL in Postgres: made so here once main's rows have Postgres's values (see `settle`)
+    not_null: bool,
+}
+
+/// `t`'s shape in Postgres now: its columns (names, types, generated or not), primary key, and row-level security
+/// (on, the role sees only some rows, and the rest would look gone), against what the folder recorded.
+fn shape(pg: &mut Client, t: &Table) -> Result<Shape> {
     let sql = "select a.attname, format_type(a.atttypid, a.atttypmod), a.attgenerated <> '', c.relrowsecurity, \
-               array_position(i.indkey::int2[], a.attnum) from pg_class c join pg_attribute a on a.attrelid = c.oid \
+               array_position(i.indkey::int2[], a.attnum), a.attnotnull, pg_get_expr(d.adbin, d.adrelid), \
+               a.attidentity <> '' or coalesce(pg_get_expr(d.adbin, d.adrelid), '') like 'nextval(%' \
+               from pg_class c join pg_attribute a on a.attrelid = c.oid \
                left join pg_index i on i.indrelid = c.oid and i.indisprimary \
+               left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum \
                where c.oid = $1::regclass and a.attnum > 0 and not a.attisdropped order by a.attnum";
     let rows = run(pg, &format!("reading {}'s columns", t.pg), sql, std::slice::from_ref(&t.pg))?;
+    let v = |r: &Texts, i: usize| r[i].clone().unwrap_or_default();
     let mut diffs = vec![];
     if rows.first().is_some_and(|r| r[3].as_deref() == Some("t")) {
         diffs.push("row-level security is on".to_string());
     }
-    let now: Vec<(String, String)> =
-        rows.iter().map(|r| (r[0].clone().unwrap_or_default(), r[1].clone().unwrap_or_default())).collect();
+    let now: Vec<(String, String)> = rows.iter().map(|r| (v(r, 0), v(r, 1))).collect();
     let was: Vec<(String, String)> = t.cols.iter().map(|c| (c.name.clone(), c.ty.clone())).collect();
-    if now != was {
+    // Postgres numbers a column added later after every one there: the recorded ones first, unchanged, then new
+    let widened = now.len() > was.len() && now[..was.len()] == was[..];
+    if now != was && !widened {
         let show = |v: &[(String, String)]| v.iter().map(|(n, ty)| format!("{n} {ty}")).collect::<Vec<_>>().join(", ");
         diffs.push(format!("its columns are ({}), not ({})", show(&now), show(&was)));
     }
     if let Some(r) = rows.iter().find(|r| r[2].as_deref() == Some("t")) {
-        diffs.push(format!("column {} is generated", r[0].clone().unwrap_or_default()));
+        diffs.push(format!("column {} is generated", v(r, 0)));
     }
     let mut key: Vec<(i64, String)> =
-        rows.iter().filter_map(|r| Some((r[4].as_deref()?.parse().ok()?, r[0].clone().unwrap_or_default()))).collect();
+        rows.iter().filter_map(|r| Some((r[4].as_deref()?.parse().ok()?, v(r, 0)))).collect();
     key.sort();
     let key: Vec<String> = key.into_iter().map(|(_, n)| n).collect();
     let was_key: Vec<String> = t.key.iter().map(|&i| t.cols[i].name.clone()).collect();
     if key != was_key {
         diffs.push(format!("its primary key is ({}), not ({})", key.join(", "), was_key.join(", ")));
     }
-    if diffs.is_empty() {
-        return Ok(());
+    if !diffs.is_empty() {
+        return Ok(Shape::Changed(diffs));
     }
-    Err(refused(format!(
-        "{} changed in Postgres since the attach: {}. Attach it again into a new folder (worlds here, and their \
-         unmerged work, stay in this one); nothing was merged",
-        t.pg,
-        diffs.join("; ")
-    )))
+    if !widened {
+        return Ok(Shape::Same);
+    }
+    let mut added = vec![];
+    for r in &rows[was.len()..] {
+        let (name, ty) = (v(r, 0), v(r, 1));
+        if r[7].as_deref() == Some("t") {
+            // values from a sequence: attach reserves them from Postgres, and that is set up only at attach
+            diffs.push(format!("column {name} was added taking its values from a sequence"));
+            continue;
+        }
+        // a default Chronos can't run is left off, as attach leaves it off. NOT NULL comes after the rows' values
+        // (see `settle`): a column added NULL, filled, then made NOT NULL in Postgres has no default to fill it here
+        let default = r[6].clone().filter(|e| !crate::sql::default_refused(e));
+        let not_null = r[5].as_deref() == Some("t");
+        added.push(Added { col: Col { name, ty, always: false }, default, not_null });
+    }
+    Ok(match diffs.is_empty() {
+        true => Shape::Added(added),
+        false => Shape::Changed(diffs),
+    })
+}
+
+/// Refuses a write-back to a table whose shape in Postgres isn't as recorded (see `shape`). Columns Postgres added
+/// come over at the next refresh; any other change needs a new attach.
+fn same_shape(pg: &mut Client, t: &Table) -> Result<()> {
+    match shape(pg, t)? {
+        Shape::Same => Ok(()),
+        Shape::Added(cols) => Err(refused(format!(
+            "{} has columns in Postgres main hasn't taken yet ({}): a refresh takes them (chronos refresh, or serve \
+             --refresh-every), then merge again; nothing was merged",
+            t.pg,
+            cols.iter().map(|a| a.col.name.as_str()).collect::<Vec<_>>().join(", ")
+        ))),
+        Shape::Changed(diffs) => Err(refused(format!(
+            "{} changed in Postgres since the attach: {}. Attach it again into a new folder (worlds here, and their \
+             unmerged work, stay in this one); nothing was merged",
+            t.pg,
+            diffs.join("; ")
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------- after the merge, and recovery
@@ -1446,9 +1701,6 @@ pub(crate) fn after_merge(core: &Core) {
     let Some(after) = AFTER.take() else { return };
     let Some(att) = core.attached.as_deref() else { return };
     let failed = store(core, att, &after.rows).err();
-    if after.committed {
-        let _ = std::fs::remove_file(att.pending_path());
-    }
     if let Some(e) = failed {
         eprintln!(
             "chronos: main couldn't take Postgres's values for {} rows ({e}); a later merge touching them reports \
@@ -1456,6 +1708,44 @@ pub(crate) fn after_merge(core: &Core) {
             after.rows.len()
         );
     }
+    // the tables its triggers wrote besides, then the pending record: kept if that fails, so the next merge into main
+    // (or a refresh, or chronos serve) settles it first, refreshing them again (see `resolve`)
+    if !after.refresh.is_empty() {
+        crash_point("before_trigger_refresh");
+    }
+    if !after.refresh.is_empty()
+        && let Err(e) = refresh_now(core, att, Some(&after.refresh))
+    {
+        eprintln!(
+            "chronos: main couldn't take the rows the merge's triggers changed in Postgres ({e}); the next merge into \
+             main takes them first"
+        );
+        return;
+    }
+    if after.committed {
+        let _ = std::fs::remove_file(att.pending_path());
+    }
+}
+
+/// What a merge's conflict with Postgres says (see `is_conflict`).
+const CHANGED_IN_POSTGRES: &str = "changed in Postgres since main last had them";
+
+/// A merge's conflict with Postgres: `n` rows `world` changes changed there since main last had them, a line each.
+fn conflict(n: usize, world: &str, source: &str, lines: &[String]) -> Error {
+    Error::Constraint {
+        code: "40001",
+        message: format!(
+            "{n} rows {world} changes {CHANGED_IN_POSTGRES} (attached {source}); nothing was written to Postgres and \
+             nothing merged. main now holds Postgres's values for them: merge again, and settle them as any conflict \
+             (OURS, THEIRS, or row by row).\n{}",
+            lines.join("\n")
+        ),
+    }
+}
+
+/// Whether `e` is a merge's conflict with Postgres (see `conflict`).
+pub(crate) fn is_conflict(e: &Error) -> bool {
+    matches!(e, Error::Constraint { code: "40001", message } if message.contains(CHANGED_IN_POSTGRES))
 }
 
 /// After a merge that failed: on a conflict with Postgres, main takes Postgres's rows for the conflicting ones (the
@@ -1482,13 +1772,14 @@ fn store(core: &Core, att: &Attached, rows: &[Stored]) -> std::result::Result<()
         return Ok(());
     }
     let db = core.db().ok_or("no database")?;
+    let tables = att.tables();
     let mut sql = vec!["begin".to_string()];
     let mut by_table: BTreeMap<usize, Vec<&Stored>> = BTreeMap::new();
     for r in rows {
         by_table.entry(r.table).or_default().push(r);
     }
     for (&ti, rs) in &by_table {
-        let t = &att.tables[ti];
+        let t = &tables[ti];
         let cols: Vec<String> = t.cols.iter().map(|c| q(&c.name)).collect();
         let keys: Vec<String> = t.key.iter().map(|&i| q(&t.cols[i].name)).collect();
         let overriding = if t.cols.iter().any(|c| c.always) { " overriding system value" } else { "" };
@@ -1513,7 +1804,7 @@ fn store(core: &Core, att: &Attached, rows: &[Stored]) -> std::result::Result<()
         }
     }
     for (&ti, rs) in by_table.iter().rev() {
-        let t = &att.tables[ti];
+        let t = &tables[ti];
         for r in rs.iter().filter(|r| r.row.is_none()) {
             let conds: Vec<String> = t
                 .key
@@ -1587,10 +1878,11 @@ pub fn resolve(core: &Core) -> std::result::Result<Option<String>, String> {
     let mut rows = vec![];
     let mut pg = connect()?;
     let touched = p["rows"].as_object().cloned().unwrap_or_default();
+    let tables = att.tables();
     pg.query(&format!("begin read only; {SETTINGS}")).map_err(|e| e.to_string())?;
     for (name, keys) in touched {
         let Some(ti) = att.table(&name) else { continue };
-        let t = &att.tables[ti];
+        let t = &tables[ti];
         let keys: Vec<Vec<Option<String>>> = serde_json::from_value(keys).unwrap_or_default();
         let found = read_rows(&mut pg, t, &keys).map_err(|e| e.to_string())?;
         for k in keys {
@@ -1599,7 +1891,18 @@ pub fn resolve(core: &Core) -> std::result::Result<Option<String>, String> {
         }
     }
     let _ = pg.query("rollback");
+    drop(pg);
     store(core, att, &rows)?;
+    // and the tables its triggers wrote besides (see `others`), read again whole: which rows isn't known any more
+    let besides: Vec<usize> = p["others"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|n| n.as_str().and_then(|n| att.table(n))).collect())
+        .unwrap_or_default();
+    if !besides.is_empty() {
+        refresh_now(core, att, Some(&besides))?;
+        let names: Vec<&str> = besides.iter().map(|&ti| tables[ti].name.as_str()).collect();
+        said.push_str(&format!("; main took what its triggers wrote in {} from Postgres", names.join(", ")));
+    }
     std::fs::remove_file(att.pending_path()).map_err(|e| e.to_string())?;
     Ok(Some(said))
 }
@@ -1623,6 +1926,288 @@ fn read_rows(pg: &mut Client, t: &Table, keys: &[Vec<Option<String>>]) -> io::Re
     Ok(rows.into_iter().map(|r| (t.key.iter().map(|&i| r[i].clone()).collect(), r)).collect())
 }
 
+// ---------------------------------------------------------------- refresh
+
+/// Rows of main compared with Postgres in one statement of a refresh.
+const REFRESH_BATCH: usize = 2_000;
+
+/// What a refresh did (see `refresh`).
+#[derive(Debug, Default)]
+pub struct Refreshed {
+    /// per table brought up to date: its name, and the rows main took that Postgres inserted, updated and deleted
+    pub tables: Vec<(String, usize, usize, usize)>,
+    /// columns Postgres added that main took (`table.column type`), before its rows (see `widen`)
+    pub added: Vec<String>,
+    /// tables left as they were, and why (their shape changed in Postgres)
+    pub skipped: Vec<String>,
+    /// when Postgres was read (ms since 1970)
+    pub at: u64,
+}
+
+impl Refreshed {
+    pub fn changed(&self) -> usize {
+        self.tables.iter().map(|(_, i, u, d)| i + u + d).sum()
+    }
+
+    pub fn to_json(&self) -> Json {
+        json!({
+            "at": self.at,
+            "changed": self.changed(),
+            "tables": self.tables.iter().map(|(t, i, u, d)| json!({"table": t, "inserted": i, "updated": u, "deleted": d}))
+                .collect::<Vec<_>>(),
+            "added": self.added,
+            "skipped": self.skipped,
+        })
+    }
+}
+
+/// `chronos refresh`, `serve --refresh-every`, HTTP `refresh`: main takes Postgres's rows as they are now, for every
+/// attached table, so rows no merge touched don't stay as old as the attach. One read of Postgres (`REPEATABLE READ`,
+/// read only: a replica will do), under the write-back lock, so no merge into main runs between the read and main
+/// taking what it read. Each of main's rows is compared with Postgres's as the write-back compares them (main's value
+/// cast to the column's type there, so a row nobody changed always compares equal), and rows Postgres has that main
+/// hasn't are read whole; main takes the differences in one change. Open worlds then see main moved, and settle the
+/// rows they changed too as any conflict at their merge. Columns Postgres added to a table are added to main's first
+/// (see `widen`), so its rows then take their values; a table whose shape changed otherwise is left as it was, and
+/// said.
+pub fn refresh(core: &Core) -> std::result::Result<Refreshed, String> {
+    refresh_with(core, None)
+}
+
+/// `refresh`, of the tables `only` names (by place) if given: then the folder doesn't count as refreshed (`as_of`),
+/// as the other tables weren't read.
+fn refresh_with(core: &Core, only: Option<&[usize]>) -> std::result::Result<Refreshed, String> {
+    let Some(att) = core.attached.as_deref() else {
+        return Err("this folder isn't attached to Postgres (chronos attach makes one that is)".into());
+    };
+    let _held = att.hold();
+    if att.pending() {
+        resolve(core).map_err(|e| format!("a merge written to Postgres before isn't settled yet: {e}"))?;
+    }
+    refresh_now(core, att, only)
+}
+
+/// `refresh_with`, with the write-back lock held and no write-back left pending (or settling one: see `resolve`).
+fn refresh_now(core: &Core, att: &Attached, only: Option<&[usize]>) -> std::result::Result<Refreshed, String> {
+    let mut pg = connect()?;
+    let out = refresh_read(core, att, &mut pg, only);
+    rollback(&mut pg);
+    let mut done = out.map_err(|e| e.to_string())?;
+    let rows: Vec<Stored> = std::mem::take(&mut done.1);
+    store(core, att, &rows)?;
+    let unsettled = settle(core, att);
+    done.0.skipped.extend(unsettled);
+    if only.is_none() {
+        att.refreshed(done.0.at).map_err(|e| e.to_string())?;
+    }
+    Ok(done.0)
+}
+
+/// The read of a refresh: what main is to take, per table (see `refresh`).
+fn refresh_read(
+    core: &Core,
+    att: &Attached,
+    pg: &mut Client,
+    only: Option<&[usize]>,
+) -> Result<(Refreshed, Vec<Stored>)> {
+    let start = format!(
+        "begin isolation level repeatable read, read only; set local statement_timeout = '{STATEMENT_TIMEOUT}'; \
+         {SETTINGS}; select count(*) from chronos.merges where id = {}",
+        lit(&att.marker())
+    );
+    let found = pg.query(&start).map_err(|e| failed("starting the refresh", &e))?;
+    if found.last().and_then(|r| r[0].as_deref()) != Some("1") {
+        return Err(refused(format!(
+            "the Postgres CHRONOS_SOURCE_URL names isn't the one this folder was attached to ({}): nothing was refreshed",
+            att.source()
+        )));
+    }
+    let mut out = Refreshed { at: crate::now_ms(), ..Default::default() };
+    let mut rows = vec![];
+    for ti in 0..att.tables().len() {
+        if only.is_some_and(|o| !o.contains(&ti)) {
+            continue;
+        }
+        let before = att.tables();
+        let t = &before[ti];
+        match shape(pg, t)? {
+            Shape::Same => {}
+            Shape::Added(cols) => {
+                let named: Vec<String> =
+                    cols.iter().map(|a| format!("{}.{} {}", t.name, a.col.name, a.col.ty)).collect();
+                if let Err(e) = widen(core, att, ti, cols) {
+                    out.skipped.push(format!(
+                        "{}: columns added in Postgres ({}) couldn't be added here: {e}",
+                        t.name,
+                        named.join(", ")
+                    ));
+                    continue;
+                }
+                out.added.extend(named);
+            }
+            Shape::Changed(diffs) => {
+                out.skipped.push(format!(
+                    "{}: changed in Postgres since the attach: {}. Attach it again into a new folder",
+                    t.name,
+                    diffs.join("; ")
+                ));
+                continue;
+            }
+        }
+        // (as recorded now: with any columns just added, which main's table has too)
+        let tables = att.tables();
+        let t = &tables[ti];
+        let main = core.view(MAIN)?;
+        let (mut ins, mut upd, mut del) = (0, 0, 0);
+        // main's rows, compared with Postgres's a batch at a time: changed or gone there
+        let mut held: Vec<Row> = vec![];
+        let mut keys: Vec<Texts> = vec![];
+        let prefix = format!("{}/", t.name);
+        let mut flush = |held: &mut Vec<Row>, pg: &mut Client| -> Result<()> {
+            if held.is_empty() {
+                return Ok(());
+            }
+            let batch: Vec<&Row> = held.iter().collect();
+            for c in compare(pg, t, &batch)? {
+                if c.changed {
+                    match &c.now {
+                        Some(_) => upd += 1,
+                        None => del += 1,
+                    }
+                    rows.push(Stored { table: ti, key: c.key, row: c.now });
+                }
+            }
+            held.clear();
+            Ok(())
+        };
+        for r in core.rows(&main.s, &prefix)? {
+            let (k, raw) = r?;
+            if !k.starts_with(&prefix) {
+                break;
+            }
+            let before = texts(core, &main.s, t, &k, &raw)?;
+            let row = Row { key: k, table: ti, before: Some(before), after: None, kept: false, unseen: vec![] };
+            keys.push(row.key_texts(t));
+            held.push(row);
+            if held.len() >= REFRESH_BATCH {
+                flush(&mut held, &mut *pg)?;
+            }
+        }
+        flush(&mut held, &mut *pg)?;
+        // rows Postgres has that main hasn't: inserted there since
+        let mut params = vec![];
+        for k in 0..t.key.len() {
+            params.push(text_array(keys.iter().map(|r| r[k].as_deref())));
+        }
+        let pg_text: Vec<String> = t.cols.iter().map(|c| format!("t.{}::text", q(&c.name))).collect();
+        let k_cols: Vec<String> = (0..t.key.len()).map(|n| format!("k{n}")).collect();
+        let k_params: Vec<String> = (1..=t.key.len()).map(|n| format!("${n}::text[]")).collect();
+        let sql = format!(
+            "select {} from {} t where not exists (select 1 from unnest({}) as k({}) where {})",
+            pg_text.join(", "),
+            t.pg,
+            k_params.join(", "),
+            k_cols.join(", "),
+            key_match(t, "t"),
+        );
+        for r in run(pg, &format!("reading rows of {} main hasn't", t.pg), &sql, &params)? {
+            let key = t.key.iter().map(|&i| r[i].clone()).collect();
+            rows.push(Stored { table: ti, key, row: Some(r) });
+            ins += 1;
+        }
+        out.tables.push((t.name.clone(), ins, upd, del));
+    }
+    Ok((out, rows))
+}
+
+/// Adds `added`, columns Postgres added to attached table `ti`, to main's table and then to the folder's record in
+/// memory, under the write-back lock (see `refresh`): one ALTER TABLE, made as the database's own change (as `store`
+/// writes rows). Main's rows get each column's default here, then Postgres's values from the same refresh; NOT NULL
+/// waits for those (`settle`). A default Chronos won't fill existing rows with (one worked out per row, such as
+/// `gen_random_uuid()`, on a table with rows: 0A000) waits too: the column comes bare, and Postgres's values fill it.
+/// The record is saved only once the refresh is done (`refreshed`): stopped before, the folder opens with the old
+/// record, finds the columns again, adds here only those main hasn't, and sets defaults and NOT NULL again. Worlds
+/// forked before keep the table as they had it until forked again.
+fn widen(core: &Core, att: &Attached, ti: usize, added: Vec<Added>) -> std::result::Result<(), String> {
+    let db = core.db().ok_or("no database")?;
+    let t = &att.tables()[ti];
+    let main = core.view(MAIN).map_err(|e| e.to_string())?;
+    let schema = core.val(&main.s, &format!("{}/{}", crate::sql::SCHEMAS, t.name)).map_err(|e| e.to_string())?;
+    let has = schema.as_ref().and_then(crate::sql::column_names).unwrap_or_default();
+    let alter = |sql: String| {
+        let _r = crate::Recovering::enter();
+        let skip = SKIP.replace(true);
+        let out = crate::sql::run(&db, MAIN, &sql, &[]);
+        SKIP.set(skip);
+        out.map(|_| ())
+    };
+    let mut later = vec![];
+    for a in &added {
+        let bare = format!("alter table {} add column {} {}", t.sql, q(&a.col.name), a.col.ty);
+        let default = match &a.default {
+            // (already here: a refresh stopped before its record was saved; its default may not be)
+            _ if has.contains(&a.col.name) => a.default.clone(),
+            Some(e) => match alter(format!("{bare} default {e}")) {
+                Ok(()) => None,
+                Err(err) if err.code == "0A000" => {
+                    alter(bare).map_err(|e| e.message)?;
+                    Some(e.clone())
+                }
+                Err(err) => return Err(err.message),
+            },
+            None => {
+                alter(bare).map_err(|e| e.message)?;
+                None
+            }
+        };
+        if default.is_some() || a.not_null {
+            later.push((ti, a.col.name.clone(), default, a.not_null));
+        }
+    }
+    att.unsettled.lock().unwrap_or_else(|p| p.into_inner()).extend(later);
+    let mut tables = att.tables.write().unwrap_or_else(|p| p.into_inner());
+    let mut next = (**tables).clone();
+    next[ti].cols.extend(added.into_iter().map(|a| a.col));
+    *tables = Arc::new(next);
+    Ok(())
+}
+
+/// Gives the columns a refresh added the default and NOT NULL that waited for their values (see `widen`), now that
+/// main's rows have Postgres's. One that can't be (a row of main still NULL there, say) stays to try at the next
+/// refresh, and is said.
+fn settle(core: &Core, att: &Attached) -> Vec<String> {
+    let mut unsettled = att.unsettled.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(db) = core.db() else { return vec![] };
+    let tables = att.tables();
+    let mut said = vec![];
+    unsettled.retain(|(ti, col, default, not_null)| {
+        let t = &tables[*ti];
+        let mut sets = vec![];
+        if let Some(e) = default {
+            sets.push(format!("alter column {} set default {e}", q(col)));
+        }
+        if *not_null {
+            sets.push(format!("alter column {} set not null", q(col)));
+        }
+        let sql = format!("alter table {} {}", t.sql, sets.join(", "));
+        let _r = crate::Recovering::enter();
+        let skip = SKIP.replace(true);
+        let out = crate::sql::run(&db, MAIN, &sql, &[]);
+        SKIP.set(skip);
+        match out {
+            Ok(_) => false,
+            Err(e) => {
+                said.push(format!(
+                    "{}: column {col}'s default or NOT NULL, as Postgres has them, couldn't be set here: {}",
+                    t.name, e.message
+                ));
+                true
+            }
+        }
+    });
+    said
+}
+
 /// For `chronos serve` on an attached folder: whether the Postgres it was attached to answers as that database, and
 /// a pending write-back settled. A line to print either way; merges into main are refused while it fails.
 pub fn check(core: &Core) -> std::result::Result<String, String> {
@@ -1639,11 +2224,15 @@ pub fn check(core: &Core) -> std::result::Result<String, String> {
         ));
     }
     drop(pg);
+    let (what, at) = match att.refreshed_at() {
+        0 => ("copied", att.at),
+        r => ("refreshed", r),
+    };
     let mut line = format!(
-        "attached to {} ({} tables, copied {} s ago): merges into main are written there first",
+        "attached to {} ({} tables, {what} {} s ago): merges into main are written there first",
         att.source(),
-        att.tables.len(),
-        crate::now_ms().saturating_sub(att.at) / 1000
+        att.tables().len(),
+        crate::now_ms().saturating_sub(at) / 1000
     );
     if let Some(s) = resolve(core)? {
         line.push_str(&format!("\n{s}"));
@@ -1695,11 +2284,17 @@ mod tests {
             (b.id.as_str(), b.host.as_str(), b.port, b.database.as_str()),
             (a.id.as_str(), "db.example.com", 6543, "shop")
         );
-        assert_eq!(b.tables, vec![t]);
+        assert_eq!(*b.tables(), vec![t]);
         // no secret goes into the folder
         assert!(!std::fs::read_to_string(dir.join(FILE)).unwrap().contains("secret"));
         assert!(Attached::load(&dir.join("nowhere")).unwrap().is_none());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn filters_joined_by_or_stay_one_condition() {
+        let w = any_of(&["t.a = 1".into(), "t.b = 2".into()]);
+        assert_eq!(format!("{w} and not exists (x)"), "((t.a = 1) or (t.b = 2)) and not exists (x)");
     }
 
     #[test]
@@ -1720,9 +2315,29 @@ mod tests {
             "unnest($1::text[], $2::bool[], $3::text[], $4::text[]) with ordinality as k(k0, p, c0, c1, i)"
         );
         assert_eq!(key_match(&t, "t"), "(t.\"a\") = (k.k0::integer)");
-        let r =
-            Row { key: "t/1".into(), table: 0, before: None, after: Some(vec![Some("1".into()), Some("x\"y".into())]) };
+        let r = Row {
+            key: "t/1".into(),
+            table: 0,
+            before: None,
+            after: Some(vec![Some("1".into()), Some("x\"y".into())]),
+            kept: false,
+            unseen: vec![],
+        };
         assert_eq!(arrays(&[&r], &t, true, &[0, 1], true), ["{\"1\"}", "{f}", "{\"1\"}", "{\"x\\\"y\"}"]);
         assert_eq!(text_array([None, Some("a\\b")]), "{NULL,\"a\\\\b\"}");
+    }
+
+    /// A conflict with Postgres, a stale read and Postgres being busy share 40001: merge outcomes count them apart.
+    #[test]
+    fn a_conflict_is_told_from_other_refusals() {
+        let pg = conflict(2, "w", "shop on db.example.com", &["  t/1: ...".into()]);
+        assert!(is_conflict(&pg) && !crate::stale::is_stale(&pg));
+        let stale = crate::stale::stale("w", "merging", &["read t/1, which changed since".into()]);
+        assert!(crate::stale::is_stale(&stale) && !is_conflict(&stale));
+        let busy = Error::Constraint {
+            code: "40001",
+            message: "Postgres, writing t: lock timeout; nothing was written: safe to merge again".into(),
+        };
+        assert!(!is_conflict(&busy) && !crate::stale::is_stale(&busy));
     }
 }

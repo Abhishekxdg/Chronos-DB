@@ -193,9 +193,16 @@ impl Exec<'_> {
     }
 
     /// ALTER TABLE `table` with one change that rewrites every row (ADD PRIMARY KEY, ALTER COLUMN ... TYPE, ADD COLUMN
-    /// of a generated column), on a big table, in parts (see the module's comment). None: not such a change, or not a
-    /// table this does (it's done as any ALTER TABLE then).
-    pub(super) fn alter_big(&self, table: &str, changes: &[Alter], only: bool) -> Result<Option<Output>> {
+    /// of a generated column), on a big table, in parts (see the module's comment), and the statement's SET TABLESPACE
+    /// `space` if it has one (written with them: see `tablespace::set_after`). None: not such a change, or not a table
+    /// this does (it's done as any ALTER TABLE then).
+    pub(super) fn alter_big(
+        &self,
+        table: &str,
+        changes: &[Alter],
+        only: bool,
+        space: Option<&str>,
+    ) -> Result<Option<Output>> {
         let [change] = changes else { return Ok(None) };
         let rewrites = match change {
             Alter::AddPrimaryKey(..) | Alter::SetType(..) => true,
@@ -222,13 +229,16 @@ impl Exec<'_> {
             let before = need_table(v, table)?;
             if !eligible(&before) || before.matview.is_some() {
                 // (changed since it was looked at: as any ALTER TABLE)
-                return Ok((self.alter_hier(v, table, changes, only)?, ()));
+                let mut writes = self.alter_hier(v, table, changes, only)?;
+                tablespace::set_after(v, &mut writes, table, space)?;
+                return Ok((writes, ()));
             }
             *self.nest.big.borrow_mut() = Some(table.to_string());
             let writes = self.alter_hier(v, table, changes, only);
             self.nest.big.take();
             let redo = self.nest.redo.take();
-            let writes = writes?;
+            let mut writes = writes?;
+            tablespace::set_after(v, &mut writes, table, space)?;
             let Some(redo) = redo else { return Ok((writes, ())) };
             let Some(Some(raw)) = writes.iter().find(|(k, _)| *k == schema_key(table)).map(|(_, x)| x.clone()) else {
                 return err("XX000", format!("ALTER TABLE of \"{table}\" in parts left no schema"));

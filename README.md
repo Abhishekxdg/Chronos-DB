@@ -10,7 +10,7 @@ What keeps to the rules is written back to your Postgres in one checked transact
 
 <br>
 
-![status](https://img.shields.io/badge/status-v0.3.2%20beta-f59e0b?style=flat-square)
+![status](https://img.shields.io/badge/status-v0.4.1%20beta-f59e0b?style=flat-square)
 ![rust](https://img.shields.io/badge/rust-1.90%2B-b7410e?style=flat-square&logo=rust&logoColor=white)
 ![postgres wire](https://img.shields.io/badge/postgres-wire%20protocol-336791?style=flat-square&logo=postgresql&logoColor=white)
 ![mcp](https://img.shields.io/badge/MCP-ready-7c3aed?style=flat-square)
@@ -34,7 +34,7 @@ What keeps to the rules is written back to your Postgres in one checked transact
 > [!IMPORTANT]
 > **Public beta (0.2): try it on a staging copy, not production.** Nobody outside the author has run a real agent on it yet, and it is built by one person.
 > - **Attach** (working beside your Postgres) is new: at most 10,000 changed rows per merge, no refresh of rows a merge doesn't touch, tables need a primary key. Tested on Neon, direct and through its pooler. See [Working beside your Postgres](docs/guides/attach-postgres.md).
-> - **On its own,** Chronos speaks the Postgres 16 protocol and much of its SQL, but it is not Postgres: 83.69% of the lines Postgres 16's regression suite expects (46 of its 219 files exactly), 7 real databases moved in with identical row checksums, point reads at about half Postgres's rate and writes at a fraction of it. Read [where it stands](docs/postgres-compatibility.md#where-it-stands-beta) before moving data in.
+> - **On its own,** Chronos speaks the Postgres 16 protocol and much of its SQL, but it is not Postgres: 86.24% of the lines Postgres 16's regression suite expects (60 of its 219 files exactly), 7 real databases moved in with identical row checksums, point reads at about half Postgres's rate and writes at a fraction of it. Read [where it stands](docs/postgres-compatibility.md#where-it-stands-beta) before moving data in.
 > - macOS 13+ and Linux only. The benchmarks it loses are listed in [BENCHMARKS.md](BENCHMARKS.md#where-chronos-db-loses).
 
 ---
@@ -488,7 +488,7 @@ The Jepsen-style test found two real bugs before this release (money created by 
 
 ## Status and roadmap
 
-Chronos DB is a **public beta** (0.3.2), and not yet used in production. The previous release was [v0.3.1](https://github.com/Abhishekxdg/chronosdb/releases/tag/v0.3.1), on 2026-10-17.
+Chronos DB is a **public beta** (0.4.1), and not yet used in production. The previous release was [v0.4.0](https://github.com/Abhishekxdg/chronosdb/releases/tag/v0.4.0), on 2026-10-22.
 
 - [x] Worlds: fork, diff, three-way merge, partial merges, time travel, undo
 - [x] Postgres wire protocol and a broad SQL surface, checked against Postgres 17

@@ -21,6 +21,11 @@ fn inh_key(parent: &str, child: &str) -> String {
     format!("{INH}/{parent}/{child}")
 }
 
+/// A JSON object of numbers by index name, as `Hier` keeps an index's tablespace.
+fn by_index(j: &Json) -> Vec<(String, i64)> {
+    j.as_object().into_iter().flatten().filter_map(|(x, n)| Some((x.clone(), n.as_i64()?))).collect()
+}
+
 /// What makes a table part of a hierarchy, as its schema row keeps it.
 #[derive(Clone, Debug, Default)]
 pub(super) struct Hier {
@@ -52,6 +57,13 @@ pub(super) struct Hier {
     pub(super) reloptions: Vec<String>,
     pub(super) toast_reloptions: Vec<String>,
     pub(super) index_reloptions: Vec<(String, Vec<String>)>,
+    /// TABLESPACE: the tablespace the table is kept in, by oid (0: the database's default, as pg_class.reltablespace
+    /// has it), and its indexes', by index name (none listed: the default) (see `tablespace`)
+    pub(super) tablespace: i64,
+    pub(super) index_spaces: Vec<(String, i64)>,
+    /// a partition's indexes that are copies of its parent's (or were attached to one), each with the parent's
+    /// index's name: which of several alike indexes is which one's (see `kid_constraint`)
+    pub(super) index_ups: Vec<(String, String)>,
 }
 
 impl Hier {
@@ -82,6 +94,14 @@ impl Hier {
                 .into_iter()
                 .flatten()
                 .map(|(x, o)| (x.clone(), strs(o)))
+                .collect(),
+            tablespace: j["tablespace"].as_i64().unwrap_or(0),
+            index_spaces: by_index(&j["index_tablespaces"]),
+            index_ups: j["index_parents"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(x, up)| Some((x.clone(), up.as_str()?.to_string())))
                 .collect(),
         }
     }
@@ -127,6 +147,57 @@ impl Hier {
             if let Some(x) = index {
                 j["replident_index"] = Json::String(x.clone());
             }
+        }
+        if self.tablespace != 0 {
+            j["tablespace"] = Json::from(self.tablespace);
+        }
+        if !self.index_spaces.is_empty() {
+            j["index_tablespaces"] =
+                Json::Object(self.index_spaces.iter().map(|(x, n)| (x.clone(), Json::from(*n))).collect());
+        }
+        if !self.index_ups.is_empty() {
+            j["index_parents"] =
+                Json::Object(self.index_ups.iter().map(|(x, up)| (x.clone(), Json::String(up.clone()))).collect());
+        }
+    }
+
+    /// The tablespace index `x` is kept in (0: the database's default).
+    pub(super) fn index_space(&self, x: &str) -> i64 {
+        self.index_spaces.iter().find(|(n, _)| n == x).map_or(0, |(_, o)| *o)
+    }
+
+    pub(super) fn set_index_space(&mut self, x: &str, oid: i64) {
+        self.index_spaces.retain(|(n, _)| n != x);
+        if oid != 0 {
+            self.index_spaces.push((x.to_string(), oid));
+        }
+    }
+
+    /// The parent's index that index `x` (a partition's) is the copy of, if one was recorded.
+    pub(super) fn index_up(&self, x: &str) -> Option<&str> {
+        self.index_ups.iter().find(|(n, _)| n == x).map(|(_, up)| up.as_str())
+    }
+
+    /// Index `x` (a partition's) is the copy of its parent's index `up`.
+    pub(super) fn link_index(&mut self, x: &str, up: &str) {
+        self.index_ups.retain(|(n, _)| n != x);
+        self.index_ups.push((x.to_string(), up.to_string()));
+    }
+
+    /// Index `x` is gone: where it was kept, and whose copy it was, go with it (one made later by its name starts
+    /// afresh).
+    pub(super) fn forget_index(&mut self, x: &str) {
+        self.index_spaces.retain(|(n, _)| n != x);
+        self.index_ups.retain(|(n, _)| n != x);
+    }
+
+    /// Index `from` is called `to` now, and is kept where it was, the copy of what it was.
+    pub(super) fn renamed_index(&mut self, from: &str, to: &str) {
+        for (n, _) in self.index_spaces.iter_mut().filter(|(n, _)| n == from) {
+            *n = to.to_string();
+        }
+        for (n, _) in self.index_ups.iter_mut().filter(|(n, _)| n == from) {
+            *n = to.to_string();
         }
     }
 
@@ -183,8 +254,14 @@ pub(super) struct CreateHier {
     pub(super) pkey_name: Option<String>,
     /// OF type: the composite type's stored name (see `Hier::of_type`)
     pub(super) of_type: Option<String>,
+    /// TABLESPACE name, and the primary key's USING INDEX TABLESPACE name (see `tablespace`)
+    pub(super) space: Option<String>,
+    pub(super) pkey_space: Option<String>,
     /// WITH (storage parameters): the table's and its TOAST table's, checked (see `reloptions`)
     pub(super) reloptions: (Vec<String>, Vec<String>),
+    /// the parents (of PARTITION OF and INHERITS) written with their schema, as stored: `public.p` is the permanent
+    /// table even where a temporary one has its name, which a stored name doesn't tell
+    pub(super) qualified: Vec<String>,
 }
 
 /// How ALTER TABLE ... DETACH PARTITION goes about it.
@@ -315,7 +392,19 @@ impl Parser {
     pub(super) fn hier_clause(&mut self, h: &mut CreateHier) -> Result<bool> {
         if self.kw("inherits") {
             self.expect_sym("(")?;
-            h.inherits = self.rel_names()?;
+            loop {
+                // (pg_temp.p names the temporary one, as a plain p does)
+                let schema = self.t.get(self.i + 1) == Some(&Tok::Sym("."))
+                    && !matches!(self.t.get(self.i), Some(Tok::Word(s) | Tok::Ident(s)) if s == "pg_temp");
+                let n = self.rel_name()?;
+                if schema {
+                    h.qualified.push(n.clone());
+                }
+                h.inherits.push(n);
+                if !self.sym(",") {
+                    break;
+                }
+            }
             self.expect_sym(")")?;
             return Ok(true);
         }
@@ -500,7 +589,7 @@ pub(super) fn type_text(c: &Col) -> String {
     }
 }
 
-fn same_type(a: &Col, b: &Col) -> bool {
+pub(super) fn same_type(a: &Col, b: &Col) -> bool {
     a.ty == b.ty && a.numeric == b.numeric && a.chars == b.chars && a.small == b.small && a.dim == b.dim
 }
 
@@ -1371,7 +1460,7 @@ impl Exec<'_> {
             let parent = need_table(v, &p)?;
             check_bound(v, &parent, &t.name, &bound)?;
             default_holds_none(v, &parent, &t.name, &bound)?;
-            clone_constraints(t, &parent, false, &index_names(v)?, v)?;
+            clone_constraints(t, &parent, (false, &[]), &index_names(v)?, v)?;
             writes.extend(link_writes(v, &parent, &t.name)?);
         } else if !parents.is_empty() {
             for p in parents {
@@ -1582,16 +1671,21 @@ fn kid_constraint(parent: &Table, kid: &Table, name: &str) -> Option<String> {
     }
     let x = parent.indexes.iter().find(|x| x.name == name)?;
     let mapped = map_ids(&x.cols, parent, kid)?;
-    kid.indexes
-        .iter()
-        .find(|k| {
-            given(&k.name)
-                && k.cols == mapped
-                && k.exprs == x.exprs
-                && k.filter == x.filter
-                && (0..mapped.len()).all(|n| k.coll(n) == x.coll(n))
-        })
-        .map(|k| k.name.clone())
+    let mut kids = kid.indexes.iter().filter(|k| {
+        given(&k.name)
+            && k.cols == mapped
+            && k.exprs == x.exprs
+            && k.filter == x.filter
+            && (0..mapped.len()).all(|n| k.coll(n) == x.coll(n))
+    });
+    // the one recorded as its copy; else one recorded as none of the parent's indexes' copy (a record naming one the
+    // parent no longer has, by that name, counts for none): of several alike, each is its own one's, and one the
+    // partition has no copy of (made ON ONLY) has none
+    let up = |k: &btree::Index| kid.hier.index_up(&k.name).filter(|u| parent.indexes.iter().any(|y| y.name == *u));
+    match kids.clone().find(|k| up(k) == Some(name)) {
+        Some(k) => Some(k.name.clone()),
+        None => kids.find(|k| up(k).is_none()).map(|k| k.name.clone()),
+    }
 }
 
 impl Exec<'_> {
@@ -2033,14 +2127,16 @@ impl Exec<'_> {
         }
         kid.hier.of = Some((parent.name.clone(), bound));
         let mut writes = link_writes(v, parent, &kid.name)?;
-        writes.extend(self.adopt_tree(v, &mut kid, parent, true)?);
+        writes.extend(self.adopt_tree(v, &mut kid, parent, (true, &[]))?);
         Ok(writes)
     }
 
     /// The writes that give partition `kid` what `parent` has (indexes, keys, foreign keys, triggers)
-    /// and the same for the partitions below it, each now a partition of a table that has it.
-    fn adopt_tree(&self, v: &View, kid: &mut Table, parent: &Table, top: bool) -> Result<Writes> {
-        clone_constraints(kid, parent, true, &index_names(v)?, v)?;
+    /// and the same for the partitions below it, each now a partition of a table that has it. `kept`: the indexes
+    /// `parent` had before (it is a partition below the one attached), which `kid` has as it has them already.
+    fn adopt_tree(&self, v: &View, kid: &mut Table, parent: &Table, (top, kept): (bool, &[String])) -> Result<Writes> {
+        let had: Vec<String> = kid.indexes.iter().map(|x| x.name.clone()).collect();
+        clone_constraints(kid, parent, (true, kept), &index_names(v)?, v)?;
         // (a foreign partition takes none of its parent's indexes)
         if kid.hier.foreign.is_some() {
             let names: Vec<String> = kid.indexes.drain(..).map(|x| x.name).collect();
@@ -2055,7 +2151,7 @@ impl Exec<'_> {
         let mut writes = schema_writes(v, kid)?;
         for mut sub in children(v, &kid.name)? {
             if sub.hier.of.is_some() {
-                writes.extend(self.adopt_tree(v, &mut sub, kid, false)?);
+                writes.extend(self.adopt_tree(v, &mut sub, kid, (false, &had))?);
             }
         }
         Ok(writes)
@@ -2108,6 +2204,7 @@ impl Exec<'_> {
         let below = unspread_triggers(v, &kid, &cloned)?;
         kid.triggers.retain(|x| !cloned.contains(&x.name));
         kid.hier.inherited.clear();
+        kid.hier.index_ups.clear();
         for f in &mut kid.fks {
             f.up = None;
         }
@@ -2261,7 +2358,9 @@ impl Exec<'_> {
             if pt.hier.part.is_none() {
                 return err_detail("42809", format!("\"{pn}\" is not a partitioned index"), "");
             }
-            // attached to it already: nothing to do; another of the partition's attached to it: refused
+            // in the order Postgres's ATExecAttachPartitionIdx checks: attached to it already, nothing to do; another
+            // of the partition's attached to it (refuseDupeIndexAttach); this one attached to another index; not an
+            // index on a partition of its table; and only then the definitions
             match kid_constraint(pt, ct, pn) {
                 Some(n) if n == cn => return Ok((vec![], ())),
                 Some(_) => {
@@ -2272,13 +2371,17 @@ impl Exec<'_> {
                 }
                 None => {}
             }
+            let key = |t: &Table, n: &str| t.has_key() && n == t.pkey_name();
+            let mark = if key(ct, cn) { "*pkey".to_string() } else { cn.to_string() };
+            if ct.hier.inherited.contains(&mark) {
+                return refuse("55000", &format!("Index \"{cn}\" is already attached to another index."));
+            }
             if ct.hier.of.as_ref().is_none_or(|(p, _)| *p != pt.name) {
                 return refuse("55000", &format!(
-                    "Index \"{pn}\" is not an index on any partition of table \"{}\".",
-                    rel_part(&ct.name)
+                    "Index \"{cn}\" is not an index on any partition of table \"{}\".",
+                    rel_part(&pt.name)
                 ));
             }
-            let key = |t: &Table, n: &str| t.has_key() && n == t.pkey_name();
             // the definitions have to be the same
             let same = if key(pt, pn) {
                 key(ct, cn) && {
@@ -2333,15 +2436,9 @@ impl Exec<'_> {
             if !same {
                 return refuse("42P17", "The index definitions do not match.");
             }
-            let mark = if key(ct, cn) { "*pkey".to_string() } else { cn.to_string() };
-            if kid_constraint(pt, ct, pn).as_deref() == Some(cn) {
-                return Ok((vec![], ())); // (it is that already)
-            }
-            if ct.hier.inherited.contains(&mark) {
-                return refuse("55000", &format!("Index \"{cn}\" is already attached to another index."));
-            }
             let mut ct = ct.clone();
             ct.hier.inherited.push(mark);
+            ct.hier.link_index(cn, pn);
             Ok((vec![(schema_key(&ct.name), Some(schema_json(&ct)))], ()))
         })?;
         Ok(Output::tag("ALTER INDEX"))
@@ -2461,9 +2558,15 @@ fn recursed(t: &Table, kids: &[Table], kid: &Table, changes: &[Alter], only: boo
             | Alter::ColOpt(..) => out.push(c.clone()),
             Alter::AddConstraint(def) => match def {
                 ConstraintDef::Check { no_inherit: false, .. } => out.push(c.clone()),
-                // (a partition names its own unique constraint, as it names its own key)
-                ConstraintDef::Unique { cols, nnd, .. } if t.hier.part.is_some() => {
-                    out.push(Alter::AddConstraint(ConstraintDef::Unique { name: None, cols: cols.clone(), nnd: *nnd }));
+                // (a partition names its own unique constraint, as it names its own key; its index is kept where
+                // the parent's statement says, as Postgres's DefineIndex gives each partition's the statement)
+                ConstraintDef::Unique { cols, nnd, space, .. } if t.hier.part.is_some() => {
+                    out.push(Alter::AddConstraint(ConstraintDef::Unique {
+                        name: None,
+                        cols: cols.clone(),
+                        nnd: *nnd,
+                        space: space.clone(),
+                    }));
                 }
                 // (under the name the table gives it: its partitions' copies have that name too)
                 ConstraintDef::Foreign { cols, .. } if t.hier.part.is_some() => {
@@ -2475,10 +2578,10 @@ fn recursed(t: &Table, kids: &[Table], kid: &Table, changes: &[Alter], only: boo
                 }
                 _ => {}
             },
-            Alter::AddPrimaryKey(cols, _) => {
+            Alter::AddPrimaryKey(cols, _, space) => {
                 // (a partition names its own key)
                 if t.hier.part.is_some() {
-                    out.push(Alter::AddPrimaryKey(cols.clone(), None));
+                    out.push(Alter::AddPrimaryKey(cols.clone(), None, space.clone()));
                 } else {
                     out.extend(cols.iter().map(|n| Alter::NotNull(n.clone(), true)));
                 }
@@ -2833,7 +2936,7 @@ pub(super) fn failing_row(table: &str, vals: &[Value], cols: &[Col]) -> Option<S
         None => (table, vals, cols),
     };
     let Some(who) = who.filter(|_| limited) else { return all(vals, cols) };
-    if !ctx.core.has_privileges() && !ctx.core.has_row_security() {
+    if !ctx.core.has_privileges() && !rls::possible(&ctx.core) {
         return all(vals, cols);
     }
     if rls::limits(&v, name, Some(&*who)).unwrap_or(true) {
@@ -3165,6 +3268,16 @@ pub(super) fn action_names(
     (t.name, con)
 }
 
+/// Where a partition's copy `name` of an index of its parent's (one in tablespace `up`) is kept: where that one is,
+/// or where default_tablespace says when that one is in the database's default, as Postgres's
+/// generateClonedIndexStmt names it (and makes it without asking for CREATE there).
+fn clone_space(v: &View, child: &mut Table, name: &str, up: i64) -> Result<()> {
+    let at = super::tablespace::place(v, None, up, child.hier.part.is_some(), false)?;
+    child.hier.forget_index(name);
+    child.hier.set_index_space(name, at);
+    Ok(())
+}
+
 /// Gives partition `child` what its parent has: CHECK constraints, UNIQUE constraints, indexes,
 /// foreign keys and row triggers, each marked as inherited. `attaching`: the table existed, and
 /// what it has that is the same as what the parent has is kept (and takes the parent's place),
@@ -3172,7 +3285,7 @@ pub(super) fn action_names(
 pub(super) fn clone_constraints(
     child: &mut Table,
     parent: &Table,
-    attaching: bool,
+    (attaching, kept): (bool, &[String]),
     others: &HashSet<String>,
     v: &View,
 ) -> Result<()> {
@@ -3236,9 +3349,14 @@ pub(super) fn clone_constraints(
                 colls: x.colls.clone(),
             });
         }
+        clone_space(v, child, &name, parent.hier.index_space(&u.name))?;
         child.hier.inherited.push(name);
     }
-    for x in parent.indexes.iter().filter(|x| !parent.uniques.iter().any(|u| u.name == x.name)) {
+    // (`kept`: the parent's indexes it had before, which a partition of it already has as it has them, or has none of
+    // when one was made ON ONLY, as Postgres's AttachPartitionEnsureIndexes leaves them)
+    for x in
+        parent.indexes.iter().filter(|x| !parent.uniques.iter().any(|u| u.name == x.name) && !kept.contains(&x.name))
+    {
         let Some(cols) = map_ids(&x.cols, parent, child) else { continue };
         // (one in another collation, or already a partition of another index, is not it)
         let attached = kid_constraint(parent, child, &x.name);
@@ -3255,6 +3373,7 @@ pub(super) fn clone_constraints(
             })
         {
             let n = o.name.clone();
+            child.hier.link_index(&n, &x.name);
             if !child.hier.inherited.contains(&n) {
                 child.hier.inherited.push(n);
             }
@@ -3274,6 +3393,8 @@ pub(super) fn clone_constraints(
             trgm: x.trgm.clone(),
             colls: x.colls.clone(),
         });
+        clone_space(v, child, &name, parent.hier.index_space(&x.name))?;
+        child.hier.link_index(&name, &x.name);
         child.hier.inherited.push(name);
     }
     for f in &parent.fks {
@@ -3375,6 +3496,10 @@ pub struct HierInfo {
     /// its storage parameters, and its indexes', by name (see `Hier::reloptions`)
     pub reloptions: Vec<String>,
     pub index_reloptions: Vec<(String, Vec<String>)>,
+    /// pg_class.reltablespace (0: the database's default) and its storage's generation (see `Hier::tablespace` and
+    /// `tablespace::Gens`)
+    pub tablespace: i64,
+    pub filenode: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -3629,6 +3754,7 @@ pub(super) fn info(v: &View, t: &Table) -> Result<HierInfo> {
         of_type: t.hier.of_type.clone(),
         reloptions: t.hier.reloptions.clone(),
         index_reloptions: t.hier.index_reloptions.clone(),
+        tablespace: t.hier.tablespace,
         ..HierInfo::default()
     };
     h.parents = t.hier.all_parents().into_iter().map(String::from).collect();
@@ -3684,12 +3810,14 @@ pub(super) fn info(v: &View, t: &Table) -> Result<HierInfo> {
 
 /// The writes that give each partition of `parent` the index `ix` (and the UNIQUE constraint `u` it
 /// is, if it is) that was just made on it, and the partitions below those: an index a partition has
-/// of its own that is the same is the parent's from then on.
+/// of its own that is the same is the parent's from then on. One made is kept in tablespace `space`, the parent's
+/// (Postgres's DefineIndex gives each partition's the statement that made the parent's).
 pub(super) fn spread_index(
     v: &View,
     parent: &Table,
     ix: &btree::Index,
     u: Option<&Unique>,
+    space: i64,
     flush: &mut dyn FnMut(Writes) -> crate::Result<()>,
 ) -> Result<Writes> {
     let mut writes = vec![];
@@ -3730,18 +3858,21 @@ pub(super) fn spread_index(
                 if let Some(u) = u {
                     kid.uniques.push(Unique { name: name.clone(), cols, nnd: u.nnd, primary: u.primary });
                 }
+                kid.hier.forget_index(&name);
+                kid.hier.set_index_space(&name, space);
                 name
             }
         };
         if !kid.hier.inherited.contains(&name) {
             kid.hier.inherited.push(name.clone());
         }
+        kid.hier.link_index(&name, &ix.name);
         let kix = kid.indexes.iter().find(|o| o.name == name).cloned().unwrap_or_else(|| ix.clone());
         let ku = kid.uniques.iter().find(|x| x.name == name).cloned();
         writes.extend(build_index(v, &kid, Some(&kix), ku.as_ref(), flush)?);
         writes.push((schema_key(&kid.name), Some(schema_json(&kid))));
         if fresh && kid.hier.part.is_some() {
-            writes.extend(spread_index(v, &kid, &kix, ku.as_ref(), flush)?);
+            writes.extend(spread_index(v, &kid, &kix, ku.as_ref(), space, flush)?);
         }
     }
     Ok(writes)

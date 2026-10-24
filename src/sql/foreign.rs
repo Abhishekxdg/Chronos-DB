@@ -495,6 +495,8 @@ pub(crate) enum ForeignStmt {
     Publication(super::publication::PubStmt),
     /// CREATE, ALTER and DROP STATISTICS (see `statistics`)
     Statistics(super::statistics::StatStmt),
+    /// CREATE, ALTER and DROP TABLESPACE, and ALTER ... ALL IN TABLESPACE (see `tablespace`)
+    Tablespace(super::tablespace::TsStmt),
 }
 
 impl ForeignStmt {
@@ -523,6 +525,7 @@ impl ForeignStmt {
                 StatStmt::Drop { .. } => "DROP STATISTICS",
             }
             .into(),
+            ForeignStmt::Tablespace(t) => t.tag().into(),
         }
     }
 }
@@ -939,10 +942,19 @@ pub(super) fn drops_tables(s: &ForeignStmt) -> bool {
     matches!(s, ForeignStmt::Drop { cascade: true, .. })
 }
 
+/// CREATE or DROP TABLESPACE (its tag), which can't run inside a transaction block (see `tablespace`).
+pub(super) fn tablespace_alone(s: &ForeignStmt) -> Option<&'static str> {
+    match s {
+        ForeignStmt::Tablespace(t) => t.alone(),
+        _ => None,
+    }
+}
+
 pub(super) fn run(db: &Db, branch: &str, s: &ForeignStmt) -> Result<Output> {
     match s {
         ForeignStmt::Publication(p) => return super::publication::run(db, branch, p),
         ForeignStmt::Statistics(x) => return super::statistics::run(db, branch, x),
+        ForeignStmt::Tablespace(t) => return super::tablespace::run(db, branch, t),
         _ => {}
     }
     let who = who(db)?;
@@ -1078,6 +1090,7 @@ pub(super) fn run(db: &Db, branch: &str, s: &ForeignStmt) -> Result<Output> {
         ForeignStmt::Owner { what, name, to } => owner(db, branch, &who, *what, name, to),
         ForeignStmt::Publication(p) => super::publication::run(db, branch, p),
         ForeignStmt::Statistics(x) => super::statistics::run(db, branch, x),
+        ForeignStmt::Tablespace(t) => super::tablespace::run(db, branch, t),
         ForeignStmt::Import { server, into } => {
             let v = db.view_tx(branch)?;
             let o = load(&v)?;

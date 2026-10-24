@@ -267,9 +267,6 @@ const CATALOG_VIEWS: [&str; 8] =
 const TS_PARSERS: [(i64, &str); 1] = [(3722, "default")];
 const TS_TEMPLATES: [(i64, &str); 4] = [(3727, "simple"), (3730, "synonym"), (3733, "ispell"), (3742, "thesaurus")];
 
-/// Postgres's tablespaces.
-const TABLESPACES: [(i64, &str); 2] = [(1663, "pg_default"), (1664, "pg_global")];
-
 /// Postgres's own operator families, operator classes, family members and conversions (see `opfamilies.tsv`).
 struct OpData {
     /// oid, access method, name
@@ -798,8 +795,9 @@ fn resolve(cat: &Catalog, ot: Ot, names: &[String], args: &[String]) -> Result<(
             Some((o, _)) => (PG_DATABASE, o, 0),
             None => return missing("3D000", format!("database \"{only}\" does not exist")),
         },
-        Ot::Tablespace => match TABLESPACES.iter().find(|(_, n)| *n == only) {
-            Some((o, _)) => (PG_TABLESPACE, *o, 0),
+        // (Postgres's two and the world's: see `tablespace`)
+        Ot::Tablespace => match cat.spaces.iter().find(|s| s.name == only) {
+            Some(s) => (PG_TABLESPACE, s.oid, 0),
             None => return missing("42704", format!("tablespace \"{only}\" does not exist")),
         },
         Ot::Fdw => match cat.foreign.fdw_oid(only) {
@@ -1467,7 +1465,8 @@ fn identify(cat: &Catalog, class: i64, oid: i64, sub: i64) -> Result<(String, Op
             some(&ty, Found::new(quoted(&name), vec![name.clone()], format!("database {name}")).named(&name))
         }
         PG_TABLESPACE => {
-            let Some((_, name)) = TABLESPACES.iter().find(|(o, _)| *o == oid) else { return none(ty) };
+            let Some(s) = cat.spaces.iter().find(|s| s.oid == oid) else { return none(ty) };
+            let name = &s.name;
             some(&ty, Found::new(quoted(name), vec![name.to_string()], format!("tablespace {name}")).named(name))
         }
         PG_FDW => {

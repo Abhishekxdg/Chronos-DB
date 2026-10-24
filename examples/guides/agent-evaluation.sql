@@ -1,6 +1,6 @@
 -- Grade an agent by diffing its world against the expected state (docs/guides/agent-evaluation.md).
 -- Against a fresh database, with no --token (so psql needs no password on loopback):
---   chronos serve evaldb
+--   CHRONOS_PROTECT_MAIN=off chronos serve evaldb   (this setup writes main directly)
 --   psql -v ON_ERROR_STOP=1 -f examples/guides/agent-evaluation.sql postgres://127.0.0.1:5433/main
 \set ON_ERROR_STOP 1
 -- how this script connected, to come back after acting as an agent (step 6)

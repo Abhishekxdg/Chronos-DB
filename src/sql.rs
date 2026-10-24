@@ -77,6 +77,7 @@ mod statistics;
 mod stats;
 mod stmtstats;
 mod sysinfo;
+mod tablespace;
 mod textext;
 mod time;
 mod timetz;
@@ -93,12 +94,14 @@ pub mod tsearch;
 mod tsparser;
 pub(crate) mod vector;
 
+pub(crate) use acl::riding;
 pub use catalog_objects::sized_type;
 pub use copy::{CopyIn, CopyOut};
 pub(crate) use funcs::{mix, seeded};
 pub(crate) use impact::critical_reasons;
 pub use impact::{Impact, Reader, impact};
 pub use safe::Reach;
+pub(crate) use tablespace::FILENODES;
 pub use time::Interval;
 
 use crate::{Db, Query, Val, View};
@@ -127,6 +130,11 @@ const BAD_INPUT: &str = "22P02";
 const RANGE: &str = "22003";
 const DIV_ZERO: &str = "22012";
 const UNSUPPORTED: &str = "0A000";
+
+/// Set by `chronos serve --studio-api`: SQL may not name a path on the server's machine. A service that hands SQL to
+/// people (Chronos Cloud's console) must not let them write copies of the database wherever the process can (the
+/// backup op, which the service itself calls with a path of its own, is not SQL and is unaffected).
+pub static NO_SERVER_PATHS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const NO_OPERATOR: &str = "42883";
 const NO_FUNCTION: &str = "42883"; // undefined_function
 const NO_PARAM: &str = "42P02";
@@ -215,7 +223,8 @@ impl From<crate::Error> for SqlError {
                     "{} rows were changed on both sides, so nothing was merged: {}{more}. {apart}\
                      See them with MERGE WORLD ... DRY RUN, then settle them: USING OURS (keep the branch's rows), \
                      USING THEIRS (keep the parent's), BY COLUMNS (combine rows where the sides changed different \
-                     columns), or RESOLVE ('table/id' = OURS | THEIRS | DELETE | '<row as JSON>', ...)",
+                     columns; with USING OURS or THEIRS, that side wins only the columns both changed), or \
+                     RESOLVE ('table/id' = OURS | THEIRS | DELETE | '<row as JSON>', ...)",
                     cs.len(),
                     keys.join("; ")
                 );
@@ -234,6 +243,11 @@ impl From<crate::Error> for SqlError {
         };
         SqlError { code, message, info: None }
     }
+}
+
+/// A plan row's columns as each side changed them, as JSON: `{"here": [..], "there": [..], "both": [..]}`.
+pub fn column_changes(c: &crate::ColumnChanges) -> Json {
+    json!({ "here": c.here, "there": c.there, "both": c.both() })
 }
 
 pub type Result<T> = std::result::Result<T, SqlError>;
@@ -567,18 +581,31 @@ impl Reg {
 }
 
 /// The record shapes in use, each once: `Type::Record` is a place here. A shape is made when a
-/// function or a statement first needs it and kept (they come from a few definitions).
+/// function or a statement first needs it and kept (they come from a few definitions). A composite type's shape is
+/// its own, kept with its name: two composite types of the same fields are two types, as in Postgres, and neither is
+/// the anonymous record of those fields.
 type RecordShape = Arc<[(String, Type)]>;
-static RECORDS: LazyLock<Mutex<Vec<RecordShape>>> = LazyLock::new(Default::default);
+/// Each shape in use, with the composite type it was made for (its stored name), if one.
+type Shapes = Vec<(Option<Arc<str>>, RecordShape)>;
+static RECORDS: LazyLock<Mutex<Shapes>> = LazyLock::new(Default::default);
 
 impl Type {
     /// The record type of these fields.
     pub(crate) fn record(fields: Vec<(String, Type)>) -> Type {
+        Type::shaped(None, fields)
+    }
+
+    /// Composite type `name`'s record type, of these fields (see `RECORDS`).
+    pub(crate) fn composite_record(name: &str, fields: Vec<(String, Type)>) -> Type {
+        Type::shaped(Some(name), fields)
+    }
+
+    fn shaped(owner: Option<&str>, fields: Vec<(String, Type)>) -> Type {
         let mut all = RECORDS.lock().unwrap();
-        let at = match all.iter().position(|f| **f == *fields) {
+        let at = match all.iter().position(|(o, f)| o.as_deref() == owner && **f == *fields) {
             Some(i) => i,
             None => {
-                all.push(fields.into());
+                all.push((owner.map(Arc::from), fields.into()));
                 all.len() - 1
             }
         };
@@ -589,10 +616,174 @@ impl Type {
     #[doc(hidden)]
     pub fn fields(self) -> Option<RecordShape> {
         match self {
-            Type::Record(i) => RECORDS.lock().unwrap().get(i as usize).cloned(),
+            Type::Record(i) => RECORDS.lock().unwrap().get(i as usize).map(|(_, f)| f.clone()),
             _ => None,
         }
     }
+
+    /// The composite type a record type was made the shape of (its stored name), if one was: still that type's, or
+    /// one it had before ALTER TYPE changed it (see `stale_record`).
+    pub(crate) fn composite_of(self) -> Option<Arc<str>> {
+        match self {
+            Type::Record(i) => RECORDS.lock().unwrap().get(i as usize).and_then(|(o, _)| o.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `t` is a shape a composite type had before ALTER TYPE changed its attributes (or dropped it), or has in
+/// another world than the one looked up in (see `userdefs::looked_up`): what a schema or a function parsed then, or
+/// there, holds, to be read again.
+fn stale_record(t: Type) -> bool {
+    matches!(t, Type::Record(_)) && t.composite_of().is_some_and(|n| userdefs::current(&n) != Some(t))
+}
+
+thread_local! {
+    /// While ALTER TYPE ... CASCADE changes its typed tables' columns with the type's attributes (see
+    /// `Exec::alter_composite`): the changes a typed table refuses otherwise.
+    static OF_TYPE_CASCADE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Composite type `n` known in `v`'s world as its row there has it now (forgotten where it has none, or one of another
+/// kind of type): after CREATE TYPE, or an ALTER TYPE that changed its attributes or its name.
+fn rehydrate_composite(v: &View, n: &str) -> Result<()> {
+    let row = v.get(&type_key(n))?.map(|r| serde_json::from_str::<Json>(&r).unwrap_or_default());
+    userdefs::sync_composite(v, n, row.as_ref());
+    Ok(())
+}
+
+/// Whether type row `j` is a shell type's (`CREATE TYPE name`: a composite of no attributes yet, to be filled in),
+/// not a composite type's of none (`AS ()`, or ALTER TYPE dropped the last), whose row says `"empty": true`.
+fn shell_row(j: &Json) -> bool {
+    j["composite"].as_array().is_some_and(Vec::is_empty) && j["empty"] != true
+}
+
+/// Whether expression `e` (as parsed) is field `attr` of column `col`: `(col).attr`, which the parser reads as column
+/// `attr` of a table `col` until it is bound (see `Binder::go`), or a field of a column the parser knew for one.
+fn is_field(e: &Expr, col: &str, attr: &str) -> bool {
+    match e {
+        Expr::Col(Some(c), f) => c == col && f == attr,
+        Expr::Func(Func::FieldOf, a) => {
+            matches!(&a[..], [Expr::Col(_, c), Expr::Lit(Value::Text(f))] if c == col && f == attr)
+        }
+        _ => false,
+    }
+}
+
+/// Whether expression `e` (as parsed) reads field `attr` of column `col` (see `is_field`).
+fn reads_field(e: &Expr, col: &str, attr: &str) -> bool {
+    let mut found = false;
+    walk(e, &mut |x| found |= is_field(x, col, attr));
+    found
+}
+
+/// Expression text `text` reading field `from` of one of columns `cols` (`(c).from`, or `c.from`, which the parser
+/// reads the same) as `to` instead: ALTER TYPE ... RENAME ATTRIBUTE. None where it reads no such field.
+fn renamed_field(text: &str, cols: &[String], from: &str, to: &str) -> Result<Option<String>> {
+    let mut toks = lex(text)?;
+    let named = |t: &Tok, n: &str| matches!(t, Tok::Word(w) | Tok::Ident(w) if w == n);
+    let col = |t: &Tok| cols.iter().any(|c| named(t, c));
+    let mut changed = false;
+    for i in 2..toks.len() {
+        if !named(&toks[i], from) || toks[i - 1] != Tok::Sym(".") {
+            continue;
+        }
+        if col(&toks[i - 2]) || (i >= 3 && toks[i - 2] == Tok::Sym(")") && col(&toks[i - 3])) {
+            toks[i] = Tok::Ident(to.to_string());
+            changed = true;
+        }
+    }
+    Ok(changed.then(|| tokens_sql(&toks)))
+}
+
+/// Whether column `i` of table `t`, an array of text or of records (an array of a composite type is kept as one of
+/// its elements' text, see `Type::oid` and `Type::name`), holds an element that is a record's text of `n` fields in
+/// one of its rows: maybe one of a composite type of `n` attributes.
+fn records_of(v: &View, t: &Table, i: usize, n: usize) -> Result<bool> {
+    let need: Vec<bool> = (0..t.cols.len()).map(|k| k == i).collect();
+    let prefix = format!("{}/", t.name);
+    for r in v.prefix(&prefix)? {
+        let (k, raw) = r?;
+        let vals = decode_raw(t, &k[prefix.len()..], &raw, Some(&need))?;
+        let Some(items) = array_values(vals[i].clone())? else { continue };
+        let fits = |x: &Value| matches!(x, Value::Text(s) if composite_fields(s).is_some_and(|f| f.len() == n));
+        if items.iter().any(fits) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// The views and materialized views over relation `table` whose queries read field `attr` of one of its columns
+/// `cols` (`(c).attr`), as Postgres records such a query's dependency on the attribute: each with whether it is a
+/// materialized view. (A query that can't be read now reads nothing.)
+fn field_readers(v: &View, table: &str, cols: &[String], attr: &str) -> Result<Vec<(String, bool)>> {
+    let mut out = vec![];
+    for d in dependents(v, table)? {
+        let (j, matview) = match v.get(&format!("{VIEWS}/{d}"))? {
+            Some(raw) => (serde_json::from_str::<Json>(&raw).unwrap_or_default(), false),
+            None => match load(v, &d)?.and_then(|t| t.matview) {
+                Some(m) => (m, true),
+                None => continue,
+            },
+        };
+        let Ok(q) = view_query(&d, j["sql"].as_str().unwrap_or_default()) else { continue };
+        let mut exprs = select_exprs(&q);
+        nested_exprs(&q, &mut exprs);
+        if exprs.iter().any(|e| cols.iter().any(|c| reads_field(e, c, attr))) {
+            out.push((d, matview));
+        }
+    }
+    Ok(out)
+}
+
+/// The first column holding values of composite type `name` (directly, or inside another type: an array of it, a
+/// domain over it, another composite type with an attribute of it), as Postgres's find_composite_type_dependencies
+/// finds one: a table's or a materialized view's, or an index's expression of it, as `relation.column` (an
+/// expression named as Postgres names an index's column of it).
+fn composite_user(v: &View, tables: &[Table], name: &str) -> Result<Option<String>> {
+    for t in tables {
+        for c in t.cols.iter().filter(|c| !c.hidden) {
+            let inside = match domain::column_type(c) {
+                Some(declared) => domain::holds(v, &declared, name)?.is_some(),
+                None => false,
+            };
+            if inside || c.ty.composite_of().as_deref() == Some(name) {
+                return Ok(Some(format!("{}.{}", rel_part(&t.name), c.name)));
+            }
+        }
+        for x in &t.indexes {
+            for text in &x.exprs {
+                let Ok(e) = index_expr(t, text) else { continue };
+                if ty_of(&e, &t.cols, &[]).is_ok_and(|ty| ty.composite_of().as_deref() == Some(name)) {
+                    return Ok(Some(format!("{}.{}", x.name, catalog_objects::expr_name(text))));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a composite type's attribute of type `text` (as written) would hold composite type `name` itself: of
+/// it, an array of it, a domain or a range over it (or a multirange of one), another composite type with an
+/// attribute of it (Postgres's CheckAttributeType refuses each).
+fn holds_itself(v: &View, name: &str, text: &str) -> Result<bool> {
+    if domain::holds(v, text, name)?.is_some() {
+        return Ok(true);
+    }
+    let multi = range::multi_by_name(text.trim()).and_then(range::of_multi).and_then(range::name_of);
+    match multi {
+        Some(r) => Ok(domain::holds(v, &r, name)?.is_some()),
+        None => Ok(false),
+    }
+}
+
+/// Empties what may hold a composite type's old shape once it has a new one: the parsed CHECK conditions and
+/// policies (a cast to the type is its shape). Schemas and functions parsed with it are read again where
+/// `stale_record` says so.
+fn composites_changed() {
+    CHECKS.lock().unwrap().clear();
+    rls::forget_parsed();
 }
 
 /// A record type's field by name: its place and type (42703 for one it hasn't, 42809 for a type that
@@ -1277,14 +1468,10 @@ fn resolve_type(v: &View, ty: Type) -> Result<Type> {
         found(i);
     }
     let j: Json = serde_json::from_str(&raw).unwrap_or_default();
-    // a composite type (`CREATE TYPE s.c AS (...)`) is its record, as the parser gives one made in public
-    if let Some(fields) = j["composite"].as_array() {
-        if userdefs::composite(&name).is_none() {
-            let fs: Vec<(String, String)> =
-                fields.iter().filter_map(|f| Some((f[0].as_str()?.to_string(), f[1].as_str()?.to_string()))).collect();
-            userdefs::register_composite(&name, &fs);
-        }
-        return Ok(userdefs::composite(&name).unwrap_or_else(|| Type::record(vec![])));
+    // a composite type (`CREATE TYPE s.c AS (...)`) is its record, as the parser gives one made in public (known as
+    // its row in `v` has it now: one an ALTER TYPE changed since is read again)
+    if j["composite"].is_array() {
+        return Ok(userdefs::sync_composite(v, &name, Some(&j)).unwrap_or_else(|| Type::record(vec![])));
     }
     // a domain is its base type (its other parts are a column's: see `domain_column`)
     if let Some(base) = j["domain"]["base"].as_str() {
@@ -2486,6 +2673,7 @@ impl SrfLevels {
                     using: vec![],
                     natural: false,
                     using_as: None,
+                    comma: true,
                 }),
             }
         }
@@ -2852,6 +3040,7 @@ fn joined_select(
         using: vec![],
         natural: false,
         using_as: None,
+        comma: true,
     }];
     all.extend(joins.iter().cloned());
     Box::new(Select {
@@ -3456,8 +3645,10 @@ fn drop_schemas(db: &Db, branch: &str, names: &[String], if_exists: bool, cascad
     let rels = tables(db, branch)?;
     let rels_all = &rels;
     let (mut drops, mut gone, mut ext_gone) = (vec![], vec![], vec![]);
-    // what CASCADE drops with them, for one notice (the drops below send none of their own)
-    let mut cascaded: Vec<String> = vec![];
+    // each schema with what is in it, for what CASCADE drops with them in one notice (the drops below send none of
+    // their own; see `schema_cascade`), and the functions among them by key
+    let mut members: Vec<(String, Vec<Dep>)> = vec![];
+    let mut funcs_in: HashMap<String, Arc<functions::Function>> = HashMap::new();
     for n in names {
         if n == "public" {
             return err(UNSUPPORTED, "the public schema can't be dropped here: drop what's in it instead");
@@ -3481,6 +3672,9 @@ fn drop_schemas(db: &Db, branch: &str, names: &[String], if_exists: bool, cascad
             rels.iter().filter(|r| matches!(r.kind, 'r' | 'p') && mine(&r.name)).map(|r| r.name.clone()).collect();
         let (views, matviews, seqs, ftables) = (kind('v'), kind('m'), kind('S'), kind('f'));
         let types = of("_sonos_types")?;
+        let mut in_it: Vec<Dep> = (tables.iter().chain(&ftables).chain(&views).chain(&matviews).chain(&seqs))
+            .map(|r| Dep::Rel(r.clone()))
+            .collect();
         // (procedures apart: each is dropped as what it is)
         let (mut funcs, mut procs) = (vec![], vec![]);
         for f in of(functions::FUNCTIONS)? {
@@ -3488,75 +3682,26 @@ fn drop_schemas(db: &Db, branch: &str, names: &[String], if_exists: bool, cascad
             for f in functions::named(&v, name)? {
                 let to = if f.procedure { &mut procs } else { &mut funcs };
                 to.push((f.name.clone(), Some(f.args.iter().map(|a| a.1).collect())));
+                if let std::collections::hash_map::Entry::Vacant(e) = funcs_in.entry(f.key()) {
+                    in_it.push(Dep::Func(f.key()));
+                    e.insert(f);
+                }
             }
         }
         funcs.dedup();
         procs.dedup();
         // an extension made in it (with its functions, which are built in here)
         let exts: Vec<String> = pgcrypto::extensions(&v)?.into_iter().filter(|e| e.1 == *n).map(|e| e.0).collect();
-        // what is in it, each with the policies of other tables that read it, as Postgres lists them
-        let rels: Vec<(String, &'static str)> = (tables.iter().map(|t| (t.clone(), "table")))
-            .chain(ftables.iter().map(|t| (t.clone(), "foreign table")))
-            .chain(views.iter().map(|t| (t.clone(), "view")))
-            .chain(matviews.iter().map(|t| (t.clone(), "materialized view")))
-            .chain(seqs.iter().map(|t| (t.clone(), "sequence")))
-            .collect();
-        let reading = rls::reading(&v, &rels)?;
-        let (mut deps, mut goes) = (vec![], vec![]);
-        for (r, k) in &rels {
-            let it = format!("{k} {}", shown_name(r));
-            deps.push(format!("{it} depends on schema {n}"));
-            goes.push(it.clone());
-            for (p, _, _) in reading.iter().filter(|(_, g, _)| g == r) {
-                let policy = format!("policy {} on table {}", p.name, shown_name(&p.table));
-                deps.push(format!("{policy} depends on {it}"));
-                goes.push(policy);
-            }
-        }
-        let sig = |(f, args): &(String, Option<Vec<Type>>)| {
-            let args: Vec<String> = args.iter().flatten().map(|t| t.pg_name().to_string()).collect();
-            format!("function {}({})", shown_name(f), args.join(", "))
-        };
-        let others = (funcs.iter().map(sig)).chain(procs.iter().map(|f| sig(f).replacen("function", "procedure", 1)));
-        for it in others {
-            deps.push(format!("{it} depends on schema {n}"));
-            goes.push(it);
-        }
-        // a type, then the typed tables of other schemas made of it (`CREATE TABLE o.t OF s.tt`), each with what is
-        // over it in turn: they go with it, as Postgres says them
+        in_it.extend(types.iter().map(|t| Dep::Type(t.clone())));
+        in_it.extend(exts.iter().map(|e| Dep::Ext(e.clone())));
+        // the typed tables of other schemas made of its types (`CREATE TABLE o.t OF s.tt`): they go with them
         let mut typed_out: Vec<String> = vec![];
         for t in &types {
-            let it = format!("type {}", shown_type(t));
-            deps.push(format!("{it} depends on schema {n}"));
-            goes.push(it.clone());
             for r in rels_all.iter().filter(|r| r.hier.of_type.as_deref() == Some(t.as_str()) && !mine(&r.name)) {
-                let table = format!("table {}", shown_name(&r.name));
-                deps.push(format!("{table} depends on {it}"));
-                goes.push(table);
-                for (d, on) in relation_dependents(&v, &r.name)? {
-                    deps.push(format!("{d} depends on {on}"));
-                    goes.push(d);
-                }
                 typed_out.push(r.name.clone());
             }
         }
-        for e in &exts {
-            let it = format!("extension {e}");
-            deps.push(format!("{it} depends on schema {n}"));
-            goes.push(it);
-        }
-        if !cascade && !deps.is_empty() {
-            return Err(SqlError {
-                code: "2BP01",
-                message: format!("cannot drop schema {n} because other objects depend on it"),
-                info: Some(Box::new(Violation {
-                    detail: Some(deps.join("\n")),
-                    hint: Some("Use DROP ... CASCADE to drop the dependent objects too.".into()),
-                    ..Violation::default()
-                })),
-            });
-        }
-        cascaded.extend(goes);
+        members.push((n.clone(), in_it));
         ext_gone.extend(exts);
         let rel = |kind, names: Vec<String>| {
             (!names.is_empty()).then_some(Stmt::DropObjects { kind, names, if_exists: true, cascade: true })
@@ -3594,6 +3739,25 @@ fn drop_schemas(db: &Db, branch: &str, names: &[String], if_exists: bool, cascad
         }
         gone.push(n.clone());
     }
+    // what goes with them, as Postgres lists it: without CASCADE, each with what it depends on, it stops the drop
+    let listed = schema_cascade(&v, &rels, &members, &funcs_in)?;
+    if !cascade && !listed.is_empty() {
+        let message = match &gone[..] {
+            [one] => format!("cannot drop schema {one} because other objects depend on it"),
+            _ => "cannot drop desired object(s) because other objects depend on them".to_string(),
+        };
+        let lines: Vec<String> =
+            listed.iter().take(MAX_REPORTED_DEPS).map(|(d, on)| format!("{d} depends on {on}")).collect();
+        return Err(SqlError {
+            code: "2BP01",
+            message,
+            info: Some(Box::new(Violation {
+                detail: Some(lines.join("\n") + &not_reported(listed.len())),
+                hint: Some("Use DROP ... CASCADE to drop the dependent objects too.".into()),
+                ..Violation::default()
+            })),
+        });
+    }
     let tmp = format!("{TX_PREFIX}{}", new_id());
     db.fork_info(branch, &tmp, crate::Info::new())?; // a transaction's name: not the user-facing fork
     let mark = NOTICES.with_borrow(Vec::len);
@@ -3610,15 +3774,7 @@ fn drop_schemas(db: &Db, branch: &str, names: &[String], if_exists: bool, cascad
         let _ = db.discard(&tmp);
     }
     if done.is_ok() {
-        match &cascaded[..] {
-            [] => {}
-            [one] => notice("NOTICE", format!("drop cascades to {one}")),
-            many => notice_detail(
-                "NOTICE",
-                format!("drop cascades to {} other objects", many.len()),
-                many.iter().map(|d| format!("drop cascades to {d}")).collect::<Vec<_>>().join("\n"),
-            ),
-        }
+        cascade_notice(&listed.into_iter().map(|(d, _)| d).collect::<Vec<_>>());
     }
     done.map(|_: usize| Output::tag("DROP SCHEMA"))
 }
@@ -3646,6 +3802,8 @@ struct Stop {
     /// what its sequence and notification functions reach (see `ctx_call`)
     ctx: Option<Arc<Ctx>>,
     mem: Option<Arc<Mem>>,
+    /// the most threads its parallel parts may run on, its own included (an agent's max_threads); 0: no cap
+    threads: usize,
 }
 
 /// A message a statement sent besides its result: RAISE NOTICE, or DROP ... IF EXISTS
@@ -3737,13 +3895,49 @@ fn pg_exact() -> bool {
     *EXACT.get_or_init(|| std::env::var("CHRONOS_PG_EXACT").is_ok_and(|v| v == "1"))
 }
 
-/// Runs `f` with the notices it raises dropped: a query EXPLAIN without ANALYZE runs only to see how it reads
-/// its tables, where Postgres doesn't run it at all, so what its functions RAISE isn't sent (f_leak's NOTICEs).
-fn unseen<T>(f: impl FnOnce() -> T) -> T {
-    let mark = NOTICES.with_borrow(Vec::len);
+thread_local! {
+    /// While a query runs under `dry_run`: set once something it ran was refused (see `dry_refusal`). `par_run`'s
+    /// helpers share it.
+    static DRY: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f`, a query EXPLAIN without ANALYZE runs only to see how it reads its tables (where Postgres's runs nothing),
+/// as one that changes nothing. What it says isn't sent; random()'s seeded numbers go on as if it hadn't run; and
+/// whatever it reaches that would change something is refused before it does (see `dry_refusal`): a statement of a
+/// function that isn't a SELECT, a built-in that changes something (`CtxFn::changes`, pg_stat_statements_reset), a
+/// row lock, a query given as text, a cursor PL/pgSQL keeps in the session opened, moved or closed. That reaches what
+/// `safe::effects` doesn't see before it runs (a PL/pgSQL function's statements, a domain's CHECK, a function of
+/// CREATE CAST) as well as what it does. None when something was refused: then it counts as not run.
+fn dry_run<T>(f: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+    /// What was there before, put back however `f` ends (a panic too: else the thread would go on refusing).
+    struct Before(Option<Arc<std::sync::atomic::AtomicBool>>, Option<funcs::Seeded>, usize);
+    impl Drop for Before {
+        fn drop(&mut self) {
+            DRY.set(self.0.take());
+            funcs::SEEDED.set(self.1);
+            NOTICES.with_borrow_mut(|n| n.truncate(self.2));
+        }
+    }
+    let refused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let before = Before(DRY.replace(Some(refused.clone())), funcs::SEEDED.get(), NOTICES.with_borrow(Vec::len));
     let out = f();
-    NOTICES.with_borrow_mut(|n| n.truncate(mark));
-    out
+    drop(before);
+    match refused.load(std::sync::atomic::Ordering::Relaxed) {
+        true => Ok(None),
+        false => out.map(Some),
+    }
+}
+
+/// Refuses `what` while a query runs under `dry_run`, with 57014, which a PL/pgSQL handler of OTHERS doesn't catch:
+/// the query stops there.
+fn dry_refusal(what: impl FnOnce() -> String) -> Result<()> {
+    DRY.with_borrow(|d| match d {
+        None => Ok(()),
+        Some(refused) => {
+            refused.store(true, std::sync::atomic::Ordering::Relaxed);
+            err(CANCELED, format!("EXPLAIN without ANALYZE doesn't run {}", what()))
+        }
+    })
 }
 
 /// An effect as SHOW OUTBOX and CLAIM OUTBOX show it.
@@ -5426,6 +5620,10 @@ enum CtxFn {
     PartKeyDef,
     PartConstraintDef,
     PartRoot,
+    /// pg_relation_filenode(regclass) and pg_filenode_relation(tablespace, filenode): a relation's pg_class.relfilenode
+    /// and back (see `tablespace::filenode`)
+    RelationFilenode,
+    FilenodeRelation,
     /// pg_get_function_arguments (false) and pg_get_function_identity_arguments (true)
     FunctionArgs(bool),
     FunctionResult,
@@ -5511,6 +5709,11 @@ enum CtxFn {
     /// ts_rewrite(query, target, substitute), and ts_rewrite(query, select) whose rows are the targets and
     /// substitutes: a query run, so a function of the session (the three-argument form needs none)
     TsRewrite,
+    /// the regression tests' library's binary_coercible(source, target): IsBinaryCoercible (see
+    /// `catalog::binary_coercible`)
+    BinaryCoercible,
+    /// the regression tests' library's set_ttdummy(on): ttdummy's switch, the session's (see `Exec::ttdummy`)
+    SetTtdummy,
 }
 
 impl CtxFn {
@@ -5547,6 +5750,8 @@ impl CtxFn {
         ("pg_get_partkeydef", CtxFn::PartKeyDef, 1..=1),
         ("pg_get_partition_constraintdef", CtxFn::PartConstraintDef, 1..=1),
         ("pg_partition_root", CtxFn::PartRoot, 1..=1),
+        ("pg_relation_filenode", CtxFn::RelationFilenode, 1..=1),
+        ("pg_filenode_relation", CtxFn::FilenodeRelation, 2..=2),
         ("pg_get_function_arguments", CtxFn::FunctionArgs(false), 1..=1),
         ("pg_get_function_identity_arguments", CtxFn::FunctionArgs(true), 1..=1),
         ("pg_get_function_result", CtxFn::FunctionResult, 1..=1),
@@ -5646,6 +5851,9 @@ impl CtxFn {
         ("pg_database_size", CtxFn::DatabaseSize, 1..=1),
         ("gin_clean_pending_list", CtxFn::GinCleanPendingList, 1..=1),
         ("ts_rewrite", CtxFn::TsRewrite, 2..=3),
+        // (the bodies of the regression tests' C functions of these names: see `functions::regress_c`)
+        ("__binary_coercible", CtxFn::BinaryCoercible, 2..=2),
+        ("__set_ttdummy", CtxFn::SetTtdummy, 1..=1),
     ];
 
     fn name(self) -> &'static str {
@@ -5655,10 +5863,40 @@ impl CtxFn {
         CtxFn::ALL.iter().find(|(_, f, _)| *f == self).map_or("?column?", |(n, ..)| n)
     }
 
+    /// Whether a call changes something besides giving its value, which EXPLAIN without ANALYZE must not (see
+    /// `dry_run`): the database (a sequence, a large object, an index's pending list), other sessions (a
+    /// notification, a backend cancelled or ended), the session (an advisory lock, a setting, a snapshot exported, a
+    /// large object's descriptor) or the server (its statistics reset). A large object's functions count but for
+    /// those that only read (see `largeobj::only_reads`), as do the XML mappings of its kind, which run a query given
+    /// as text (query_to_xml) or move a cursor (cursor_to_xml). (ts_rewrite's query is stopped where it runs: see
+    /// `inner_query`.)
+    fn changes(self) -> bool {
+        match self {
+            CtxFn::PgStat(name) => name.starts_with("pg_stat_reset"),
+            CtxFn::LargeObject(name) => !largeobj::only_reads(name),
+            f => matches!(
+                f,
+                CtxFn::NextVal
+                    | CtxFn::SetVal
+                    | CtxFn::Notify
+                    | CtxFn::AdvisoryLock(..)
+                    | CtxFn::AdvisoryUnlock(_)
+                    | CtxFn::AdvisoryUnlockAll
+                    | CtxFn::SetConfig
+                    | CtxFn::CancelBackend
+                    | CtxFn::TerminateBackend
+                    | CtxFn::GinCleanPendingList
+                    | CtxFn::ExportSnapshot
+                    | CtxFn::SetTtdummy
+            ),
+        }
+    }
+
     fn ty(self) -> Type {
         match self {
             CtxFn::RegOid(r) | CtxFn::ToReg(r) => Type::Reg(r),
-            CtxFn::PartRoot => Type::Reg(Reg::Class),
+            CtxFn::PartRoot | CtxFn::FilenodeRelation => Type::Reg(Reg::Class),
+            CtxFn::RelationFilenode => Type::Oid,
             // pg_typeof: a regtype (bound to the argument's type's oid; see `Binder`)
             CtxFn::TypeOf => Type::Reg(Reg::Type),
             CtxFn::RegClassOid => Type::Oid,
@@ -5681,8 +5919,10 @@ impl CtxFn {
             | CtxFn::HasPrivilege(_)
             | CtxFn::StatsVisible
             | CtxFn::ColumnIsUpdatable
-            | CtxFn::RowSecurityActive => Type::Bool,
+            | CtxFn::RowSecurityActive
+            | CtxFn::BinaryCoercible => Type::Bool,
             CtxFn::HashText
+            | CtxFn::SetTtdummy
             | CtxFn::BackendPid
             | CtxFn::TriggerDepth
             | CtxFn::InetNull(true)
@@ -6550,6 +6790,9 @@ struct Join {
     natural: bool,
     /// USING (a, b) AS x: a name for the join's USING columns alone (`x.a`, `x.*`; see `using`)
     using_as: Option<String>,
+    /// a comma, not CROSS JOIN: the source starts another FROM item, which the joins after it join to (a JOIN
+    /// binds tighter than a comma: their USING and NATURAL see its columns, not those of the items before it)
+    comma: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -6773,6 +7016,95 @@ fn plain_col(name: &str, ty: Type) -> ColDef {
     }
 }
 
+/// The columns CREATE TABLE AS (and SELECT INTO) makes of its query `query`, read in `v`, whose output columns are
+/// `found`: named as `cols` names the first of them (the rest as the query does), each of the query's type, with the
+/// collation it derives and a char(n)'s or varchar(n)'s width, as Postgres keeps them. The names are checked as
+/// Postgres checks them (once it has found the table isn't there already).
+fn ctas_columns(
+    v: Option<&View>,
+    query: &Select,
+    found: &Columns,
+    cols: &[String],
+) -> Result<(Vec<String>, Vec<ColDef>)> {
+    let names: Vec<String> = found.iter().enumerate().map(|(i, (n, _))| cols.get(i).unwrap_or(n).clone()).collect();
+    if cols.len() > found.len() {
+        return err(SYNTAX, "too many column names were specified");
+    }
+    if let Some((_, n)) = names.iter().enumerate().find(|(i, n)| names[..*i].contains(n)) {
+        return err(DUP_COLUMN, format!("column \"{n}\" specified more than once"));
+    }
+    no_void_column(&names, found)?;
+    // (and their collations, as Postgres keeps them: a query of tables' columns, best found)
+    let colls = v.and_then(|v| select_columns_with(v, query, &[], &[]).ok()).map(|(_, c)| c).unwrap_or_default();
+    // (a char(n) or varchar(n) column of the query stays one: a char(n)'s blanks are not part of its values)
+    let widths = v.map(|v| char_widths(v, query)).unwrap_or_default();
+    let mut made: Vec<ColDef> = vec![];
+    for (i, (n, (_, t))) in names.iter().zip(found).enumerate() {
+        let coll = match colls.get(i).map(|s| s.column()) {
+            Some(collation::Coll::INDETERMINATE) if collation::collatable(*t) => {
+                return Err(collation::underived(n));
+            }
+            Some(c) if c != collation::Coll::DEFAULT && collation::collatable(*t) => Some(c),
+            _ => None,
+        };
+        let chars = held_chars(widths.get(i).copied().flatten()).filter(|_| matches!(*t, Type::Text | Type::Array(25)));
+        made.push(ColDef { collate: coll.map(collation::Named::Coll), chars, ..plain_col(n, *t) });
+    }
+    Ok((names, made))
+}
+
+/// The CREATE TABLE that CREATE TABLE AS makes its table with: its query's columns (see `ctas_columns`), as its own,
+/// with no keys, defaults or constraints.
+fn ctas_create(table: &str, cols: Vec<ColDef>, if_not_exists: bool, temp: bool, space: Option<&str>) -> Stmt {
+    Stmt::Create {
+        constraints: vec![],
+        table: table.into(),
+        cols,
+        key: vec![],
+        if_not_exists,
+        temp,
+        likes: vec![],
+        on_commit: None,
+        // (TABLESPACE: where it is kept, as CREATE TABLE's)
+        hier: hier::CreateHier { space: space.map(String::from), ..Default::default() },
+        unlogged: false,
+    }
+}
+
+/// The ALTERs that mask CREATE TABLE AS's copies (named `names`) of masked columns, as `masks` (see `mask::derived`)
+/// masks them, before any row is in the table.
+fn ctas_masks(table: &str, names: &[String], masks: &[Option<char>]) -> Result<Vec<Statement>> {
+    let mut out = vec![];
+    for (n, m) in names.iter().zip(masks) {
+        if let Some(m) = m {
+            let (t, c, how) = (ident(table), ident(n), mask::mode_name(*m));
+            out.extend(parse(&format!("alter table {t} alter column {c} set masked with {how}"))?);
+        }
+    }
+    Ok(out)
+}
+
+/// CREATE TABLE AS's error for a relation already there (with no IF NOT EXISTS), as Postgres's
+/// CreateTableAsRelExists words it: before its query runs, its columns are checked or the table is made.
+fn ctas_exists(table: &str) -> SqlError {
+    SqlError { code: TABLE_EXISTS, message: format!("relation \"{}\" already exists", rel_part(table)), info: None }
+}
+
+/// The INSERT that puts rows `rows`, which CREATE TABLE AS read of its query before it made the table, in it.
+fn ctas_insert(table: &str, rows: Vec<Vec<Value>>) -> Stmt {
+    Stmt::Insert {
+        table: table.into(),
+        alias: None,
+        cols: None,
+        rows: rows.into_iter().map(|r| r.into_iter().map(Expr::Lit).collect()).collect(),
+        query: None,
+        conflict: None,
+        returning: None,
+        overriding: None,
+        checks: None,
+    }
+}
+
 /// CREATE / ALTER SEQUENCE's options, as written (None: not given).
 #[derive(Clone, Debug, Default)]
 struct SeqOpts {
@@ -6811,6 +7143,8 @@ enum ConstraintDef {
         cols: Vec<String>,
         /// NULLS NOT DISTINCT: two nulls count as equal
         nnd: bool,
+        /// USING INDEX TABLESPACE name: where its index is kept (see `tablespace`)
+        space: Option<String>,
     },
     /// `not_valid`: NOT VALID (counted in ALTER TABLE ... ADD CONSTRAINT only), the rows there are aren't checked
     Check { name: Option<String>, text: String, no_inherit: bool, not_valid: bool },
@@ -6938,13 +7272,30 @@ impl std::fmt::Display for Target {
     }
 }
 
-/// What ALTER TYPE changes in an enum.
+/// What ALTER TYPE changes in an enum, or in a composite type.
 #[derive(Clone, Debug)]
 enum TypeChange {
     /// ADD VALUE [IF NOT EXISTS] 'label' [BEFORE | AFTER 'label'] (true: BEFORE)
     Add(String, bool, Option<(bool, String)>),
     RenameValue(String, String),
     Rename(String),
+    /// SET SCHEMA s
+    Schema(String),
+    /// a composite type's attributes, in order, each with its CASCADE (true) or RESTRICT
+    Attrs(Vec<(AttrChange, bool)>),
+}
+
+/// One change to a composite type's attributes (see `Exec::alter_composite`).
+#[derive(Clone, Debug)]
+enum AttrChange {
+    /// ADD ATTRIBUTE a type: the attribute, and its type as written
+    Add(String, String),
+    /// DROP ATTRIBUTE [IF EXISTS] a
+    Drop(String, bool),
+    /// ALTER ATTRIBUTE a [SET DATA] TYPE t
+    Type(String, String),
+    /// RENAME ATTRIBUTE a TO b
+    Rename(String, String),
 }
 
 /// What follows a type's name: `varchar(n)`'s and `char(n)`'s length (and whether it is fixed),
@@ -7056,7 +7407,8 @@ enum MergeAction {
 }
 
 /// `WITH x AS (INSERT | UPDATE | DELETE ... RETURNING ...), ... <statement>`: the data-changing
-/// statements run first, in order, each keeping its RETURNING rows under its id (`Source::cte`,
+/// statements run first, in order (in a WITH RECURSIVE, one that reads one after it runs after that
+/// one: see `Parser::forward_dml`), each keeping its RETURNING rows under its id (`Source::cte`,
 /// with `DML_CTE` set), which is what the names hold where the statement after them reads them.
 /// They all take effect or none does. As in Postgres the names hold only what RETURNING gave;
 /// unlike it, a statement here sees the changes of those before it, in the tables it reads.
@@ -7090,8 +7442,8 @@ enum Alter {
     /// ALTER COLUMN c DROP EXPRESSION [IF EXISTS]: a generated column becomes a plain one
     DropExpression(String, bool),
     AddConstraint(ConstraintDef),
-    /// ADD [CONSTRAINT name] PRIMARY KEY (columns)
-    AddPrimaryKey(Vec<String>, Option<String>),
+    /// ADD [CONSTRAINT name] PRIMARY KEY (columns) [USING INDEX TABLESPACE t]
+    AddPrimaryKey(Vec<String>, Option<String>, Option<String>),
     DropConstraint(String, bool, bool), // if exists, cascade
     /// ENABLE [ALWAYS | REPLICA] | DISABLE TRIGGER name | ALL | USER (None): the state pg_trigger.tgenabled
     /// gets, `O`, `A`, `R` or `D` (see `functions::Trigger::mode`)
@@ -7109,8 +7461,10 @@ enum Alter {
     Validate(String),
     /// ALTER CONSTRAINT name [NOT] DEFERRABLE [INITIALLY ...]: a foreign key's deferral
     Deferral(String, bool, bool),
-    /// accepted, with this notice: OWNER TO, storage parameters, SET TABLESPACE
+    /// accepted, with this notice: OWNER TO, storage parameters
     Noop(&'static str),
+    /// SET TABLESPACE name: where the table (or index, or materialized view) is kept (see `tablespace`)
+    SetTablespace(String),
     /// ALTER INDEX a RENAME TO b (or a unique constraint's index, and the constraint with it)
     RenameIndex(String, String),
     /// ATTACH PARTITION table FOR VALUES ... | DEFAULT
@@ -7139,6 +7493,10 @@ enum Alter {
     /// constraint, and where in the statement the constraint starts (what its errors point at)
     KeyUsingIndex(String, Option<String>, bool, Option<u32>),
 }
+
+/// The notice ALTER COLUMN ... SET (n_distinct = ...) and RESET (...) give: its `Alter::Noop`, which takes the lock
+/// Postgres takes for column options (see `lock_level`).
+const COLUMN_OPTIONS: &str = "column options only tune Postgres's planner: nothing to do here";
 
 /// One of ALTER COLUMN's SET STORAGE (its word), SET COMPRESSION (its word), SET STATISTICS (the target) and SET
 /// or DROP MASKED.
@@ -7503,6 +7861,8 @@ enum Stmt {
         if_not_exists: bool,
         temp: bool,
         data: bool,
+        /// TABLESPACE name (see `tablespace`)
+        space: Option<String>,
     },
     CreateAs {
         table: String,
@@ -7513,6 +7873,8 @@ enum Stmt {
         data: bool,
         /// ON COMMIT DELETE ROWS (false) or DROP (true), as CREATE TABLE's
         on_commit: Option<bool>,
+        /// TABLESPACE name (see `tablespace`)
+        space: Option<String>,
     },
     /// CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION role]
     CreateSchema {
@@ -7570,6 +7932,9 @@ enum Stmt {
         range: Option<String>,
         /// AS (field type, ...): the fields' names and their types as written
         composite: Option<Vec<(String, String)>>,
+        /// CREATE TYPE name alone: a shell type, of no fields until a CREATE TYPE fills it in (where `AS ()` is a
+        /// type of none)
+        shell: bool,
     },
     /// CREATE DOMAIN name [AS] type [DEFAULT e] [NOT NULL] [CHECK (e)]...: a column of it is the type
     /// with these (see `domain_column`); `base` is the type as written, each check with VALUE in it
@@ -7641,6 +8006,9 @@ enum Stmt {
         name: String,
         opts: Vec<(String, Option<Json>)>,
         if_exists: bool,
+        /// the lock it takes, as Postgres's AlterTableGetRelOptionsLockLevel gives it for the options named, the
+        /// ones RESET ignores too (`reloptions::lock_mode`)
+        lock: &'static str,
     },
     /// ALTER VIEW name ALTER [COLUMN] col SET DEFAULT expr (its SQL) | DROP DEFAULT (None)
     ViewDefault {
@@ -7729,6 +8097,8 @@ enum Stmt {
         concurrently: bool,
         /// WITH (storage parameters), checked (see `reloptions`)
         options: Vec<String>,
+        /// TABLESPACE name (see `tablespace`)
+        space: Option<String>,
     },
     DropIndex {
         name: String,
@@ -7908,6 +8278,9 @@ enum Stmt {
         name: String,
         spec: Json,
     },
+    /// ALTER AGENT name ROTATE TOKEN: issue it a fresh token (the old one stops working); the new
+    /// token is shown once, like CREATE AGENT's
+    RotateAgentToken(String),
     DropAgent(String),
     ShowAgents,
     /// SHOW AGENT name PRIVILEGES [IN WORLD w]: what it may do with each table (see `agentprivs`)
@@ -7987,6 +8360,10 @@ enum Stmt {
     /// ALTER SYSTEM SET synchronous_commit = full | normal | off
     SetSync(crate::SyncCommit),
     ShowSync,
+    /// ALTER SYSTEM SET wal_shipping = off | async | sync, or wal_shipping_delay = <ms>
+    SetShipping(Option<crate::Shipping>, Option<u64>),
+    ShowShipping,
+    ShowShippingDelay,
     /// SHOW STORAGE [FOR WORLD w]: what each world costs on its own
     ShowStorage(Option<String>),
     /// SHOW METRICS: operation counts and latencies since the database opened, and counters
@@ -8072,7 +8449,8 @@ enum Stmt {
     Explain {
         analyze: bool,
         /// EXPLAIN (COSTS OFF) without VERBOSE, SETTINGS or SUMMARY: the plan as Postgres's planner would make it,
-        /// where its shape doesn't turn on costs (see `plan`)
+        /// where its shape doesn't turn on costs (see `plan`), when the session asks for it (chronos.explain =
+        /// postgres, exact mode's default: see `explain_shows_postgres`)
         pg_plan: bool,
         stmt: Box<Stmt>,
         /// the statement as written, before views and table hierarchies were put in it (see `Statement::catalog`):
@@ -10099,6 +10477,8 @@ struct Parser {
     catalog_call: bool,
     /// the OPTIONS (...) of the columns read (a foreign table's): column, options (see `foreign`)
     col_options: Vec<(String, foreign::OptChanges)>,
+    /// a column's PRIMARY KEY ... USING INDEX TABLESPACE name, read: the tablespace (see `tablespace`)
+    pkey_space: Option<String>,
     /// each aggregate call read, in order: its name's token and the subquery depth it is at (`sub_depth`), for an
     /// error that points to one (see `agg_filter`)
     agg_at: Vec<(usize, u32)>,
@@ -10138,6 +10518,16 @@ fn spend(copied: &std::cell::Cell<usize>, n: usize) -> bool {
     copied.get() <= MAX_COPIED
 }
 
+/// The built-in type `name` names (`tsquery`, `box`), parsed as a column's type would be; None for another name.
+pub(super) fn builtin_type_named(name: &str) -> Option<Type> {
+    if !catalog::is_builtin_type_name(name) {
+        return None;
+    }
+    let mut p = Parser::new(lex(name).ok()?);
+    let t = p.ty().ok()?;
+    p.peek().is_none().then_some(t)
+}
+
 impl Parser {
     fn new(t: Vec<Tok>) -> Parser {
         Parser {
@@ -10173,6 +10563,7 @@ impl Parser {
             pinned: false,
             catalog_call: false,
             col_options: vec![],
+            pkey_space: None,
             agg_at: vec![],
             spread: false,
         }
@@ -11510,6 +11901,8 @@ impl Parser {
             "show" if self.kw("outbox_keep_payloads") => Ok(Stmt::ShowSystem(crate::Setting::OutboxKeepPayloads)),
             "show" if self.kw("disk") => Ok(Stmt::ShowDisk),
             "show" if self.kw("synchronous_commit") => Ok(Stmt::ShowSync),
+            "show" if self.kw("wal_shipping_delay") => Ok(Stmt::ShowShippingDelay),
+            "show" if self.kw("wal_shipping") => Ok(Stmt::ShowShipping),
             "show" if self.kw("storage") => {
                 let world = if self.kw("for") {
                     self.kw("world");
@@ -11800,6 +12193,10 @@ impl Parser {
             }
             "alter" if self.kw("agent") => {
                 let name = self.branch_name()?;
+                if self.kw("rotate") {
+                    self.expect_kw("token")?;
+                    return Ok(Stmt::RotateAgentToken(name));
+                }
                 self.expect_kw("set")?;
                 Ok(Stmt::AlterAgent { name, spec: self.meta_pairs()? })
             }
@@ -11892,6 +12289,32 @@ impl Parser {
                             Ok(Stmt::SetSync(m))
                         }
                         None => self.fail("expected synchronous_commit = full, normal or off"),
+                    };
+                }
+                if self.kw("wal_shipping_delay") {
+                    if !self.sym("=") {
+                        self.expect_kw("to")?;
+                    }
+                    return match self.next() {
+                        Some(Tok::Num(n)) if n.parse::<u64>().is_ok() => Ok(Stmt::SetShipping(None, n.parse().ok())),
+                        _ => self.fail("expected wal_shipping_delay = <ms>"),
+                    };
+                }
+                if self.kw("wal_shipping") {
+                    if !self.sym("=") {
+                        self.expect_kw("to")?;
+                    }
+                    let v = match self.peek().cloned() {
+                        Some(Tok::Str(v)) => Some(v),
+                        Some(Tok::Word(v) | Tok::Ident(v)) => Some(v),
+                        _ => None,
+                    };
+                    return match v.as_deref().and_then(crate::Shipping::parse) {
+                        Some(m) => {
+                            self.i += 1;
+                            Ok(Stmt::SetShipping(Some(m), None))
+                        }
+                        None => self.fail("expected wal_shipping = off, async or sync"),
                     };
                 }
                 let system =
@@ -12493,6 +12916,7 @@ impl Parser {
                 temp,
                 data: true,
                 on_commit: None,
+                space: None,
             });
         }
         Ok(Stmt::Select(Box::new(query)))
@@ -12510,6 +12934,20 @@ impl Parser {
                 true => err("42P16", "cannot create temporary relation in non-temporary schema"),
             };
         }
+        // (none in pg_catalog: Postgres keeps it to its own catalogs, unless allow_system_table_mods is on)
+        let at = self.i;
+        if self.name()? == "pg_catalog" && self.sym(".") {
+            let name = self.name()?;
+            return Err(SqlError {
+                code: "42501",
+                message: format!("permission denied to create \"pg_catalog.{name}\""),
+                info: Some(Box::new(Violation {
+                    detail: Some("System catalog modifications are currently disallowed.".into()),
+                    ..Violation::default()
+                })),
+            });
+        }
+        self.i = at;
         self.qualified(true, Kind::Rel)
     }
 
@@ -12535,7 +12973,7 @@ impl Parser {
             }
         }
         // what may come before AS: USING heap, WITH (storage parameters), WITHOUT OIDS, ON COMMIT, TABLESPACE name
-        let (mut method, mut on_commit) = (None, None);
+        let (mut method, mut on_commit, mut space) = (None, None, None);
         loop {
             if self.is_kw("on") && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "commit") {
                 // (as CREATE TABLE's: PRESERVE ROWS is what a temporary table does anyway)
@@ -12572,7 +13010,7 @@ impl Parser {
                 self.i += 2;
             } else if self.is_kw("tablespace") && matches!(self.t.get(self.i + 1), Some(Tok::Word(_) | Tok::Ident(_))) {
                 self.i += 1;
-                self.name()?;
+                space = Some(self.name()?);
             } else {
                 break;
             }
@@ -12607,6 +13045,7 @@ impl Parser {
                 if_not_exists,
                 temp,
                 data,
+                space,
             }));
         }
         if !matches!(self.peek(), Some(Tok::Word(w)) if matches!(w.as_str(), "select" | "with" | "values" | "table")) {
@@ -12620,7 +13059,7 @@ impl Parser {
             data = !self.kw("no");
             self.expect_kw("data")?;
         }
-        Ok(Some(Stmt::CreateAs { table: table.into(), cols, query, if_not_exists, temp, data, on_commit }))
+        Ok(Some(Stmt::CreateAs { table: table.into(), cols, query, if_not_exists, temp, data, on_commit, space }))
     }
 
     /// A SELECT after its keyword: parts joined by UNION / INTERSECT / EXCEPT, then ORDER BY,
@@ -13111,10 +13550,19 @@ impl Parser {
 
     /// The joins after `first`, left to right (see `joined`).
     fn join_loop(&mut self, first: Source, mut joins: Vec<Join>) -> Result<(Source, Vec<Join>)> {
+        // where the FROM item after the last comma starts in `joins`
+        let mut item = None;
         loop {
             // NATURAL [INNER | LEFT | RIGHT | FULL] JOIN: joined on every column both sides have
             let natural = self.kw("natural");
-            let kind = if self.sym(",") {
+            let comma = self.sym(",");
+            if comma {
+                if let Some(at) = item {
+                    Self::comma_item(&mut joins, at);
+                }
+                item = Some(joins.len());
+            }
+            let kind = if comma {
                 JoinKind::Cross
             } else if self.kw("cross") {
                 self.expect_kw("join")?;
@@ -13174,6 +13622,7 @@ impl Parser {
                 using,
                 natural,
                 using_as,
+                comma,
             });
             joins.extend(inner);
             if let Some(q) = on
@@ -13186,7 +13635,25 @@ impl Parser {
                 });
             }
         }
+        if let Some(at) = item {
+            Self::comma_item(&mut joins, at);
+        }
         Ok((first, joins))
+    }
+
+    /// The FROM item that starts at `joins[at]`, after a comma, made one source where a RIGHT or FULL join is among
+    /// the joins that make it. A JOIN binds tighter than a comma (`p, q FULL JOIN r` joins q and r, then p to them),
+    /// which joins run left to right keep for an inner or LEFT join, but not for one that keeps its right side's
+    /// rows: those would come without p's (as the right side of an outer join that is itself joins is, see
+    /// `join_loop`; written back in place, see `viewdef`).
+    fn comma_item(joins: &mut Vec<Join>, at: usize) {
+        if !joins.iter().skip(at + 1).any(|j| matches!(j.kind, JoinKind::Right | JoinKind::Full)) {
+            return;
+        }
+        let rest = joins.split_off(at + 1);
+        let Some(mut head) = joins.pop() else { return };
+        head.src = Self::group_source(head.src, rest, GROUP.into());
+        joins.push(head);
     }
 
     /// One FROM source, or a parenthesized join's sources.
@@ -14177,6 +14644,10 @@ impl Parser {
         let mut dml: Vec<(u64, Stmt)> = vec![];
         let mut silent: Vec<String> = vec![];
         let mut cte_at: Vec<(String, usize)> = vec![]; // (each name's token)
+        // each query's id as written (`Source::cte`: of `dml`'s or of `ctes`'), and how many of `ctes` there are up to
+        // each of `dml` (those after it it may read too, in a WITH RECURSIVE)
+        let mut ids: Vec<u64> = vec![];
+        let mut dml_before: Vec<usize> = vec![];
         loop {
             let name_at = self.i;
             let name = self.name()?;
@@ -14229,6 +14700,8 @@ impl Parser {
                     None => silent.push(name),
                 }
                 dml.push((id, st));
+                ids.push(id);
+                dml_before.push(ctes.len());
                 if !self.sym(",") {
                     break;
                 }
@@ -14262,9 +14735,11 @@ impl Parser {
             }
             let reads_itself = recursive && mentions(&q, &name);
             if recursive {
-                // x reads y, a WITH query after it, which reads x
-                for other in ctes.iter().filter(|c| c.3.is_none()) {
-                    if mentions(&other.2, &name) && mentions(&q, &other.0) {
+                // x reads y, a WITH query after it, which reads x (in x's first part or, x being recursive, its step)
+                for other in &ctes {
+                    let reads_this =
+                        mentions(&other.2, &name) || other.3.as_ref().is_some_and(|r| mentions(&r.step, &name));
+                    if reads_this && mentions(&q, &other.0) {
                         let other_at = cte_at.iter().find(|(n, _)| *n == other.0).map(|(_, k)| *k);
                         return Err(SqlError {
                             code: UNSUPPORTED,
@@ -14311,10 +14786,15 @@ impl Parser {
                 rec = Some(Rec { name: name.clone(), base: q.clone(), step, all });
                 cost *= 3; // each use copies it, and its base and step
             }
-            ctes.push((name, names, q, rec, (cost, deep, next_cte_id())));
+            let id = next_cte_id();
+            ids.push(id);
+            ctes.push((name, names, q, rec, (cost, deep, id)));
             if !self.sym(",") {
                 break;
             }
+        }
+        if recursive && !dml.is_empty() {
+            self.forward_dml(&ctes, &mut dml, &dml_before, (&ids, &cte_at), &silent)?;
         }
         let (at, peak) = (self.depth, self.peak);
         self.peak = at;
@@ -14374,6 +14854,86 @@ impl Parser {
             Stmt::Select(Box::new(q))
         };
         Ok(if dml.is_empty() { main } else { Stmt::With(Box::new(WithDml { dml, main })) })
+    }
+
+    /// WITH RECURSIVE's queries that change rows (`dml`, with `before` how many of `ctes` there are up to each): each
+    /// of them reads the WITH queries after it too, as every query of a WITH RECURSIVE sees all of them (`t AS (INSERT
+    /// INTO y SELECT * FROM t2 RETURNING *), t2 AS (UPDATE y ... RETURNING *)`); and one that reads another's rows,
+    /// itself or through a query that does, runs after that one, which Postgres runs as the first reads its rows.
+    /// All the queries (`written`: their ids, names and names' tokens, as written) must then go in an order where each
+    /// reads only those before it, as Postgres sorts them (its TopologicalSort): when none can, it is mutual recursion.
+    fn forward_dml(
+        &mut self,
+        ctes: &[Cte],
+        dml: &mut Vec<(u64, Stmt)>,
+        before: &[usize],
+        written: (&[u64], &[(String, usize)]),
+        silent: &[String],
+    ) -> Result<()> {
+        let (ids, at) = written;
+        for ((_, st), before) in dml.iter_mut().zip(before) {
+            let (depth, peak) = (self.depth, self.peak);
+            self.peak = depth;
+            self.inlined(&ctes[*before..], depth, peak, |(n, cols, c, r, (cost, _, id)), copied| {
+                inline_stmt(st, n, cols, c, r.as_ref(), *cost, *id, copied)
+            })?;
+        }
+        // what each reads of the others: those put in it (and in them, so what it reads through them), and by name
+        // those not put in (after it, for a query that doesn't change rows; those that give no rows back)
+        let reads: Vec<CteReads> = ids
+            .iter()
+            .map(|id| {
+                let mut r = CteReads::default();
+                if let Some((_, st)) = dml.iter().find(|(d, _)| d == id) {
+                    r.stmt(st);
+                } else if let Some((_, _, q, rec, _)) = ctes.iter().find(|c| c.4.2 == *id) {
+                    r.select(q);
+                    if let Some(rec) = rec {
+                        r.select(&rec.step);
+                    }
+                }
+                r
+            })
+            .collect();
+        let on = |k: usize, j: usize| j != k && (reads[k].ids.contains(&ids[j]) || reads[k].names.contains(&at[j].0));
+        // Postgres's sort: at each place, the first of those left that reads none of the others left, swapped there;
+        // none, and it refuses the query at that place
+        let count = ids.len();
+        let mut deps: Vec<Vec<usize>> = (0..count).map(|k| (0..count).filter(|&j| on(k, j)).collect()).collect();
+        let mut sorted: Vec<usize> = (0..count).collect();
+        for i in 0..count {
+            let Some(j) = (i..count).find(|&j| deps[sorted[j]].is_empty()) else {
+                return Err(SqlError {
+                    code: UNSUPPORTED,
+                    message: "mutual recursion between WITH items is not implemented".into(),
+                    info: Some(Box::new(Violation {
+                        position: self.starts.get(at[sorted[i]].1).map(|s| *s as u32 + 1),
+                        ..Violation::default()
+                    })),
+                });
+            };
+            sorted.swap(i, j);
+            let done = sorted[i];
+            deps.iter_mut().for_each(|d| d.retain(|&x| x != done));
+        }
+        if let Some(n) =
+            silent.iter().find(|n| reads.iter().zip(at).any(|(r, (own, _))| own != *n && r.names.contains(n)))
+        {
+            return err(UNSUPPORTED, format!("WITH query \"{n}\" does not have a RETURNING clause"));
+        }
+        // the order they run in: each after those it reads, as written otherwise (there is one: the sort found one)
+        let of: Vec<usize> = (0..count).filter(|&k| ids[k] & DML_CTE != 0).collect();
+        let mut order: Vec<usize> = vec![];
+        while let Some(i) = (0..of.len())
+            .find(|&i| !order.contains(&i) && (0..of.len()).all(|j| j == i || order.contains(&j) || !on(of[i], of[j])))
+        {
+            order.push(i);
+        }
+        let left: Vec<usize> = (0..of.len()).filter(|i| !order.contains(i)).collect();
+        order.extend(left);
+        let mut stmts: Vec<Option<(u64, Stmt)>> = std::mem::take(dml).into_iter().map(Some).collect();
+        dml.extend(order.into_iter().filter_map(|i| stmts[i].take()));
+        Ok(())
     }
 
     /// Puts WITH queries `ctes` in what was just read from depth `at` (`peak` being the parser's
@@ -14530,7 +15090,7 @@ impl Parser {
             RecPlace::Ok => format!("recursive reference to query \"{name}\" must not appear more than once"),
         };
         // the base: not at all
-        let mut w = RecWalk { name, top_with, seen: 0, found: None };
+        let mut w = RecWalk { name, top_with, seen: 0, found: None, walked: HashSet::new() };
         w.set(q, &q.set[..q.set.len() - 1], RecPlace::NonRecursive);
         if let Some((place, k)) = w.found {
             // (one through the query's own WITH is in its text before the base)
@@ -14538,7 +15098,7 @@ impl Parser {
             return fail("42P19", message(place), at);
         }
         // the step: once, where it can be
-        let mut w = RecWalk { name, top_with, seen: 0, found: None };
+        let mut w = RecWalk { name, top_with, seen: 0, found: None, walked: HashSet::new() };
         w.select(step, RecPlace::Ok);
         if let Some((place, k)) = w.found {
             let at = if top_with && place == RecPlace::Subquery { ref_at(&refs, 0) } else { ref_at(&step_refs, k) };
@@ -14979,8 +15539,12 @@ impl Parser {
         Ok(())
     }
 
-    /// ALTER INDEX [IF EXISTS] name RENAME TO new | SET TABLESPACE t | SET (storage parameters).
+    /// ALTER INDEX [IF EXISTS] name RENAME TO new | SET TABLESPACE t | SET (storage parameters), and ALTER INDEX ALL
+    /// IN TABLESPACE (see `tablespace`).
     fn alter_index(&mut self) -> Result<Stmt> {
+        if self.at_move_all() {
+            return self.move_all('i');
+        }
         let if_exists = self.kw("if");
         if if_exists {
             self.expect_kw("exists")?;
@@ -15056,9 +15620,15 @@ impl Parser {
             let changes = vec![Alter::IndexOptions(reloptions::parse(self)?, reset)];
             return Ok(Stmt::Alter { table: name, changes, if_exists, only: false });
         }
+        // SET TABLESPACE t: where it is kept (see `tablespace`)
+        if self.is_kw("set") && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "tablespace") {
+            self.i += 2;
+            let changes = vec![Alter::SetTablespace(self.name()?)];
+            return Ok(Stmt::Alter { table: name, changes, if_exists, only: false });
+        }
         // (ALTER COLUMN n SET STATISTICS: what the planner would read)
         if self.kw("set") || self.kw("reset") || self.kw("alter") {
-            self.skip_rest(); // TABLESPACE t, (fillfactor = 70): how an index is stored
+            self.skip_rest(); // (fillfactor = 70): how an index is stored
             return Ok(Stmt::NoopNotice(
                 "ALTER INDEX",
                 "storage settings aren't used: there is one store, without pages to fill",
@@ -15114,6 +15684,9 @@ impl Parser {
 
     /// After ALTER [MATERIALIZED] VIEW: `[IF EXISTS] name RENAME TO new`, or `OWNER TO role`.
     fn alter_view(&mut self, tag: &'static str, kind: &'static str) -> Result<Stmt> {
+        if kind == "materialized view" && self.at_move_all() {
+            return self.move_all('m');
+        }
         let if_exists = self.if_exists()?;
         let name = self.rel_name()?;
         if self.kw("rename") {
@@ -15139,50 +15712,20 @@ impl Parser {
             let reset = self.is_kw("reset");
             self.i += 2;
             let mut opts: Vec<(String, Option<Json>)> = vec![];
+            let mut named: Vec<reloptions::Given> = vec![];
             loop {
                 let opt = self.name()?.to_lowercase();
                 let value = if self.sym("=") { self.next() } else { None };
-                let view_opt = matches!(opt.as_str(), "security_invoker" | "security_barrier" | "check_option");
-                if kind != "view" && view_opt && !reset {
-                    return err("22023", format!("unrecognized parameter \"{opt}\""));
-                }
-                if kind == "view" && !reset {
-                    let kept = match opt.as_str() {
-                        "security_invoker" | "security_barrier" => Json::Bool(bool_option(&opt, value)?),
-                        "check_option" => {
-                            // (no value given is "true", as for any option)
-                            let text = match value {
-                                Some(Tok::Word(w) | Tok::Str(w) | Tok::Ident(w) | Tok::Num(w)) => w,
-                                Some(t) => tokens_shown(&[t]),
-                                None => "true".into(),
-                            };
-                            match text.to_lowercase().as_str() {
-                                l @ ("local" | "cascaded") => Json::String(l.into()),
-                                _ => {
-                                    return Err(SqlError {
-                                        code: "22023",
-                                        message: format!("invalid value for enum option \"check_option\": {text}"),
-                                        info: Some(Box::new(Violation {
-                                            detail: Some("Valid values are \"local\" and \"cascaded\".".into()),
-                                            ..Violation::default()
-                                        })),
-                                    });
-                                }
-                            }
-                        }
-                        _ => return err("22023", format!("unrecognized parameter \"{opt}\"")),
-                    };
-                    opts.push((opt, Some(kept)));
-                } else if view_opt && kind == "view" {
-                    opts.push((opt, None));
-                }
+                named.push((None, opt.clone(), None));
+                opts.extend(view_option(opt, value, kind, reset)?);
                 if !self.sym(",") {
                     break;
                 }
             }
             self.expect_sym(")")?;
+            let lock = reloptions::lock_mode(&named);
             return Ok(match kind {
-                "view" => Stmt::ViewOptions { name, opts, if_exists },
+                "view" => Stmt::ViewOptions { name, opts, if_exists, lock },
                 _ => Stmt::Noop(tag),
             });
         }
@@ -15210,6 +15753,15 @@ impl Parser {
         {
             self.i += 2;
             let changes = vec![Alter::SetSchema(self.name()?)];
+            return Ok(Stmt::Alter { table: name, changes, if_exists, only: false });
+        }
+        // SET TABLESPACE t: where it is kept, as a table is (see `tablespace`)
+        if kind == "materialized view"
+            && self.is_kw("set")
+            && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "tablespace")
+        {
+            self.i += 2;
+            let changes = vec![Alter::SetTablespace(self.name()?)];
             return Ok(Stmt::Alter { table: name, changes, if_exists, only: false });
         }
         if !self.kw("owner") {
@@ -15320,6 +15872,10 @@ impl Parser {
             return self.alter_policy();
         }
         self.expect_kw("table")?;
+        // ALL IN TABLESPACE t ... SET TABLESPACE: every table there moved (see `tablespace`)
+        if self.at_move_all() {
+            return self.move_all('r');
+        }
         let if_exists = self.kw("if");
         if if_exists {
             self.expect_kw("exists")?;
@@ -15358,11 +15914,12 @@ impl Parser {
                 if self.kw("primary") {
                     self.expect_kw("key")?;
                     self.expect_sym("(")?;
-                    changes.push(Alter::AddPrimaryKey(self.names()?, named.clone()));
+                    let cols = self.names()?;
                     if self.kw("include") {
                         self.expect_sym("(")?;
                         self.names()?;
                     }
+                    changes.push(Alter::AddPrimaryKey(cols, named.clone(), self.constraint_space()?));
                     if !self.sym(",") {
                         return Ok(Stmt::Alter { table, changes, if_exists, only });
                     }
@@ -15619,7 +16176,7 @@ impl Parser {
                     // RESET (attribute options): n_distinct and the like, which only tune the planner
                     self.i += 1;
                     self.skip_parens()?;
-                    Alter::Noop("column options only tune Postgres's planner: nothing to do here")
+                    Alter::Noop(COLUMN_OPTIONS)
                 } else if set && self.kw("masked") {
                     let m = match self.kw("with") {
                         false => mask::HASH,
@@ -15643,7 +16200,7 @@ impl Parser {
                     Alter::ColOpt(c, ColOpt::Stats(if neg { -n } else { n }))
                 } else if set && matches!(self.peek(), Some(Tok::Sym("("))) {
                     self.skip_parens()?;
-                    Alter::Noop("column options only tune Postgres's planner: nothing to do here")
+                    Alter::Noop(COLUMN_OPTIONS)
                 } else if set {
                     if self.kw("default") {
                         Alter::SetDefault(c, Some(self.default_expr()?))
@@ -15691,8 +16248,7 @@ impl Parser {
                     self.kw("reset");
                 }
                 if set && self.kw("tablespace") {
-                    self.name()?;
-                    Alter::Noop("tablespaces aren't used: every table is in the one store")
+                    Alter::SetTablespace(self.name()?)
                 } else if set && self.kw("schema") {
                     Alter::SetSchema(self.name()?)
                 } else if set && self.kw("logged") {
@@ -16246,10 +16802,17 @@ impl Parser {
                 Ok(s)
             }
             _ => {
-                let name = self.name()?;
-                if matches!(self.peek(), Some(Tok::Sym("-"))) {
-                    // `task-1` lexes as task, -, 1: say how to write it instead of a bare syntax error
-                    return self.fail(&format!("world names with a dash need quotes, like '{name}-...'"));
+                let mut name = self.name()?;
+                // `add-todos` lexes as add, -, todos: where a world is named there's no arithmetic, so the pieces
+                // are one name (agents fork such names, and write them unquoted)
+                while matches!(self.peek(), Some(Tok::Sym("-"))) {
+                    match self.t.get(self.i + 1) {
+                        Some(Tok::Word(w) | Tok::Num(w)) => {
+                            name = format!("{name}-{w}");
+                            self.i += 2;
+                        }
+                        _ => return self.fail(&format!("world names with a dash need quotes, like '{name}-...'")),
+                    }
                 }
                 Ok(name)
             }
@@ -16488,8 +17051,8 @@ impl Parser {
             }
         }
         self.expect_sym(")")?;
-        // INCLUDE (columns) only lets an index answer a query alone; WITH (fillfactor = ...) and
-        // TABLESPACE say how it's stored. None changes which rows it finds.
+        // INCLUDE (columns) only lets an index answer a query alone; WITH (fillfactor = ...) says how it's stored
+        // and TABLESPACE where (see `tablespace`). None changes which rows it finds.
         let include = if self.kw("include") {
             self.expect_sym("(")?;
             self.names()?
@@ -16504,9 +17067,7 @@ impl Parser {
         } else {
             vec![]
         };
-        if self.kw("tablespace") {
-            self.name()?;
-        }
+        let space = if self.kw("tablespace") { Some(self.name()?) } else { None };
         let filter = if self.kw("where") {
             let (start, toks) = (self.i, self.ahead(true));
             self.expr()?;
@@ -16529,6 +17090,7 @@ impl Parser {
             only,
             concurrently,
             options,
+            space,
         })
     }
 
@@ -16625,48 +17187,6 @@ impl Parser {
         }
         if self.kw("collation") {
             return self.create_collation();
-        }
-        if self.kw("tablespace") {
-            // CREATE TABLESPACE name [OWNER role] LOCATION 'dir' [WITH (options)]: refused where Postgres refuses it (a
-            // relative location, an option tablespaces don't have), else not kept
-            self.name()?;
-            if self.kw("owner") {
-                self.name()?;
-            }
-            self.expect_kw("location")?;
-            match self.next() {
-                Some(Tok::Str(l)) if !l.is_empty() && !l.starts_with('/') => {
-                    return err("42P17", "tablespace location must be an absolute path");
-                }
-                Some(Tok::Str(_)) => {}
-                t => {
-                    self.put_back(t);
-                    return self.fail("expected the tablespace's location as a string");
-                }
-            }
-            if self.kw("with") {
-                self.expect_sym("(")?;
-                loop {
-                    let opt = self.name()?;
-                    let known =
-                        ["seq_page_cost", "random_page_cost", "effective_io_concurrency", "maintenance_io_concurrency"];
-                    if !known.contains(&opt.as_str()) {
-                        return err("22023", format!("unrecognized parameter \"{opt}\""));
-                    }
-                    if self.sym("=") {
-                        self.next();
-                    }
-                    if !self.sym(",") {
-                        break;
-                    }
-                }
-                self.expect_sym(")")?;
-            }
-            self.skip_rest();
-            return Ok(Stmt::NoopNotice(
-                "CREATE TABLESPACE",
-                "tablespaces aren't used: every table is in the one store",
-            ));
         }
         if self.kw("extension") {
             let if_not_exists = self.kw("if");
@@ -16816,7 +17336,13 @@ impl Parser {
             type_name(&name)?;
             // CREATE TYPE name: a shell type, a name for a type to be filled in later; here a type of no fields
             if matches!(self.peek(), None | Some(Tok::Sym(";"))) {
-                return Ok(Stmt::CreateType { name, labels: vec![], range: None, composite: Some(vec![]) });
+                return Ok(Stmt::CreateType {
+                    name,
+                    labels: vec![],
+                    range: None,
+                    composite: Some(vec![]),
+                    shell: true,
+                });
             }
             // CREATE TYPE name (INPUT = f, OUTPUT = g, LIKE = t, ...): a base type, of a built-in type's I/O functions
             if self.sym("(") {
@@ -16885,7 +17411,7 @@ impl Parser {
                 }
                 self.expect_sym(")")?;
                 let Some(sub) = subtype else { return err("42P17", "type \"subtype\" is not specified") };
-                return Ok(Stmt::CreateType { name, labels: vec![], range: Some(sub), composite: None });
+                return Ok(Stmt::CreateType { name, labels: vec![], range: Some(sub), composite: None, shell: false });
             }
             if self.sym("(") {
                 let mut fields = vec![];
@@ -16900,7 +17426,13 @@ impl Parser {
                     }
                     self.expect_sym(")")?;
                 }
-                return Ok(Stmt::CreateType { name, labels: vec![], range: None, composite: Some(fields) });
+                return Ok(Stmt::CreateType {
+                    name,
+                    labels: vec![],
+                    range: None,
+                    composite: Some(fields),
+                    shell: false,
+                });
             }
             if !self.kw("enum") {
                 return err(
@@ -16926,7 +17458,7 @@ impl Parser {
             if labels.len() > MAX_LABELS {
                 return too_many_labels();
             }
-            return Ok(Stmt::CreateType { name, labels, range: None, composite: None });
+            return Ok(Stmt::CreateType { name, labels, range: None, composite: None, shell: false });
         }
         if self.kw("schema") {
             // CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION role]
@@ -17063,11 +17595,19 @@ impl Parser {
         }
         let (mut cols, mut key, mut constraints, mut likes) = (vec![], vec![], vec![], vec![]);
         let mut hier = hier::CreateHier::default();
+        self.pkey_space = None;
         // a partition: PARTITION OF parent [(column options, constraints)] FOR VALUES ... | DEFAULT
         let partition = self.kw("partition");
         if partition {
             self.expect_kw("of")?;
-            hier.of = Some((self.table_name()?, hier::BoundSpec::Default));
+            // (pg_temp.p names the temporary one, as a plain p does)
+            let schema = self.t.get(self.i + 1) == Some(&Tok::Sym("."))
+                && !matches!(self.t.get(self.i), Some(Tok::Word(s) | Tok::Ident(s)) if s == "pg_temp");
+            let parent = self.table_name()?;
+            if schema {
+                hier.qualified.push(parent.clone());
+            }
+            hier.of = Some((parent, hier::BoundSpec::Default));
         }
         // a typed table: OF a composite type, the type's fields its columns ([(table constraints)] after it)
         let typed = !partition && self.kw("of");
@@ -17164,6 +17704,7 @@ impl Parser {
                         self.expect_sym("(")?;
                         self.names()?;
                     }
+                    hier.pkey_space = self.constraint_space()?;
                 } else if let Some(c) = self.table_constraint(named.clone())? {
                     constraints.push(c);
                 } else if named.is_some() {
@@ -17252,8 +17793,7 @@ impl Parser {
                 // WITHOUT OIDS: the old spelling of what every table is now
                 self.i += 2;
             } else if self.kw("tablespace") {
-                let space = self.name()?;
-                let _ = space;
+                hier.space = Some(self.name()?);
             } else if self.kw("using") {
                 let method = self.name()?;
                 if method != "heap" {
@@ -17263,6 +17803,10 @@ impl Parser {
             } else {
                 break;
             }
+        }
+        // (a column's PRIMARY KEY ... USING INDEX TABLESPACE)
+        if hier.pkey_space.is_none() {
+            hier.pkey_space = self.pkey_space.take();
         }
         Ok(Stmt::Create { table, cols, key, constraints, if_not_exists, temp, likes, on_commit, hier, unlogged: false })
     }
@@ -17378,6 +17922,21 @@ impl Parser {
         }
     }
 
+    /// `[WITH (storage parameters)] [USING INDEX TABLESPACE name]` after a PRIMARY KEY or UNIQUE constraint: how
+    /// Postgres keeps its index (the parameters aren't kept here), and where (see `tablespace`).
+    fn constraint_space(&mut self) -> Result<Option<String>> {
+        if self.is_kw("with") && matches!(self.t.get(self.i + 1), Some(Tok::Sym("("))) {
+            self.i += 1;
+            self.skip_parens()?;
+        }
+        if self.is_kw("using") && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "index") {
+            self.i += 2;
+            self.expect_kw("tablespace")?;
+            return Ok(Some(self.name()?));
+        }
+        Ok(None)
+    }
+
     fn table_constraint(&mut self, name: Option<String>) -> Result<Option<ConstraintDef>> {
         if self.kw("unique") {
             let nnd = self.nulls_not_distinct()?;
@@ -17388,8 +17947,9 @@ impl Parser {
                 self.expect_sym("(")?;
                 self.names()?;
             }
+            let space = self.constraint_space()?;
             self.key_deferral()?;
-            return Ok(Some(ConstraintDef::Unique { name, cols, nnd }));
+            return Ok(Some(ConstraintDef::Unique { name, cols, nnd, space }));
         }
         if self.kw("foreign") {
             self.expect_kw("key")?;
@@ -17642,6 +18202,9 @@ impl Parser {
             if self.kw("primary") {
                 self.expect_kw("key")?;
                 c.primary = true;
+                if let Some(space) = self.constraint_space()? {
+                    self.pkey_space = Some(space);
+                }
             } else if self.kw("not") {
                 self.expect_kw("null")?;
                 c.not_null = true;
@@ -17733,8 +18296,14 @@ impl Parser {
                 continue;
             } else if self.kw("unique") {
                 let nnd = self.nulls_not_distinct()?;
+                let space = self.constraint_space()?;
                 self.key_deferral()?;
-                c.constraints.push(ConstraintDef::Unique { name: named.take(), cols: vec![c.name.clone()], nnd });
+                c.constraints.push(ConstraintDef::Unique {
+                    name: named.take(),
+                    cols: vec![c.name.clone()],
+                    nnd,
+                    space,
+                });
             } else if self.kw("references") {
                 let col = vec![c.name.clone()];
                 c.constraints.push(self.references(named.take(), col)?);
@@ -17904,7 +18473,7 @@ impl Parser {
         Ok(Stmt::AlterCollation { name, change })
     }
 
-    /// After ALTER TYPE: an enum's labels, or its name.
+    /// After ALTER TYPE: an enum's labels, a composite type's attributes, or its name, schema or owner.
     fn alter_type(&mut self) -> Result<Stmt> {
         let name = self.qualified(false, Kind::Type)?;
         let label = |p: &mut Parser| match p.next() {
@@ -17914,6 +18483,55 @@ impl Parser {
                 p.fail("expected a label in quotes")
             }
         };
+        // an attribute's type as written (its COLLATE read and not kept: the attributes keep their types' own)
+        let attribute_type = |p: &mut Parser| -> Result<String> {
+            let (_, t) = p.text_of(|p| p.ty().map(drop))?;
+            if p.kw("collate") {
+                p.collation_name()?;
+            }
+            Ok(t)
+        };
+        // ADD | DROP | ALTER ATTRIBUTE ..., [, ...]: each with its CASCADE (to the typed tables) or RESTRICT
+        let attribute = |p: &Parser| {
+            matches!(p.peek(), Some(Tok::Word(w)) if matches!(w.as_str(), "add" | "drop" | "alter"))
+                && matches!(p.t.get(p.i + 1), Some(Tok::Word(w)) if w == "attribute")
+        };
+        if attribute(self) {
+            let mut changes = vec![];
+            loop {
+                let change = match self.next() {
+                    Some(Tok::Word(w)) if w == "add" => {
+                        self.expect_kw("attribute")?;
+                        let a = self.name()?;
+                        AttrChange::Add(a, attribute_type(self)?)
+                    }
+                    Some(Tok::Word(w)) if w == "drop" => {
+                        self.expect_kw("attribute")?;
+                        let quiet = self.if_exists()?;
+                        AttrChange::Drop(self.name()?, quiet)
+                    }
+                    t => {
+                        self.put_back(t);
+                        self.expect_kw("alter")?;
+                        self.expect_kw("attribute")?;
+                        let a = self.name()?;
+                        if self.kw("set") {
+                            self.expect_kw("data")?;
+                        }
+                        self.expect_kw("type")?;
+                        AttrChange::Type(a, attribute_type(self)?)
+                    }
+                };
+                changes.push((change, self.cascade()));
+                if !self.sym(",") {
+                    break;
+                }
+                if !attribute(self) {
+                    return self.fail("expected ADD, DROP or ALTER ATTRIBUTE");
+                }
+            }
+            return Ok(Stmt::AlterType { name, change: TypeChange::Attrs(changes) });
+        }
         let change = if self.kw("add") {
             self.expect_kw("value")?;
             let quiet = self.if_not_exists()?;
@@ -17931,17 +18549,29 @@ impl Parser {
                 let a = label(self)?;
                 self.expect_kw("to")?;
                 TypeChange::RenameValue(a, label(self)?)
+            } else if self.kw("attribute") {
+                // (alone: Postgres's RENAME ATTRIBUTE is a statement of its own)
+                let a = self.name()?;
+                self.expect_kw("to")?;
+                let b = self.name()?;
+                TypeChange::Attrs(vec![(AttrChange::Rename(a, b), self.cascade())])
             } else {
                 self.expect_kw("to")?;
                 let to = self.name()?;
                 type_name(&to)?;
-                TypeChange::Rename(to)
+                // (in its own schema)
+                TypeChange::Rename(qualify(schema_part(&name), &to))
             }
+        } else if self.kw("set") {
+            if !self.kw("schema") {
+                return err(UNSUPPORTED, "ALTER TYPE ... SET (...) of a base type's properties isn't supported here");
+            }
+            TypeChange::Schema(self.name()?)
         } else if self.kw("owner") {
             self.expect_kw("to")?;
             return Ok(Stmt::AlterOwner(acl::Owned::Type(name, false), self.role_spec(false)?));
         } else {
-            return err(UNSUPPORTED, "ALTER TYPE does ADD VALUE, RENAME VALUE and RENAME TO (of enum types) here");
+            return self.fail("expected ADD, DROP, ALTER, RENAME, SET SCHEMA or OWNER TO");
         };
         Ok(Stmt::AlterType { name, change })
     }
@@ -21117,6 +21747,11 @@ impl Parser {
                     }
                     self.expect_sym(")")?;
                 }
+                // TABLESPACE t: where a materialized view is kept (see `tablespace`), carried with its options, which
+                // are none of a view's
+                if materialized && self.kw("tablespace") {
+                    reloptions.push(("tablespace".into(), self.name()?));
+                }
                 self.expect_kw("as")?;
                 // copied first: parsing takes the text out of the tokens it reads
                 let (start, toks, len) = (self.i, self.ahead(false), self.t.len());
@@ -21601,6 +22236,8 @@ struct RewriteKey {
     merging: bool,
     /// masked columns read masked (see `mask`)
     masked: bool,
+    /// the tenant an agent's statement is held to (see `rls::tenant`)
+    tenant: Option<Arc<str>>,
     declared: Option<Vec<bool>>,
     /// the parameters' types it runs with (see `joined_place`)
     types: Vec<Type>,
@@ -21630,6 +22267,7 @@ impl RewriteKey {
             skipping: rls::skipped(),
             merging: rls::merging_now(),
             masked: mask::on(),
+            tenant: rls::tenant(),
             declared,
             types: PARAM_TYPES.with_borrow(Clone::clone),
             temp: session_temp().map(|t| std::ptr::from_ref(&*t.core) as usize),
@@ -21908,6 +22546,9 @@ pub struct Script {
     toks: std::cell::OnceCell<Vec<Tok>>,
     /// parsed along a search_path other than public
     resolved: bool,
+    /// the world it was parsed in: a statement after a USE WORLD is parsed again in the world it switched to, whose
+    /// types (a composite type's shape) may be others
+    world: String,
 }
 
 impl Script {
@@ -21956,6 +22597,7 @@ impl Script {
                     nums,
                     toks: Default::default(),
                     resolved: false,
+                    world: String::new(),
                 });
             }
             p.calls = false;
@@ -22658,19 +23300,28 @@ struct Check {
     valid: bool,
 }
 
-/// Parsed CHECK conditions by their text.
-static CHECKS: LazyLock<Mutex<HashMap<String, Expr>>> = LazyLock::new(Default::default);
+/// Parsed CHECK conditions by their text, each with the composite types' shapes it was parsed with (a cast to one):
+/// parsed again where one is no longer its type's in the world looked up in (see `stale_record`).
+#[allow(clippy::type_complexity)]
+static CHECKS: LazyLock<Mutex<HashMap<String, (Expr, Vec<Type>)>>> = LazyLock::new(Default::default);
 
 fn check_expr(text: &str) -> Result<Expr> {
-    if let Some(e) = CHECKS.lock().unwrap().get(text) {
-        return Ok(e.clone());
+    let hit = CHECKS.lock().unwrap().get(text).cloned();
+    if let Some((e, shapes)) = hit
+        && !shapes.iter().any(|t| stale_record(*t))
+    {
+        return Ok(e);
     }
-    let mut p = Parser::new(lex(text)?);
-    let e = p.expr()?;
-    if p.peek().is_some() {
-        return p.fail("expected the end of the CHECK condition");
-    }
-    CHECKS.lock().unwrap().insert(text.into(), e.clone());
+    let (e, shapes) = userdefs::noting(|| {
+        let mut p = Parser::new(lex(text)?);
+        let e = p.expr()?;
+        if p.peek().is_some() {
+            return p.fail("expected the end of the CHECK condition");
+        }
+        Ok(e)
+    });
+    let e = e?;
+    CHECKS.lock().unwrap().insert(text.into(), (e.clone(), shapes));
     Ok(e)
 }
 
@@ -23082,6 +23733,11 @@ fn schema_changes(before: &Json, after: &Json) -> Vec<String> {
     let cols = |j: &Json| -> Vec<Json> { j["columns"].as_array().cloned().unwrap_or_default() };
     let (b, a) = (cols(before), cols(after));
     let by_id = |cs: &[Json], id: &Json| cs.iter().find(|c| c["id"] == *id).cloned();
+    // the parsed columns, for their sizes: varchar(5) to varchar(10) keeps the stored type `text`
+    let parsed = |j: &Json| schema_of(&Val::from(j.to_string())).ok();
+    let (tb, ta) = (parsed(before), parsed(after));
+    let col =
+        |t: &Option<Table>, id: &Json| t.as_ref()?.cols.iter().find(|c| Some(c.id as u64) == id.as_u64()).cloned();
     let mut out = vec![];
     for c in &b {
         match by_id(&a, &c["id"]) {
@@ -23091,12 +23747,17 @@ fn schema_changes(before: &Json, after: &Json) -> Vec<String> {
                 if c["name"] != n["name"] {
                     out.push(format!("{} -> {name}", c["name"].as_str().unwrap_or("?")));
                 }
-                if c["type"] != n["type"] {
-                    out.push(format!(
+                match (col(&tb, &c["id"]), col(&ta, &n["id"])) {
+                    (Some(x), Some(y)) if !hier::same_type(&x, &y) => {
+                        out.push(format!("{name}: {} -> {}", sized_sql(&x), sized_sql(&y)))
+                    }
+                    (Some(_), Some(_)) => {}
+                    _ if c["type"] != n["type"] => out.push(format!(
                         "{name}: {} -> {}",
                         c["type"].as_str().unwrap_or("?"),
                         n["type"].as_str().unwrap_or("?")
-                    ));
+                    )),
+                    _ => {}
                 }
                 if c["not_null"] != n["not_null"] {
                     out.push(format!(
@@ -23485,13 +24146,13 @@ fn alter_sql(name: &str, b: &Table, a: &Table) -> Vec<String> {
                     out.push(format!("alter table {t} rename column {} to {};", ident(&c.name), ident(&n.name)));
                 }
                 let col = ident(&n.name);
-                if n.ty != c.ty || n.coll != c.coll {
+                // a size is part of the type: varchar(5) to varchar(10), numeric(10,2) to numeric(12,2)
+                if !hier::same_type(c, n) || n.coll != c.coll {
                     let coll = match n.coll {
                         collation::Coll::DEFAULT => String::new(),
                         x => format!(" collate {}", x.sql()),
                     };
-                    // (a new collation alone keeps the type as it is: varchar(5), not text)
-                    let ty = if n.ty == c.ty { sized_sql(n) } else { n.ty.name().to_string() };
+                    let ty = sized_sql(n);
                     out.push(format!("alter table {t} alter column {col} type {ty}{coll};"));
                 }
                 if n.default != c.default || n.default_sql != c.default_sql {
@@ -23625,6 +24286,7 @@ fn agent_spec(j: &Json) -> Result<crate::AgentSpec> {
                     _ => num()?,
                 })
             }
+            "max_threads" => spec.max_threads = Some(num()?),
             "max_query_ms" => {
                 spec.max_query_ms = Some(match v {
                     Json::String(s) => {
@@ -23643,6 +24305,15 @@ fn agent_spec(j: &Json) -> Result<crate::AgentSpec> {
             }
             "disabled" => {
                 spec.disabled = Some(v.as_bool().ok_or_else(|| bad("disabled must be true or false".into()))?)
+            }
+            "tenant" => spec.tenant = Some(v.clone()),
+            "valid_for" => {
+                spec.valid_for = Some(match v {
+                    Json::String(s) => {
+                        interval_ms(time::parse_interval(s).ok_or_else(|| bad(format!("'{s}' is not an interval")))?)
+                    }
+                    _ => num()?,
+                })
             }
             "policy" => {
                 spec.policy = Some(match v {
@@ -23754,7 +24425,7 @@ fn need_src(v: &View, src: &Source) -> Result<Table> {
 fn load_world(v: &View, name: &str) -> Result<Option<Table>> {
     reserved(name)?;
     if let Some(s) = v.get(&schema_key(name))? {
-        let mut t = schema_of(&s)?;
+        let mut t = schema_in(Some(v), &s)?;
         t.name = name.into();
         for c in &mut t.cols {
             c.table = name.into();
@@ -23817,8 +24488,21 @@ fn temp_table(v: &View, name: &str) -> Result<Option<Table>> {
 
 /// A schema row, parsed once and cached by its text. The table's name is left for the caller.
 fn schema_of(s: &Val) -> Result<Table> {
-    // its enum columns' label sets held, unless one was forgotten: then it's parsed again
-    let held = |t: &Table| t.cols.iter().all(|c| !matches!(c.ty, Type::Enum(i) if enum_of(i).map(hold_enum).is_err()));
+    schema_in(None, s)
+}
+
+/// `schema_of`, of a schema row read from `v` where it's given: its composite columns of the types as `v`'s world has
+/// them (another world may have changed one, and parsed the same text first).
+fn schema_in(v: Option<&View>, s: &Val) -> Result<Table> {
+    let stale = |t: Type| match v {
+        Some(v) => userdefs::stale_in(v, t),
+        None => stale_record(t),
+    };
+    // its enum columns' label sets held, unless one was forgotten, and its composite columns' types as they are now
+    // (not as they were before an ALTER TYPE): else it's parsed again
+    let held = |t: &Table| {
+        t.cols.iter().all(|c| !matches!(c.ty, Type::Enum(i) if enum_of(i).map(hold_enum).is_err()) && !stale(c.ty))
+    };
     // (first the very text this thread found before: a statement reads its tables' schemas, and a commit all of
     // them, as rows the world shares, so most are found by their address, with no hash of the text and no lock)
     let at = Arc::as_ptr(s) as *const u8 as usize;
@@ -23832,7 +24516,10 @@ fn schema_of(s: &Val) -> Result<Table> {
     let t = match found {
         Some(t) => t,
         None => {
-            let t = parse_schema("", s)?;
+            let t = match v {
+                Some(v) => userdefs::in_world(v, || parse_schema("", s))?,
+                None => parse_schema("", s)?,
+            };
             let mut c = PARSED.lock().unwrap();
             // (as many as a database of thousands of tables has: a statement that reads every schema, as one
             // that checks what references the rows it writes does, would otherwise parse them all each time)
@@ -24079,8 +24766,14 @@ fn schemas(v: &View) -> Result<Vec<Table>> {
 const UNIQ: &str = "_sonos_uniq";
 const REFS: &str = "_sonos_ref";
 
+/// Whether row `key` keeps when an object was made (see `acl::MADE`): no definition of its own, it follows the
+/// object's.
+pub(crate) fn made_row(key: &str) -> bool {
+    key.strip_prefix(acl::MADE).is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Whether a key is one of those index rows (hidden from DIFF).
-pub(crate) fn internal(key: &str) -> bool {
+pub fn internal(key: &str) -> bool {
     key.starts_with("_sonos_uniq/")
         || key.starts_with("_sonos_ref/")
         || key.starts_with("_sonos_seq/")
@@ -24882,6 +25575,17 @@ pub(crate) fn btree_entry(key: &str) -> bool {
 /// schema the merge changed (an index made or dropped on the branch, a column dropped) gets all
 /// its entries rebuilt.
 pub(crate) fn reindex(v: &View, before: &View, keys: &[String]) -> Result<Vec<(String, Option<crate::Val>)>> {
+    // (with the composite types as the merged state's rows have them: not those of the world a session runs in, nor
+    // of another database)
+    userdefs::in_world(v, || reindex_in(v, before, keys))
+}
+
+/// `reindex`, with composite types looked up as `v` has them.
+fn reindex_in(v: &View, before: &View, keys: &[String]) -> Result<Vec<(String, Option<crate::Val>)>> {
+    // (the parent's rows, where the merge changes a type's row, read with the types the parent has: those their
+    // entries were made with)
+    let typed = keys.iter().any(|k| type_row(k));
+    let in_parent = |f: &mut dyn FnMut() -> Result<()>| if typed { userdefs::in_world(before, f) } else { f() };
     // (only the tables the merge changed a row or the schema of are looked at below: a commit of a few rows reads
     // a few schemas, not every table's)
     let schema_prefix = format!("{SCHEMAS}/");
@@ -24908,7 +25612,12 @@ pub(crate) fn reindex(v: &View, before: &View, keys: &[String]) -> Result<Vec<(S
         }
         Ok(out)
     };
-    let (old, new) = (indexed(before)?, indexed(v)?);
+    let mut old = HashMap::new();
+    in_parent(&mut || {
+        old = indexed(before)?;
+        Ok(())
+    })?;
+    let new = indexed(v)?;
     if old.is_empty() && new.is_empty() {
         return Ok(vec![]);
     }
@@ -24945,16 +25654,21 @@ pub(crate) fn reindex(v: &View, before: &View, keys: &[String]) -> Result<Vec<(S
         }
     }
     // rows the merge changed: the parent's entries for the old row go, the merged row's come
-    for k in keys {
-        let Some((tn, id)) = k.split_once('/') else { continue };
-        if whole.contains(tn) || btree_entry(k) || tn.starts_with("_sonos_") {
-            continue;
-        }
-        if let (Some(t), Some(raw)) = (old.get(tn), before.get(k)?) {
-            for e in entries(t, id, &raw)? {
-                out.entry(e).or_insert(None);
+    let changed = || {
+        (keys.iter().filter_map(|k| Some((k, k.split_once('/')?))))
+            .filter(|(k, (tn, _))| !whole.contains(*tn) && !btree_entry(k) && !tn.starts_with("_sonos_"))
+    };
+    in_parent(&mut || {
+        for (k, (tn, id)) in changed() {
+            if let (Some(t), Some(raw)) = (old.get(tn), before.get(k)?) {
+                for e in entries(t, id, &raw)? {
+                    out.entry(e).or_insert(None);
+                }
             }
         }
+        Ok(())
+    })?;
+    for (k, (tn, id)) in changed() {
         if let (Some(t), Some(raw)) = (new.get(tn), v.get(k)?) {
             for e in entries(t, id, &raw)? {
                 out.insert(e, Some(crate::Val::from(id)));
@@ -26003,6 +26717,12 @@ pub(crate) fn stored(v: &View, key: &str, json: &str) -> crate::Result<Val> {
     }
 }
 
+/// The columns of SQL table `table` in `v`, by name, as `stored` packs a row to them; none for a table of JSON rows.
+pub(crate) fn stored_columns(v: &View, table: &str) -> crate::Result<Option<Vec<String>>> {
+    let t = load(v, table).map_err(sql_to_db)?.filter(|t| t.schema);
+    Ok(t.map(|t| t.cols.into_iter().map(|c| c.name).collect()))
+}
+
 fn sql_to_db(e: SqlError) -> crate::Error {
     crate::Error::Constraint { code: e.code, message: e.message }
 }
@@ -26104,7 +26824,8 @@ fn row_from_json(
 /// references a removed one, and a unique value that changed hands wasn't taken from a row that
 /// still has it (as when one side wins a conflict by choice).
 pub(crate) fn check_merge(v: &View, before: &View, keys: &[String]) -> Result<()> {
-    check_merge_in(v, before, keys, &HashSet::new())
+    // (its rows read with the composite types as the merged state has them: see `reindex`)
+    userdefs::in_world(v, || check_merge_in(v, before, keys, &HashSet::new()))
 }
 
 /// `reindex` and `check_merge` for a part of the rows (`keys`) of a merge whose result is the merging side's own state
@@ -26121,9 +26842,12 @@ pub(crate) fn check_published(v: &View, before: &View, keys: &[String]) -> Resul
         .collect();
     let mut shown: Vec<String> = keys.to_vec();
     shown.retain(|k| k.strip_prefix(&format!("{SCHEMAS}/")).is_none_or(|t| !fresh.contains(t)));
-    let entries = reindex(v, before, &shown)?;
-    check_merge_in(v, before, keys, &fresh)?;
-    Ok(entries)
+    // (both with the composite types as the merged state has them, found once: see `reindex`)
+    userdefs::in_world(v, || {
+        let entries = reindex(v, before, &shown)?;
+        check_merge_in(v, before, keys, &fresh)?;
+        Ok(entries)
+    })
 }
 
 /// Bytes of row keys a big transaction's commit checks at a time (see `check_published`): a sixteenth of
@@ -26382,7 +27106,7 @@ fn add_constraint(v: &View, t: &mut Table, c: &ConstraintDef) -> Result<()> {
         return err("42710", format!("constraint \"{n}\" for relation \"{}\" already exists", rel_part(&t.name)));
     }
     match c {
-        ConstraintDef::Unique { name, cols, nnd } => {
+        ConstraintDef::Unique { name, cols, nnd, space } => {
             let mut ids = vec![];
             for n in cols {
                 // (as Postgres's index build says it)
@@ -26403,6 +27127,9 @@ fn add_constraint(v: &View, t: &mut Table, c: &ConstraintDef) -> Result<()> {
                 None => free_object_name(t, rel_part(&t.name), &cols.join("_"), "key"),
             };
             key_name(&name)?;
+            // (where its index is kept: USING INDEX TABLESPACE's, else default_tablespace's)
+            let at = tablespace::place(v, space.as_deref(), 0, t.hier.part.is_some(), true)?;
+            t.hier.set_index_space(&name, at);
             t.uniques.push(Unique { name, cols: ids, nnd: *nnd, primary: false });
         }
         ConstraintDef::Foreign {
@@ -27314,6 +28041,11 @@ pub(crate) fn row_texts(schema: &Val, raw: &str) -> Option<Vec<(String, Option<S
     )
 }
 
+/// The names of the columns schema row `schema` gives its table (as `row_texts` names them).
+pub(crate) fn column_names(schema: &Val) -> Option<Vec<String>> {
+    Some(schema_of(schema).ok()?.cols.iter().filter(|c| !c.hidden).map(|c| c.name.clone()).collect())
+}
+
 /// A row of SQL table `table` given as each column's text as Postgres writes it (the other way from `row_texts`), as
 /// `v` stores it: its row key and its packed value. For rows read from the Postgres a folder is attached to (see
 /// `crate::attach`); a column not given is null.
@@ -28033,6 +28765,11 @@ fn par_run_on<T: Send>(
 ) -> Result<Vec<T>> {
     use std::sync::atomic::{AtomicUsize, Ordering::*};
     let k = k.max(1);
+    // an agent's max_threads: its statement leaves the other cores to main's traffic
+    let threads = match STOP.with_borrow(|s| s.as_ref().map_or(0, |s| s.threads)) {
+        0 => threads,
+        cap => threads.min(cap),
+    };
     // a seeded generator is one sequence: its numbers go to rows in the one order the data gives
     let extra = if funcs::SEEDED.get().is_some() { 0 } else { (k - 1).min(threads.max(1) - 1) };
     let got = if extra == 0 {
@@ -28057,8 +28794,12 @@ fn par_run_on<T: Send>(
         (catalog::world_state(), PATH.with_borrow(Clone::clone), SESSION.with_borrow(Clone::clone));
     let who = roles::current();
     let ts_config = tsearch::default_config();
+    let using = crate::stale::USING.with_borrow(Clone::clone);
+    let dry = DRY.with_borrow(Clone::clone);
     let work = || {
         STOP.set(stop.clone()); // helper threads stop with the statement too
+        crate::stale::USING.set(using.clone()); // and keep what they read as its columns (see `stale`)
+        DRY.set(dry.clone()); // and change nothing where it may not (see `dry_run`)
         tsearch::set_default(ts_config); // and search text as its session does
         roles::enter(who.clone()); // and run as its role
         time::restore_zone(zone.clone()); // and read times in its session's zone
@@ -28123,6 +28864,7 @@ fn par_run_on<T: Send>(
                 PATH.set(None);
                 SESSION.set(None);
                 STOP.set(None);
+                DRY.set(None);
                 finished(&mine);
             };
             let job: Box<dyn FnOnce() + Send + '_> = Box::new(job);
@@ -28252,8 +28994,8 @@ enum Left<'a> {
 
 /// What a join on disk needs from its step (see `Exec::grace_join`).
 struct Grace<'a> {
-    le: &'a Expr,
-    c: usize,
+    lkeys: &'a [&'a Expr], // the left side of each key column's equality
+    cols: &'a [usize],     // the key columns of the right side (see `HashIndex::on`)
     rest: &'a [&'a Expr],
     now: &'a [&'a Expr],
     left_join: bool,
@@ -28378,6 +29120,17 @@ impl HashIndex {
         })
     }
 
+    /// An index of `rows` on columns `cols` together (see `vals_key`).
+    fn on(rows: &Batch, cols: &[usize]) -> Result<HashIndex> {
+        match cols {
+            [c] => HashIndex::new(rows, *c),
+            _ => HashIndex::over(rows.len, |i| {
+                let r = rows.row(i);
+                Ok(vals_key(cols.iter().map(|&c| &r[c])))
+            }),
+        }
+    }
+
     /// An index of `len` rows by the key `key` gives each (None: a null, which matches nothing).
     fn over(len: usize, key: impl Fn(usize) -> Result<Option<HKey>> + Sync) -> Result<HashIndex> {
         let n = if len >= PAR_MIN { parts_for(len).next_power_of_two().min(64) } else { 1 };
@@ -28412,14 +29165,83 @@ impl HashIndex {
 
     /// The rows holding `v`, in order.
     fn get(&self, v: &Value) -> impl Iterator<Item = usize> + '_ {
+        self.get_key((*v != Value::Null).then(|| hkey(v)))
+    }
+
+    /// The rows whose key is `k` (None, a null, matches nothing), in order.
+    fn get_key(&self, k: Option<HKey>) -> impl Iterator<Item = usize> + '_ {
         let (mut part, mut first) = (&self.parts[0], None);
-        if *v != Value::Null {
-            let k = hkey(v);
+        if let Some(k) = k {
             part = &self.parts[partition(&k, self.parts.len())];
             first = part.head.get(&k).copied();
         }
         std::iter::successors(first, |&at| Some(part.next[at]).filter(|&n| n != usize::MAX)).map(|at| part.rows[at])
     }
+}
+
+/// The hash key of several values together: one value's own key, several as a tuple; None if
+/// any is null (a null matches nothing).
+fn vals_key<'a>(vals: impl IntoIterator<Item = &'a Value>) -> Option<HKey> {
+    let mut keys: Vec<HKey> = vals.into_iter().map(|v| (*v != Value::Null).then(|| hkey(v))).collect::<Option<_>>()?;
+    Some(if keys.len() == 1 { keys.pop().unwrap() } else { HKey::Tuple(keys) })
+}
+
+/// The equalities between columns of different tables that `conds` imply and don't state:
+/// `a.x = b.y` and `b.y = c.z` give `a.x = c.z`. Columns are `Expr::Idx` into `cols`, table k's
+/// in `ranges[k]`; a class of equal columns counts only if they all have one type and collation.
+fn implied_equalities(conds: &[&Expr], cols: &[Col], ranges: &[std::ops::Range<usize>]) -> Vec<Expr> {
+    let table = |i: usize| ranges.iter().position(|r| r.contains(&i));
+    let mut pairs = vec![];
+    for e in conds {
+        if let Expr::Bin(a, Op::Eq, b) = e
+            && let (Expr::Idx(x), Expr::Idx(y)) = (&**a, &**b)
+            && let (Some(tx), Some(ty)) = (table(*x), table(*y))
+            && tx != ty
+        {
+            pairs.push((*x.min(y), *x.max(y)));
+        }
+    }
+    if pairs.len() < 2 {
+        return vec![];
+    }
+    // classes of columns joined by `=`, smallest member first
+    let mut class: FastMap<usize, usize> = FastMap::default();
+    fn find(class: &mut FastMap<usize, usize>, i: usize) -> usize {
+        let p = *class.entry(i).or_insert(i);
+        if p == i {
+            return i;
+        }
+        let r = find(class, p);
+        class.insert(i, r);
+        r
+    }
+    for &(x, y) in &pairs {
+        let (rx, ry) = (find(&mut class, x), find(&mut class, y));
+        if rx != ry {
+            class.insert(rx.max(ry), rx.min(ry));
+        }
+    }
+    let mut members: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+    for i in class.keys().copied().collect::<Vec<_>>() {
+        let r = find(&mut class, i);
+        members.entry(r).or_default().push(i);
+    }
+    let mut out = vec![];
+    for (_, mut m) in members {
+        m.sort_unstable();
+        let first = &cols[m[0]];
+        if !m.iter().all(|&i| cols[i].ty == first.ty && cols[i].coll == first.coll) {
+            continue;
+        }
+        for (n, &x) in m.iter().enumerate() {
+            for &y in &m[n + 1..] {
+                if table(x) != table(y) && !pairs.contains(&(x, y)) {
+                    out.push(Expr::Bin(Box::new(Expr::Idx(x)), Op::Eq, Box::new(Expr::Idx(y))));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Batches end to end, in order.
@@ -28467,7 +29289,7 @@ impl Drop for Parts<'_> {
         if let Some(how) = self.counted.take() {
             let found = *self.found.get_mut();
             let asked = match self.access {
-                Access::Ids(r) => r.len() as i64,
+                Access::Ids(r) | Access::QuietIds(r) => r.len() as i64,
                 Access::Rows(r) => r.len() as i64,
                 _ => found,
             };
@@ -28492,7 +29314,7 @@ impl<'a> Parts<'a> {
         let prefix = format!("{}/", t.name);
         let (marks, total, k) = match access {
             Access::Rows(r) => (vec![], r.len(), parts_for(r.len())),
-            Access::Ids(r) => (vec![], r.len(), parts_for(r.len())),
+            Access::Ids(r) | Access::QuietIds(r) => (vec![], r.len(), parts_for(r.len())),
             _ => {
                 let (mut marks, mut total) = v.marks(&prefix, View::MARK_ROWS)?;
                 if marks.len() + 1 < parts_for(total) {
@@ -28598,6 +29420,15 @@ impl<'a> Parts<'a> {
                     }
                 }
             }
+            Access::QuietIds(r) => {
+                let quiet = self.v.unrecorded();
+                for id in &r[i * n / k..(i + 1) * n / k] {
+                    let key = row_key(&t.name, id);
+                    if let Some(raw) = quiet.get(&key)? {
+                        one(&key, &raw)?;
+                    }
+                }
+            }
             Access::Range(after, upto) => {
                 // this part's share of the range: most parts of a narrow range have none
                 let lo = self.cut(i).max(after.as_deref());
@@ -28674,6 +29505,8 @@ enum Access {
     Rows(Vec<(String, Val)>),
     /// The rows with these ids, in key order, each read as it's reached (what a B-tree index found)
     Ids(Vec<String>),
+    /// Ids, read past the world's read set: `index_access` recorded the rows its conditions can match instead
+    QuietIds(Vec<String>),
     /// The rows with keys after the first (exclusive) up to the second (inclusive); None: no bound.
     Range(Option<String>, Option<String>),
 }
@@ -28721,7 +29554,7 @@ fn scan(
         // at, and the rows it found)
         let counted = pgstat::taken(&t.name);
         let asked = match &access {
-            Access::Ids(ids) => Some(ids.len() as i64),
+            Access::Ids(ids) | Access::QuietIds(ids) => Some(ids.len() as i64),
             Access::Key(_) => Some(1),
             _ => None,
         };
@@ -28750,6 +29583,16 @@ fn scan(
             Access::Ids(ids) => {
                 for id in ids {
                     if let Some(raw) = v.get(&row_key(&t.name, &id))?
+                        && !one(&id, &raw)?
+                    {
+                        break;
+                    }
+                }
+            }
+            Access::QuietIds(ids) => {
+                let quiet = v.unrecorded();
+                for id in ids {
+                    if let Some(raw) = quiet.get(&row_key(&t.name, &id))?
                         && !one(&id, &raw)?
                     {
                         break;
@@ -28901,6 +29744,7 @@ pub fn live_summary(l: &crate::LiveCheck) -> String {
 /// world that checks its reads read when it scanned a whole table with them (see `stale`). The
 /// conditions on their own are a superset of the rows the scan returned, so a row changed outside
 /// them can't have changed what it read.
+#[derive(Clone)]
 pub(crate) struct RowFilter {
     table: String,
     conds: Vec<(String, Bounds)>,
@@ -28918,6 +29762,7 @@ fn kept_value(v: &Value) -> Option<Json> {
         Value::Timestamp(t) => json!(["timestamp", t]),
         Value::TimestampTz(t) => json!(["timestamptz", t]),
         Value::Time(t) => json!(["time", t]),
+        Value::Numeric(d) => json!(["numeric", d.to_string()]),
         _ => return None,
     })
 }
@@ -28935,6 +29780,7 @@ fn kept_value_back(j: &Json) -> Option<Value> {
         "timestamp" => Value::Timestamp(n()?),
         "timestamptz" => Value::TimestampTz(n()?),
         "time" => Value::Time(n()?),
+        "numeric" => Value::Numeric(decimal::Dec::parse(j[1].as_str()?)?),
         _ => return None,
     })
 }
@@ -28968,6 +29814,61 @@ impl RowFilter {
         Some(json!({ "table": self.table, "conds": conds }))
     }
 
+    /// These conditions as a Postgres condition on the rows of alias `a`, given the Postgres type of each column
+    /// (`format_type`, as `crate::attach` records it): for asking the Postgres an attached folder copies for the rows
+    /// they can match. Written only where Postgres compares exactly as here: whole numbers on integer and numeric
+    /// columns, text on text and varchar compared byte by byte (`COLLATE "C"`, as here), booleans, and IS NULL. Any
+    /// other condition is left out, which only lets more rows through; None when none is left (every row may match).
+    pub(crate) fn to_postgres(&self, a: &str, types: &[(String, String)]) -> Option<String> {
+        let mut parts = vec![];
+        for (c, b) in &self.conds {
+            let Some((_, ty)) = types.iter().find(|(n, _)| n == c) else { continue };
+            let numeric = matches!(ty.as_str(), "smallint" | "integer" | "bigint") || ty.starts_with("numeric");
+            let text = ty == "text" || ty.starts_with("character varying");
+            let col = format!("{a}.{}", crate::attach::q(c));
+            let text = text && b.coll.is_none();
+            if !numeric && !text && ty != "boolean" {
+                if b.eq == Some(Value::Null) {
+                    parts.push(format!("{col} is null"));
+                }
+                continue;
+            }
+            let x = if text { format!("{col} collate \"C\"") } else { col };
+            // a value as Postgres reads it for this column, or None: one of another type, left out
+            let lit = |v: &Value| match v {
+                Value::Int(n) if numeric => Some(n.to_string()),
+                // (a constant compared with a numeric column is one: written as Postgres reads it back, NaN too)
+                Value::Numeric(d) if numeric => Some(format!("'{d}'::numeric")),
+                Value::Text(s) if text => Some(format!("'{}'", s.replace('\'', "''"))),
+                Value::Bool(x) if !numeric && !text => Some(x.to_string()),
+                _ => None,
+            };
+            match &b.eq {
+                Some(Value::Null) => parts.push(format!("{x} is null")),
+                Some(e) => {
+                    if let Some(l) = lit(e) {
+                        parts.push(format!("{x} = {l}"));
+                    }
+                }
+                None => {}
+            }
+            if let Some(ps) = &b.points
+                && let Some(ls) = ps.iter().map(lit).collect::<Option<Vec<_>>>()
+                && !ls.is_empty()
+            {
+                parts.push(format!("{x} in ({})", ls.join(", ")));
+            }
+            for (bound, op) in [(&b.lo, [">", ">="]), (&b.hi, ["<", "<="])] {
+                if let Some((v, inc)) = bound
+                    && let Some(l) = lit(v)
+                {
+                    parts.push(format!("{x} {} {l}", op[*inc as usize]));
+                }
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join(" and "))
+    }
+
     /// Back from `to_json`.
     pub(crate) fn from_json(j: &Json) -> Option<RowFilter> {
         let bound = |x: &Json| -> Option<Option<(Value, bool)>> {
@@ -28994,6 +29895,55 @@ impl RowFilter {
             })
             .collect::<Option<_>>()?;
         Some(RowFilter { table: j["table"].as_str()?.to_string(), conds })
+    }
+}
+
+#[cfg(test)]
+mod row_filter_tests {
+    use super::{Bounds, RowFilter, Value};
+
+    #[test]
+    fn only_conditions_postgres_compares_as_here_are_asked_of_it() {
+        let types: Vec<(String, String)> =
+            [("org_id", "integer"), ("status", "text"), ("score", "double precision"), ("total", "numeric(10,2)")]
+                .iter()
+                .map(|(n, t)| (n.to_string(), t.to_string()))
+                .collect();
+        let eq = |v: Value| Bounds { eq: Some(v), ..Default::default() };
+        let f = |conds: Vec<(&str, Bounds)>| RowFilter {
+            table: "leads".into(),
+            conds: conds.into_iter().map(|(c, b)| (c.to_string(), b)).collect(),
+        };
+        let both = f(vec![("org_id", eq(Value::Int(42))), ("status", eq(Value::Text("o'pen".into())))]);
+        assert_eq!(
+            both.to_postgres("t", &types).as_deref(),
+            Some(r#"t."org_id" = 42 and t."status" collate "C" = 'o''pen'"#)
+        );
+        // a float, or a value of another type than the column's: left out, so more rows are asked for, never fewer
+        let odd =
+            f(vec![("org_id", eq(Value::Int(42))), ("score", eq(Value::Float(1.5))), ("status", eq(Value::Int(1)))]);
+        assert_eq!(odd.to_postgres("t", &types).as_deref(), Some(r#"t."org_id" = 42"#));
+        let ranged = f(vec![(
+            "org_id",
+            Bounds { lo: Some((Value::Int(1), true)), hi: Some((Value::Int(9), false)), ..Default::default() },
+        )]);
+        assert_eq!(ranged.to_postgres("t", &types).as_deref(), Some(r#"t."org_id" >= 1 and t."org_id" < 9"#));
+        let listed =
+            f(vec![("org_id", Bounds { points: Some(vec![Value::Int(1), Value::Int(2)]), ..Default::default() })]);
+        assert_eq!(listed.to_postgres("t", &types).as_deref(), Some(r#"t."org_id" in (1, 2)"#));
+        let dec = super::decimal::Dec::parse("42.50").unwrap();
+        let money = f(vec![("total", eq(Value::Numeric(dec)))]);
+        assert_eq!(money.to_postgres("t", &types).as_deref(), Some(r#"t."total" = '42.50'::numeric"#));
+        // kept as it is across a clean close (see `stale`), so the read is still narrowed after it
+        let back = RowFilter::from_json(&money.to_json().expect("a numeric bound is kept")).unwrap();
+        assert_eq!(back.to_postgres("t", &types).as_deref(), Some(r#"t."total" = '42.50'::numeric"#));
+        assert_eq!(
+            f(vec![("score", eq(Value::Null))]).to_postgres("t", &types).as_deref(),
+            Some(r#"t."score" is null"#)
+        );
+        // nothing left to ask by: every row may match
+        assert_eq!(f(vec![("score", eq(Value::Float(1.5)))]).to_postgres("t", &types), None);
+        assert_eq!(f(vec![("gone", eq(Value::Int(1)))]).to_postgres("t", &types), None);
     }
 }
 
@@ -29650,10 +30600,35 @@ pub fn masks_refuse(db: &Db, branch: &str, tables: &[&str]) -> Result<Option<Str
     mask::agent_refused(db, "chronos mcp (started without --unmask)", branch, tables)
 }
 
+/// For the row API's reads and writes of rows (get, find, put, delete, batch) by agent `agent` held to a tenant: the
+/// message refusing it a table of `tables` with the tenant's column, which SQL keeps to the tenant and the row API,
+/// reading rows as they are, can't. Its own world's diff and merge aren't asked: every row in it was written held to
+/// the tenant, and it may see no other world's (see `Acting::may_see_changes`).
+pub fn tenant_refuses(db: &Db, agent: &str, branch: &str, tables: &[&str]) -> Result<Option<String>> {
+    if let Ok(a) = db.agent(agent)
+        && let Some(col) = a.tenant.as_ref().and_then(|t| t["column"].as_str().map(String::from))
+    {
+        let v = db.view_tx(branch)?;
+        for t in tables {
+            if load_world(&v, t)?.is_some_and(|tb| tb.cols.iter().any(|c| c.name == col)) {
+                return Ok(Some(format!(
+                    "agent {agent} works for one tenant ({}), and the row API works on rows as they are: read and \
+                     change table \"{}\" with SQL (the sql tool, or POST /v1/sql), which keeps to the tenant",
+                    a.tenant_sql().unwrap_or_default(),
+                    rel_part(t)
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Whether `row_security_refuses` may refuse anything: a table of the database has had row-level security or a
 /// policy, or the database has a mask key (some column was masked).
 pub fn row_security_possible(db: &Db) -> bool {
-    db.core.has_row_security() || db.core.masks_made()
+    db.core.has_row_security()
+        || db.core.masks_made()
+        || db.agents().is_ok_and(|a| a.iter().any(|a| a.tenant.is_some()))
 }
 
 /// An hstore's binary form on the wire, as hstore_recv reads it and hstore_send writes it: how many pairs, then
@@ -33399,13 +34374,16 @@ fn base_representation(v: &View, func: &str, which: &str) -> Result<Type> {
 }
 
 /// The rows of a query a function is given as text (ts_rewrite's and ts_stat's, run as Postgres runs
-/// them through SPI): in a session of its own on the running statement's world, which is left as it
-/// was (its zone, catalog, search path and session) once the query is done.
+/// them through SPI, a read-only cursor: see `read_only_text`): in a session of its own on the running statement's
+/// world, which is left as it was (its zone, catalog, search path and session) once the query is done. Not under
+/// EXPLAIN without ANALYZE (see `dry_run`): the query isn't looked at, so it isn't run.
 fn inner_query(sql: &str, who: &str) -> Result<Output> {
+    dry_refusal(|| format!("{who}()'s query"))?;
     let Some(ctx) = STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.clone())) else {
         return err(UNSUPPORTED, format!("{who}() needs a session"));
     };
     let Some(db) = ctx.core.db() else { return err(UNSUPPORTED, format!("{who}() needs a running database")) };
+    read_only_text(sql, true)?;
     let (zone, world, path, home) =
         (time::zone_state(), catalog::world_state(), PATH.with_borrow(Clone::clone), SESSION.with_borrow(Clone::clone));
     let ran = run(&db, &ctx.world, sql, &[]);
@@ -33418,6 +34396,51 @@ fn inner_query(sql: &str, who: &str) -> Result<Output> {
         message: format!("{who}() was given a statement that returns no rows"),
         info: None,
     })
+}
+
+/// Refuses query text a function runs as Postgres's runs it through SPI read-only (ts_stat's and ts_rewrite's cursor,
+/// query_to_xml's SPI_execute): a statement that isn't a SELECT, or changes rows or locks them (a subquery's FOR
+/// UPDATE too), "is not allowed in a non-volatile function"; `one`: a cursor's, of one statement that gives rows, else
+/// 42P11 (invalid_cursor_definition), as SPI_cursor_open raises it. So the text can't write, or reach past the session
+/// (a merge, a world dropped), whatever the statement that runs it was let do.
+fn read_only_text(sql: &str, one: bool) -> Result<()> {
+    let stmts = parse(sql)?;
+    if one && stmts.len() != 1 {
+        return err("42P11", "cannot open multi-query plan as cursor");
+    }
+    for s in &stmts {
+        if one && !gives_rows(&s.0) {
+            return err("42P11", format!("cannot open {} query as cursor", functions::what(&s.0)));
+        }
+        if let Some(e) = non_volatile_refusal(&s.0) {
+            return Err(e);
+        }
+        if !matches!(s.0, Stmt::Select(_)) {
+            return err(UNSUPPORTED, format!("{} is not allowed in a non-volatile function", functions::what(&s.0)));
+        }
+        // (a subquery's FOR UPDATE, which Postgres's planner makes the statement's row marks)
+        let mut locks = None;
+        let _ = functions::visit(&mut s.0.clone(), &mut |_| Ok(()), &mut |q| {
+            locks = locks.or(q.locking.iter().map(|c| c.0).max());
+        });
+        if let Some(strongest) = locks {
+            return err(UNSUPPORTED, format!("{} is not allowed in a non-volatile function", locking_tag(strongest)));
+        }
+    }
+    Ok(())
+}
+
+/// Whether statement `s` gives rows, as a cursor needs (Postgres's plan's result description): a query, or a write
+/// with RETURNING.
+fn gives_rows(s: &Stmt) -> bool {
+    match s {
+        Stmt::Select(_) | Stmt::Locking(..) | Stmt::Explain { .. } => true,
+        Stmt::Insert { returning, .. } | Stmt::Update { returning, .. } | Stmt::Delete { returning, .. } => {
+            returning.is_some()
+        }
+        Stmt::With(w) => gives_rows(&w.main),
+        _ => false,
+    }
 }
 
 /// Runs merge check `query` on world `world` in a session of its own, within `timeout` ms, and
@@ -33669,6 +34692,29 @@ pub fn table_statistics(db: &crate::Core, branch: &str, name: &str) -> Result<Ve
     Ok(statistics::shown_for_table(&catalog::Catalog::of(db, branch)?, name))
 }
 
+/// Column `c`'s type id where it isn't its type's own, and its type modifier, as `TableInfo::typmods` keeps them.
+fn col_typmod(c: &Col) -> (i64, i64) {
+    match (c.chars, c.numeric) {
+        // bit(n) and bit varying(n) keep their length without the four a character type's modifier adds
+        (Some((n, fixed)), _) if matches!(c.ty, Type::Bit | Type::VarBit) => {
+            (if fixed { 1560 } else { 1562 }, i64::from(n))
+        }
+        // (a varchar's and a char(n)'s, their arrays' too: `_varchar` with its elements' typmod)
+        (Some(chars), _) if matches!(c.ty, Type::Text | Type::Array(25)) => {
+            match chars_oid(Some(chars), c.ty != Type::Text) {
+                Some((oid, typmod)) => (i64::from(oid), i64::from(typmod)),
+                None => (0, -1),
+            }
+        }
+        (_, Some((p, s))) => (1700, (i64::from(p) << 16 | (i64::from(s) & 0x7ff)) + 4),
+        _ if c.ty == Type::Text && c.coll.folds() => (collation::CITEXT_OID, -1),
+        _ if c.dim.is_some_and(|d| d >= TPREC) => (0, i64::from(c.dim.unwrap_or(TPREC) - TPREC)),
+        _ if c.dim.is_some() => (0, i64::from(c.dim.unwrap_or(0))),
+        _ if c.small => (21, -1),
+        _ => (0, -1),
+    }
+}
+
 /// The tables on a branch, by name: made with CREATE TABLE, or by writing JSON rows; and its
 /// views and sequences.
 pub fn tables(db: &crate::Core, branch: &str) -> Result<Vec<TableInfo>> {
@@ -33687,6 +34733,8 @@ pub fn tables(db: &crate::Core, branch: &str) -> Result<Vec<TableInfo>> {
         ps.sort_by_key(|p| p.made);
     }
     let reg = if policies.is_empty() { None } else { Some(roles::registry(db)?) };
+    // how many times each relation's storage was made anew (pg_class.relfilenode), kept apart from the schemas
+    let gens = tablespace::Gens::all(&v)?;
     for name in names.clone() {
         let info = |kind| TableInfo {
             name: name.clone(),
@@ -33848,29 +34896,7 @@ pub fn tables(db: &crate::Core, branch: &str) -> Result<Vec<TableInfo>> {
                 Some((d.start, d.inc, d.max, d.min, d.cycle))
             })
             .collect();
-        let typmods = t
-            .cols
-            .iter()
-            .map(|c| match (c.chars, c.numeric) {
-                // bit(n) and bit varying(n) keep their length without the four a character type's modifier adds
-                (Some((n, fixed)), _) if matches!(c.ty, Type::Bit | Type::VarBit) => {
-                    (if fixed { 1560 } else { 1562 }, i64::from(n))
-                }
-                // (a varchar's and a char(n)'s, their arrays' too: `_varchar` with its elements' typmod)
-                (Some(chars), _) if matches!(c.ty, Type::Text | Type::Array(25)) => {
-                    match chars_oid(Some(chars), c.ty != Type::Text) {
-                        Some((oid, typmod)) => (i64::from(oid), i64::from(typmod)),
-                        None => (0, -1),
-                    }
-                }
-                (_, Some((p, s))) => (1700, (i64::from(p) << 16 | (i64::from(s) & 0x7ff)) + 4),
-                _ if c.ty == Type::Text && c.coll.folds() => (collation::CITEXT_OID, -1),
-                _ if c.dim.is_some_and(|d| d >= TPREC) => (0, i64::from(c.dim.unwrap_or(TPREC) - TPREC)),
-                _ if c.dim.is_some() => (0, i64::from(c.dim.unwrap_or(0))),
-                _ if c.small => (21, -1),
-                _ => (0, -1),
-            })
-            .collect();
+        let typmods = t.cols.iter().map(col_typmod).collect();
         // the counter a serial or identity column keeps is a sequence of its own, named as Postgres names it
         for c in t.cols.iter().filter(|c| c.auto == Some(Auto::Serial)) {
             if c.seq.as_deref().is_some_and(|s| !s.contains('.') || named_sequence(&v, s)) {
@@ -33956,8 +34982,14 @@ pub fn tables(db: &crate::Core, branch: &str) -> Result<Vec<TableInfo>> {
         let reads = t.matview.as_ref().map_or_else(Vec::new, |m| {
             m["reads"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect()
         });
-        let (constraints, indexes) = catalog::describe(&v, &t);
-        let hier = hier::info(&v, &t)?;
+        let (constraints, mut indexes) = catalog::describe(&v, &t);
+        let mut hier = hier::info(&v, &t)?;
+        if let Some(g) = gens.get(&name) {
+            hier.filenode = g.table;
+            for x in &mut indexes {
+                x.filenode = g.index(&x.name);
+            }
+        }
         let shown = |text: &Option<String>| text.as_ref().map(|x| catalog::expr_def(x, &t.cols, true));
         let policies = policies
             .get(&name)
@@ -34073,6 +35105,9 @@ pub struct Session {
     /// masked columns read masked though no agent acts (a plain `chronos mcp <folder>`, a model the database's
     /// owner runs: see `mask`)
     pub masked: bool,
+    /// a client of the server (the Postgres port, HTTP), not the folder's own shell or the library: it can't turn
+    /// main's protection off (see `Setting::ProtectMain`), as whoever holds the server's token could
+    pub remote: bool,
     /// SET hnsw.ef_search (0: the search index's default)
     ef: usize,
     /// SET statement_timeout, in ms (0: none; None: the database's default, see `Setting`)
@@ -34274,6 +35309,34 @@ pub(crate) fn forget_world_stats(uid: u64, worlds: &[&str]) {
     if !worlds.is_empty() {
         stmtstats::forget_worlds(uid, worlds);
     }
+}
+
+/// Forgets the composite types the process read in of worlds of database `uid` that were dropped (a transaction's
+/// too) or brought up to their world (a READ COMMITTED transaction's levels), or of all of them (None: it closed).
+/// See `userdefs::forget_worlds`.
+pub(crate) fn forget_world_types(uid: u64, worlds: Option<&[&str]>) {
+    match worlds {
+        Some(w) => userdefs::forget_worlds(uid, w),
+        None => userdefs::forget_database(uid),
+    }
+}
+
+/// World `child` of `core` merged whole into `parent`: its composite types forgotten, and the parent's read in again
+/// where the merge may have changed them (see `userdefs::merged`).
+pub(crate) fn merged_world_types(core: &crate::Core, child: &str, parent: Option<&str>) {
+    userdefs::merged(core, child, parent);
+}
+
+/// World `world` of `core`'s rows changed other than by its sessions' statements (a merge into it that leaves the
+/// merged world open, a rebase, a write of a type's row through the API, RESTORE): the composite types the process
+/// read in of it are read in again (see `userdefs::reread`).
+pub(crate) fn world_types_moved(core: &crate::Core, world: &str) {
+    userdefs::reread(core, world);
+}
+
+/// Whether row `key` is a type's (see `type_key`): a write of one changes the world's composite types.
+pub(crate) fn type_row(key: &str) -> bool {
+    key.starts_with("_sonos_types/")
 }
 
 /// Forgets a connection that closed.
@@ -34499,6 +35562,10 @@ fn setting(st: &SessState, live: &[(&str, String)], name: &str) -> Option<(Strin
     if let Some((n, v)) = SETTINGS.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
         return Some((n.to_string(), v.to_string()));
     }
+    // chronos.explain, not set (or RESET): its default, which SHOW says (see `explain_shows_postgres`)
+    if name == "chronos.explain" {
+        return Some((name.to_string(), if pg_exact() { "postgres" } else { "chronos" }.to_string()));
+    }
     // a custom setting the session made once
     if name.contains('.') && st.placeholders.contains(name) {
         return Some((name.to_string(), String::new()));
@@ -34544,8 +35611,33 @@ fn checked_setting(name: &str, value: Option<&str>) -> Result<Option<String>> {
                 ..Violation::default()
             })),
         }),
+        // chronos.explain: what EXPLAIN (COSTS OFF) shows (see `explain_shows_postgres`)
+        (None, Some(v)) if name.eq_ignore_ascii_case("chronos.explain") => {
+            match v.trim().to_ascii_lowercase().as_str() {
+                m @ ("chronos" | "postgres") => Ok(Some(m.to_string())),
+                _ => Err(SqlError {
+                    code: "22023",
+                    message: format!("invalid value for parameter \"chronos.explain\": \"{v}\""),
+                    info: Some(Box::new(Violation {
+                        hint: Some("Available values: chronos, postgres.".into()),
+                        ..Violation::default()
+                    })),
+                }),
+            }
+        }
         (None, v) if name.contains('.') => Ok(v.map(String::from)),
         (None, _) => Err(unknown_setting(name)),
+    }
+}
+
+/// Whether EXPLAIN (COSTS OFF) shows the plan PostgreSQL 16 would choose (where `plan` can make it) rather than
+/// Chronos's own steps: only when the session asks for it (`SET chronos.explain = postgres`), so no client is shown a
+/// plan Chronos doesn't run without asking; and by default in exact mode (CHRONOS_PG_EXACT, the regression suite's).
+fn explain_shows_postgres() -> bool {
+    match session_setting("chronos.explain").map(|m| m.to_ascii_lowercase()).as_deref() {
+        Some("postgres") => true,
+        Some("chronos") => false,
+        _ => pg_exact(),
     }
 }
 
@@ -34571,6 +35663,9 @@ fn setting_name_shown(name: &str) -> String {
 
 /// Every setting the running session can read, for SHOW ALL and pg_settings: (name, value, where
 /// it came from, whether SET can't change it). Without a session, Chronos's values as they are at start.
+/// chronos.explain's description, as SHOW ALL and pg_settings give it.
+pub(super) const EXPLAIN_SETTING_ABOUT: &str = "Which plan EXPLAIN (COSTS OFF) shows: chronos (how Chronos runs it) or postgres (the plan PostgreSQL 16 would choose).";
+
 fn all_settings() -> Vec<(String, String, &'static str, bool)> {
     let ctx = STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.clone()));
     let none = SessState::default();
@@ -34597,8 +35692,17 @@ fn all_settings() -> Vec<(String, String, &'static str, bool)> {
             out.push((shown, value, if set { "session" } else { "default" }, read_only));
         }
     }
+    // chronos.explain, set or not, as a setting an extension defines is listed (not in exact mode, whose pg_settings
+    // are Postgres's alone)
+    if !pg_exact()
+        && let Some((shown, value)) = setting(st, live, "chronos.explain")
+    {
+        let set = st.local.contains_key("chronos.explain") || st.settings.contains_key("chronos.explain");
+        out.push((shown, value, if set { "session" } else { "default" }, false));
+    }
     // custom settings (SET app.org_id = ...) the session made
-    let mut custom: Vec<_> = st.settings.iter().chain(st.local.iter()).filter(|(n, _)| n.contains('.')).collect();
+    let mut custom: Vec<_> =
+        st.settings.iter().chain(st.local.iter()).filter(|(n, _)| n.contains('.') && *n != "chronos.explain").collect();
     custom.sort();
     out.extend(custom.into_iter().map(|(n, v)| (n.clone(), v.clone(), "session", false)));
     out.sort_by_key(|a| a.0.to_lowercase());
@@ -34617,6 +35721,7 @@ const NOTE_EVERY: u64 = 60_000;
 fn shown_reads(reads: impl IntoIterator<Item = (String, String)>) -> Vec<(String, String)> {
     reads
         .into_iter()
+        .filter(|(_, c)| !c.is_empty()) // a table read for its rows alone (see `impact::trace`)
         .filter(|(t, _)| !t.starts_with("pg_") && !t.starts_with("information_schema") && !crate::reserved_table(t))
         .collect()
 }
@@ -35144,6 +36249,7 @@ impl Session {
             tx: None,
             agent: None,
             masked: false,
+            remote: false,
             ef: 0,
             timeout: None,
             cancel: Default::default(),
@@ -35201,6 +36307,81 @@ impl Session {
         db.note_reads(client, &fresh);
     }
 
+    /// For a world that checks its reads (see `stale`): the columns of each table plain SELECT `s` reads, so a row
+    /// changed since only in other columns doesn't hold its merge. None, and any column counts: another statement,
+    /// one calling a function made with CREATE FUNCTION (which may read anything), or under row security (whose
+    /// policies read columns the query doesn't name). A table read whole (`*`) is left out: all of its columns.
+    fn read_columns(&self, db: &Db, s: &Statement) -> Option<crate::stale::Using> {
+        let Stmt::Select(_) = &s.0 else { return None };
+        if db.has_row_security() || self.agent.as_ref().is_some_and(|a| db.agent(a).is_ok_and(|a| a.tenant.is_some())) {
+            return None;
+        }
+        let v = db.view_tx(self.target()).ok()?;
+        if !v.recording() {
+            return None;
+        }
+        // with the views it reads inlined: a view may call a function, or read columns the statement doesn't name
+        let views = db.has_views();
+        let mut st = match views {
+            true => match expand_stmt(&v, &s.0, None, true, true) {
+                Ok(Some((e, _))) => e,
+                Ok(None) => s.0.clone(),
+                Err(_) => return None,
+            },
+            false => s.0.clone(),
+        };
+        // what may read more than the columns it names: a function made with CREATE FUNCTION, an aggregate made with
+        // CREATE AGGREGATE (its state function's SQL) in place or as a window function, and a function that reaches
+        // past the row (a table's size, the catalog, a sequence)
+        fn opaque(e: &Expr) -> bool {
+            let user_agg = |a: &Agg| matches!(a, Agg::List(ListAgg::User(_), _));
+            match e {
+                Expr::Call(_) | Expr::Func(Func::Ctx(_), _) => true,
+                Expr::Agg(a, ..) => user_agg(a),
+                Expr::Window(w) => matches!(&w.func, WinFn::Agg(a) if user_agg(a)),
+                _ => false,
+            }
+        }
+        let (mut calls, mut srfs) = (false, false);
+        let _ = functions::visit(
+            &mut st,
+            &mut |e| {
+                calls |= opaque(e);
+                Ok(())
+            },
+            &mut |q| {
+                // a set-returning function in FROM; a NATURAL JOIN, whose join columns aren't named yet; and DISTINCT
+                // ON with a subquery in it: any column may count
+                srfs |= q.from.iter().chain(q.joins.iter().map(|j| &j.src)).any(|f| f.srf.is_some())
+                    || q.joins.iter().any(|j| j.natural)
+                    || q.distinct_on.iter().any(|e| {
+                        let mut found = false;
+                        walk(e, &mut |x| {
+                            found |= opaque(x) || matches!(x, Expr::Sub(_) | Expr::Exists(..) | Expr::InSub(..))
+                        });
+                        found
+                    });
+            },
+        );
+        if calls || srfs {
+            return None;
+        }
+        let mut cols: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+        let mut whole = HashSet::new();
+        let Stmt::Select(q) = &st else { return None };
+        for (t, c) in impact::named_reads(&v, q) {
+            if c == "*" {
+                whole.insert(t.clone());
+            }
+            let e = cols.entry(t).or_default();
+            if !c.is_empty() {
+                e.insert(c); // (empty: read for its rows alone, `count(*)`, `select 1`)
+            }
+        }
+        cols.retain(|t, _| !whole.contains(t));
+        Some(Arc::new(cols))
+    }
+
     /// The search_path names are looked up along, when it isn't just public (see `find_named`).
     fn search(&self, db: &Db) -> Option<SearchPath> {
         let roles = db.core.has_privileges().then(|| self.who(db).ok()).flatten();
@@ -35226,7 +36407,11 @@ impl Session {
     /// Parses `sql` as this session reads it: names without a schema found along its
     /// search_path, in its world.
     pub fn parse(&self, db: &Db, sql: &str) -> Result<Vec<Statement>> {
-        self.parsing(db, || parse(sql))
+        // (with the world's composite types as its rows have them now, as a script is: see `script`)
+        self.parsing(db, || {
+            userdefs::hydrate_composites();
+            parse(sql)
+        })
     }
 
     /// Runs `f`, a parse of the session's statements, with its search_path in reach and as the role it runs as: what
@@ -35388,10 +36573,12 @@ impl Session {
                 return Ok((Some(Output::tag(format!("CREATE {noun}"))), me.agent));
             }
             Stmt::UseBranch(..) => me.may_read(&self.branch)?,
-            Stmt::Execute { .. } => {} // the statement it runs is checked when it runs
+            // the statement it runs is checked when it runs; its arguments, worked out first, here (nextval, lo_create)
+            Stmt::Execute { .. } if safe::side_effects(&s.0) => me.may_write(&self.branch, 0)?,
+            Stmt::Execute { .. } => {}
             Stmt::CreateDatabase(_) | Stmt::DropDatabase { .. } => me.may_admin()?, // worlds with no owner
             Stmt::Simulate(_) | Stmt::Replay { .. } => {} // checked as it runs: its worlds are the agent's
-            Stmt::MergeBranch { dry: true, .. } => me.may_read(&self.branch)?,
+            Stmt::MergeBranch { name, dry: true, .. } => me.may_see_changes(&world(name))?,
             Stmt::MergeBranch { name, into: Some(into), .. } => me.may_merge_into(&world(name), into)?,
             Stmt::MergeBranch { name, .. } => me.may_merge(&world(name))?,
             // else an agent could outlive its world_ttl, or the database's world_idle_ttl
@@ -35406,7 +36593,20 @@ impl Session {
             // checked as they run: 'outbox' or 'admin', policy or not
             Stmt::AckOutbox(_) | Stmt::RetryOutbox(_) | Stmt::ClaimOutbox { .. } => {}
             Stmt::Rebase { name, .. } => me.may_write(&world(name), 0)?, // it changes the world only
-            Stmt::CheckReads(name) => me.may_read(&world(name))?,        // it reads only
+            Stmt::CheckReads(name) => me.may_see_changes(&world(name))?, // it reads only
+            // changes shown as rows, whatever tenant they are (see `Acting::may_see_changes`)
+            Stmt::Diff(a, b, ..) | Stmt::Readers(a, b) => {
+                me.may_see_changes(&world(a))?;
+                if let Some(b) = b {
+                    me.may_see_changes(b)?;
+                }
+            }
+            Stmt::ShowHistory { world: w, .. } => match w {
+                Some(w) => me.may_see_changes(w)?,
+                None => me.may_list_all("SHOW HISTORY")?,
+            },
+            Stmt::ShowReviews => me.may_list_all("SHOW REVIEWS")?,
+            Stmt::ShowAudit { .. } => me.may_list_all("SHOW AUDIT")?,
             // its own; another's is for those who manage agents
             Stmt::ShowAgentPrivileges { agent, world: w } => {
                 me.may_read(w.as_deref().unwrap_or(&self.branch))?;
@@ -35977,6 +37177,14 @@ impl Session {
     /// CREATE TABLE AS and SELECT INTO: the query's columns make the table (as its own, with no keys
     /// or defaults), then its rows go in. All or nothing: outside a transaction it runs in one of its
     /// own, so a query that fails leaves no table behind.
+    ///
+    /// Postgres binds what the query reads before it makes the table, so the query never reads the new table. Here
+    /// the query's names are bound as it is parsed, and a name it reads that isn't there yet fails as its columns are
+    /// found, before the table is made; but a temporary table and the world's table of its name are both read by
+    /// that name, the temporary one first, so `CREATE TEMP TABLE t AS SELECT * FROM public.t` would read the new,
+    /// empty table. So a temporary table's query runs first, its rows held (an INSERT into a temporary table takes
+    /// them whole anyway), then the table is made and they go in. A permanent table's go in by an INSERT ... SELECT
+    /// once it is made, which holds only a part of them at a time.
     #[allow(clippy::too_many_arguments)]
     fn create_table_as(
         &mut self,
@@ -35990,6 +37198,7 @@ impl Session {
         if_not_exists: bool,
         temp: bool,
         data: bool,
+        space: Option<&str>,
     ) -> Result<Output> {
         let select = Statement(Stmt::Select(Box::new(query.clone())), PlanCache::default(), s.2);
         let found = self.columns(db, &select, types)?.unwrap_or_default();
@@ -36003,78 +37212,21 @@ impl Session {
             (None, true) => false,
             _ => relation_kind(&db.view_tx(self.target())?, table)?.is_some(),
         };
-        if exists && if_not_exists {
+        if exists {
+            if !if_not_exists {
+                return Err(ctas_exists(table));
+            }
             notice("NOTICE", format!("relation \"{}\" already exists, skipping", rel_part(table)));
             return Ok(Output::tag("CREATE TABLE AS"));
         }
-        let names: Vec<String> = found.iter().enumerate().map(|(i, (n, _))| cols.get(i).unwrap_or(n).clone()).collect();
         // CREATE on the schema and USAGE on the columns' types (a domain's too, which the table's columns
         // don't keep), as the table is made
-        if !exists && !temp {
+        if !temp {
             self.may_run(db, &s.0)?;
         }
-        if !exists {
-            if cols.len() > found.len() {
-                return err(SYNTAX, "too many column names were specified");
-            }
-            if let Some((_, n)) = names.iter().enumerate().find(|(i, n)| names[..*i].contains(n)) {
-                return err(DUP_COLUMN, format!("column \"{n}\" specified more than once"));
-            }
-            no_void_column(&names, &found)?;
-        }
-        // (and their collations, as Postgres keeps them: a query of tables' columns, best found)
-        let colls = db
-            .view_tx(self.target())
-            .ok()
-            .and_then(|v| select_columns_with(&v, query, &[], &[]).ok())
-            .map(|(_, c)| c)
-            .unwrap_or_default();
-        // (a char(n) or varchar(n) column of the query stays one: a char(n)'s blanks are not part of its values)
-        let widths = db.view_tx(self.target()).ok().map(|v| char_widths(&v, query)).unwrap_or_default();
-        let mut made: Vec<ColDef> = vec![];
-        for (i, (n, (_, t))) in names.iter().zip(&found).enumerate() {
-            let coll = match colls.get(i).map(|s| s.column()) {
-                Some(collation::Coll::INDETERMINATE) if collation::collatable(*t) => {
-                    return Err(collation::underived(n));
-                }
-                Some(c) if c != collation::Coll::DEFAULT && collation::collatable(*t) => Some(c),
-                _ => None,
-            };
-            let chars =
-                held_chars(widths.get(i).copied().flatten()).filter(|_| matches!(*t, Type::Text | Type::Array(25)));
-            made.push(ColDef { collate: coll.map(collation::Named::Coll), chars, ..plain_col(n, *t) });
-        }
-        let create = Statement(
-            Stmt::Create {
-                constraints: vec![],
-                table: table.into(),
-                cols: made,
-                key: vec![],
-                if_not_exists,
-                temp,
-                likes: vec![],
-                on_commit: None,
-                hier: Default::default(),
-                unlogged: false,
-            },
-            PlanCache::default(),
-            false,
-        );
-        let insert = Statement(
-            Stmt::Insert {
-                table: table.into(),
-                alias: None,
-                cols: None,
-                rows: vec![],
-                query: Some(Box::new(query.clone())),
-                conflict: None,
-                returning: None,
-                overriding: None,
-                checks: None,
-            },
-            PlanCache::default(),
-            s.2,
-        );
+        let (names, made) = ctas_columns(db.view_tx(self.target()).ok().as_ref(), query, &found, cols)?;
+        let create = Statement(ctas_create(table, made, if_not_exists, temp, space), PlanCache::default(), false);
+        let first = data && temp;
         let own = self.tx.is_none();
         let plain = |st: Stmt| Statement(st, PlanCache::default(), false);
         if own {
@@ -36086,23 +37238,37 @@ impl Session {
             true => vec![],
             false => mask::derived(&db.view_tx(self.target())?, query, names.len())?,
         };
-        let made = self.step(db, &create, &[], &[]).and_then(|out| {
-            for (n, m) in names.iter().zip(&masks) {
-                if let Some(m) = m {
-                    let sql = format!(
-                        "alter table {} alter column {} set masked with {}",
-                        ident(table),
-                        ident(n),
-                        mask::mode_name(*m)
-                    );
-                    for st in parse(&sql)? {
-                        self.step(db, &st, &[], &[])?;
-                    }
-                }
+        // (read as a statement of the session's reads them, its temporary tables too)
+        let rows = match first {
+            true => self.with_temp(|| select.execute(db, self.target(), params, types)).map(|o| Some(o.rows)),
+            false => Ok(None),
+        };
+        let made = rows.and_then(|rows| {
+            let out = self.step(db, &create, &[], &[])?;
+            for st in ctas_masks(table, &names, &masks)? {
+                self.step(db, &st, &[], &[])?;
             }
             if !data {
                 return Ok(out);
             }
+            let (insert, params, types) = match rows {
+                Some(rows) if rows.is_empty() => return Ok(Output::tag("SELECT 0")),
+                Some(rows) => (plain(ctas_insert(table, rows)), &[] as &[Value], &[] as &[Type]),
+                None => {
+                    let insert = Stmt::Insert {
+                        table: table.into(),
+                        alias: None,
+                        cols: None,
+                        rows: vec![],
+                        query: Some(Box::new(query.clone())),
+                        conflict: None,
+                        returning: None,
+                        overriding: None,
+                        checks: None,
+                    };
+                    (Statement(insert, PlanCache::default(), s.2), params, types)
+                }
+            };
             let out = acl::filling(table, || self.step(db, &insert, params, types))?;
             let n = out.tag.rsplit(' ').next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
             Ok(Output::tag(format!("SELECT {n}")))
@@ -36423,11 +37589,13 @@ impl Session {
     pub fn script(&self, db: &Db, sql: &str) -> Result<Script> {
         self.received(Arc::from(sql));
         let mut s = self.parsing(db, || {
+            userdefs::hydrate_composites();
             range::hydrate();
             userdefs::hydrate();
             Script::new(sql)
         })?;
         s.resolved = self.search(db).is_some();
+        s.world.clone_from(&self.branch);
         Ok(s)
     }
 
@@ -36440,13 +37608,20 @@ impl Session {
     }
 
     /// A script's `i`th statement as it's about to run: parsed again when names in it may mean
-    /// something else by now (a search_path is or was set, and statements before it ran).
+    /// something else by now (a search_path is or was set, or a USE WORLD switched worlds, and
+    /// statements before it ran).
     pub fn next_statement(&self, db: &Db, script: &Script, i: usize) -> Result<Statement> {
         // (a script of several statements: each is recorded in pg_stat_statements by its own text)
         *self.stmt_sql.lock().unwrap_or_else(|p| p.into_inner()) =
             (script.texts.len() > 1).then(|| script.texts.get(i).cloned()).flatten();
-        if i > 0 && (script.resolved || self.search(db).is_some()) {
-            return self.parsing(db, || script.parse_again(i));
+        let moved = script.world != self.branch;
+        if i > 0 && (script.resolved || self.search(db).is_some() || moved) {
+            return self.parsing(db, || {
+                if moved {
+                    userdefs::hydrate_composites(); // (the world's composite types, as its rows have them)
+                }
+                script.parse_again(i)
+            });
         }
         Ok(script.stmts[i].clone())
     }
@@ -36785,6 +37960,7 @@ impl Session {
             agent: self.agent.is_some(),
             // (an agent without 'unmask' reads masked columns masked: see `mask`)
             masked: self.masked || (self.agent.is_some() && !agent.as_ref().is_some_and(|a| a.may(crate::Can::Unmask))),
+            tenant: agent.as_ref().and_then(|a| a.tenant_sql()).map(Arc::from),
             pid: self.pid,
             txid: self.tx.as_ref().map_or_else(next_txid, |t| t.txid),
             rc: self.tx.as_ref().is_some_and(|t| t.iso.per_statement() && !t.imported),
@@ -36795,6 +37971,7 @@ impl Session {
             gone: self.gone.clone(),
             ctx: Some(ctx),
             mem,
+            threads: agent.as_ref().map_or(0, |a| a.max_threads as usize),
         }));
         let (seed, clock) = (funcs::SEEDED.replace(self.seed), time::FROZEN.replace(self.clock));
         let who_was = roles::enter(Some(current));
@@ -36823,7 +38000,11 @@ impl Session {
         };
         // (the statistics' counts as the statement found them: a run again starts from them too)
         let stat_was = pgstat::before(&self.state, self.tx.is_some(), self.tx.as_ref().is_some_and(|t| t.failed));
+        // a world that checks its reads keeps the columns a plain SELECT reads with what it reads (see `stale`)
+        let using = crate::stale::USING.take();
+        // (worked out on the snapshot the statement runs on: a view replaced since the last one reads other columns)
         let mut out = (if takes_no_snapshot(&s.0) { Ok(()) } else { self.fresh_snapshot(db) })
+            .map(|_| crate::stale::USING.set(self.read_columns(db, s)))
             .and_then(|_| match s.0 {
                 Stmt::Select(_) if !s.2 => Ok(()),
                 _ => self.reserve(db, s, None),
@@ -36861,7 +38042,11 @@ impl Session {
             }
             if kind != RESERVE {
                 // (waiting holds nothing: no lock of the database's, nothing the statement did)
-                if let Err(e) = self.wait_for_holders(db).and_then(|_| self.fresh_snapshot(db)) {
+                if let Err(e) = self
+                    .wait_for_holders(db)
+                    .and_then(|_| self.fresh_snapshot(db))
+                    .map(|_| crate::stale::USING.set(self.read_columns(db, s)))
+                {
                     out = Err(e);
                     break;
                 }
@@ -36896,6 +38081,7 @@ impl Session {
                 .and_then(|_| self.step(db, s, params, types));
             temp_unwind(0, out.is_ok());
         }
+        crate::stale::USING.set(using);
         {
             let mut st = self.state.lock().unwrap();
             st.used.clear();
@@ -36964,6 +38150,7 @@ impl Session {
             st.pending_events.clear();
             st.fk_modes.clear();
             st.deferred_trigs.clear();
+            st.rel_locks.clear(); // and the relations it locked (with no advisory lock taken too)
         }
         // ON COMMIT DELETE ROWS and DROP: when a transaction commits, which is each statement's end
         // outside one
@@ -37022,6 +38209,15 @@ impl Session {
     }
 
     fn step(&mut self, db: &Db, s: &Statement, params: &[Value], types: &[Type]) -> Result<Output> {
+        // main's protection is what stands between a leaked token and main: a person turns it off, on the database's
+        // own machine, not an agent or a client of the server
+        if matches!(s.0, Stmt::SetSystem(crate::Setting::ProtectMain, 0)) && (self.agent.is_some() || self.remote) {
+            return err(
+                "42501",
+                "protect_main is turned off only from the database's own machine: chronos <folder> (its shell), then \
+                 ALTER SYSTEM SET protect_main = off; not by an agent or a client of the server",
+            );
+        }
         let control = takes_no_snapshot(&s.0);
         if !control && let Some(t) = &mut self.tx {
             t.queried = true;
@@ -37029,6 +38225,11 @@ impl Session {
         let in_tx = self.tx.is_some();
         let no_tx = || err("25001", "branch statements can't run inside a transaction; COMMIT or ROLLBACK first");
         match &s.0 {
+            // CREATE and DROP TABLESPACE, as Postgres's would make or remove a directory: outside a transaction
+            Stmt::Foreign(f) if in_tx && foreign::tablespace_alone(f).is_some() => err(
+                "25001",
+                format!("{} cannot run inside a transaction block", foreign::tablespace_alone(f).unwrap_or_default()),
+            ),
             // DROP SERVER ... CASCADE drops the server's foreign tables after it, by a statement of their own:
             // outside a transaction, one of its own makes the whole all or nothing
             Stmt::Foreign(f) if !in_tx && foreign::drops_tables(f) => {
@@ -37172,7 +38373,21 @@ impl Session {
                 self.set_transaction_read_only(on)
             }
             Stmt::SetVar { name, value, local } => {
+                // (chronos.explain by any case, `SET "Chronos.Explain"`, is the one setting, as Postgres's names are)
+                let lowered;
+                let name = if name.eq_ignore_ascii_case("chronos.explain") {
+                    lowered = name.to_ascii_lowercase();
+                    &lowered
+                } else {
+                    name
+                };
                 let checked = if name == "all" { None } else { checked_setting(name, value.as_deref())? };
+                // (default_tablespace names a tablespace there is, as Postgres's check_default_tablespace asks)
+                if name == "default_tablespace"
+                    && let Some(space) = &checked
+                {
+                    tablespace::check_default(&db.view_tx(self.target())?, space)?;
+                }
                 let value = &checked;
                 let mut st = self.state.lock().unwrap();
                 // (a change of stats_fetch_consistency drops the statistics' snapshot at the next read)
@@ -37237,7 +38452,10 @@ impl Session {
                 let rows: Vec<Vec<Value>> = all_settings()
                     .into_iter()
                     .map(|(n, v, ..)| {
-                        let about = settings::find(&n).map_or("", |d| d.short);
+                        let about = match n.as_str() {
+                            "chronos.explain" => EXPLAIN_SETTING_ABOUT,
+                            _ => settings::find(&n).map_or("", |d| d.short),
+                        };
                         vec![Value::Text(n), Value::Text(v), Value::Text(about.into())]
                     })
                     .collect();
@@ -37926,15 +39144,28 @@ impl Session {
                 if in_tx {
                     return no_tx();
                 }
-                let to = db.world(b)?.name; // a name, or a world's ID
+                // a name, or a world's ID; or a world as it was (`name@when`, read only), as a
+                // connection to that database name gets (see pg.rs's `startup`)
+                let (world, to) = match b.split_once('@').filter(|_| db.world(b).is_err()) {
+                    Some((w, when)) => {
+                        let w = db.world(w)?.name;
+                        let past = format!("{w}@{when}");
+                        db.view(&past)?; // a time in the history window, or why not
+                        (w, past)
+                    }
+                    None => {
+                        let w = db.world(b)?.name;
+                        (w.clone(), w)
+                    }
+                };
                 // (a session's transaction world is that session's own)
-                if db.private_world(&to) {
+                if db.private_world(&world) {
                     return Err(crate::Error::NoBranch(b.clone()).into());
                 }
                 // CONNECT on the world it switches to, as a login there would need
                 if db.core.has_privileges() {
                     let (who, _) = self.who(db)?;
-                    if !who.superuser && !acl::database(&db.view_tx(&to)?, &to)?.has(&who, acl::CONNECT) {
+                    if !who.superuser && !acl::database(&db.view_tx(&to)?, &world)?.has(&who, acl::CONNECT) {
                         return Err(SqlError {
                             code: "42501",
                             message: format!("permission denied for database \"{to}\""),
@@ -37960,6 +39191,7 @@ impl Session {
             | Stmt::ReviewWorld { .. }
             | Stmt::SetRetention(_)
             | Stmt::SetSync(_)
+            | Stmt::SetShipping(..)
             | Stmt::Simulate(_)
             | Stmt::Replay { .. }
             | Stmt::SetSystem(..)
@@ -37999,9 +39231,20 @@ impl Session {
                 *name = Some(self.branch.clone());
                 self.step(db, &Statement(named, PlanCache::default(), false), params, types)
             }
-            Stmt::CreateAs { table, cols, query, if_not_exists, temp, data, on_commit } => {
-                let made =
-                    self.create_table_as(db, s, params, types, table, cols, query, *if_not_exists, *temp, *data)?;
+            Stmt::CreateAs { table, cols, query, if_not_exists, temp, data, on_commit, space } => {
+                let made = self.create_table_as(
+                    db,
+                    s,
+                    params,
+                    types,
+                    table,
+                    cols,
+                    query,
+                    *if_not_exists,
+                    *temp,
+                    *data,
+                    space.as_deref(),
+                )?;
                 // (what a temporary table does at COMMIT, as CREATE TEMP TABLE ... ON COMMIT registers it)
                 if *temp && let Some(drop) = on_commit {
                     self.on_commit.retain(|(t, _)| t != table);
@@ -38043,7 +39286,7 @@ impl Session {
                 };
                 self.execute(db, &Statement(explain, PlanCache::default(), st.2), &vals, &p.types)
             }
-            Stmt::CreateAsExecute { table, cols, name, args, if_not_exists, temp, data } => {
+            Stmt::CreateAsExecute { table, cols, name, args, if_not_exists, temp, data, space } => {
                 let Some(p) = self.prepared.get(name).cloned() else {
                     return err("26000", format!("prepared statement \"{name}\" does not exist"));
                 };
@@ -38069,7 +39312,19 @@ impl Session {
                 let Some(Stmt::Select(q)) = p.stmt.as_ref().map(|st| &st.0) else {
                     return err("42809", "prepared statement is not a SELECT");
                 };
-                self.create_table_as(db, s, &vals, &p.types, table, cols, q, *if_not_exists, *temp, *data)
+                self.create_table_as(
+                    db,
+                    s,
+                    &vals,
+                    &p.types,
+                    table,
+                    cols,
+                    q,
+                    *if_not_exists,
+                    *temp,
+                    *data,
+                    space.as_deref(),
+                )
             }
             Stmt::Create { temp: true, likes, .. } if !likes.is_empty() => {
                 // LIKE reads a table of the world: its columns are written out, and the temporary table made from them
@@ -38104,6 +39359,7 @@ impl Session {
                     }
                 }
                 let temp = self.temp_db()?;
+                let actor = crate::disk::actor();
                 let _private = crate::acting_as(""); // its own database: see `temp_db`
                 // INHERITS / PARTITION OF a temporary table: both are in the temporary database
                 if let Stmt::Create { hier, .. } = &st {
@@ -38121,13 +39377,44 @@ impl Session {
                         }
                     }
                 }
+                // (at home in the session's world, as a statement on temporary tables runs: the tablespaces it may
+                // name, or temp_tablespaces does, are the world's)
+                let (st, branch) = (Statement(st, PlanCache::default(), s.2), self.temp_branch());
                 let made =
-                    Statement(st, PlanCache::default(), s.2).execute(&temp, &self.temp_branch(), params, types)?;
+                    catalog::at_home(&db.core, self.target(), &actor, || st.execute(&temp, &branch, params, types))?;
                 if let Stmt::Create { table, on_commit: Some(drop), .. } = &s.0 {
                     self.on_commit.retain(|(t, _)| t != table);
                     self.on_commit.push((table.clone(), *drop));
                 }
                 Ok(made)
+            }
+            // a permanent table can't inherit from or be a partition of a temporary one, which ends with the session
+            // (as Postgres's MergeAttributes refuses it)
+            Stmt::Create { temp: false, hier, .. } if self.temp.is_some() => {
+                let d = self.temp.as_ref().expect("checked");
+                let tv = d.view_tx(&self.temp_branch())?;
+                // (a parent written with its schema, `public.p`, is the permanent one, temporary one of its name or
+                // not; pg_temp.p is the temporary one)
+                let temp_parent =
+                    |p: &String| -> Result<bool> { Ok(!hier.qualified.contains(p) && load(&tv, p)?.is_some()) };
+                if let Some((p, _)) = &hier.of
+                    && temp_parent(p)?
+                {
+                    return err(
+                        "42809",
+                        format!(
+                            "cannot create a permanent relation as partition of temporary relation \"{}\"",
+                            rel_part(p)
+                        ),
+                    );
+                }
+                if let Some(p) = hier.inherits.iter().find(|p| matches!(temp_parent(p), Ok(true))) {
+                    return err("42809", format!("cannot inherit from temporary relation \"{}\"", rel_part(p)));
+                }
+                if self.temp_target(s)? {
+                    return self.temp_step(db, s, params, types);
+                }
+                s.execute(db, self.target(), params, types)
             }
             _ if self.temp_target(s)? => self.temp_step(db, s, params, types),
             _ => s.execute(db, self.target(), params, types),
@@ -38437,6 +39724,18 @@ fn top_changing_tag(s: &Stmt) -> Option<String> {
     }
 }
 
+/// The command tag of a SELECT whose strongest row lock is `strongest`: `SELECT FOR UPDATE`, ...
+fn locking_tag(strongest: u8) -> String {
+    use crate::RowLock;
+    let what = match strongest {
+        RowLock::UPDATE => "UPDATE",
+        RowLock::NO_KEY_UPDATE => "NO KEY UPDATE",
+        RowLock::SHARE => "SHARE",
+        _ => "KEY SHARE",
+    };
+    format!("SELECT FOR {what}")
+}
+
 /// The command tag of statement `s` if it changes anything (what a READ ONLY transaction refuses, and what a
 /// non-volatile function may not run); None for what reads, and the statements that don't touch the database.
 fn changing_tag(s: &Stmt) -> Option<String> {
@@ -38446,17 +39745,7 @@ fn changing_tag(s: &Stmt) -> Option<String> {
         // (COPY (INSERT ... RETURNING) TO: its statement's)
         Stmt::Copy(c) if c.dml.is_some() => return c.dml.as_deref().and_then(changing_tag),
         Stmt::With(w) => return w.dml.iter().find_map(|(_, st)| changing_tag(st)),
-        Stmt::Locking(_, clauses) => {
-            use crate::RowLock;
-            let strongest = clauses.iter().map(|c| c.0).max().unwrap_or(RowLock::UPDATE);
-            let what = match strongest {
-                RowLock::UPDATE => "UPDATE",
-                RowLock::NO_KEY_UPDATE => "NO KEY UPDATE",
-                RowLock::SHARE => "SHARE",
-                _ => "KEY SHARE",
-            };
-            format!("SELECT FOR {what}")
-        }
+        Stmt::Locking(_, clauses) => locking_tag(clauses.iter().map(|c| c.0).max().unwrap_or(crate::RowLock::UPDATE)),
         Stmt::Begin
         | Stmt::BeginRead(_)
         | Stmt::Commit
@@ -38559,7 +39848,7 @@ impl Statement {
             | Stmt::Update { .. }
             | Stmt::Delete { .. }
             | Stmt::Explain { .. } => {
-                let maybe = db.has_views() || db.has_inherits() || db.core.has_row_security() || branch.contains('@');
+                let maybe = db.has_views() || db.has_inherits() || rls::possible(&db.core) || branch.contains('@');
                 self.touches(maybe || mask::on() || self.reads_ctid(), db.has_sequences())
             }
             _ => false,
@@ -38598,7 +39887,7 @@ fn rewrite_error(db: &Db, branch: &str, st: &Stmt, params: Option<&[Value]>) -> 
             | Stmt::Merge(_)
             | Stmt::Explain { .. }
     );
-    if !reads || !db.core.has_row_security() {
+    if !reads || !rls::possible(&db.core) {
         return None;
     }
     match rls::skipping(false, || catalog_stmt(db, branch, st, params)) {
@@ -38635,7 +39924,7 @@ fn catalog_stmt(db: &Db, branch: &str, st: &Stmt, params: Option<&[Value]>) -> R
         return Ok(None); // nothing to read (and the world may be gone: DROP WORLD, UNDO MERGE, ...)
     }
     // (a world in the past may hold views)
-    let maybe = db.has_views() || db.has_inherits() || db.core.has_row_security() || branch.contains('@');
+    let maybe = db.has_views() || db.has_inherits() || rls::possible(&db.core) || branch.contains('@');
     let maybe = maybe || mask::on() || reads_ctid(st);
     let seqs = db.has_sequences();
     if !touches(st, maybe, seqs) {
@@ -39092,6 +40381,8 @@ impl Statement {
             }
             Stmt::ShowPath => return fixed(&[("search_path", Type::Text)]),
             Stmt::ShowSync => return fixed(&[("synchronous_commit", Type::Text)]),
+            Stmt::ShowShipping => return fixed(&[("wal_shipping", Type::Text)]),
+            Stmt::ShowShippingDelay => return fixed(&[("wal_shipping_delay", Type::Text)]),
             Stmt::ShowSystem(crate::Setting::WorldIdleTtl) => return fixed(&[("world_idle_ttl", Type::Interval)]),
             Stmt::ShowSystem(k @ (crate::Setting::ProtectMain | crate::Setting::OutboxKeepPayloads)) => {
                 return fixed(&[(k.name(), Type::Text)]);
@@ -39144,7 +40435,7 @@ impl Statement {
                     ms("max_ms"),
                 ]);
             }
-            Stmt::CreateAgent { .. } => {
+            Stmt::CreateAgent { .. } | Stmt::RotateAgentToken(_) => {
                 return fixed(&[("name", Type::Text), ("id", Type::Text), ("token", Type::Text)]);
             }
             Stmt::ShowAgentPrivileges { .. } => return fixed(&agentprivs::COLUMNS),
@@ -39164,6 +40455,9 @@ impl Statement {
                     ("max_memory_mb", Type::BigInt),
                     ("policy", Type::Text),
                     ("max_idle_ms", Type::BigInt),
+                    ("max_threads", Type::BigInt),
+                    ("tenant", Type::Text),
+                    ("expires", Type::TimestampTz),
                 ]);
             }
             Stmt::ShowPolicies | Stmt::CreatePolicy { .. } | Stmt::AlterPolicy { .. } => {
@@ -39284,6 +40578,7 @@ impl Statement {
                     ("theirs", Type::Json),
                     ("result", Type::Json),
                     ("postgres", Type::Json),
+                    ("columns", Type::Json),
                 ]);
             }
             Stmt::Diff(_, _, true, _) => return fixed(&[("sql", Type::Text)]),
@@ -39524,7 +40819,7 @@ impl Statement {
                 Stmt::DropFunction { .. }
                     | Stmt::AlterRoutine { .. }
                     | Stmt::DropType { .. }
-                    | Stmt::AlterType { change: TypeChange::Rename(_), .. }
+                    | Stmt::AlterType { change: TypeChange::Rename(_) | TypeChange::Schema(_), .. }
                     | Stmt::DropExtension { .. }
             );
         let moves = if changes { comments::moves(&x.view()?, &self.0)? } else { vec![] };
@@ -39538,6 +40833,16 @@ impl Statement {
             true => acl::to_make(&x.view()?, &self.0)?,
             false => None,
         };
+        // (and when it is made, in the order objects are made in, which DROP ... CASCADE lists them by: see
+        // `acl::MADE`)
+        let stamp = match acl::may_stamp(&self.0) {
+            true => acl::to_stamp(&x.view()?, &self.0)?,
+            false => None,
+        };
+        let stamp_moves = if acl::renames(&self.0) { acl::stamp_moves(&x.view()?, &self.0)? } else { vec![] };
+        // (which join the writes that make, rename and drop what they are on, so the statement stays one write: a
+        // crash keeps all of it or none)
+        let ride = acl::Ride::start(x.db, branch, stamp, stamp_moves, acl::may_unstamp(&self.0))?;
         let out = self.run_here(x, branch, params)?;
         if changes {
             comments::after(x.db, branch, moves)?;
@@ -39548,9 +40853,7 @@ impl Statement {
         if changes {
             rls::after(x.db, branch, rls_moves)?;
         }
-        if let Some(m) = made {
-            acl::made(x.db, branch, &m)?;
-        }
+        ride.finish(x.db, branch, made)?;
         Ok(out)
     }
 
@@ -39566,8 +40869,16 @@ impl Statement {
             }
             Stmt::SetVar { .. } | Stmt::ShowVar(_) => err(UNSUPPORTED, "settings need a session"),
             Stmt::SetSnapshot(_) => err("25P01", "SET TRANSACTION can only be used in transaction blocks"),
-            Stmt::CreateAs { .. } | Stmt::CreateAsExecute { .. } => {
-                err(UNSUPPORTED, "CREATE TABLE AS and SELECT INTO need a session")
+            // (a temporary table is made in the session's own database, which a function's statements don't make
+            // tables in; a prepared statement is the session's)
+            Stmt::CreateAs { temp: true, .. } => err(
+                UNSUPPORTED,
+                "CREATE TEMP TABLE AS and SELECT INTO a temporary table in a function aren't supported yet: the \
+                 session makes its temporary tables",
+            ),
+            Stmt::CreateAsExecute { .. } => err(UNSUPPORTED, "CREATE TABLE AS EXECUTE needs a session"),
+            Stmt::CreateAs { table, cols, query, if_not_exists, data, space, .. } => {
+                x.create_table_as(table, cols, query, *if_not_exists, *data, self.2, space.as_deref())
             }
             Stmt::ShowPath => {
                 let columns = self.columns(db, branch, &[])?;
@@ -39776,27 +41087,35 @@ impl Statement {
                 let (schema, from) = (schema_part(&text_rel(name)).to_string(), rel_part(&text_rel(name)).to_string());
                 // ALTER INDEX renames a table, a view or a sequence too, as Postgres does
                 let stored = text_rel(name);
-                let kind = {
+                let (kind, index) = {
                     let v = db.view_tx(branch)?;
                     if index_owner(&v, &qualify(&schema, &from))?.is_some() {
-                        None
+                        (None, true)
                     } else {
-                        relation_kind(&v, &stored)?
+                        (relation_kind(&v, &stored)?, false)
                     }
+                };
+                // what it renamed stays locked until the transaction ends, under its new name: an index against
+                // other changes, anything else against everyone (Postgres retries with the lock a table needs)
+                let held = |mode| {
+                    hold_ddl_locks(&[(stored.clone(), mode, false)]);
+                    rename_held(&stored, &qualify(&schema, to));
                 };
                 match kind {
                     Some("view") => {
-                        return x.rename_view(&stored, to, false, "view").map(|_| Output::tag("ALTER INDEX"));
+                        x.rename_view(&stored, to, false, "view")?;
+                        held(ACCESS_EXCLUSIVE);
+                        return Ok(Output::tag("ALTER INDEX"));
                     }
                     Some("sequence") => {
-                        return x
-                            .move_sequence(&stored, &Alter::RenameTable(to.clone()))
-                            .map(|_| Output::tag("ALTER INDEX"));
+                        x.move_sequence(&stored, &Alter::RenameTable(to.clone()))?;
+                        held(ACCESS_EXCLUSIVE);
+                        return Ok(Output::tag("ALTER INDEX"));
                     }
                     Some(_) => {
-                        return x
-                            .alter(&stored, &[Alter::RenameTable(to.clone())], false)
-                            .map(|_| Output::tag("ALTER INDEX"));
+                        x.alter(&stored, &[Alter::RenameTable(to.clone())], false)?;
+                        held(ACCESS_EXCLUSIVE);
+                        return Ok(Output::tag("ALTER INDEX"));
                     }
                     None => {}
                 }
@@ -39811,6 +41130,9 @@ impl Statement {
                     };
                     Ok((x.alter_writes(v, &t.name, &[Alter::RenameIndex(from.clone(), to.clone())])?, ()))
                 })?;
+                if index {
+                    held(SHARE_UPDATE_EXCLUSIVE);
+                }
                 Ok(Output::tag("ALTER INDEX"))
             }
             Stmt::IndexColumnAlter { name, action, if_exists } => {
@@ -40012,12 +41334,13 @@ impl Statement {
                             json(p.theirs.clone()),
                             json(p.result.clone()),
                             pg.map_or(Value::Null, |r| json(r.postgres.as_deref().map(Val::from))),
+                            p.columns.as_ref().map_or(Value::Null, |c| Value::Json(column_changes(c))),
                         ]
                     })
                     .collect();
                 let line = |outcome: &str, detail: String| {
                     let mut r = vec![Value::Null, Value::Null, Value::Text(outcome.into()), Value::Text(detail)];
-                    r.resize(9, Value::Null);
+                    r.resize(10, Value::Null);
                     r
                 };
                 // destructive first: a line per table (rows deleted, updated, inserted), then the rows it deletes,
@@ -40136,6 +41459,17 @@ impl Statement {
                 Ok(Output {
                     typmods: vec![],
                     tag: "CREATE AGENT".into(),
+                    columns,
+                    rows: vec![vec![Value::Text(a.name), Value::Text(a.id), Value::Text(token)]],
+                })
+            }
+            Stmt::RotateAgentToken(name) => {
+                let token = db.rotate_agent_token_with(name, roles::scram_iterations())?;
+                let a = db.agent(name)?;
+                let columns = self.columns(db, branch, &[])?;
+                Ok(Output {
+                    typmods: vec![],
+                    tag: "ALTER AGENT".into(),
                     columns,
                     rows: vec![vec![Value::Text(a.name), Value::Text(a.id), Value::Text(token)]],
                 })
@@ -40382,6 +41716,7 @@ impl Statement {
                 let rows: Vec<Vec<Value>> = agents
                     .into_iter()
                     .map(|a| {
+                        let tenant = a.tenant_sql();
                         vec![
                             Value::Text(a.name),
                             Value::Text(a.id),
@@ -40397,6 +41732,12 @@ impl Statement {
                             Value::Int(a.max_memory_mb as i64),
                             a.policy.map_or(Value::Null, Value::Text),
                             Value::Int(a.max_idle_ms as i64),
+                            Value::Int(a.max_threads as i64),
+                            tenant.map_or(Value::Null, Value::Text),
+                            match a.expires {
+                                0 => Value::Null,
+                                e => Value::TimestampTz(e as i64 * 1000),
+                            },
                         ]
                     })
                     .collect();
@@ -40498,6 +41839,24 @@ impl Statement {
                     rows: vec![vec![Value::Text(db.sync_commit().name().into())]],
                 })
             }
+            Stmt::SetShipping(m, delay) => {
+                let (was, was_delay) = db.wal_shipping();
+                db.set_wal_shipping(m.unwrap_or(was), delay.unwrap_or(was_delay))?;
+                Ok(Output::tag("ALTER SYSTEM"))
+            }
+            Stmt::ShowShipping | Stmt::ShowShippingDelay => {
+                let columns = self.columns(db, branch, &[])?;
+                let (m, delay) = db.wal_shipping();
+                let shown = match &self.0 {
+                    Stmt::ShowShipping => m.name().to_string(),
+                    _ => format!("{delay}ms"),
+                };
+                Ok(Output { typmods: vec![], tag: "SHOW".into(), columns, rows: vec![vec![Value::Text(shown)]] })
+            }
+            Stmt::Backup(_) if NO_SERVER_PATHS.load(std::sync::atomic::Ordering::Relaxed) => err(
+                "42501",
+                "BACKUP names a path on the server's machine, which this server's SQL may not: use the backup call or chronos <folder> backup <dir>",
+            ),
             Stmt::Backup(path) => {
                 let b = db.backup(path).map_err(crate::Error::from)?;
                 let columns = self.columns(db, branch, &[])?;
@@ -40710,7 +42069,7 @@ impl Statement {
                 UNSUPPORTED,
                 "USE BRANCH, transactions, prepared statements, cursors, LISTEN, NOTIFY, DISCARD, LOCK and SET CONSTRAINTS need a session (sql::Session)",
             ),
-            Stmt::CreateType { name, labels, range, composite } => {
+            Stmt::CreateType { name, labels, range, composite, shell } => {
                 let filling = userdefs::is_shell(name) && composite.as_ref().is_none_or(|f| !f.is_empty());
                 // (a composite type the process knows by name may be one dropped since: its row, below, says)
                 if Type::from_name(name).is_some() && !filling && userdefs::composite(name).is_none() {
@@ -40724,28 +42083,31 @@ impl Statement {
                 }
                 db.batch_with(branch, |v| {
                     need_schema(v, name)?;
-                    // (a shell type, `CREATE TYPE name`, is filled in by the CREATE TYPE that defines it)
-                    let shell = |r: &str| {
-                        serde_json::from_str::<Json>(r).is_ok_and(|j| j["composite"] == serde_json::json!([]))
-                    };
+                    // (a shell type, `CREATE TYPE name`, is filled in by the CREATE TYPE that defines it: `AS ()` too, not
+                    // another shell's)
+                    let is_shell = |r: &str| serde_json::from_str::<Json>(r).is_ok_and(|j| shell_row(&j));
                     match v.get(&type_key(name))? {
-                        Some(r) if shell(&r) && composite.as_ref().is_none_or(|f| !f.is_empty()) => {}
+                        Some(r) if is_shell(&r) && !shell => {}
                         Some(_) => return err("42710", format!("type \"{name}\" already exists")),
-                        None => {
-                            no_relation_named(v, name)?;
-                            userdefs::forget_composite(name); // (one of this name, dropped: this one is new)
-                        }
+                        None => no_relation_named(v, name)?,
                     }
                     let row = match (range, composite) {
                         (Some(sub), _) => serde_json::json!({ "range": { "subtype": sub } }),
                         (_, Some(fields)) => {
-                            userdefs::register_composite(name, fields);
-                            serde_json::json!({ "composite": fields })
+                            let mut row = serde_json::json!({ "composite": fields });
+                            // (`AS ()` is a type of no attributes, not a shell type to be filled in: its row says so)
+                            if fields.is_empty() && !shell {
+                                row["empty"] = Json::Bool(true);
+                            }
+                            row
                         }
                         _ => serde_json::json!({ "enum": labels }),
                     };
                     Ok((vec![(type_key(name), Some(row.to_string()))], ()))
                 })?;
+                // (known in the world as its row has it, once written: a composite type of the name dropped before is
+                // forgotten, this one being new)
+                rehydrate_composite(&db.view_tx(branch)?, name)?;
                 Ok(Output::tag("CREATE TYPE"))
             }
             Stmt::CreateBaseType { name, input, output, like } => {
@@ -40753,9 +42115,7 @@ impl Statement {
                     need_schema(v, name)?;
                     // (a shell type, `CREATE TYPE name`, is filled in; another type of the name is there already)
                     match v.get(&type_key(name))? {
-                        Some(r)
-                            if serde_json::from_str::<Json>(&r)
-                                .is_ok_and(|j| j["composite"] == serde_json::json!([])) => {}
+                        Some(r) if serde_json::from_str::<Json>(&r).is_ok_and(|j| shell_row(&j)) => {}
                         Some(_) => return err("42710", format!("type \"{name}\" already exists")),
                         None => no_relation_named(v, name)?,
                     }
@@ -40767,7 +42127,7 @@ impl Statement {
                             "a base type's input and output functions must be one built-in type's here",
                         );
                     }
-                    userdefs::forget_composite(name);
+                    userdefs::forget_composite(v, name);
                     userdefs::register_base(name, repr);
                     let row = serde_json::json!({ "base": {
                         "repr": repr.name(), "input": input, "output": output, "like": like,
@@ -40812,10 +42172,29 @@ impl Statement {
                 for id in restart.1 {
                     let _ = restart_counter(db, &id, None, None);
                 }
+                // (a composite type dropped is no type by its name: one made of the name later is another)
+                let v = db.view_tx(branch)?;
+                for n in names {
+                    userdefs::forget_composite(&v, n);
+                }
                 Ok(Output::tag("DROP TYPE"))
             }
             Stmt::AlterType { name, change } => {
-                db.batch_with(branch, |v| x.alter_type(v, name, change).map(|w| (w, ())))?;
+                let done = db.batch_with(branch, |v| x.alter_type(v, name, change).map(|w| (w, ())));
+                // (a composite type changed is known as its row has it now: by its new name, if it has one, and no
+                // longer by the old)
+                let moved = match change {
+                    TypeChange::Rename(to) => Some(to.clone()),
+                    TypeChange::Schema(s) => Some(qualify(s, rel_part(name))),
+                    _ => None,
+                };
+                if matches!(change, TypeChange::Attrs(_)) || moved.is_some() {
+                    let v = db.view_tx(branch)?;
+                    for n in std::iter::once(name).chain(moved.as_ref()) {
+                        rehydrate_composite(&v, n)?;
+                    }
+                }
+                done?;
                 Ok(Output::tag("ALTER TYPE"))
             }
             Stmt::CreateCollation { name, opts, from, if_not_exists } => {
@@ -40874,7 +42253,12 @@ impl Statement {
                 };
                 Ok(Output::tag(if matches!(self.0, Stmt::Do(_)) { "DO" } else { "CALL" }))
             }
-            Stmt::CreateTrigger(t, table, replace) => x.create_trigger(t, table, *replace),
+            // (holding its table against writers until the transaction ends, as Postgres's does)
+            Stmt::CreateTrigger(t, table, replace) => {
+                let out = x.create_trigger(t, table, *replace)?;
+                hold_ddl_locks(&[(table.clone(), SHARE_ROW_EXCLUSIVE, false)]);
+                Ok(out)
+            }
             Stmt::DropTrigger { name, table, if_exists } => x.drop_trigger(name, table, *if_exists),
             Stmt::RenameTrigger { name, table, to } => x.rename_trigger(name, table, to),
             Stmt::RenameRule { name, table, to } => {
@@ -41056,6 +42440,7 @@ impl Statement {
                 only,
                 concurrently,
                 options,
+                space,
             } => x
                 .create_index(
                     name.as_deref(),
@@ -41069,7 +42454,7 @@ impl Statement {
                     (*using, trgm.as_deref()),
                     *only,
                     *concurrently,
-                    options,
+                    (options, space.as_deref()),
                 )
                 .map_err(index_build_failed),
             Stmt::AttachIndex { parent, child } => x.attach_index(parent, child),
@@ -41090,11 +42475,22 @@ impl Statement {
             Stmt::Merge(m) => x.merge_into(m),
             Stmt::Alter { table, changes, if_exists, .. } if matches!(&changes[..], [Alter::IndexOptions(..)]) => {
                 let Some(Alter::IndexOptions(given, reset)) = changes.first() else { unreachable!() };
-                x.index_options(table, given, *reset, *if_exists)
+                // (IF EXISTS finding none holds nothing)
+                let found = !*if_exists || index_owner(&x.view()?, &text_rel(table))?.is_some();
+                let out = x.index_options(table, given, *reset, *if_exists)?;
+                if found {
+                    hold_ddl_locks(&[(table.clone(), lock_level(changes), false)]);
+                }
+                Ok(out)
             }
             Stmt::Alter { table, changes, if_exists, .. } if matches!(&changes[..], [Alter::IndexStats(..)]) => {
                 let Some(Alter::IndexStats(col, target)) = changes.first() else { unreachable!() };
-                x.index_stats(table, *col, *target, *if_exists)
+                let found = !*if_exists || index_owner(&x.view()?, &text_rel(table))?.is_some();
+                let out = x.index_stats(table, *col, *target, *if_exists)?;
+                if found {
+                    hold_ddl_locks(&[(table.clone(), lock_level(changes), false)]);
+                }
+                Ok(out)
             }
             Stmt::Alter { table, changes, if_exists, only } => {
                 let (kind, owner) = {
@@ -41102,12 +42498,17 @@ impl Statement {
                     let kind = relation_kind(&v, table)?;
                     (kind, if kind.is_none() { index_owner(&v, table)? } else { None })
                 };
-                // ALTER TABLE renames an index too, in Postgres
+                // one of Postgres's own catalog tables, which only a superuser allowed system table changes may change
+                if kind.is_none() && owner.is_none() && system_catalog(table) {
+                    return err("42501", format!("permission denied: \"{}\" is a system catalog", rel_part(table)));
+                }
+                // ALTER TABLE renames an index too, in Postgres (locking it against everyone, as ALTER TABLE does)
                 if let (Some(owner), [Alter::RenameTable(to)]) = (&owner, &changes[..]) {
                     let from = rel_part(table).to_string();
-                    return x
-                        .alter(owner, &[Alter::RenameIndex(from, to.clone())], false)
-                        .map(|_| Output::tag("ALTER TABLE"));
+                    x.alter(owner, &[Alter::RenameIndex(from, to.clone())], false)?;
+                    hold_ddl_locks(&[(table.clone(), ACCESS_EXCLUSIVE, false)]);
+                    rename_held(table, &qualify(schema_part(table), to));
+                    return Ok(Output::tag("ALTER TABLE"));
                 }
                 // ALTER SEQUENCE ... SET SCHEMA of a serial column's own counter (`t_id_seq`, which has no row of its
                 // own): owned by its table, it can't be moved apart from it
@@ -41118,7 +42519,8 @@ impl Statement {
                 {
                     return Err(owned_sequence_moved(table, &t));
                 }
-                if *if_exists && kind.is_none() {
+                // (an index is there too: ALTER INDEX IF EXISTS of one that is goes on)
+                if *if_exists && kind.is_none() && owner.is_none() {
                     notice("NOTICE", format!("relation \"{table}\" does not exist, skipping"));
                     return Ok(Output::tag("ALTER TABLE"));
                 }
@@ -41151,7 +42553,51 @@ impl Statement {
                         });
                     }
                 }
-                match (kind, &changes[..]) {
+                // what it locks, until the transaction ends (see `alter_locks`)
+                if kind.is_some() || owner.is_some() {
+                    hold_ddl_locks(&alter_locks(&x.view()?, table, changes)?);
+                }
+                // a view: what ALTER TABLE does to one too (SET and DROP DEFAULT, SET and RESET of its options, RENAME
+                // [COLUMN], SET SCHEMA), done as ALTER VIEW does it; anything else is refused, as Postgres refuses it
+                // before changing anything
+                if kind == Some("view") {
+                    let on_view = |c: &Alter| {
+                        matches!(
+                            c,
+                            Alter::SetDefault(..)
+                                | Alter::RelOptions(..)
+                                | Alter::RenameColumn(..)
+                                | Alter::RenameTable(_)
+                                | Alter::SetSchema(_)
+                        )
+                    };
+                    if let Some(action) = changes.iter().filter(|c| !on_view(c)).find_map(alter_action) {
+                        return Err(SqlError {
+                            code: "42809",
+                            message: format!(
+                                "ALTER action {action} cannot be performed on relation \"{}\"",
+                                rel_part(table)
+                            ),
+                            info: Some(Box::new(Violation {
+                                detail: Some("This operation is not supported for views.".into()),
+                                ..Violation::default()
+                            })),
+                        });
+                    }
+                    if changes
+                        .iter()
+                        .all(|c| matches!(c, Alter::SetDefault(..) | Alter::RelOptions(..) | Alter::RenameColumn(..)))
+                    {
+                        x.alter_view_as_table(table, changes)?;
+                        return Ok(Output::tag("ALTER TABLE"));
+                    }
+                }
+                // (a table's indexes move with it to another schema, and what the transaction holds of them too)
+                let moved = match changes.iter().any(|c| matches!(c, Alter::SetSchema(_))) {
+                    true => load(&x.view()?, table)?.map(|t| index_names(&t)).unwrap_or_default(),
+                    false => vec![],
+                };
+                let out = match (kind, &changes[..]) {
                     // ALTER TABLE renames, and moves, a view or a sequence too, in Postgres
                     (Some("view"), [Alter::RenameTable(to)]) => {
                         x.rename_view(table, to, false, "view").map(|_| Output::tag("ALTER TABLE"))
@@ -41161,18 +42607,51 @@ impl Statement {
                         x.move_sequence(table, c)
                     }
                     _ => x.alter(table, changes, *only),
+                }?;
+                if let Some(to) = altered_name(table, changes) {
+                    rename_held(table, &to);
+                    for ix in &moved {
+                        rename_held(ix, &qualify(schema_part(&to), rel_part(ix)));
+                    }
                 }
+                Ok(out)
             }
+            // (each locking the view against everyone until the transaction ends, as Postgres's ALTER VIEW does: a
+            // SET or RESET of options as the options named need, so a RESET of a table's, fillfactor, only against
+            // other changes)
             Stmt::RenameViewColumn { name, from, to, if_exists } => {
-                x.rename_view_column(name, from, to, *if_exists).map(|_| Output::tag("ALTER VIEW"))
+                let found = relation_kind(&x.view()?, name)?.is_some();
+                x.rename_view_column(name, from, to, *if_exists)?;
+                if found {
+                    hold_ddl_locks(&[(name.clone(), ACCESS_EXCLUSIVE, false)]);
+                }
+                Ok(Output::tag("ALTER VIEW"))
             }
-            Stmt::ViewOptions { name, opts, if_exists } => x.view_options(name, opts, *if_exists),
+            Stmt::ViewOptions { name, opts, if_exists, lock } => {
+                let found = relation_kind(&x.view()?, name)?.is_some();
+                let out = x.view_options(name, opts, *if_exists)?;
+                if found {
+                    hold_ddl_locks(&[(name.clone(), lock, false)]);
+                }
+                Ok(out)
+            }
             Stmt::ViewDefault { name, col, default, if_exists } => {
-                x.view_default(name, col, default.as_deref(), *if_exists)
+                let found = relation_kind(&x.view()?, name)?.is_some();
+                let out = x.view_default(name, col, default.as_deref(), *if_exists)?;
+                if found {
+                    hold_ddl_locks(&[(name.clone(), ACCESS_EXCLUSIVE, false)]);
+                }
+                Ok(out)
             }
-            Stmt::RenameView { name, to, if_exists, kind } => x
-                .rename_view(name, to, *if_exists, kind)
-                .map(|_| Output::tag(if *kind == "view" { "ALTER VIEW" } else { "ALTER MATERIALIZED VIEW" })),
+            Stmt::RenameView { name, to, if_exists, kind } => {
+                let found = relation_kind(&x.view()?, name)?.is_some();
+                x.rename_view(name, to, *if_exists, kind)?;
+                if found {
+                    hold_ddl_locks(&[(name.clone(), ACCESS_EXCLUSIVE, false)]);
+                    rename_held(name, &qualify(schema_part(name), to));
+                }
+                Ok(Output::tag(if *kind == "view" { "ALTER VIEW" } else { "ALTER MATERIALIZED VIEW" }))
+            }
             Stmt::Insert { table, alias, cols, rows, query, conflict, returning, overriding, checks } => x.insert(
                 table,
                 alias.as_deref(),
@@ -41226,6 +42705,7 @@ pub(crate) fn schema_object(key: &str) -> bool {
         || key.starts_with("_sonos_critical/")
         || key.starts_with("_sonos_comments/")
         || key.starts_with("_sonos_extensions/")
+        || key.starts_with("_sonos_types/")
 }
 
 /// A NOTIFY as a listening session receives it (Postgres's NotificationResponse).
@@ -41317,6 +42797,9 @@ struct Ctx {
     agent: bool,
     /// it is an agent's without the `unmask` capability: masked columns read masked (see `mask`)
     masked: bool,
+    /// it is an agent's held to a tenant: the condition (`"org_id" = 42`) every row it reads or writes of a table with
+    /// that column meets (see `rls::tenant`)
+    tenant: Option<Arc<str>>,
     /// pg_backend_pid(): the connection's id
     pid: i32,
     /// txid_current(): the transaction's number
@@ -41408,9 +42891,10 @@ struct SessState {
     /// the transaction's advisory locks, each with the savepoint depth it was taken at: a
     /// ROLLBACK TO lets go of those taken since, as Postgres does
     xact_locks: Vec<(advisory::Held, usize)>,
-    /// the relations LOCK TABLE locked in the transaction: each's stored name, the mode (pg_locks names it), and the
-    /// savepoint depth it was locked at (a ROLLBACK TO lets go of those since, as Postgres does)
-    rel_locks: Vec<(String, &'static str, usize)>,
+    /// the relations LOCK TABLE and DDL statements locked in the transaction: each's stored name, the mode (pg_locks
+    /// names it), the savepoint depth it was locked at (a ROLLBACK TO lets go of those since, as Postgres does), and
+    /// whether it is the relation's TOAST table that is locked (see `hold_ddl_locks`)
+    rel_locks: Vec<(String, &'static str, usize, bool)>,
     /// the cursors PL/pgSQL functions opened (OPEN, a refcursor), by portal name: open until the transaction
     /// ends, for a later call or the session's FETCH to read, as Postgres's portals are
     portals: HashMap<String, Cursor>,
@@ -41418,6 +42902,8 @@ struct SessState {
     portal_no: u64,
     /// what its statements counted for the cumulative statistics, not yet added in (see `pgstat`)
     stats: pgstat::Pending,
+    /// set_ttdummy(0) turned the regression tests' ttdummy trigger off (see `Exec::ttdummy` and `ttdummy_off`)
+    ttdummy_off: bool,
 }
 
 type Restart = (usize, String, Option<String>, Option<SeqDef>, (Option<(i64, i64)>, (i64, Option<String>)));
@@ -41486,10 +42972,202 @@ fn hold_relation_locks(names: &[String], mode: &'static str) {
     let Some(ctx) = STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.clone())) else { return };
     let mut st = ctx.state.lock().unwrap_or_else(|p| p.into_inner());
     for n in names {
-        if !st.rel_locks.iter().any(|(x, m, _)| x == n && *m == mode) {
-            st.rel_locks.push((n.clone(), mode, ctx.depth));
+        if !st.rel_locks.iter().any(|(x, m, _, toast)| x == n && *m == mode && !toast) {
+            st.rel_locks.push((n.clone(), mode, ctx.depth, false));
         }
     }
+}
+
+/// A relation lock a DDL statement takes: the relation's stored name (an index's is `schema.index`, as
+/// `Catalog::oid_of` finds it), the mode as pg_locks names it, and whether it is the relation's TOAST table that is
+/// locked rather than the relation.
+type RelLock = (String, &'static str, bool);
+
+/// The lock modes, weakest first.
+const LOCK_MODES: [&str; 8] = [
+    "AccessShareLock",
+    "RowShareLock",
+    "RowExclusiveLock",
+    "ShareUpdateExclusiveLock",
+    "ShareLock",
+    "ShareRowExclusiveLock",
+    "ExclusiveLock",
+    "AccessExclusiveLock",
+];
+const ACCESS_SHARE: &str = "AccessShareLock";
+const ROW_SHARE: &str = "RowShareLock";
+const SHARE_UPDATE_EXCLUSIVE: &str = "ShareUpdateExclusiveLock";
+const SHARE_ROW_EXCLUSIVE: &str = "ShareRowExclusiveLock";
+const ACCESS_EXCLUSIVE: &str = "AccessExclusiveLock";
+
+/// The stronger of two lock modes.
+fn stronger(a: &'static str, b: &'static str) -> &'static str {
+    let rank = |m: &str| LOCK_MODES.iter().position(|x| *x == m);
+    if rank(b) > rank(a) { b } else { a }
+}
+
+/// The lock ALTER TABLE takes on its relation for `changes`, as Postgres's AlterTableGetLockLevel works it out: the
+/// strongest any of them needs, and SHARE UPDATE EXCLUSIVE at least. What only tunes the planner or vacuum (statistics
+/// targets, CLUSTER ON, storage parameters, column options) and VALIDATE CONSTRAINT let reads and writes go on; a
+/// foreign key (it adds triggers) and a trigger's state keep writers out; the rest keep everyone out.
+fn lock_level(changes: &[Alter]) -> &'static str {
+    changes.iter().fold(SHARE_UPDATE_EXCLUSIVE, |mode, c| {
+        let needs = match c {
+            Alter::ColOpt(_, ColOpt::Stats(_))
+            | Alter::IndexStats(..)
+            | Alter::Cluster(_)
+            | Alter::Validate(_)
+            | Alter::MergeByColumns(_)
+            | Alter::Attach(..)
+            | Alter::Detach(_, hier::Detach::Concurrently | hier::Detach::Finalize) => SHARE_UPDATE_EXCLUSIVE,
+            Alter::Noop(why) if *why == COLUMN_OPTIONS => SHARE_UPDATE_EXCLUSIVE,
+            Alter::RelOptions(given, _) | Alter::IndexOptions(given, _) => reloptions::lock_mode(given),
+            Alter::AddConstraint(ConstraintDef::Foreign { .. }) | Alter::Trigger(..) => SHARE_ROW_EXCLUSIVE,
+            _ => ACCESS_EXCLUSIVE,
+        };
+        stronger(mode, needs)
+    })
+}
+
+/// The stored names of a table's indexes: its primary key's, its unique constraints' and those CREATE INDEX made.
+fn index_names(t: &Table) -> Vec<String> {
+    let names = (t.has_key().then(|| t.pkey_name()).into_iter())
+        .chain(t.uniques.iter().map(|u| u.name.clone()))
+        .chain(t.indexes.iter().map(|x| x.name.clone()));
+    let mut out: Vec<String> = vec![];
+    for n in names.map(|n| qualify(schema_part(&t.name), &n)) {
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    out
+}
+
+/// The stored name of the index a foreign key referencing `t`'s columns `refcols` (none: its primary key) leans on:
+/// the primary key's, or a unique constraint's or unique index's on just those columns (not one with expressions or
+/// WHERE, which a foreign key can't lean on).
+fn referenced_index(t: &Table, refcols: &[String]) -> Option<String> {
+    let same = |mut cols: Vec<&str>| {
+        let mut want: Vec<&str> = refcols.iter().map(String::as_str).collect();
+        cols.sort_unstable();
+        want.sort_unstable();
+        cols == want
+    };
+    let key: Vec<&str> = t.key_cols().iter().map(|&i| t.cols[i].name.as_str()).collect();
+    let name = match t.has_key() && (refcols.is_empty() || same(key)) {
+        true => t.pkey_name(),
+        false => t
+            .uniques
+            .iter()
+            .find(|u| {
+                uniq_index(t, u).is_none()
+                    && same(
+                        u.cols
+                            .iter()
+                            .filter_map(|id| t.cols.iter().find(|c| c.id == *id))
+                            .map(|c| c.name.as_str())
+                            .collect(),
+                    )
+            })?
+            .name
+            .clone(),
+    };
+    Some(qualify(schema_part(&t.name), &name))
+}
+
+/// What ALTER TABLE `changes` on `name` locks, as Postgres's does: the relation, in `lock_level`'s mode, and what some
+/// changes reach besides. CLUSTER ON locks the index; a change of storage parameters, the TOAST table; a foreign key,
+/// the table it references and that key's index (and, checking the rows there are, the indexes of both tables, which
+/// the planner opens for its query); VALIDATE CONSTRAINT of one, the table it references against changes to the keys,
+/// and both tables' indexes; ATTACH and DETACH PARTITION, the partition.
+fn alter_locks(v: &View, name: &str, changes: &[Alter]) -> Result<Vec<RelLock>> {
+    let mode = lock_level(changes);
+    let mut out = vec![(name.to_string(), mode, false)];
+    let table = load(v, name)?;
+    let indexes_of = |v: &View, n: &str| -> Result<Vec<RelLock>> {
+        Ok(load(v, n)?
+            .map_or_else(Vec::new, |t| index_names(&t).into_iter().map(|i| (i, ACCESS_SHARE, false)).collect()))
+    };
+    for c in changes {
+        match c {
+            Alter::Cluster(Some(ix)) => out.push((qualify(schema_part(name), ix), SHARE_UPDATE_EXCLUSIVE, false)),
+            Alter::RelOptions(..) => out.push((name.to_string(), mode, true)),
+            Alter::AddConstraint(ConstraintDef::Foreign { table: to, refcols, not_valid, .. }) => {
+                out.push((to.clone(), SHARE_ROW_EXCLUSIVE, false));
+                // (and the index of the key it references, which Postgres 16.15 keeps from being dropped meanwhile)
+                if let Some(ix) = load(v, to)?.and_then(|t| referenced_index(&t, refcols)) {
+                    out.push((ix, ACCESS_SHARE, false));
+                }
+                if !not_valid {
+                    out.extend(indexes_of(v, name)?);
+                    out.extend(indexes_of(v, to)?);
+                }
+            }
+            Alter::Validate(con) => {
+                if let Some(fk) = table.as_ref().and_then(|t| t.fks.iter().find(|f| f.name == *con)) {
+                    out.push((fk.table.clone(), ROW_SHARE, false));
+                    out.extend(indexes_of(v, name)?);
+                    out.extend(indexes_of(v, &fk.table)?);
+                }
+            }
+            Alter::Attach(child, _) => out.push((child.clone(), ACCESS_EXCLUSIVE, false)),
+            // (only CONCURRENTLY lets reads and writes of the partition go on: FINALIZE, which ends a detach that
+            // was cancelled, locks it against everyone, as Postgres's ATExecDetachPartitionFinalize does)
+            Alter::Detach(child, how) => {
+                let m = match how {
+                    hier::Detach::Concurrently => SHARE_UPDATE_EXCLUSIVE,
+                    _ => ACCESS_EXCLUSIVE,
+                };
+                out.push((child.clone(), m, false));
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// What a DDL statement locks (see `alter_locks`), held by the running session's transaction until it ends, as LOCK
+/// TABLE's are. A statement changing the catalogs gives its transaction a number, as Postgres's does, which pg_locks
+/// then shows the transaction holding too.
+fn hold_ddl_locks(locks: &[RelLock]) {
+    let Some(ctx) = STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.clone())) else { return };
+    let _ = current_xact_id(ctx.txid, ctx.tx.is_some(), false);
+    let mut st = ctx.state.lock().unwrap_or_else(|p| p.into_inner());
+    for (n, mode, toast) in locks {
+        if !st.rel_locks.iter().any(|l| l.0 == *n && l.1 == *mode && l.3 == *toast) {
+            st.rel_locks.push((n.clone(), mode, ctx.depth, *toast));
+        }
+    }
+}
+
+/// A relation the transaction renamed, or moved to another schema: the locks it holds on it are held under its new
+/// name, as Postgres's are held on the relation, not on its name. One taken before the savepoint the rename was made
+/// after is held under both, at the rename's depth under the new: a ROLLBACK TO that undoes the rename lets go of that
+/// one only, and the relation, its old name back, is still held as it was.
+fn rename_held(from: &str, to: &str) {
+    let Some(ctx) = STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.clone())) else { return };
+    let mut st = ctx.state.lock().unwrap_or_else(|p| p.into_inner());
+    let mut older = vec![];
+    for l in st.rel_locks.iter_mut().filter(|l| l.0 == from) {
+        match l.2 >= ctx.depth {
+            true => l.0 = to.to_string(),
+            false => older.push((l.1, l.3)),
+        }
+    }
+    for (mode, toast) in older {
+        if !st.rel_locks.iter().any(|l| l.0 == to && l.1 == mode && l.3 == toast) {
+            st.rel_locks.push((to.to_string(), mode, ctx.depth, toast));
+        }
+    }
+}
+
+/// The name ALTER TABLE `changes` leave `name` with: renamed, or moved to another schema.
+fn altered_name(name: &str, changes: &[Alter]) -> Option<String> {
+    changes.iter().find_map(|c| match c {
+        Alter::RenameTable(to) => Some(qualify(schema_part(name), to)),
+        Alter::SetSchema(s) => Some(qualify(s, rel_part(name))),
+        _ => None,
+    })
 }
 
 /// The advisory lock functions (see `advisory`).
@@ -41615,8 +43293,8 @@ fn setting_call(ctx: &Ctx, f: CtxFn, a: &[Value]) -> Result<Value> {
         return Ok(Value::Null);
     }
     let name = a[0].to_text().to_lowercase();
-    let mut st = ctx.state.lock().unwrap();
     if f == CtxFn::CurrentSetting {
+        let st = ctx.state.lock().unwrap();
         let missing_ok = a.get(1).map_or(Ok(Some(false)), truth)?.unwrap_or(false);
         return match setting(&st, &ctx.live, &name) {
             Some((_, v)) => Ok(Value::Text(v)),
@@ -41627,7 +43305,14 @@ fn setting_call(ctx: &Ctx, f: CtxFn, a: &[Value]) -> Result<Value> {
     // (a null value is DEFAULT)
     let given = (a[1] != Value::Null).then(|| a[1].to_text());
     let checked = checked_setting(&name, given.as_deref())?;
+    // (default_tablespace names a tablespace there is, as SET's does: see `tablespace::check_default`)
+    if name == "default_tablespace"
+        && let Some(space) = &checked
+    {
+        tablespace::check_default(&ctx.core.view_tx(&ctx.world)?, space)?;
+    }
     let local = truth(&a[2])?.unwrap_or(false);
+    let mut st = ctx.state.lock().unwrap();
     // kept as SET keeps them; SET LOCAL's outside a transaction last for the statement, so no
     // longer than now. (search_path, statement_timeout and TimeZone are the session's own: a
     // statement sets those, set_config() reads them back but leaves them.)
@@ -41661,6 +43346,9 @@ fn setting_call(ctx: &Ctx, f: CtxFn, a: &[Value]) -> Result<Value> {
 /// A `CtxFn` on its arguments' values.
 fn ctx_call(f: CtxFn, a: &[Value]) -> Result<Value> {
     use Value::*;
+    if f.changes() {
+        dry_refusal(|| format!("{}()", f.name()))?;
+    }
     match f {
         CtxFn::CurrentSchema => return Ok(current_schema().map_or(Null, Text)),
         CtxFn::TableIsVisible
@@ -41674,6 +43362,8 @@ fn ctx_call(f: CtxFn, a: &[Value]) -> Result<Value> {
         | CtxFn::PartKeyDef
         | CtxFn::PartConstraintDef
         | CtxFn::PartRoot
+        | CtxFn::RelationFilenode
+        | CtxFn::FilenodeRelation
         | CtxFn::FunctionArgs(_)
         | CtxFn::FunctionResult
         | CtxFn::FunctionDef
@@ -41690,7 +43380,8 @@ fn ctx_call(f: CtxFn, a: &[Value]) -> Result<Value> {
         | CtxFn::InputValid
         | CtxFn::Description
         | CtxFn::ColDescription
-        | CtxFn::CurrentSchemas => return catalog::call(f, a),
+        | CtxFn::CurrentSchemas
+        | CtxFn::BinaryCoercible => return catalog::call(f, a),
         // acldefault(kind, owner): the privileges an object of this kind starts with (see `acl`)
         CtxFn::AclDefault => {
             if a.contains(&Null) {
@@ -41750,6 +43441,15 @@ fn ctx_call(f: CtxFn, a: &[Value]) -> Result<Value> {
         let text = |x: &Value| if *x == Null { String::new() } else { x.to_text() };
         notify(&ctx.state, ctx.depth, text(&a[0]), text(&a[1]))?;
         return Ok(Text(String::new())); // void
+    }
+    // set_ttdummy(on): the state ttdummy was in (1: on), as it is turned on or off (as regress.c's, it lasts as
+    // long as the session, whatever the transaction does)
+    if f == CtxFn::SetTtdummy {
+        let Int(on) = coerce(a[0].clone(), Type::BigInt)? else { return Ok(Null) };
+        let mut st = ctx.state.lock().unwrap();
+        let was = !st.ttdummy_off;
+        st.ttdummy_off = on == 0;
+        return Ok(Int(i64::from(was)));
     }
     if f == CtxFn::CurrentDatabase {
         return Ok(Text(ctx.home.clone()));
@@ -42346,7 +44046,7 @@ fn like_columns(
                 *key = cols;
             }
             for u in &src.uniques {
-                constraints.push(ConstraintDef::Unique { name: None, cols: names(&u.cols), nnd: u.nnd });
+                constraints.push(ConstraintDef::Unique { name: None, cols: names(&u.cols), nnd: u.nnd, space: None });
             }
             indexes.extend(src.indexes.iter().map(|x| (src.clone(), x.clone())));
         }
@@ -43078,6 +44778,157 @@ fn bool_option(opt: &str, value: Option<Tok>) -> Result<bool> {
     }
 }
 
+/// One option of ALTER VIEW's (or ALTER TABLE's, naming a view) SET (option = value) or RESET (option), checked as
+/// Postgres's view_reloptions checks it: what `Exec::view_options` keeps of it (a RESET's None), or nothing, for a
+/// RESET of an option a view hasn't (Postgres says nothing of it either). A materialized view (`kind`) takes none of
+/// a view's options, and keeps none of its storage settings.
+fn view_option(opt: String, value: Option<Tok>, kind: &str, reset: bool) -> Result<Option<(String, Option<Json>)>> {
+    let view_opt = matches!(opt.as_str(), "security_invoker" | "security_barrier" | "check_option");
+    if kind != "view" && view_opt && !reset {
+        return err("22023", format!("unrecognized parameter \"{opt}\""));
+    }
+    if kind != "view" || (reset && !view_opt) {
+        return Ok(None);
+    }
+    if reset {
+        return Ok(Some((opt, None)));
+    }
+    let kept = match opt.as_str() {
+        "security_invoker" | "security_barrier" => Json::Bool(bool_option(&opt, value)?),
+        "check_option" => {
+            // (no value given is "true", as for any option)
+            let text = match value {
+                Some(Tok::Word(w) | Tok::Str(w) | Tok::Ident(w) | Tok::Num(w)) => w,
+                Some(t) => tokens_shown(&[t]),
+                None => "true".into(),
+            };
+            match text.to_lowercase().as_str() {
+                l @ ("local" | "cascaded") => Json::String(l.into()),
+                _ => {
+                    return Err(SqlError {
+                        code: "22023",
+                        message: format!("invalid value for enum option \"check_option\": {text}"),
+                        info: Some(Box::new(Violation {
+                            detail: Some("Valid values are \"local\" and \"cascaded\".".into()),
+                            ..Violation::default()
+                        })),
+                    });
+                }
+            }
+        }
+        _ => return err("22023", format!("unrecognized parameter \"{opt}\"")),
+    };
+    Ok(Some((opt, Some(kept))))
+}
+
+/// SET or RESET of view `name`'s options `opts` (`view_option`'s: a value set, None for a RESET), on its stored
+/// definition `j`: kept as pg_class.reloptions shows them (a value set replaces the option's, or comes last; a RESET
+/// takes it out), and as the fields its reads and writes go by.
+fn set_view_options(j: &mut Json, name: &str, opts: &[(String, Option<Json>)]) -> Result<()> {
+    let mut relopts: Vec<(String, String)> = serde_json::from_value(j["reloptions"].clone()).unwrap_or_default();
+    for (opt, value) in opts {
+        match value {
+            Some(x) => {
+                let text = match x {
+                    Json::String(s) => s.clone(),
+                    x => x.to_string(),
+                };
+                match relopts.iter_mut().find(|(o, _)| o == opt) {
+                    Some(r) => r.1 = text,
+                    None => relopts.push((opt.clone(), text)),
+                }
+            }
+            None => relopts.retain(|(o, _)| o != opt),
+        }
+    }
+    match relopts.is_empty() {
+        true => {
+            if let Some(o) = j.as_object_mut() {
+                o.remove("reloptions");
+            }
+        }
+        false => j["reloptions"] = serde_json::json!(relopts),
+    }
+    for (opt, value) in opts {
+        let field = if opt == "check_option" { "check" } else { opt.as_str() };
+        match value {
+            Some(x) => {
+                if field == "check"
+                    && let Some(why) = not_updatable(&view_query(name, j["sql"].as_str().unwrap_or_default())?)
+                {
+                    return Err(SqlError {
+                        code: UNSUPPORTED,
+                        message: "WITH CHECK OPTION is supported only on automatically updatable views".into(),
+                        info: Some(Box::new(Violation { hint: Some(why.into()), ..Violation::default() })),
+                    });
+                }
+                j[field] = x.clone();
+            }
+            None => {
+                if let Some(o) = j.as_object_mut() {
+                    o.remove(field);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// SET DEFAULT `default` (its SQL) or DROP DEFAULT (None) of view `name`'s column `col`, on its stored definition
+/// `j`: kept as its `defaults`.
+fn set_view_default(j: &mut Json, name: &str, col: &str, default: Option<&str>) -> Result<()> {
+    if !j["columns"].as_array().is_some_and(|cs| cs.iter().any(|c| c == col)) {
+        return err(NO_COLUMN, format!("column \"{col}\" of relation \"{}\" does not exist", rel_part(name)));
+    }
+    if !j["defaults"].is_object() {
+        j["defaults"] = Json::Object(Map::new());
+    }
+    match (default, j["defaults"].as_object_mut()) {
+        (Some(sql), Some(d)) => {
+            d.insert(col.to_string(), Json::String(sql.to_string()));
+        }
+        (None, Some(d)) => {
+            d.remove(col);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// RENAME COLUMN `from` TO `to` of view `name`, on its stored definition `j` (with the changes made of it before in
+/// the statement): its columns' names, kept as its `columns`. A view another view reads keeps its names, unless the
+/// caller writes those views again to follow it (`followed`: see `Exec::rename_view_column`).
+fn rename_view_col(v: &View, j: &mut Json, name: &str, from: &str, to: &str, followed: bool) -> Result<()> {
+    let sql = j["sql"].as_str().unwrap_or_default().to_string();
+    let cols: Vec<String> =
+        j["columns"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
+    // (a view made without a column list has its query's names)
+    let found = select_columns_with(v, &view_query(name, &sql)?, &[], &[])?.0;
+    let mut names: Vec<String> =
+        found.iter().enumerate().map(|(i, (n, _))| cols.get(i).cloned().unwrap_or_else(|| n.clone())).collect();
+    let Some(at) = names.iter().position(|n| n == from) else {
+        return err(NO_COLUMN, format!("column \"{from}\" does not exist"));
+    };
+    if names.iter().any(|n| n == to) {
+        return err("42701", format!("column \"{to}\" of relation \"{}\" already exists", rel_part(name)));
+    }
+    if !followed && let Some(d) = dependents(v, name)?.first() {
+        return err(
+            UNSUPPORTED,
+            format!("can't rename a column of view \"{name}\": view \"{d}\" reads it; drop that view first"),
+        );
+    }
+    names[at] = to.to_string();
+    j["columns"] = Json::from(names);
+    // (a default is the column's, whatever its name)
+    if let Some(d) = j["defaults"].as_object_mut()
+        && let Some(x) = d.remove(from)
+    {
+        d.insert(to.to_string(), x);
+    }
+    Ok(())
+}
+
 fn view_def(v: &View, name: &str) -> Result<Option<ViewDef>> {
     let Some(raw) = v.get(&format!("{VIEWS}/{name}"))? else { return Ok(None) };
     let j: Json = serde_json::from_str(&raw).unwrap_or_default();
@@ -43197,6 +45048,55 @@ fn relation_kind(v: &View, name: &str) -> Result<Option<&'static str>> {
         return Ok(Some("sequence"));
     }
     Ok(load(v, name)?.map(|t| if t.matview.is_some() { "materialized view" } else { "table" }))
+}
+
+/// Whether `name` is one of Postgres's own catalog tables (pg_class, pg_attribute, ...), which ALTER TABLE refuses
+/// to change, as Postgres refuses anyone but a superuser with allow_system_table_mods on; not a view of them.
+fn system_catalog(name: &str) -> bool {
+    const CATALOG_VIEWS: &[&str] =
+        &["pg_tables", "pg_views", "pg_matviews", "pg_indexes", "pg_sequences", "pg_roles", "pg_user", "pg_settings"];
+    catalog::table_oid(name).is_some() && !CATALOG_VIEWS.contains(&name)
+}
+
+/// What Postgres calls a change of ALTER TABLE in the error refusing it for a kind of relation that can't have it
+/// (alter_table_type_to_string): None for Chronos's own, and for those that aren't Postgres's subcommands.
+fn alter_action(c: &Alter) -> Option<&'static str> {
+    Some(match c {
+        Alter::AddColumn(..) => "ADD COLUMN",
+        Alter::DropColumn(..) => "DROP COLUMN",
+        Alter::SetType(..) => "ALTER COLUMN ... SET DATA TYPE",
+        Alter::SetDefault(..) => "ALTER COLUMN ... SET DEFAULT",
+        Alter::NotNull(_, true) => "ALTER COLUMN ... SET NOT NULL",
+        Alter::NotNull(_, false) => "ALTER COLUMN ... DROP NOT NULL",
+        Alter::Identity(_, Some(_), false, _) => "ALTER COLUMN ... ADD IDENTITY",
+        Alter::Identity(_, Some(_), true, _) => "ALTER COLUMN ... SET",
+        Alter::Identity(_, None, ..) => "ALTER COLUMN ... DROP IDENTITY",
+        Alter::DropExpression(..) => "ALTER COLUMN ... DROP EXPRESSION",
+        Alter::ColOpt(_, ColOpt::Storage(_)) => "ALTER COLUMN ... SET STORAGE",
+        Alter::ColOpt(_, ColOpt::Compression(_)) => "ALTER COLUMN ... SET COMPRESSION",
+        Alter::ColOpt(_, ColOpt::Stats(_)) => "ALTER COLUMN ... SET STATISTICS",
+        Alter::FdwOptions(Some(_), _) => "ALTER COLUMN ... OPTIONS",
+        Alter::FdwOptions(None, _) => "OPTIONS",
+        Alter::AddConstraint(_) | Alter::AddPrimaryKey(..) | Alter::KeyUsingIndex(..) => "ADD CONSTRAINT",
+        Alter::DropConstraint(..) => "DROP CONSTRAINT",
+        Alter::Validate(_) => "VALIDATE CONSTRAINT",
+        Alter::Deferral(..) => "ALTER CONSTRAINT",
+        Alter::Cluster(Some(_)) => "CLUSTER ON",
+        Alter::Cluster(None) => "SET WITHOUT CLUSTER",
+        Alter::Unlogged(true) => "SET UNLOGGED",
+        Alter::Unlogged(false) => "SET LOGGED",
+        Alter::ReplicaIdentity(..) => "REPLICA IDENTITY",
+        Alter::Inherit(_, true) => "INHERIT",
+        Alter::Inherit(_, false) => "NO INHERIT",
+        Alter::Attach(..) => "ATTACH PARTITION",
+        Alter::Detach(_, hier::Detach::Finalize) => "DETACH PARTITION ... FINALIZE",
+        Alter::Detach(..) => "DETACH PARTITION",
+        Alter::RowSecurity(Some(true), _) => "ENABLE ROW SECURITY",
+        Alter::RowSecurity(Some(false), _) => "DISABLE ROW SECURITY",
+        Alter::RowSecurity(None, Some(true)) => "FORCE ROW SECURITY",
+        Alter::RowSecurity(None, Some(false)) => "NO FORCE ROW SECURITY",
+        _ => return None,
+    })
 }
 
 /// The table whose index is named `name` (as stored, `schema.index`): one CREATE INDEX made, a unique constraint's,
@@ -43352,6 +45252,26 @@ fn dependents(v: &View, name: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// `dependents`, and the views and materialized views that read columns of table `name` without naming it: through a
+/// function's rows of it in their FROM (see `column_deps`).
+fn column_dependents(v: &View, name: &str) -> Result<Vec<String>> {
+    let names = |j: &Json| j["deps"].as_array().is_some_and(|ds| ds.iter().any(|d| d[0] == name));
+    let mut out = dependents(v, name)?;
+    for r in v.prefix(&format!("{VIEWS}/"))? {
+        let (k, raw) = r?;
+        let d = &k[VIEWS.len() + 1..];
+        if !out.iter().any(|x| x == d) && names(&serde_json::from_str(&raw).unwrap_or_default()) {
+            out.push(d.to_string());
+        }
+    }
+    for t in schemas(v)? {
+        if !out.contains(&t.name) && t.matview.as_ref().is_some_and(names) {
+            out.push(t.name);
+        }
+    }
+    Ok(out)
+}
+
 /// What depends on relation `name` in turn (the views and materialized views over it, and theirs), each with what it
 /// depends on, as Postgres's DETAIL names them (schema-qualified where the search_path doesn't find them): `("view
 /// go.v", "table go.t")`.
@@ -43409,7 +45329,7 @@ fn column_readers(v: &View, table: &str, col: &str, id: u32) -> Result<Vec<Colum
         }))
     };
     let mut out = vec![];
-    for d in dependents(v, table)? {
+    for d in column_dependents(v, table)? {
         let (j, matview) = match v.get(&format!("{VIEWS}/{d}"))? {
             Some(raw) => (serde_json::from_str::<Json>(&raw).unwrap_or_default(), false),
             None => match load(v, &d)?.and_then(|t| t.matview) {
@@ -43434,7 +45354,20 @@ fn column_readers(v: &View, table: &str, col: &str, id: u32) -> Result<Vec<Colum
 /// The columns of tables query `q` reads, by their ids, as a view made of it depends on them (see `column_readers`):
 /// `[[table, [id, ...]], ...]`; None where they can't be told.
 fn column_deps(v: &View, q: &Select) -> Option<Json> {
-    let used = acl::columns_used(v, &Stmt::Select(Box::new(q.clone()))).ok()?;
+    let mut used = acl::columns_used(v, &Stmt::Select(Box::new(q.clone()))).ok()?;
+    // a function's rows of a table in FROM (`from f() t`, RETURNS SETOF t): the columns of the table the query reads
+    // through it, as Postgres's view depends on them; read as if the table stood in the call's place
+    let mut through = q.clone();
+    if rows_in_place(v, &mut through)
+        && let Ok(more) = acl::columns_used(v, &Stmt::Select(Box::new(through)))
+    {
+        for (rel, cols) in more {
+            match used.iter_mut().find(|(r, _)| *r == rel) {
+                Some((_, c)) => c.extend(cols),
+                None => used.push((rel, cols)),
+            }
+        }
+    }
     let mut out = vec![];
     for (rel, cols) in used {
         let Ok(Some(t)) = load(v, &rel) else { continue }; // (a view's columns are its query's)
@@ -43442,6 +45375,36 @@ fn column_deps(v: &View, q: &Select) -> Option<Json> {
         out.push(serde_json::json!([rel, ids]));
     }
     Some(Json::Array(out))
+}
+
+/// Puts the table in place of each call in `q`'s FROM (its subqueries' too) of a function that returns that table's
+/// rows (see `functions::rows_of_call`), under the call's alias, for what the query reads of it to be told (see
+/// `column_deps`); whether it put any. A call with a column alias list (`f() t(a, b)`) is left: its names aren't the
+/// table's.
+fn rows_in_place(v: &View, q: &mut Select) -> bool {
+    let mut put = false;
+    for s in q.from.iter_mut().chain(q.joins.iter_mut().map(|j| &mut j.src)) {
+        if let Some(sub) = s.sub.as_deref_mut() {
+            put |= rows_in_place(v, sub);
+        }
+        let Some((name, args)) = s.srf.as_deref() else { continue };
+        if !s.names.is_empty() {
+            continue;
+        }
+        if let Some(t) = functions::rows_of_call(v, name, args.len()) {
+            (s.srf, s.table) = (None, t);
+            put = true;
+        }
+    }
+    for (_, _, p) in &mut q.set {
+        put |= rows_in_place(v, p);
+    }
+    let mut inner = false;
+    let _ = select_subqueries(q, &mut |s| {
+        inner |= rows_in_place(v, s);
+        Ok(true)
+    });
+    put || inner
 }
 
 /// The rows a view or materialized view `name` (of `kind`, as `relation_kind` says) is kept in, to be deleted when
@@ -43455,6 +45418,7 @@ fn relation_gone(v: &View, name: &str, kind: &str) -> Result<Vec<(String, Option
             w.push((r?.0, None));
         }
         w.extend(index_rows(v, name)?.into_iter().map(|k| (k, None)));
+        w.extend(tablespace::gens_dropped(v, name)?);
         w.push((schema_key(name), None));
     }
     for r in v.prefix(&rules::prefix_of(name))? {
@@ -43476,28 +45440,299 @@ fn rel_made(v: &View, name: &str) -> String {
     }
 }
 
-/// The views and materialized views that go when `roots` are dropped (they read one, or read one that does), in the
-/// order Postgres's "drop cascades to" lists them: the reverse of the order findDependentObjects finds them in,
-/// which visits each object's dependents newest first and puts each after its own dependents.
-fn dependents_listed(v: &View, roots: &[String]) -> Result<Vec<String>> {
-    fn visit(v: &View, n: &str, seen: &mut HashSet<String>, out: &mut Vec<String>) -> Result<()> {
-        let mut deps = dependents(v, n)?;
-        deps.sort_by_cached_key(|d| std::cmp::Reverse((rel_made(v, d), d.clone())));
-        for d in deps {
+/// Where an object comes in the order objects were made, as Postgres's oids order them: its stamp (see `acl::MADE`;
+/// empty for one made before stamps were kept, which comes first), then what else tells (a view's own `made`, a
+/// function's oid), then its name.
+type MadeKey = (String, String, String);
+
+/// What an object a DROP ... CASCADE reaches has depending on it, each with its `MadeKey` (see `cascade_order`).
+type Dependents<'a, N> = dyn FnMut(&N) -> Result<Vec<(N, MadeKey)>> + 'a;
+
+/// Where relation `name` (a view or materialized view: `view`) comes in the order objects were made (see `MadeKey`).
+fn rel_order(v: &View, name: &str, view: bool) -> MadeKey {
+    let own = if view { rel_made(v, name) } else { String::new() };
+    (acl::made_at(v, &format!("rel/{name}")), own, name.to_string())
+}
+
+/// Where policy `name` on table `table` comes in the order objects were made (see `MadeKey`): its stamp, then its
+/// place among its table's policies (`made`: see `rls::Policy`).
+fn policy_order(v: &View, table: &str, name: &str, made: u64) -> MadeKey {
+    (acl::made_at(v, &rls::made_key(table, name)), format!("{made:020}"), format!("{table}/{name}"))
+}
+
+/// What a DROP ... CASCADE reaches, as Postgres's pg_depend has it (see `cascade_order`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Dep {
+    Schema(String),
+    /// a relation, by its stored name
+    Rel(String),
+    Type(String),
+    /// a function or procedure, by its row's key
+    Func(String),
+    Ext(String),
+    /// a policy: its table, and its name
+    Policy(String, String),
+    /// a foreign key: its table, and its name
+    Fk(String, String),
+}
+
+/// What dropping `roots` reaches, in the order Postgres's "drop cascades to" lists it, each with the object it was
+/// reached from: findDependentObjects visits an object's dependents newest first (by oid; here by `MadeKey`) and puts
+/// each after its own dependents, and reportDependentObjects reads that list from its end. So each object comes after
+/// the newest of what it depends on, and the objects of a schema in the order they were made. A root another one
+/// reaches is visited from that one, as there; the roots themselves are left out.
+fn cascade_order<N: Clone + Eq + std::hash::Hash>(
+    roots: &[N],
+    dependents: &mut Dependents<'_, N>,
+) -> Result<Vec<(N, N)>> {
+    fn visit<N: Clone + Eq + std::hash::Hash>(
+        n: &N,
+        dependents: &mut Dependents<'_, N>,
+        seen: &mut HashSet<N>,
+        out: &mut Vec<(N, N)>,
+    ) -> Result<()> {
+        let mut deps = dependents(n)?;
+        deps.sort_by(|a, b| b.1.cmp(&a.1));
+        for (d, _) in deps {
             if seen.insert(d.clone()) {
-                visit(v, &d, seen, out)?;
-                out.push(d);
+                visit(&d, dependents, seen, out)?;
+                out.push((d, n.clone()));
             }
         }
         Ok(())
     }
-    let mut seen: HashSet<String> = roots.iter().cloned().collect();
-    let mut out = vec![];
+    let (mut seen, mut out) = (HashSet::new(), vec![]);
     for r in roots {
-        visit(v, r, &mut seen, &mut out)?;
+        if seen.insert(r.clone()) {
+            visit(r, dependents, &mut seen, &mut out)?;
+        }
     }
     out.reverse();
+    out.retain(|(d, _)| !roots.contains(d));
     Ok(out)
+}
+
+/// The views and materialized views that go when `roots` are dropped (they read one, or read one that does), in the
+/// order Postgres's "drop cascades to" lists them (see `cascade_order`).
+fn dependents_listed(v: &View, roots: &[String]) -> Result<Vec<String>> {
+    let order = cascade_order(roots, &mut |n: &String| {
+        Ok(dependents(v, n)?.into_iter().map(|d| (d.clone(), rel_order(v, &d, true))).collect())
+    })?;
+    Ok(order.into_iter().map(|(d, _)| d).collect())
+}
+
+/// How many of the objects a DROP reaches its message names, as Postgres's MAX_REPORTED_DEPS: the rest are counted.
+const MAX_REPORTED_DEPS: usize = 100;
+
+/// What a DROP's DETAIL ends with when it reaches `n` objects, more than it names (`MAX_REPORTED_DEPS`).
+fn not_reported(n: usize) -> String {
+    match n.saturating_sub(MAX_REPORTED_DEPS) {
+        0 => String::new(),
+        1 => "\nand 1 other object (see server log for list)".into(),
+        k => format!("\nand {k} other objects (see server log for list)"),
+    }
+}
+
+/// The NOTICE DROP ... CASCADE sends for what it drops besides what it names (`listed`, as getObjectDescription names
+/// each), as Postgres's reportDependentObjects: one said alone; more counted, the first so many in the DETAIL.
+fn cascade_notice(listed: &[String]) {
+    match listed {
+        [] => {}
+        [one] => notice("NOTICE", format!("drop cascades to {one}")),
+        many => {
+            let lines: Vec<String> =
+                many.iter().take(MAX_REPORTED_DEPS).map(|d| format!("drop cascades to {d}")).collect();
+            notice_detail(
+                "NOTICE",
+                format!("drop cascades to {} other objects", many.len()),
+                lines.join("\n") + &not_reported(many.len()),
+            )
+        }
+    }
+}
+
+/// Function `f` as Postgres's getObjectDescription names it for the running session (format_procedure): its name,
+/// schema-qualified unless the search_path finds it by that name and its argument types (public's bare, as
+/// `shown_name` has it), then those types, `,` between them: `f(integer,text)`.
+fn func_shown(v: &View, f: &functions::Function) -> String {
+    let bare = rel_part(&f.name);
+    let same = |g: &Arc<functions::Function>| g.args.iter().map(|a| a.1).eq(f.args.iter().map(|a| a.1));
+    let found = funcs_on_path(bare).into_iter().find(|n| functions::named(v, n).is_ok_and(|fs| fs.iter().any(&same)));
+    let name = match schema_part(&f.name) == "public" || found.as_deref() == Some(f.name.as_str()) {
+        true => ident(bare),
+        false => format!("{}.{}", ident(schema_part(&f.name)), ident(bare)),
+    };
+    let arg = |t: Type| match t {
+        Type::Enum(i) => type_shown(v, &enum_name(i)),
+        t => t.pg_name().into_owned(),
+    };
+    format!("{name}({})", f.args.iter().map(|a| arg(a.1)).collect::<Vec<_>>().join(","))
+}
+
+/// Stored type `name` as format_type names it for the running session: a relation's row type bare where the relation
+/// is found by its name (TypeIsVisible is RelationIsVisible for one, and public's is bare, as `shown_name` has it),
+/// any other type where the search_path finds it (`shown_type`); each part quoted if it needs it.
+fn type_shown(v: &View, name: &str) -> String {
+    match relation_kind(v, name) {
+        Ok(Some(_)) => match shown_name(name) {
+            s if s == rel_part(name) => ident(&s),
+            s => s,
+        },
+        _ => shown_type(name),
+    }
+}
+
+/// Where a function that takes or gives relation `rel`'s row type (`view`: a view or materialized view) comes among
+/// what depends on the relation (see `MadeKey`): pg_depend has it on the row type, whose oid comes right after the
+/// relation's, so it comes before everything made after the relation; those of one relation in the order they were
+/// made.
+fn row_typed_order(v: &View, rel: &str, view: bool, f: &functions::Function) -> MadeKey {
+    let (at, own, name) = rel_order(v, rel, view);
+    let made = acl::made_at(v, &format!("func/{}", f.sig()));
+    (at, own, format!("{name}\0{made}\0{:020}\0{}", f.oid.unwrap_or(0), f.sig()))
+}
+
+/// What DROP SCHEMA reaches (`members`: each schema dropped, with what is in it; `funcs`: the functions among them, by
+/// key), in the order Postgres lists it (see `cascade_order`), each as getObjectDescription names it with the object
+/// it depends on. An object of a schema depends on it; besides, what reads a relation (views, materialized views, the
+/// policies of other tables), the tables below it, other tables' foreign keys to it, and a type's typed tables depend
+/// on them. Left out, as Postgres reaches them through what owns them (an automatic dependency, which it doesn't
+/// report): a partition of a table that goes, and a sequence owned by a column of one.
+fn schema_cascade(
+    v: &View,
+    rels: &[TableInfo],
+    members: &[(String, Vec<Dep>)],
+    funcs: &HashMap<String, Arc<functions::Function>>,
+) -> Result<Vec<(String, String)>> {
+    let info: HashMap<&str, &TableInfo> = rels.iter().map(|r| (r.name.as_str(), r)).collect();
+    // what reads each relation, the tables below it and the sequences its columns own; each type's typed tables
+    let mut over: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut typed: HashMap<&str, Vec<&str>> = HashMap::new();
+    for r in rels {
+        let above = r.reads.iter().chain(&r.hier.parents).chain(r.owner.iter().map(|(t, ..)| t));
+        for x in above {
+            over.entry(x.as_str()).or_default().push(&r.name);
+        }
+        if let Some(t) = &r.hier.of_type {
+            typed.entry(t.as_str()).or_default().push(&r.name);
+        }
+    }
+    let mut keys: HashMap<Dep, MadeKey> = HashMap::new();
+    let mut key = |d: &Dep, policy_made: u64| -> MadeKey {
+        if let Some(k) = keys.get(d) {
+            return k.clone();
+        }
+        let k = match d {
+            Dep::Rel(n) => rel_order(v, n, info.get(n.as_str()).is_some_and(|r| matches!(r.kind, 'v' | 'm'))),
+            Dep::Type(n) => (acl::made_at(v, &format!("type/{n}")), String::new(), n.clone()),
+            Dep::Func(k) => match funcs.get(k) {
+                Some(f) => {
+                    (acl::made_at(v, &format!("func/{}", f.sig())), format!("{:020}", f.oid.unwrap_or(0)), f.sig())
+                }
+                None => (String::new(), String::new(), k.clone()),
+            },
+            Dep::Ext(n) => (acl::made_at(v, &format!("ext/{n}")), String::new(), n.clone()),
+            Dep::Policy(t, n) => policy_order(v, t, n, policy_made),
+            Dep::Fk(t, n) => (acl::made_at(v, &format!("rel/{t}")), String::new(), format!("{t}/{n}")),
+            Dep::Schema(n) => (String::new(), String::new(), n.clone()),
+        };
+        keys.insert(d.clone(), k.clone());
+        k
+    };
+    let roots: Vec<Dep> = members.iter().map(|(n, _)| Dep::Schema(n.clone())).collect();
+    // what goes besides the policies and foreign keys of other tables (which are the tables' that go too)
+    let below = |d: &Dep| -> Vec<Dep> {
+        match d {
+            Dep::Schema(n) => members.iter().find(|(m, _)| m == n).map(|(_, ds)| ds.clone()).unwrap_or_default(),
+            Dep::Rel(r) => over.get(r.as_str()).into_iter().flatten().map(|x| Dep::Rel(x.to_string())).collect(),
+            Dep::Type(t) => typed.get(t.as_str()).into_iter().flatten().map(|x| Dep::Rel(x.to_string())).collect(),
+            _ => vec![],
+        }
+    };
+    let first =
+        cascade_order(&roots, &mut |d: &Dep| Ok(below(d).into_iter().map(|x| (x.clone(), key(&x, 0))).collect()))?;
+    let going: Vec<(String, &'static str)> = first
+        .iter()
+        .filter_map(|(d, _)| match d {
+            Dep::Rel(n) => Some((n.clone(), "table")),
+            _ => None,
+        })
+        .collect();
+    let goes: HashSet<&str> = going.iter().map(|(n, _)| n.as_str()).collect();
+    let reading = rls::reading(v, &going)?;
+    let mut fks: HashMap<&str, Vec<Dep>> = HashMap::new();
+    for &g in &goes {
+        let mut from: Vec<&String> = info.get(g).map(|r| r.referenced_by.iter().collect()).unwrap_or_default();
+        from.dedup();
+        for o in from.into_iter().filter(|o| !goes.contains(o.as_str())) {
+            let Some(t) = load(v, o)? else { continue };
+            // (a partition's copy of its parent's goes with that one, as in Postgres, unsaid)
+            for f in t.fks.iter().filter(|f| f.table == g && !t.hier.inherited.contains(&f.name)) {
+                fks.entry(g).or_default().push(Dep::Fk(t.name.clone(), f.name.clone()));
+            }
+        }
+    }
+    // the functions of other schemas that take or give the row type of a relation that goes, which go with it (see
+    // `drop_relation_writes`), each where `row_typed_order` puts it
+    let mut fns = funcs.clone();
+    let mut row_typed: HashMap<&str, Vec<(Dep, MadeKey)>> = HashMap::new();
+    for &g in &goes {
+        let view = info.get(g).is_some_and(|r| matches!(r.kind, 'v' | 'm'));
+        for f in functions::using_row_type(v, g)?.into_iter().filter(|f| !funcs.contains_key(&f.key())) {
+            row_typed.entry(g).or_default().push((Dep::Func(f.key()), row_typed_order(v, g, view, &f)));
+            fns.entry(f.key()).or_insert(f);
+        }
+    }
+    let order = cascade_order(&roots, &mut |d: &Dep| {
+        let mut out: Vec<(Dep, MadeKey)> = below(d).into_iter().map(|x| (x.clone(), key(&x, 0))).collect();
+        if let Dep::Rel(r) = d {
+            for (p, _, _) in reading.iter().filter(|(_, g, _)| g == r) {
+                let x = Dep::Policy(p.table.clone(), p.name.clone());
+                out.push((x.clone(), key(&x, p.made)));
+            }
+            for x in fks.get(r.as_str()).into_iter().flatten() {
+                out.push((x.clone(), key(x, 0)));
+            }
+            out.extend(row_typed.get(r.as_str()).into_iter().flatten().cloned());
+        }
+        Ok(out)
+    })?;
+    let noun = |n: &str| match info.get(n).map(|r| r.kind) {
+        Some('v') => "view",
+        Some('m') => "materialized view",
+        Some('S') => "sequence",
+        Some('f') => "foreign table",
+        _ => "table",
+    };
+    let shown = |d: &Dep| match d {
+        Dep::Schema(n) => format!("schema {n}"),
+        Dep::Rel(n) => format!("{} {}", noun(n), shown_name(n)),
+        Dep::Type(n) => format!("type {}", shown_type(n)),
+        Dep::Func(k) => match fns.get(k) {
+            Some(f) => format!("function {}", func_shown(v, f)),
+            None => format!("function {k}"),
+        },
+        Dep::Ext(n) => format!("extension {n}"),
+        Dep::Policy(t, n) => format!("policy {n} on table {}", shown_name(t)),
+        Dep::Fk(t, n) => format!("constraint {n} on table {}", shown_name(t)),
+    };
+    // (what a function of another schema is reached from: the row type of the relation)
+    let shown_on = |d: &Dep, on: &Dep| match (d, on) {
+        (Dep::Func(k), Dep::Rel(r)) if !funcs.contains_key(k) => format!("type {}", type_shown(v, r)),
+        _ => shown(on),
+    };
+    // (a partition of a table that goes, a sequence a column of one owns)
+    let owned = |n: &str| {
+        info.get(n).is_some_and(|r| {
+            r.hier.of.as_ref().is_some_and(|(p, ..)| goes.contains(p.as_str()))
+                || r.owner.as_ref().is_some_and(|(t, ..)| goes.contains(t.as_str()))
+        })
+    };
+    Ok(order
+        .iter()
+        .filter(|(d, _)| !matches!(d, Dep::Rel(n) if owned(n.as_str())))
+        .map(|(d, on)| (shown(d), shown_on(d, on)))
+        .collect())
 }
 
 /// Applies `f` to each subquery in `e` (wherever it is: the left side of IN too), in place; whether
@@ -44949,6 +47184,57 @@ fn populated(t: &Table) -> Result<()> {
 }
 
 impl Exec<'_> {
+    /// CREATE TABLE AS (or SELECT INTO) that a function runs (`EXECUTE 'CREATE TABLE t AS SELECT ...'`), in the
+    /// transaction it runs in, as a session runs one (see `Session::create_table_as`): the query's rows are read
+    /// before the table is made, as Postgres binds what the query reads first, then put in it. `calls`: the
+    /// statement's flag (see `Statement`).
+    #[allow(clippy::too_many_arguments)]
+    fn create_table_as(
+        &self,
+        table: &str,
+        cols: &[String],
+        query: &Select,
+        if_not_exists: bool,
+        data: bool,
+        calls: bool,
+        space: Option<&str>,
+    ) -> Result<Output> {
+        let v = self.db.view_tx(self.branch)?;
+        let select = Stmt::Select(Box::new(query.clone()));
+        let types: Vec<Type> = self.types.iter().map(|t| t.unwrap_or(Type::Text)).collect();
+        let found = Statement(select.clone(), PlanCache::default(), calls)
+            .columns(self.db, self.branch, &types)?
+            .unwrap_or_default();
+        // (a relation already there: with IF NOT EXISTS left as it is, the query unrun; else Postgres's error)
+        if relation_kind(&v, table)?.is_some() {
+            if !if_not_exists {
+                return Err(ctas_exists(table));
+            }
+            notice("NOTICE", format!("relation \"{}\" already exists, skipping", rel_part(table)));
+            return Ok(Output::tag("CREATE TABLE AS"));
+        }
+        let (names, made) = ctas_columns(Some(&v), query, &found, cols)?;
+        // made by a person from masked columns: its copies of them are masked too, before any row is in it
+        let masks = match mask::on() {
+            true => vec![],
+            false => mask::derived(&v, query, names.len())?,
+        };
+        let rows = match data {
+            true => Some(self.run_body(&select, false)?.rows),
+            false => None,
+        };
+        self.run_stmt(&ctas_create(table, made, if_not_exists, false, space))?;
+        for st in ctas_masks(table, &names, &masks)? {
+            self.run_stmt(&st.0)?;
+        }
+        let Some(rows) = rows else { return Ok(Output::tag("CREATE TABLE AS")) };
+        let n = rows.len();
+        if n > 0 {
+            acl::filling(table, || self.run_stmt(&ctas_insert(table, rows)))?;
+        }
+        Ok(Output::tag(format!("SELECT {n}")))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn create_view(
         &self,
@@ -45035,6 +47321,7 @@ impl Exec<'_> {
                 coll.push(if collation::collatable(ty) { c } else { collation::Coll::DEFAULT });
             }
             let deps = column_deps(&v, query);
+            let space = reloptions.iter().find(|(o, _)| o == "tablespace").map(|(_, n)| n.as_str());
             return self.create_matview(
                 name,
                 &names,
@@ -45043,7 +47330,7 @@ impl Exec<'_> {
                 sql,
                 (reads, deps),
                 data,
-                if_not_exists,
+                (if_not_exists, space),
             );
         }
         let types: Vec<_> = found.iter().map(|(_, t)| t.name()).collect();
@@ -45164,54 +47451,7 @@ impl Exec<'_> {
                 };
             };
             let mut j: Json = serde_json::from_str(&raw).unwrap_or_default();
-            // (pg_class.reloptions: a value set replaces the option's, or comes last; RESET takes it out)
-            let mut relopts: Vec<(String, String)> =
-                serde_json::from_value(j["reloptions"].clone()).unwrap_or_default();
-            for (opt, value) in opts {
-                match value {
-                    Some(x) => {
-                        let text = match x {
-                            Json::String(s) => s.clone(),
-                            x => x.to_string(),
-                        };
-                        match relopts.iter_mut().find(|(o, _)| o == opt) {
-                            Some(r) => r.1 = text,
-                            None => relopts.push((opt.clone(), text)),
-                        }
-                    }
-                    None => relopts.retain(|(o, _)| o != opt),
-                }
-            }
-            match relopts.is_empty() {
-                true => {
-                    if let Some(o) = j.as_object_mut() {
-                        o.remove("reloptions");
-                    }
-                }
-                false => j["reloptions"] = serde_json::json!(relopts),
-            }
-            for (opt, value) in opts {
-                let field = if opt == "check_option" { "check" } else { opt.as_str() };
-                match value {
-                    Some(x) => {
-                        if field == "check"
-                            && let Some(why) = not_updatable(&view_query(name, j["sql"].as_str().unwrap_or_default())?)
-                        {
-                            return Err(SqlError {
-                                code: UNSUPPORTED,
-                                message: "WITH CHECK OPTION is supported only on automatically updatable views".into(),
-                                info: Some(Box::new(Violation { hint: Some(why.into()), ..Violation::default() })),
-                            });
-                        }
-                        j[field] = x.clone();
-                    }
-                    None => {
-                        if let Some(o) = j.as_object_mut() {
-                            o.remove(field);
-                        }
-                    }
-                }
-            }
+            set_view_options(&mut j, name, opts)?;
             Ok((vec![(key, Some(j.to_string()))], ()))
         })?;
         if skipped {
@@ -45240,27 +47480,53 @@ impl Exec<'_> {
                 };
             };
             let mut j: Json = serde_json::from_str(&raw).unwrap_or_default();
-            if !j["columns"].as_array().is_some_and(|cs| cs.iter().any(|c| c == col)) {
-                return err(NO_COLUMN, format!("column \"{col}\" of relation \"{}\" does not exist", rel_part(name)));
-            }
-            if !j["defaults"].is_object() {
-                j["defaults"] = Json::Object(Map::new());
-            }
-            match (default, j["defaults"].as_object_mut()) {
-                (Some(sql), Some(d)) => {
-                    d.insert(col.to_string(), Json::String(sql.to_string()));
-                }
-                (None, Some(d)) => {
-                    d.remove(col);
-                }
-                _ => {}
-            }
+            set_view_default(&mut j, name, col, default)?;
             Ok((vec![(key, Some(j.to_string()))], ()))
         })?;
         if skipped {
             notice("NOTICE", format!("relation \"{name}\" does not exist, skipping"));
         }
         Ok(Output::tag("ALTER VIEW"))
+    }
+
+    /// ALTER TABLE naming view `name`, with `changes` a view can have (SET and DROP DEFAULT, SET and RESET of its
+    /// options, RENAME COLUMN): each made as ALTER VIEW makes it, in their order, and all in one write, so that one
+    /// failing leaves the view as it was, as Postgres's ALTER TABLE, one change of the catalogs, does.
+    fn alter_view_as_table(&self, name: &str, changes: &[Alter]) -> Result<()> {
+        self.db.batch_with(self.branch, |v| {
+            let key = format!("{VIEWS}/{name}");
+            let Some(raw) = v.get(&key)? else {
+                return err(NO_TABLE, format!("relation \"{name}\" does not exist"));
+            };
+            let mut j: Json = serde_json::from_str(&raw).unwrap_or_default();
+            for c in changes {
+                match c {
+                    Alter::SetDefault(col, default) => {
+                        let sql = default.as_ref().map(|d| d.1.as_str());
+                        if let Some(sql) = sql {
+                            check_expr(sql)?;
+                        }
+                        set_view_default(&mut j, name, col, sql)?;
+                    }
+                    Alter::RelOptions(given, reset) => {
+                        // (transformRelOptions's checks of them all: a namespace has to be `toast`, whose parameters
+                        // a view, having no TOAST table, then ignores, and a RESET gives no values; then
+                        // view_reloptions's of the view's own)
+                        reloptions::transform(&[], given, None, &["toast"], *reset)?;
+                        let mut opts = vec![];
+                        for (_, opt, value) in given.iter().filter(|g| g.0.is_none()) {
+                            let value = value.clone().map(Tok::Word);
+                            opts.extend(view_option(opt.to_lowercase(), value, "view", *reset)?);
+                        }
+                        set_view_options(&mut j, name, &opts)?;
+                    }
+                    Alter::RenameColumn(from, to) => rename_view_col(v, &mut j, name, from, to, false)?,
+                    _ => {}
+                }
+            }
+            Ok((vec![(key, Some(j.to_string()))], ()))
+        })?;
+        Ok(())
     }
 
     /// A materialized view is a table holding its query's rows (see `matview_rows`), whose schema
@@ -45275,7 +47541,7 @@ impl Exec<'_> {
         sql: &str,
         (reads, deps): (Vec<String>, Option<Json>),
         data: bool,
-        if_not_exists: bool,
+        (if_not_exists, space): (bool, Option<&str>),
     ) -> Result<Output> {
         let rows = if data { self.select(q)?.rows } else { vec![] };
         // made by a person from masked columns: its copies of them are masked too (an agent's query read masks)
@@ -45314,6 +47580,9 @@ impl Exec<'_> {
                 return err(TABLE_EXISTS, format!("relation \"{name}\" already exists"));
             }
             no_type_named(v, name, false)?;
+            // (TABLESPACE: where it is kept, else default_tablespace's, as a table's)
+            let mut t = t.clone();
+            t.hier.tablespace = tablespace::place(v, space, 0, false, true)?;
             let mut w = vec![(schema_key(name), Some(schema_json(&t)))];
             w.extend(matview_rows(&t, &rows)?);
             Ok((w, ()))
@@ -45438,13 +47707,17 @@ impl Exec<'_> {
                 Some(_) => {}
             }
         }
+        // (what is named: the rest goes with it, said in the order Postgres says it; see `cascade_order`)
+        let named = gone.len();
         let mut i = 0;
-        let mut cascaded: Vec<String> = vec![];
-        // (the views and materialized views that go because they read what goes)
-        let mut via_views: Vec<String> = vec![];
+        // the views and materialized views that read each relation that goes (and go too), and the partitions that
+        // go with their tables, unsaid
+        let mut readers: HashMap<String, Vec<String>> = HashMap::new();
+        let mut parts: HashSet<String> = HashSet::new();
         while i < gone.len() {
             let (n, k) = gone[i].clone();
-            for d in dependents(v, &n)? {
+            let over = dependents(v, &n)?;
+            for d in over.iter().cloned() {
                 if gone.iter().any(|(g, _)| *g == d) {
                     continue;
                 }
@@ -45461,9 +47734,9 @@ impl Exec<'_> {
                         })),
                     });
                 }
-                via_views.push(d.clone());
                 gone.push((d, dk));
             }
+            readers.insert(n.clone(), over);
             // partitions go with their table; the tables that inherit from it need CASCADE
             if k == "table"
                 && let Some(t) = load(v, &n)?.filter(|t| t.hier.is_parent())
@@ -45474,21 +47747,13 @@ impl Exec<'_> {
                 if t.hier.part.is_none() && !cascade && !fresh.is_empty() {
                     return Err(hier::needs_cascade(v, &n, &fresh));
                 }
-                if t.hier.part.is_none() {
-                    cascaded.extend(fresh.iter().map(|(d, _)| format!("{} {}", foreign::rel_noun(v, d), rel_part(d))));
+                if t.hier.part.is_some() {
+                    parts.extend(fresh.iter().map(|(d, _)| d.clone()));
                 }
                 let fresh: Vec<String> = fresh.into_iter().map(|(d, _)| d.clone()).collect();
                 gone.extend(fresh.into_iter().map(|d| (d, "table")));
             }
             i += 1;
-        }
-        if !via_views.is_empty() {
-            let roots: Vec<String> =
-                gone.iter().filter(|(g, _)| !via_views.contains(g)).map(|(g, _)| g.clone()).collect();
-            for d in dependents_listed(v, &roots)? {
-                let dk = relation_kind(v, &d)?.unwrap_or("view");
-                cascaded.push(format!("{dk} {}", shown_name(&d)));
-            }
         }
         // the policies of other tables that read one (see `rls::reading`): 2BP01, or with CASCADE they go
         let mut w = vec![];
@@ -45512,35 +47777,109 @@ impl Exec<'_> {
                 })),
             });
         }
+        let mut policies_gone = HashSet::new();
         for (p, _, _) in &reading {
-            let what = format!("policy {} on table {}", p.name, rel_part(&p.table));
-            if !cascaded.contains(&what) {
-                cascaded.push(what);
+            if policies_gone.insert(p.key()) {
                 w.push((p.key(), None));
             }
         }
+        // the functions of a dropped relation's row type (`f(t onek)`, RETURNS SETOF onek), which pg_depend has on the
+        // relation's type: 2BP01, or with CASCADE they go
+        let mut typed: Vec<(Arc<functions::Function>, &str)> = vec![];
+        for (g, _) in &gone {
+            for f in functions::using_row_type(v, g)? {
+                if !typed.iter().any(|(h, _)| h.key() == f.key()) {
+                    typed.push((f, g.as_str()));
+                }
+            }
+        }
+        if !cascade && let Some((_, r)) = typed.first() {
+            let k = gone.iter().find(|(g, _)| g == r).map_or("table", |(_, k)| *k);
+            let k = if k == "table" { foreign::rel_noun(v, r) } else { k };
+            let detail = typed
+                .iter()
+                .filter(|(_, g)| g == r)
+                .map(|(f, _)| format!("function {} depends on type {}", func_shown(v, f), type_shown(v, r)))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(SqlError {
+                code: "2BP01",
+                message: format!("cannot drop {k} {} because other objects depend on it", rel_part(r)),
+                info: Some(Box::new(Violation {
+                    detail: Some(detail),
+                    hint: Some("Use DROP ... CASCADE to drop the dependent objects too.".into()),
+                    ..Violation::default()
+                })),
+            });
+        }
+        w.extend(typed.iter().map(|(f, _)| (f.key(), None)));
         // the foreign keys of other tables that reference a dropped one, dropped below: each is said
         // (a partition's copy of its parent's goes with that one, as in Postgres, unsaid)
+        let mut fks: Vec<(String, String, String)> = vec![];
         if cascade {
             let goes = |t: &str| gone.iter().any(|(g, k)| g == t && matches!(*k, "table" | "materialized view"));
             for o in schemas(v)?.iter().filter(|o| !goes(&o.name)) {
                 for f in o.fks.iter().filter(|f| goes(&f.table) && !o.hier.inherited.contains(&f.name)) {
-                    let what = format!("constraint {} on table {}", f.name, rel_part(&o.name));
-                    if !cascaded.contains(&what) {
-                        cascaded.push(what);
+                    let fk = (o.name.clone(), f.name.clone(), f.table.clone());
+                    if !fks.contains(&fk) {
+                        fks.push(fk);
                     }
                 }
             }
         }
-        match (&cascaded[..], said) {
-            (_, Some(said)) => said.extend(cascaded.iter().cloned()),
-            ([], None) => {}
-            ([one], None) => notice("NOTICE", format!("drop cascades to {one}")),
-            (many, None) => notice_detail(
-                "NOTICE",
-                format!("drop cascades to {} other objects", many.len()),
-                many.iter().map(|d| format!("drop cascades to {d}")).collect::<Vec<_>>().join("\n"),
-            ),
+        // all of it, as Postgres lists it: what reads each relation, the tables below it, the policies of other tables
+        // that read it, the functions of its row type and the foreign keys to it, each after the newest of what it
+        // depends on
+        let kinds: HashMap<&str, &str> = gone.iter().map(|(g, k)| (g.as_str(), *k)).collect();
+        let roots: Vec<Dep> = gone[..named].iter().map(|(g, _)| Dep::Rel(g.clone())).collect();
+        let order = cascade_order(&roots, &mut |d: &Dep| {
+            let Dep::Rel(r) = d else { return Ok(vec![]) };
+            let mut out: Vec<(Dep, MadeKey)> = vec![];
+            let mut rel = |x: &str| {
+                let view = matches!(kinds.get(x).copied(), Some("view" | "materialized view"));
+                out.push((Dep::Rel(x.to_string()), rel_order(v, x, view)));
+            };
+            for x in readers.get(r).into_iter().flatten().filter(|x| kinds.contains_key(x.as_str())) {
+                rel(x);
+            }
+            if kinds.get(r.as_str()) == Some(&"table") {
+                for x in hier::child_names(v, r)?.iter().filter(|x| kinds.contains_key(x.as_str())) {
+                    rel(x);
+                }
+            }
+            for (p, _, _) in reading.iter().filter(|(_, g, _)| g == r) {
+                out.push((Dep::Policy(p.table.clone(), p.name.clone()), policy_order(v, &p.table, &p.name, p.made)));
+            }
+            let view = matches!(kinds.get(r.as_str()).copied(), Some("view" | "materialized view"));
+            for (f, _) in typed.iter().filter(|(_, g)| *g == r.as_str()) {
+                out.push((Dep::Func(f.key()), row_typed_order(v, r, view, f)));
+            }
+            for (o, name, _) in fks.iter().filter(|(_, _, t)| t == r) {
+                let made = (acl::made_at(v, &format!("rel/{o}")), String::new(), format!("{o}/{name}"));
+                out.push((Dep::Fk(o.clone(), name.clone()), made));
+            }
+            Ok(out)
+        })?;
+        let mut cascaded: Vec<String> = vec![];
+        for (d, _) in order {
+            cascaded.push(match d {
+                Dep::Rel(x) if parts.contains(&x) => continue,
+                Dep::Rel(x) => {
+                    let k = kinds.get(x.as_str()).copied().unwrap_or("table");
+                    format!("{} {}", if k == "table" { foreign::rel_noun(v, &x) } else { k }, shown_name(&x))
+                }
+                Dep::Policy(t, n) => format!("policy {n} on table {}", shown_name(&t)),
+                Dep::Func(k) => match typed.iter().find(|(f, _)| f.key() == k) {
+                    Some((f, _)) => format!("function {}", func_shown(v, f)),
+                    None => format!("function {k}"),
+                },
+                Dep::Fk(t, n) => format!("constraint {n} on table {}", shown_name(&t)),
+                Dep::Schema(_) | Dep::Type(_) | Dep::Ext(_) => continue,
+            });
+        }
+        match said {
+            Some(said) => said.extend(cascaded),
+            None => cascade_notice(&cascaded),
         }
         // a sequence owned by a dropped table's column goes with it (as an OWNED BY sequence does)
         let tables_gone: Vec<&str> =
@@ -45642,6 +47981,8 @@ impl Exec<'_> {
                             t.cols.iter().filter(|c| c.auto == Some(Auto::Serial)).filter_map(|c| c.seq.clone()),
                         );
                     }
+                    // (and how many times its storage was made anew)
+                    w.extend(tablespace::gens_dropped(v, n)?);
                     w.push((schema_key(n), None));
                 }
             }
@@ -45682,8 +48023,8 @@ impl Exec<'_> {
             }
             no_type_named(v, &new, true)?;
             // (the views reading it are written again to read it by its new name, as Postgres's follow it)
-            let rn = viewdef::Renames { table: name.to_string(), to_table: Some(new.clone()), col: None };
-            let Some(follow) = self.renamed_dependents(v, name, &rn)? else {
+            let rn = viewdef::Renames { table: name.to_string(), to_table: Some(new.clone()), col: None, cols: None };
+            let Some(follow) = self.renamed_dependents(v, name, &rn, None)? else {
                 let d = dependents(v, name)?.into_iter().next().unwrap_or_default();
                 return err(
                     UNSUPPORTED,
@@ -45965,7 +48306,8 @@ impl Exec<'_> {
         Ok(writes)
     }
 
-    /// ALTER VIEW name RENAME COLUMN old TO new: the view's column names, with that one changed (its query stays).
+    /// ALTER VIEW name RENAME COLUMN old TO new: the view's column names, with that one changed (its query stays), and
+    /// the views reading it written again to read the column by its new name.
     fn rename_view_column(&self, name: &str, from: &str, to: &str, if_exists: bool) -> Result<()> {
         self.db.batch_with(self.branch, |v| {
             let key = format!("{VIEWS}/{name}");
@@ -45977,31 +48319,30 @@ impl Exec<'_> {
                 return err(NO_TABLE, format!("relation \"{name}\" does not exist"));
             };
             let mut j: Json = serde_json::from_str(&raw).unwrap_or_default();
-            let Some(def) = view_def(v, name)? else {
-                return err(NO_TABLE, format!("relation \"{name}\" does not exist"));
+            // the views reading it, which name the column, follow it, as Postgres's read it by number (`x AS a`)
+            let rn = viewdef::Renames {
+                table: name.to_string(),
+                to_table: None,
+                col: Some((from.to_string(), to.to_string())),
+                cols: None,
             };
-            // (a view made without a column list has its query's names)
-            let found = select_columns_with(v, &view_query(name, &def.sql)?, &[], &[])?.0;
-            let mut names: Vec<String> = found
-                .iter()
-                .enumerate()
-                .map(|(i, (n, _))| def.cols.get(i).cloned().unwrap_or_else(|| n.clone()))
-                .collect();
-            let Some(at) = names.iter().position(|n| n == from) else {
-                return err(NO_COLUMN, format!("column \"{from}\" does not exist"));
+            // (one that doesn't name it is left as it is)
+            let renamed = |r: &mut TableInfo| {
+                for c in r.columns.iter_mut().filter(|c| c.0 == from) {
+                    c.0 = to.to_string();
+                }
             };
-            if names.iter().any(|n| n == to) {
-                return err("42701", format!("column \"{to}\" of relation \"{}\" already exists", rel_part(name)));
-            }
-            if let Some(d) = dependents(v, name)?.first() {
+            rename_view_col(v, &mut j, name, from, to, true)?;
+            let Some(follow) = self.renamed_dependents(v, name, &rn, Some(&renamed))? else {
+                let d = dependents(v, name)?.into_iter().next().unwrap_or_default();
                 return err(
                     UNSUPPORTED,
                     format!("can't rename a column of view \"{name}\": view \"{d}\" reads it; drop that view first"),
                 );
-            }
-            names[at] = to.to_string();
-            j["columns"] = Json::from(names);
-            Ok((vec![(key, Some(j.to_string()))], ()))
+            };
+            let mut writes = vec![(key, Some(j.to_string()))];
+            writes.extend(follow);
+            Ok((writes, ()))
         })?;
         Ok(())
     }
@@ -47941,6 +50282,10 @@ impl<'a> Exec<'a> {
     /// the statement is one of `Nest::prepared` or `Nest::pl`, whose verdict that there's nothing to expand
     /// holds for the rest of the statement (no DDL runs in it).
     fn run_body(&self, s: &Stmt, kept: bool) -> Result<Output> {
+        // (under EXPLAIN without ANALYZE, which runs a query only to see how it reads: see `dry_run`)
+        if !matches!(s, Stmt::Select(_)) {
+            dry_refusal(|| functions::what(s).to_string())?;
+        }
         if let Some(out) = self.temp_dml(s)? {
             return Ok(out);
         }
@@ -47958,7 +50303,7 @@ impl<'a> Exec<'a> {
             None => {
                 // (one of a table with row security is looked at each time: whose policies apply, if
                 // any, depends on who runs it, a SECURITY DEFINER function's owner or its caller)
-                if kept && !(self.db.core.has_row_security() && rls::touched(&self.view()?, s)?) {
+                if kept && !(rls::possible(&self.db.core) && rls::touched(&self.view()?, s)?) {
                     self.nest.plain.borrow_mut().insert(at);
                 }
                 self.run_stmt(s)
@@ -49043,7 +51388,7 @@ impl Exec<'_> {
         need: &[bool],
         keep: &[bool],
         own: &[&Expr],
-        c: usize,
+        cols: &[usize],
     ) -> Result<Right> {
         let w = t.cols.len();
         if !par_ok(t, &access, own) {
@@ -49075,7 +51420,8 @@ impl Exec<'_> {
                 let mut seq = 0u64;
                 let mut put = |b: &Batch| -> Result<()> {
                     for r in b.rows() {
-                        files[part_of(&hkey(&r[c]), n)].write(seq, r).map_err(spill_io)?;
+                        let k = vals_key(cols.iter().map(|&c| &r[c])).unwrap_or(HKey::Null);
+                        files[part_of(&k, n)].write(seq, r).map_err(spill_io)?;
                         seq += 1;
                     }
                     Ok(())
@@ -49108,8 +51454,9 @@ impl Exec<'_> {
             (0..n).map(|_| spill::Spill::new(g.width)).collect::<std::io::Result<_>>().map_err(spill_io)?;
         let file_of = |r: &[Value]| -> Result<usize> {
             // a null matches nothing: any file will do
-            let x = ev(g.le, &Env { cols: &p.cols, row: r, params: self.params, aggs: &[], sub: None })?;
-            Ok(part_of(&hkey(&x), n))
+            let env = Env { cols: &p.cols, row: r, params: self.params, aggs: &[], sub: None };
+            let xs = g.lkeys.iter().map(|le| ev(le, &env)).collect::<Result<Vec<_>>>()?;
+            Ok(part_of(&vals_key(xs.iter().map(|x| &**x)).unwrap_or(HKey::Null), n))
         };
         let (parts, head) = match from {
             Left::Parts(parts, head) => (parts, head),
@@ -49164,13 +51511,14 @@ impl Exec<'_> {
                 rb.push().clone_from_slice(&r);
                 rseq.push(s);
             }
-            let index = HashIndex::new(&rb, g.c)?;
+            let index = HashIndex::on(&rb, g.cols)?;
             let mut out: Vec<(u64, u64, Vec<Value>)> = vec![];
             for rec in lf.read().map_err(spill_io)? {
                 let (s, l) = rec.map_err(spill_io)?;
-                let x = ev(g.le, &Env { cols: &p.cols, row: &l, params: self.params, aggs: &[], sub: None })?;
+                let env = Env { cols: &p.cols, row: &l, params: self.params, aggs: &[], sub: None };
+                let xs = g.lkeys.iter().map(|le| ev(le, &env)).collect::<Result<Vec<_>>>()?;
                 let mut matched = false;
-                for j in index.get(&x) {
+                for j in index.get_key(vals_key(xs.iter().map(|x| &**x))) {
                     let mut row = l.clone();
                     row[g.at..g.at + rb.width].clone_from_slice(rb.row(j));
                     if holds(g.rest, &p.cols, &row, self.params)? {
@@ -49809,7 +52157,9 @@ impl Exec<'_> {
                             | Stmt::ShowPath
                             | Stmt::ShowZone
                             | Stmt::ShowTimeout
-                            | Stmt::ShowSync => "SHOW",
+                            | Stmt::ShowSync
+                            | Stmt::ShowShipping
+                            | Stmt::ShowShippingDelay => "SHOW",
                             Stmt::SetConstraints { .. } => "SET CONSTRAINTS",
                             Stmt::Set
                             | Stmt::SetVar { .. }
@@ -50367,6 +52717,26 @@ impl Exec<'_> {
             lo.as_ref().is_some_and(|(l, inc)| if *inc { cmp(l).is_lt() } else { cmp(l).is_le() })
                 || hi.as_ref().is_some_and(|(h, inc)| if *inc { cmp(h).is_gt() } else { cmp(h).is_ge() })
         };
+        // a world that checks its reads keeps the rows these conditions can match, as a scan without an index does
+        // (see `access`), not the index entries read: the same rows or more, and what a check against the Postgres
+        // an attached folder copies can ask it for (see `attach`). Conditions only on expressions keep the entries.
+        let conds: Vec<(String, Bounds)> = match v.recording() {
+            true => bounds
+                .iter()
+                .filter(|(i, _)| **i < t.cols.len())
+                .map(|(i, b)| (t.cols[*i].name.clone(), b.clone()))
+                .collect(),
+            false => vec![],
+        };
+        let quiet = v.unrecorded();
+        let filtered = !conds.is_empty();
+        let v = match filtered {
+            false => v,
+            true => {
+                v.filtered(&t.name, RowFilter { table: t.name.clone(), conds });
+                &quiet
+            }
+        };
         const FEW: usize = 1024; // up to this many entries, the table's size isn't looked at
         let (mut ids, mut cap) = (vec![], None::<usize>);
         let (mut over, mut bytes, budget) = (false, 0, spill::work_mem());
@@ -50427,7 +52797,7 @@ impl Exec<'_> {
         ids.sort_unstable();
         ids.dedup();
         self.reads(t, pgstat::Read::Index(ix.name.clone()));
-        Ok(Some(Access::Ids(ids)))
+        Ok(Some(if filtered { Access::QuietIds(ids) } else { Access::Ids(ids) }))
     }
 
     /// Rows of `t` that pass `filter` (UPDATE and DELETE).
@@ -50672,6 +53042,11 @@ impl Exec<'_> {
         if !any_left {
             pool.extend(ons.iter().flatten().copied());
         }
+        // what those equalities imply: `c.w = no.w` and `o.w = no.w` make `c.w = o.w`, so the
+        // join order sees every column two tables share (see `rank`) and a hash join keys on all
+        // of them. Only between columns of one type and collation, where `=` is transitive
+        let implied = if any_left { vec![] } else { implied_equalities(&pool, &p.cols, &ranges) };
+        pool.extend(implied.iter());
         let mut applied = vec![false; pool.len()];
         // a RIGHT or FULL join pads every table before it with nulls: no WHERE condition is
         // checked before the last such join, or padded rows would escape it
@@ -50731,7 +53106,7 @@ impl Exec<'_> {
                     (_, Some(rows)) if known => rows.len(),
                     (Access::Key(_), _) => 1,
                     (Access::Rows(r), _) => r.len(),
-                    (Access::Ids(r), _) => r.len(),
+                    (Access::Ids(r) | Access::QuietIds(r), _) => r.len(),
                     (Access::Range(..), _) => usize::MAX - 1, // fewer than all, but unknown
                     (Access::All | Access::Filtered, _) => usize::MAX,
                 };
@@ -50743,10 +53118,16 @@ impl Exec<'_> {
             let (mut order, mut joined) = (vec![start], vec![false; n]);
             joined[start] = true;
             while order.len() < n {
+                // linked by its whole key first (a row each), then by more columns: joined to
+                // customer, orders (w, d, c_id) comes before new_order (w, d), which matches every
+                // customer of a district and made TPC-C's CH Q3 hold tens of millions of rows
                 let rank = |k: usize| {
-                    let links: Vec<usize> = pool.iter().filter_map(|e| link(e, k, &joined).map(|l| l.1)).collect();
-                    let by_key = links.iter().any(|&c| tables[k].key == Some(c));
-                    (links.is_empty(), !by_key, size[k], k)
+                    let mut links: Vec<usize> = pool.iter().filter_map(|e| link(e, k, &joined).map(|l| l.1)).collect();
+                    links.sort_unstable();
+                    links.dedup();
+                    let key = tables[k].key_cols();
+                    let by_key = !key.is_empty() && key.iter().all(|c| links.contains(c));
+                    (links.is_empty(), !by_key, std::cmp::Reverse(links.len()), size[k], k)
                 };
                 let next = (0..n).filter(|&k| !joined[k]).min_by_key(|&k| rank(k)).unwrap();
                 joined[next] = true;
@@ -50996,7 +53377,7 @@ impl Exec<'_> {
                 // already found few rows (those join by lookups)
                 let few = match &access {
                     Access::Rows(r) => r.len() <= FEW,
-                    Access::Ids(r) => r.len() <= FEW,
+                    Access::Ids(r) | Access::QuietIds(r) => r.len() <= FEW,
                     _ => false,
                 };
                 if n > 1 && !few && !any_rf && par_ok(t, &access, &own_here) {
@@ -51031,7 +53412,7 @@ impl Exec<'_> {
                 // (rows an index found, too few for more than one part: read here, without the parts' machinery)
                 let one_part = match &access {
                     Access::Rows(r) => parts_for(r.len()) <= 1,
-                    Access::Ids(r) => parts_for(r.len()) <= 1,
+                    Access::Ids(r) | Access::QuietIds(r) => parts_for(r.len()) <= 1,
                     _ => false,
                 };
                 if !early
@@ -51065,6 +53446,31 @@ impl Exec<'_> {
             let hashed = eq.as_ref().map(|e| e.0).or(calc.as_ref().map(|c| c.0));
             let rest: Vec<&Expr> =
                 check.iter().enumerate().filter(|(i, _)| hashed != Some(*i)).map(|(_, e)| *e).collect();
+            // a hash join in memory keys on every `joined.x = k.y` of the same kind, not just the
+            // first: hashed on `w_id` alone, a join on (w_id, d_id, o_id) probes all of a
+            // warehouse's rows for each row. They stay in `rest` too, checked as before
+            let keys: Vec<(Expr, usize)> = match &eq {
+                Some((pos, le, c)) => {
+                    let mut keys = vec![(le.clone(), *c)];
+                    for (_, e) in check.iter().enumerate().filter(|(i, _)| i != pos) {
+                        if let Some((x, c)) = link(e, k, &joined)
+                            && !keys.iter().any(|(_, kc)| *kc == c)
+                            && no_subs([&x])
+                            && let (Ok(a), Ok(b)) = (
+                                ty_in(&x, &p.cols, self.types, &[]),
+                                ty_in(&Expr::Idx(ranges[k].start + c), &p.cols, self.types, &[]),
+                            )
+                            && semi::hashes_alike(a, b)
+                        {
+                            keys.push((x, c));
+                        }
+                    }
+                    keys
+                }
+                None => vec![],
+            };
+            let key_cols: Vec<usize> = keys.iter().map(|(_, c)| *c).collect();
+            let lkeys: Vec<&Expr> = keys.iter().map(|(e, _)| e).collect();
             let all_checks: Vec<&Expr> = own.iter().chain(check.iter()).copied().collect();
             // this table's rows where its own conditions hold
             let read_right = |t: &mut Table, access: Access| -> Result<Batch> {
@@ -51083,27 +53489,29 @@ impl Exec<'_> {
             // rows `range` of `left` joined to their matches in `right`, found by `index` from the
             // value of `le`, where `rest` holds (no subqueries: this runs on any core); a LEFT
             // join keeps unmatched rows, padded with nulls
-            let probe = |left: &Batch, range: std::ops::Range<usize>, le: &Expr, right: &Batch, index: &HashIndex| {
-                let mut out = Batch::new(width);
-                for i in range {
-                    let l = left.row(i);
-                    let x = ev(le, &Env { cols: &p.cols, row: l, params: self.params, aggs: &[], sub: None })?;
-                    let mut matched = false;
-                    for j in index.get(&x) {
-                        let c = out.extend(l);
-                        c[at..at + right.width].clone_from_slice(right.row(j));
-                        if holds(&rest, &p.cols, c, self.params)? {
-                            matched = true;
-                        } else {
-                            out.pop();
+            let probe =
+                |left: &Batch, range: std::ops::Range<usize>, lkeys: &[&Expr], right: &Batch, index: &HashIndex| {
+                    let mut out = Batch::new(width);
+                    for i in range {
+                        let l = left.row(i);
+                        let env = Env { cols: &p.cols, row: l, params: self.params, aggs: &[], sub: None };
+                        let xs = lkeys.iter().map(|le| ev(le, &env)).collect::<Result<Vec<_>>>()?;
+                        let mut matched = false;
+                        for j in index.get_key(vals_key(xs.iter().map(|x| &**x))) {
+                            let c = out.extend(l);
+                            c[at..at + right.width].clone_from_slice(right.row(j));
+                            if holds(&rest, &p.cols, c, self.params)? {
+                                matched = true;
+                            } else {
+                                out.pop();
+                            }
+                        }
+                        if !matched && left_join {
+                            out.extend(l);
                         }
                     }
-                    if !matched && left_join {
-                        out.extend(l);
-                    }
-                }
-                Ok::<_, SqlError>(out)
-            };
+                    Ok::<_, SqlError>(out)
+                };
 
             if let Some(f) = first.take() {
                 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
@@ -51124,7 +53532,7 @@ impl Exec<'_> {
                     Ok(Some(b))
                 })?;
                 match hash {
-                    Some((_, le, c)) if seen.into_inner() > FEW => {
+                    Some(_) if seen.into_inner() > FEW => {
                         // join each part of the first table on the core that reads it, and with
                         // GROUP BY after this last step, group it there too when the aggregates
                         // come out the same however the rows are split (see `exact`)
@@ -51136,16 +53544,25 @@ impl Exec<'_> {
                                 && p.aggs.iter().all(|a| exact(a, &p.cols))
                         });
                         // this table's rows, unless they outgrow CHRONOS_WORK_MEM: then a join on disk
-                        let right = match self.read_bounded(v, t, access, &need, keep, &own_here, *c)? {
+                        let right = match self.read_bounded(v, t, access, &need, keep, &own_here, &key_cols)? {
                             Right::Held(b) => b,
                             Right::Spilled(files) => {
-                                let g = Grace { le, c: *c, rest: &rest, now: &now, left_join, at, width, fold };
+                                let g = Grace {
+                                    lkeys: &lkeys,
+                                    cols: &key_cols,
+                                    rest: &rest,
+                                    now: &now,
+                                    left_join,
+                                    at,
+                                    width,
+                                    fold,
+                                };
                                 (rows, grouped) = self.grace_join(Left::Parts(&parts, head), files, &g, p)?;
                                 joined[k] = true;
                                 continue;
                             }
                         };
-                        let index = HashIndex::new(&right, *c)?;
+                        let index = HashIndex::on(&right, &key_cols)?;
                         let head: Vec<std::sync::Mutex<Option<Batch>>> =
                             head.into_iter().map(std::sync::Mutex::new).collect();
                         let outs = par_run(parts.k, |i, _| {
@@ -51154,7 +53571,7 @@ impl Exec<'_> {
                                 Some(b) => b,
                                 None => parts.read(i)?,
                             };
-                            let mut out = probe(&left, 0..left.len, le, &right, &index)?;
+                            let mut out = probe(&left, 0..left.len, &lkeys, &right, &index)?;
                             let mut g = Groups::default();
                             if let Some(group) = fold {
                                 out.retain(|r| holds(&now, &p.cols, r, self.params))?;
@@ -51217,7 +53634,7 @@ impl Exec<'_> {
             let mut access = Some(access);
             let mut held: Option<Right> = match &eq {
                 Some((_, le, c)) if !lookups && no_subs(std::iter::once(le).chain(rest.iter().copied())) => {
-                    Some(self.read_bounded(v, t, access.take().unwrap(), &need, keep, &own_here, *c)?)
+                    Some(self.read_bounded(v, t, access.take().unwrap(), &need, keep, &own_here, &key_cols)?)
                 }
                 _ => None,
             };
@@ -51270,9 +53687,18 @@ impl Exec<'_> {
                     }
                 }
                 // a hash join whose other side outgrows CHRONOS_WORK_MEM: on disk (see `grace_join`)
-                Some((_, ref le, c)) if matches!(held, Some(Right::Spilled(_))) => {
+                Some(_) if matches!(held, Some(Right::Spilled(_))) => {
                     let Some(Right::Spilled(files)) = held.take() else { unreachable!() };
-                    let g = Grace { le, c, rest: &rest, now: &now, left_join, at, width, fold: None };
+                    let g = Grace {
+                        lkeys: &lkeys,
+                        cols: &key_cols,
+                        rest: &rest,
+                        now: &now,
+                        left_join,
+                        at,
+                        width,
+                        fold: None,
+                    };
                     out = self.grace_join(Left::Rows(&rows), files, &g, p)?.0;
                 }
                 eq => {
@@ -51282,22 +53708,22 @@ impl Exec<'_> {
                     };
                     match &eq {
                         // many rows: probe on every free core
-                        Some((_, le, c))
+                        Some((_, le, _))
                             if rows.len >= PAR_MIN && no_subs(std::iter::once(le).chain(rest.iter().copied())) =>
                         {
-                            let index = HashIndex::new(&right, *c)?;
-                            let parts = par_chunks(rows.len, |range| probe(&rows, range, le, &right, &index))?;
+                            let index = HashIndex::on(&right, &key_cols)?;
+                            let parts = par_chunks(rows.len, |range| probe(&rows, range, &lkeys, &right, &index))?;
                             out = concat(width, parts);
                         }
                         // ponytail: a hash join matches equal values of the same kind; text '5' won't meet 5
-                        Some((_, le, c)) => {
-                            let index = HashIndex::new(&right, *c)?;
+                        Some(_) => {
+                            let index = HashIndex::on(&right, &key_cols)?;
                             for l in rows.rows() {
-                                let x = ev(
-                                    le,
-                                    &Env { cols: &p.cols, row: l, params: self.params, aggs: &[], sub: Some(self) },
-                                )?;
-                                add(l, &rest, &mut index.get(&x).map(|i| right.row(i)))?;
+                                let env =
+                                    Env { cols: &p.cols, row: l, params: self.params, aggs: &[], sub: Some(self) };
+                                let xs = keys.iter().map(|(le, _)| ev(le, &env)).collect::<Result<Vec<_>>>()?;
+                                let found = index.get_key(vals_key(xs.iter().map(|x| &**x)));
+                                add(l, &rest, &mut found.map(|i| right.row(i)))?;
                             }
                         }
                         None => match &calc {
@@ -51328,8 +53754,9 @@ impl Exec<'_> {
                                     }
                                     Some(index) => {
                                         if rows.len >= PAR_MIN && no_subs(rest.iter().copied()) {
-                                            let parts =
-                                                par_chunks(rows.len, |range| probe(&rows, range, le, &right, &index))?;
+                                            let parts = par_chunks(rows.len, |range| {
+                                                probe(&rows, range, &[le], &right, &index)
+                                            })?;
                                             out = concat(width, parts);
                                         } else {
                                             for l in rows.rows() {
@@ -51425,6 +53852,17 @@ impl Exec<'_> {
         let per = if r.all { 1 } else { 2 };
         let mut bytes = rows.iter().map(|x| per * spill::size_of(x)).sum::<usize>();
         let cap = held_cap();
+        // a step of another WITH RECURSIVE query's rows alone (`(WITH RECURSIVE x AS (...) SELECT * FROM x)`), when this
+        // one's reader takes only so many: asked each round for the rows still wanted, so x's rounds stop there too, as
+        // Postgres's stop when nothing pulls more of their rows (x's may never end)
+        let mut capped = match limit {
+            Some(_) if r.all && r.step.limit.is_none() && r.step.offset.is_none() => {
+                let mut s = r.step.clone();
+                s.limit = Some(Expr::Lit(Value::Int(0)));
+                rec_cap(&s).is_some().then_some(s)
+            }
+            _ => None,
+        };
         let mut last = rows.clone();
         let mut rounds = 0;
         while !last.is_empty() {
@@ -51437,7 +53875,14 @@ impl Exec<'_> {
             }
             self.working.borrow_mut().insert(r.name.clone(), Arc::new(last));
             self.subs.borrow_mut().clear(); // subqueries may read the rows so far
-            let stepped = self.select(&r.step)?;
+            let stepped = match (&mut capped, limit) {
+                (Some(s), Some(n)) => {
+                    let wanted = n.saturating_sub(rows.len());
+                    s.limit = Some(Expr::Lit(Value::Int(i64::try_from(wanted).unwrap_or(i64::MAX))));
+                    self.select(s)?
+                }
+                _ => self.select(&r.step)?,
+            };
             // the step's columns of a wider kind of number than the base's (integer, then numeric): the rows so far
             // are of the base's types, which the step's don't fit, as Postgres refuses it
             if rounds == 1
@@ -51838,6 +54283,7 @@ impl Exec<'_> {
     /// tables it locks that made them, locked until it ends (see `Core::claim`). Each
     /// locked table's primary key is read along with the query's own columns, which then drop.
     fn locking(&self, s: &Select, clauses: &[(u8, Vec<String>, u8)]) -> Result<Output> {
+        dry_refusal(|| "SELECT FOR UPDATE".into())?; // (see `dry_run`)
         let what = match () {
             _ if !s.set.is_empty() => Some("UNION/INTERSECT/EXCEPT"),
             _ if s.distinct => Some("DISTINCT clause"),
@@ -53247,6 +55693,18 @@ impl Exec<'_> {
                 return err(TABLE_EXISTS, format!("table \"{table}\" already exists"));
             }
             no_type_named(v, table, false)?;
+            // TABLESPACE: where the table is kept (a partition naming none: where its parent says its partitions
+            // go), chosen before anything it makes, as Postgres's DefineRelation chooses it; a foreign table has no
+            // storage to keep anywhere
+            let up = match &t.hier.of {
+                Some((p, _)) => load(v, p)?.map_or(0, |p| p.hier.tablespace),
+                None => 0,
+            };
+            let partitioned = t.hier.part.is_some();
+            t.hier.tablespace = tablespace::place(v, hier.space.as_deref(), up, partitioned, true)?;
+            if hier.foreign.is_some() {
+                t.hier.tablespace = 0;
+            }
             // (the checks first, then the unique constraints, then the foreign keys, as Postgres makes
             // them: an unnamed one is named after the names those before it took)
             let mut given: Vec<&ConstraintDef> =
@@ -53299,6 +55757,27 @@ impl Exec<'_> {
                 let cols = at.iter().map(|&i| t.cols[i].id).collect();
                 t.uniques.push(Unique { name, cols, nnd: false, primary: true });
             }
+            // where the key's index is kept: USING INDEX TABLESPACE's, else default_tablespace's; a partition's copy
+            // of its parent's key is where that one is, as Postgres's generateClonedIndexStmt names it
+            let pkey = if t.has_key() {
+                Some(t.pkey_name())
+            } else {
+                t.uniques.iter().find(|u| u.primary).map(|u| u.name.clone())
+            };
+            if let Some(pk) = pkey {
+                let space = if t.hier.inherited.iter().any(|x| x == "*pkey") {
+                    let up = match &t.hier.of {
+                        Some((p, _)) => {
+                            load(v, p)?.filter(Table::has_key).map_or(0, |p| p.hier.index_space(&p.pkey_name()))
+                        }
+                        None => 0,
+                    };
+                    tablespace::place(v, None, up, partitioned, false)?
+                } else {
+                    tablespace::place(v, hier.pkey_space.as_deref(), 0, partitioned, true)?
+                };
+                t.hier.set_index_space(&pk, space);
+            }
             let mut writes = vec![(schema_key(table), Some(schema_json(&t)))];
             writes.extend(links);
             writes.extend(on_server);
@@ -53316,47 +55795,143 @@ impl Exec<'_> {
 
     /// The writes that make the views and materialized views reading relation `table` read it as `rn` renames it:
     /// each one's query written again (see `viewdef::renamed_text`), as Postgres's, which read it by oid and its
-    /// columns by number, follow a rename. None where one of them is of a form not written back.
-    fn renamed_dependents(&self, v: &View, table: &str, rn: &viewdef::Renames) -> Result<Option<hier::Writes>> {
+    /// columns by number, follow a rename. None where one of them is of a form not written back. `after` (a column
+    /// renamed): `table`'s entry as the rename leaves it, against which one that reads as it did is left as it is
+    /// (see `dependents_written`).
+    fn renamed_dependents(
+        &self,
+        v: &View,
+        table: &str,
+        rn: &viewdef::Renames,
+        after: Option<&dyn Fn(&mut TableInfo)>,
+    ) -> Result<Option<hier::Writes>> {
         let deps = dependents(v, table)?;
-        if deps.is_empty() {
-            return Ok(Some(vec![]));
-        }
-        let rels = tables(&self.db.core, self.branch)?;
         let mut writes = vec![];
-        for d in deps {
-            let Some(i) = rels.iter().position(|r| r.name == d) else { return Ok(None) };
-            let Some((text, aliases)) = viewdef::renamed_text(&rels, i, rn) else { return Ok(None) };
-            // (it must read as SQL again)
-            if view_query(&d, &text).is_err() {
-                return Ok(None);
-            }
-            let follow = |reads: &mut Json| {
-                if let (Some(to), Some(all)) = (&rn.to_table, reads.as_array_mut()) {
-                    for x in all.iter_mut().filter(|x| *x == table) {
-                        *x = Json::String(to.clone());
-                    }
-                }
-            };
-            if let Some(raw) = v.get(&format!("{VIEWS}/{d}"))? {
-                let mut j: Json = serde_json::from_str(&raw).unwrap_or_default();
-                j["sql"] = Json::String(text);
-                j["aliases"] = serde_json::json!(aliases);
-                follow(&mut j["reads"]);
-                writes.push((format!("{VIEWS}/{d}"), Some(j.to_string())));
-                continue;
-            }
-            let Some(mut t) = load(v, &d)? else { return Ok(None) };
-            let Some(m) = t.matview.as_mut() else { return Ok(None) };
-            m["sql"] = Json::String(text);
-            m["aliases"] = serde_json::json!(aliases);
-            follow(&mut m["reads"]);
-            writes.push((schema_key(&t.name), Some(schema_json(&t))));
+        for w in self.dependents_written(v, table, rn, &deps, after)? {
+            let Some(w) = w else { return Ok(None) };
+            writes.extend(w);
         }
         Ok(Some(writes))
     }
 
+    /// `renamed_dependents` for ALTER TABLE's change of `table`'s columns (`after`: its entry as the change leaves
+    /// it): each one written again where it needs to be and can be, and left as it is where it is of a form not
+    /// written back; those going in the same change (their keys among `gone`) left out.
+    fn column_dependents(
+        &self,
+        v: &View,
+        table: &str,
+        rn: &viewdef::Renames,
+        gone: &[String],
+        after: &dyn Fn(&mut TableInfo),
+    ) -> Result<hier::Writes> {
+        let deps: Vec<String> = dependents(v, table)?
+            .into_iter()
+            .filter(|d| !gone.contains(&format!("{VIEWS}/{d}")) && !gone.contains(&schema_key(d)))
+            .collect();
+        Ok(self.dependents_written(v, table, rn, &deps, Some(after))?.into_iter().flatten().flatten().collect())
+    }
+
+    /// Views (or materialized views) `deps`, which read `table`, written again for its change `rn` (see
+    /// `viewdef::renamed_text`): for each, its row's new value; nothing where its text, read by name against
+    /// `table` as the change leaves it (`after` makes its entry so), reads as the text written again (see
+    /// `viewdef::kept_text`), as each name in it still finds the column it found (so an ADD COLUMN a view doesn't
+    /// see leaves its row as it is); None where it is of a form not written back.
+    fn dependents_written(
+        &self,
+        v: &View,
+        table: &str,
+        rn: &viewdef::Renames,
+        deps: &[String],
+        after: Option<&dyn Fn(&mut TableInfo)>,
+    ) -> Result<Vec<Option<hier::Writes>>> {
+        if deps.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut rels = tables(&self.db.core, self.branch)?;
+        let at = |rels: &[TableInfo], d: &str| rels.iter().position(|r| r.name == d);
+        // (each must read as SQL again)
+        let texts: Vec<Option<(String, Vec<String>)>> = deps
+            .iter()
+            .map(|d| viewdef::renamed_text(&rels, at(&rels, d)?, rn).filter(|(text, _)| view_query(d, text).is_ok()))
+            .collect();
+        let mut kept: Vec<Option<String>> = vec![None; deps.len()];
+        if let (Some(after), Some(k)) = (after, at(&rels, table)) {
+            after(&mut rels[k]);
+            for (x, d) in kept.iter_mut().zip(deps) {
+                *x = at(&rels, d).and_then(|i| viewdef::kept_text(&rels, i));
+            }
+        }
+        let mut out = vec![];
+        for ((d, text), kept) in deps.iter().zip(texts).zip(kept) {
+            out.push(match text {
+                None => None,
+                Some((text, _)) if kept.as_deref() == Some(text.as_str()) => Some(vec![]),
+                Some((text, aliases)) => self.dependent_row(v, table, d, rn, text, aliases)?.map(|w| vec![w]),
+            });
+        }
+        Ok(out)
+    }
+
+    /// View (or materialized view) `d`'s row with its query `text` (and the aliases made up for it) in place of its
+    /// own, written again for `table`'s change `rn`; None where it is neither.
+    fn dependent_row(
+        &self,
+        v: &View,
+        table: &str,
+        d: &str,
+        rn: &viewdef::Renames,
+        text: String,
+        aliases: Vec<String>,
+    ) -> Result<Option<(String, Option<String>)>> {
+        let follow = |reads: &mut Json| {
+            if let (Some(to), Some(all)) = (&rn.to_table, reads.as_array_mut()) {
+                for x in all.iter_mut().filter(|x| *x == table) {
+                    *x = Json::String(to.clone());
+                }
+            }
+        };
+        if let Some(raw) = v.get(&format!("{VIEWS}/{d}"))? {
+            let mut j: Json = serde_json::from_str(&raw).unwrap_or_default();
+            j["sql"] = Json::String(text);
+            j["aliases"] = serde_json::json!(aliases);
+            follow(&mut j["reads"]);
+            return Ok(Some((format!("{VIEWS}/{d}"), Some(j.to_string()))));
+        }
+        let Some(mut t) = load(v, d)? else { return Ok(None) };
+        let Some(m) = t.matview.as_mut() else { return Ok(None) };
+        m["sql"] = Json::String(text);
+        m["aliases"] = serde_json::json!(aliases);
+        follow(&mut m["reads"]);
+        Ok(Some((schema_key(&t.name), Some(schema_json(&t)))))
+    }
+
     fn alter(&self, table: &str, changes: &[Alter], only: bool) -> Result<Output> {
+        // SET TABLESPACE: the relation's own, not its partitions' (see `set_tablespace`), made after the statement's
+        // other changes and written with them (one statement is one write: a move made apart from them could fail, or
+        // be lost to a crash, after they were written). As Postgres's ATPrepSetTableSpace, each one's relation and
+        // tablespace are checked first, in turn, then that there is only one; whether the relation may go there (not
+        // to pg_global) is checked as it moves, after the other changes, as ATExecSetTableSpace checks it.
+        if let [Alter::SetTablespace(space)] = changes {
+            return self.set_tablespace(table, space);
+        }
+        let mut space = None;
+        for c in changes {
+            if let Alter::SetTablespace(s) = c {
+                tablespace::set_prep(&self.view()?, table, s)?;
+                if space.replace(s.as_str()).is_some() {
+                    return err(SYNTAX, "cannot have multiple SET TABLESPACE subcommands");
+                }
+            }
+        }
+        let others: Vec<Alter>;
+        let changes = match space {
+            Some(_) => {
+                others = changes.iter().filter(|c| !matches!(c, Alter::SetTablespace(_))).cloned().collect();
+                &others[..]
+            }
+            None => changes,
+        };
         // ENABLE | DISABLE | FORCE | NO FORCE ROW LEVEL SECURITY: the table's own, not its partitions' or
         // children's, kept in a row of its own (see `rls`)
         let (enable, force) = changes.iter().fold((None, None), |(e, f), c| match c {
@@ -53368,6 +55943,7 @@ impl Exec<'_> {
             self.db.batch_with::<(), SqlError>(self.branch, |v| {
                 let mut writes = if rest.is_empty() { vec![] } else { self.alter_hier(v, table, &rest, only)? };
                 writes.push(rls::alter_flags(v, table, enable, force)?);
+                tablespace::set_after(v, &mut writes, table, space)?;
                 Ok((writes, ()))
             })?;
             return Ok(Output::tag("ALTER TABLE"));
@@ -53391,18 +55967,38 @@ impl Exec<'_> {
                     return err("42809", format!("\"{table}\" is not a table"));
                 }
                 add_constraint(v, &mut t, c)?;
+                let mut schema = vec![(schema_key(table), Some(schema_json(&t)))];
+                // (a move is worked out before any of the index's rows is written, as a statement that fails writes
+                // none of them, and refused after the build's own errors, as Postgres moves the table once its index
+                // is built)
+                let moved = tablespace::set_after(v, &mut schema, table, space);
+                let mut held = |_: Vec<(String, Option<String>)>| Ok::<(), crate::Error>(());
+                let flush = if moved.is_ok() { flush } else { &mut held };
                 let mut writes = build_index(v, &t, None, t.uniques.last(), flush)?;
-                writes.push((schema_key(table), Some(schema_json(&t))));
+                moved?;
+                writes.extend(schema);
                 Ok((writes, ()))
             })
             .map_err(index_build_failed)?;
             return Ok(Output::tag("ALTER TABLE"));
         }
         // a change that writes every row again, on a big table: in parts (see `rewrite`)
-        if !in_tree && let Some(out) = self.alter_big(table, changes, only)? {
+        if !in_tree && let Some(out) = self.alter_big(table, changes, only, space)? {
             return Ok(out);
         }
-        self.db.batch_with(self.branch, |v| self.alter_hier(v, table, changes, only).map(|w| (w, ())))?;
+        self.db.batch_with::<(), SqlError>(self.branch, |v| {
+            let mut writes = self.alter_hier(v, table, changes, only)?;
+            tablespace::set_after(v, &mut writes, table, space)?;
+            Ok((writes, ()))
+        })?;
+        Ok(Output::tag("ALTER TABLE"))
+    }
+
+    /// ALTER TABLE | INDEX | MATERIALIZED VIEW name SET TABLESPACE space: where the relation is kept from now on (see
+    /// `tablespace::move_rel`), as Postgres's ATExecSetTableSpace moves it: a table without its indexes, an index by
+    /// itself. A partitioned table's (or index's) is only where its partitions are made from then on.
+    fn set_tablespace(&self, name: &str, space: &str) -> Result<Output> {
+        self.db.batch_with::<(), SqlError>(self.branch, |v| Ok((tablespace::set_writes(v, name, space)?, ())))?;
         Ok(Output::tag("ALTER TABLE"))
     }
 
@@ -53631,8 +56227,11 @@ impl Exec<'_> {
                 out.push((Gone::Table(t.name.clone()), n.to_string()));
             }
             for t in tables {
+                // (a column of a composite type is of its record; one of a domain over it goes with the domain)
                 let uses = |c: &&Col| {
-                    c.domain.as_deref() == Some(n) || matches!(c.ty, Type::Enum(i) if *enum_type(i).name == *n)
+                    c.domain.as_deref() == Some(n)
+                        || matches!(c.ty, Type::Enum(i) if *enum_type(i).name == *n)
+                        || (c.domain.is_none() && c.ty.composite_of().as_deref() == Some(n))
                 };
                 for c in t.cols.iter().filter(uses) {
                     out.push((Gone::Column(t, c.name.clone()), n.to_string()));
@@ -54006,12 +56605,57 @@ impl Exec<'_> {
 
     /// ALTER TYPE's writes: the enum's labels or name, in its row and in the schema of every
     /// table with a column of it (which keeps a copy), with the rows holding a renamed label
-    /// rewritten; renamed, its functions' names for it follow.
+    /// rewritten; renamed (or moved to another schema), its functions' names for it follow. A composite type's
+    /// attributes: see `alter_composite`.
     fn alter_type(&self, v: &View, name: &str, change: &TypeChange) -> Result<Vec<(String, Option<String>)>> {
+        if let TypeChange::Attrs(changes) = change {
+            return self.alter_composite(v, name, changes);
+        }
         let Some(raw) = v.get(&type_key(name))? else {
             return err("42704", format!("type \"{name}\" does not exist"));
         };
         let j: Json = serde_json::from_str(&raw).unwrap_or_default();
+        // where RENAME TO or SET SCHEMA moves it (a type already in the schema stays where it is)
+        let moved = match change {
+            TypeChange::Rename(n) => Some(n.clone()),
+            TypeChange::Schema(s) => {
+                need_schema(v, &qualify(s, "x"))?;
+                let to = qualify(s, rel_part(name));
+                if to == name {
+                    return Ok(vec![]);
+                }
+                Some(to)
+            }
+            _ => None,
+        };
+        if let Some(to) = &moved {
+            let taken =
+                Type::from_name(to).is_some() || v.get(&type_key(to))?.is_some() || relation_kind(v, to)?.is_some();
+            if taken {
+                return match change {
+                    TypeChange::Schema(s) => {
+                        err("42710", format!("type \"{}\" already exists in schema \"{s}\"", rel_part(to)))
+                    }
+                    _ => err("42710", format!("type \"{}\" already exists", rel_part(to))),
+                };
+            }
+        }
+        if j["composite"].is_array() {
+            return match &moved {
+                Some(to) => self.move_composite(v, name, to, &j),
+                None => err("42809", format!("{} is not an enum", shown_type(name))),
+            };
+        }
+        // (the rest are an enum's, or a domain's name: a range type's or a base type's row isn't one to write over)
+        if !(j["enum"].is_array() || moved.is_some() && j.get("domain").is_some()) {
+            if moved.is_some() {
+                return err(
+                    UNSUPPORTED,
+                    "ALTER TYPE ... RENAME TO and SET SCHEMA of a range or base type aren't supported here",
+                );
+            }
+            return err("42809", format!("{} is not an enum", shown_type(name)));
+        }
         let mut labels: Vec<String> =
             j["enum"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(String::from)).collect();
         let not_label = |l: &str| err("22023", format!("\"{l}\" is not an existing enum label"));
@@ -54092,11 +56736,12 @@ impl Exec<'_> {
                 labels[i] = b.clone();
                 renamed = Some((Value::Text(a.clone()), Value::Text(b.clone())));
             }
-            TypeChange::Rename(n) if j.get("domain").is_some() => return self.rename_domain(v, name, n),
-            TypeChange::Rename(n) => {
-                if Type::from_name(n).is_some() || v.get(&type_key(n))?.is_some() || relation_kind(v, n)?.is_some() {
-                    return err("42710", format!("type \"{n}\" already exists"));
-                }
+            TypeChange::Attrs(_) => unreachable!("a composite type's: see alter_composite"),
+            TypeChange::Rename(_) | TypeChange::Schema(_) if j.get("domain").is_some() => {
+                return self.rename_domain(v, name, moved.as_deref().unwrap_or(name));
+            }
+            TypeChange::Rename(_) | TypeChange::Schema(_) => {
+                let n = moved.as_deref().unwrap_or(name);
                 // views keep their columns' types by name
                 for r in v.prefix(&format!("{VIEWS}/"))? {
                     let (k, _) = r?;
@@ -54110,7 +56755,7 @@ impl Exec<'_> {
                         );
                     }
                 }
-                to = n.clone();
+                to = n.to_string();
             }
         }
         let ty = enum_named(&to, Some(labels.clone()));
@@ -54176,6 +56821,612 @@ impl Exec<'_> {
         Ok(writes)
     }
 
+    /// ALTER TYPE name ADD | DROP | ALTER | RENAME ATTRIBUTE ...: composite type `name`'s attributes changed in order,
+    /// and its row's with them, as Postgres's ALTER TABLE changes a composite type's relation. As there, each change
+    /// is first checked against the type as it is (an attribute ALTER ... TYPE changes is there and no column holds
+    /// values of the type; a type of typed tables is changed only with CASCADE), then they are made: with CASCADE
+    /// each typed table of it (and the tables inheriting from one) has its column changed the same way, and what
+    /// reads an attribute dropped goes with it (a table's CHECK or index, a view). A column holding values of the
+    /// type has them written again for an attribute added (null) or dropped, its default and missing value too, and
+    /// the index entries of them made again; an attribute renamed is named anew where a CHECK, an index or a domain's
+    /// check reads it. (Postgres keeps values and expressions by attribute number, so its rows and expressions follow
+    /// without being written.)
+    fn alter_composite(&self, v: &View, name: &str, changes: &[(AttrChange, bool)]) -> Result<hier::Writes> {
+        let shown = rel_part(name);
+        // (a type that isn't a composite one, a shell type too, has no relation: Postgres's RangeVarGetRelidExtended
+        // finds none of the name, where a relation of another kind is no composite type)
+        let no_relation = || err(NO_TABLE, format!("relation \"{name}\" does not exist"));
+        let Some(raw) = v.get(&type_key(name))? else {
+            if relation_kind(v, name)?.is_some() {
+                return err("42809", format!("\"{shown}\" is not a composite type"));
+            }
+            return no_relation();
+        };
+        let j: Json = serde_json::from_str(&raw).unwrap_or_default();
+        let Some(stored) = j["composite"].as_array().filter(|_| !shell_row(&j)) else { return no_relation() };
+        // (known as its row has it, as the tables' schemas below are read with it)
+        rehydrate_composite(v, name)?;
+        let mut fields: Vec<(String, String)> =
+            stored.iter().filter_map(|f| Some((f[0].as_str()?.to_string(), f[1].as_str()?.to_string()))).collect();
+        let tables = schemas(v)?;
+        let typed: Vec<&Table> = tables.iter().filter(|t| t.hier.of_type.as_deref() == Some(name)).collect();
+        // a table's columns holding values of the type (of it, or of a domain over it), by place
+        let holders = |t: &Table| -> Vec<usize> {
+            (0..t.cols.len()).filter(|&i| t.cols[i].ty.composite_of().as_deref() == Some(name)).collect()
+        };
+        let holder_names = |t: &Table| -> Vec<String> { holders(t).iter().map(|&i| t.cols[i].name.clone()).collect() };
+        let no_attr = |a: &str| err(NO_COLUMN, format!("column \"{a}\" of relation \"{shown}\" does not exist"));
+        for (change, cascade) in changes {
+            if let AttrChange::Type(a, _) = change {
+                if !fields.iter().any(|(f, _)| f == a) {
+                    return no_attr(a);
+                }
+                if let Some(user) = composite_user(v, &tables, name)? {
+                    return err(
+                        UNSUPPORTED,
+                        format!("cannot alter type \"{shown}\" because column \"{user}\" uses it"),
+                    );
+                }
+            }
+            if !typed.is_empty() && !cascade {
+                return Err(SqlError {
+                    code: "2BP01",
+                    message: format!("cannot alter type \"{shown}\" because it is the type of a typed table"),
+                    info: Some(Box::new(Violation {
+                        hint: Some("Use ALTER ... CASCADE to alter the typed tables too.".into()),
+                        ..Violation::default()
+                    })),
+                });
+            }
+        }
+        // an attribute's definition, as a column of a typed table is given it (its type there, and checked: it has to
+        // be there, and not hold the type itself)
+        let attribute = |a: &str, t: &str| -> Result<ColDef> {
+            let def = Parser::new(lex(&format!("{} {t}", ident(a)))?).column()?;
+            resolve_type(v, def.ty)?;
+            if holds_itself(v, name, t)? {
+                return err("42P16", format!("composite type {shown} cannot be made a member of itself"));
+            }
+            Ok(def)
+        };
+        let kind = |matview: bool| if matview { "materialized view" } else { "view" };
+        let mut writes = vec![];
+        // the typed tables' changes; by table, the CHECKs and the indexes dropped with an attribute; the views and
+        // materialized views dropped with one; the attributes renamed; and where each attribute's value was in a
+        // value of the type before (None: added)
+        let mut alters: Vec<Alter> = vec![];
+        let mut checks_gone: BTreeMap<String, Vec<Alter>> = BTreeMap::new();
+        let mut indexes_gone: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut views_gone: Vec<(String, &str)> = vec![];
+        let mut renamed: Vec<(String, String)> = vec![];
+        let mut was_at: Vec<Option<usize>> = (0..fields.len()).map(Some).collect();
+        for (change, cascade) in changes {
+            match change {
+                AttrChange::Add(a, t) => {
+                    if fields.iter().any(|(f, _)| f == a) {
+                        return err(DUP_COLUMN, format!("column \"{a}\" of relation \"{shown}\" already exists"));
+                    }
+                    let def = attribute(a, t)?;
+                    fields.push((a.clone(), t.clone()));
+                    was_at.push(None);
+                    alters.push(Alter::AddColumn(def, false));
+                }
+                AttrChange::Drop(a, quiet) => {
+                    let Some(at) = fields.iter().position(|(f, _)| f == a) else {
+                        if *quiet {
+                            notice(
+                                "NOTICE",
+                                format!("column \"{a}\" of relation \"{shown}\" does not exist, skipping"),
+                            );
+                            continue;
+                        }
+                        return no_attr(a);
+                    };
+                    // what reads it, as Postgres records each one's dependency on the attribute: the CHECKs and
+                    // the indexes (an expression or WHERE) of tables with a column of the type (`(y).a`), the views
+                    // and materialized views over those tables reading it so, and the checks of the domains over
+                    // the type (`(VALUE).a`); each once, where an earlier change hasn't dropped it already
+                    let mut checks: Vec<(String, String)> = vec![];
+                    let mut indexes: Vec<(String, String)> = vec![];
+                    let mut views: Vec<(String, bool)> = vec![];
+                    for t in tables.iter().filter(|t| !views_gone.iter().any(|(n, _)| *n == t.name)) {
+                        let cols = holder_names(t);
+                        if cols.is_empty() {
+                            continue;
+                        }
+                        let reads =
+                            |text: &str| check_expr(text).is_ok_and(|e| cols.iter().any(|c| reads_field(&e, c, a)));
+                        let dropped = |n: &str, by: &BTreeMap<String, Vec<String>>| {
+                            by.get(&t.name).is_some_and(|x| x.iter().any(|x| x == n))
+                        };
+                        for c in t.checks.iter().filter(|c| reads(&c.text)) {
+                            let before = checks_gone.get(&t.name).is_some_and(|x| {
+                                x.iter().any(|d| matches!(d, Alter::DropConstraint(n, ..) if *n == c.name))
+                            });
+                            if !before {
+                                checks.push((t.name.clone(), c.name.clone()));
+                            }
+                        }
+                        // (a partition's copy of its parent's index goes with the parent's)
+                        for x in t.indexes.iter().filter(|x| !t.hier.inherited.contains(&x.name)) {
+                            if x.exprs.iter().chain(&x.filter).any(|e| reads(e)) && !dropped(&x.name, &indexes_gone) {
+                                indexes.push((t.name.clone(), x.name.clone()));
+                            }
+                        }
+                        for r in field_readers(v, &t.name, &cols, a)? {
+                            if !views.contains(&r) && !views_gone.iter().any(|(n, _)| *n == r.0) {
+                                views.push(r);
+                            }
+                        }
+                    }
+                    let domains = domain::checks_reading(v, name, a)?;
+                    let mut said: Vec<String> =
+                        (checks.iter().map(|(t, c)| format!("constraint {c} on table {}", rel_part(t))))
+                            .chain(indexes.iter().map(|(_, x)| format!("index {}", rel_part(x))))
+                            .chain(views.iter().map(|(n, m)| format!("{} {}", kind(*m), rel_part(n))))
+                            .chain(domains.iter().map(|(_, c)| format!("constraint {c}")))
+                            .collect();
+                    if !said.is_empty() && !cascade {
+                        let on = format!("column {a} of composite type {shown}");
+                        return Err(SqlError {
+                            code: "2BP01",
+                            message: format!("cannot drop {on} because other objects depend on it"),
+                            info: Some(Box::new(Violation {
+                                detail: Some(
+                                    said.iter().map(|s| format!("{s} depends on {on}")).collect::<Vec<_>>().join("\n"),
+                                ),
+                                hint: Some("Use DROP ... CASCADE to drop the dependent objects too.".into()),
+                                ..Violation::default()
+                            })),
+                        });
+                    }
+                    if let Some((d, c)) = domains.first() {
+                        return err(
+                            UNSUPPORTED,
+                            format!(
+                                "ALTER TYPE ... DROP ATTRIBUTE ... CASCADE doesn't drop a domain's constraint yet: drop \
+                                 constraint {c} of domain {} first",
+                                shown_type(d)
+                            ),
+                        );
+                    }
+                    // (an index that would take more with it: a partitioned table's, with its partitions', or a
+                    // unique one a foreign key references, with the foreign key)
+                    for (tn, x) in &indexes {
+                        let Some(t) = tables.iter().find(|t| t.name == *tn) else { continue };
+                        let referenced = match t.uniques.iter().find(|u| u.name == *x) {
+                            Some(u) => unique_referenced(v, t, u)?.is_some(),
+                            None => false,
+                        };
+                        if t.hier.part.is_some() || referenced {
+                            return err(
+                                UNSUPPORTED,
+                                format!(
+                                    "ALTER TYPE ... DROP ATTRIBUTE ... CASCADE doesn't drop index {x} yet (a \
+                                     partitioned table's, or one a foreign key references): drop it first"
+                                ),
+                            );
+                        }
+                    }
+                    // (and the views over the views that go, as DROP ... CASCADE of them would take them)
+                    let mut gone: Vec<(String, &str)> = views.iter().map(|(n, m)| (n.clone(), kind(*m))).collect();
+                    let roots: Vec<String> = views.iter().map(|(n, _)| n.clone()).collect();
+                    for d in dependents_listed(v, &roots)? {
+                        if gone.iter().chain(&views_gone).any(|(n, _)| *n == d) {
+                            continue;
+                        }
+                        let dk = relation_kind(v, &d)?.unwrap_or("view");
+                        said.push(format!("{dk} {}", rel_part(&d)));
+                        gone.push((d, dk));
+                    }
+                    match &said[..] {
+                        [] => {}
+                        [one] => notice("NOTICE", format!("drop cascades to {one}")),
+                        many => notice_detail(
+                            "NOTICE",
+                            format!("drop cascades to {} other objects", many.len()),
+                            many.iter().map(|w| format!("drop cascades to {w}")).collect::<Vec<_>>().join("\n"),
+                        ),
+                    }
+                    for (t, c) in checks {
+                        checks_gone.entry(t).or_default().push(Alter::DropConstraint(c, false, false));
+                    }
+                    for (t, x) in indexes {
+                        indexes_gone.entry(t).or_default().push(x);
+                    }
+                    views_gone.extend(gone);
+                    fields.remove(at);
+                    was_at.remove(at);
+                    alters.push(Alter::DropColumn(a.clone(), false, *cascade));
+                }
+                AttrChange::Type(a, t) => {
+                    let Some(at) = fields.iter().position(|(f, _)| f == a) else { return no_attr(a) };
+                    let def = attribute(a, t)?;
+                    let old = std::mem::replace(&mut fields[at].1, t.clone());
+                    // (the domains over it that read the attribute have their checks bound again)
+                    domain::rebind_over(v, name, a, &old, &fields)?;
+                    let mods =
+                        TypeMods { chars: def.chars, numeric: def.numeric, dim: def.dim, small: def.small, coll: None };
+                    alters.push(Alter::SetType(a.clone(), def.ty, mods, vec![], None));
+                }
+                AttrChange::Rename(a, b) => {
+                    let Some(at) = fields.iter().position(|(f, _)| f == a) else {
+                        return err(NO_COLUMN, format!("column \"{a}\" does not exist"));
+                    };
+                    if fields.iter().any(|(f, _)| f == b) {
+                        return err(DUP_COLUMN, format!("column \"{b}\" of relation \"{shown}\" already exists"));
+                    }
+                    // (a view's query names it in its SQL, which isn't written again here)
+                    for t in &tables {
+                        let cols = holder_names(t);
+                        if cols.is_empty() {
+                            continue;
+                        }
+                        if let Some((d, m)) = field_readers(v, &t.name, &cols, a)?.into_iter().next() {
+                            return err(
+                                UNSUPPORTED,
+                                format!(
+                                    "can't rename attribute {a} of type {shown}: {} \"{}\" reads it; drop it, rename, \
+                                     then make it again",
+                                    kind(m),
+                                    rel_part(&d)
+                                ),
+                            );
+                        }
+                    }
+                    fields[at].0 = b.clone();
+                    renamed.push((a.clone(), b.clone()));
+                    alters.push(Alter::RenameColumn(a.clone(), b.clone()));
+                }
+            }
+        }
+        // the values of the type are written again where an attribute's place in them changed (added or dropped)
+        let moved = was_at.len() != stored.len() || was_at.iter().enumerate().any(|(k, w)| *w != Some(k));
+        let gone = |n: &str| views_gone.iter().any(|(g, _)| g == n);
+        for t in tables.iter().filter(|t| moved && !gone(&t.name)) {
+            // (not those inside another type's: an array of it, a range over it, another composite type of it; an
+            // array of a composite type is kept as one of its elements' text, of whichever type they are, so one
+            // holding elements of the type's number of attributes may hold it)
+            for (i, c) in t.cols.iter().enumerate().filter(|(_, c)| !c.hidden) {
+                let records =
+                    matches!(c.ty, Type::Array(e) if e == Type::Text.oid() || e == Type::record(vec![]).oid());
+                let inside = match domain::column_type(c) {
+                    Some(declared) => domain::holds(v, &declared, name)? == Some(true),
+                    None if records => records_of(v, t, i, stored.len())?,
+                    None => false,
+                };
+                if inside {
+                    return err(
+                        UNSUPPORTED,
+                        format!(
+                            "ALTER TYPE ... ADD and DROP ATTRIBUTE of type {shown} aren't supported here while column \
+                             \"{}.{}\" may hold it inside another type (an array, a range or another composite type)",
+                            rel_part(&t.name),
+                            c.name
+                        ),
+                    );
+                }
+            }
+            // (nor rows named by values of it, a primary key of it, nor the foreign keys over them)
+            for i in holders(t) {
+                let id = t.cols[i].id;
+                let keyed = t.in_key(i)
+                    || t.fks.iter().any(|f| f.cols.contains(&id))
+                    || tables.iter().any(|o| o.fks.iter().any(|f| f.table == t.name && f.refs.contains(&id)));
+                if keyed {
+                    return err(
+                        UNSUPPORTED,
+                        format!(
+                            "ALTER TYPE ... ADD and DROP ATTRIBUTE of type {shown} aren't supported here while column \
+                             \"{}.{}\" is in a primary or foreign key",
+                            rel_part(&t.name),
+                            t.cols[i].name
+                        ),
+                    );
+                }
+            }
+        }
+        let mut row = serde_json::json!({ "composite": fields.iter().map(|(n, t)| [n, t]).collect::<Vec<_>>() });
+        // (a type left with no attributes is one of none, not a shell type to be filled in: see `shell_row`)
+        if fields.is_empty() {
+            row["empty"] = Json::Bool(true);
+        }
+        writes.push((type_key(name), Some(row.to_string())));
+        // (each typed table, and those inheriting from it, as Postgres's ATTypedTableRecursion reaches them)
+        let typed_from = writes.len();
+        if !alters.is_empty() {
+            for t in &typed {
+                OF_TYPE_CASCADE.set(true);
+                let done = self.alter_hier(v, &t.name, &alters, false);
+                OF_TYPE_CASCADE.set(false);
+                writes.extend(done?);
+            }
+        }
+        let cascaded: HashSet<String> = (writes[typed_from..].iter())
+            .filter_map(|(k, _)| k.strip_prefix(&format!("{SCHEMAS}/")).map(String::from))
+            .collect();
+        for (t, drops) in checks_gone {
+            writes.extend(self.alter_writes(v, &t, &drops)?);
+        }
+        for (n, k) in &views_gone {
+            writes.extend(relation_gone(v, n, k)?);
+        }
+        for (a, b) in &renamed {
+            writes.extend(domain::renamed_attribute(v, name, a, b)?);
+        }
+        // a value of the type as it is now: each attribute's value where it is now
+        let reshape = |s: &str| -> Option<String> {
+            let parts = composite_fields(s)?;
+            let now: Vec<Value> = (was_at.iter())
+                .map(|w| w.and_then(|j| parts.get(j).cloned().flatten()).map_or(Value::Null, Value::Text))
+                .collect();
+            Some(composite_text(&now))
+        };
+        let new_ty = match moved {
+            true => match userdefs::in_world(v, || userdefs::shape_of(name, &fields)) {
+                Some(t) => Some(t),
+                None => return err(UNSUPPORTED, format!("the attributes of type {shown} can't be read")),
+            },
+            false => None,
+        };
+        // the tables with a column of the type: their schemas as the changes above left them (a CHECK dropped), with
+        // their columns' defaults and missing values of the type written again, an attribute renamed where their
+        // CHECKs and indexes read it, and the indexes dropped with an attribute gone; and with their rows' values to
+        // write again, each with its schema as it is now
+        let mut rewrite: Vec<(&Table, Table)> = vec![];
+        for t in tables.iter().filter(|t| !gone(&t.name)) {
+            let cols = holders(t);
+            let drops = indexes_gone.get(&t.name);
+            if cols.is_empty() || !(moved || !renamed.is_empty() || drops.is_some()) {
+                continue;
+            }
+            let key = schema_key(&t.name);
+            let at = writes.iter().rposition(|(k, _)| *k == key);
+            let mut nt = match at.map(|i| writes[i].1.clone()) {
+                Some(Some(raw)) => {
+                    let mut x = schema_of(&Val::from(raw.as_str()))?;
+                    x.name = t.name.clone();
+                    for c in &mut x.cols {
+                        c.table = t.name.clone();
+                    }
+                    x
+                }
+                Some(None) => continue,
+                None => t.clone(),
+            };
+            let same_cols = nt.cols.iter().map(|c| c.id).eq(t.cols.iter().map(|c| c.id));
+            if moved && (cascaded.contains(&t.name) || !same_cols) {
+                return err(
+                    UNSUPPORTED,
+                    format!(
+                        "ALTER TYPE ... ADD and DROP ATTRIBUTE ... CASCADE of type {shown} aren't supported here while \
+                         table \"{}\", whose columns they change, has a column of it",
+                        rel_part(&t.name)
+                    ),
+                );
+            }
+            let mut changed = false;
+            if moved {
+                for &i in &cols {
+                    let c = &mut nt.cols[i];
+                    for d in [&mut c.default, &mut c.missing].into_iter().flatten() {
+                        if let Value::Text(s) = &*d
+                            && let Some(x) = reshape(s)
+                        {
+                            *d = Value::Text(x);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            let names = holder_names(&nt);
+            for (a, b) in &renamed {
+                let re = |text: &mut String| -> Result<bool> {
+                    match renamed_field(text, &names, a, b)? {
+                        Some(x) => {
+                            *text = x;
+                            Ok(true)
+                        }
+                        None => Ok(false),
+                    }
+                };
+                for c in &mut nt.checks {
+                    changed |= re(&mut c.text)?;
+                }
+                for x in &mut nt.indexes {
+                    for e in x.exprs.iter_mut().chain(x.filter.as_mut()) {
+                        changed |= re(e)?;
+                    }
+                }
+                for x in &mut nt.excludes {
+                    for e in x.parts.iter_mut().map(|p| &mut p.0).chain(x.pred.as_mut()) {
+                        changed |= re(e)?;
+                    }
+                }
+                for c in &mut nt.cols {
+                    if let Some(g) = &mut c.generated {
+                        changed |= re(g)?;
+                    }
+                }
+                if let Some(k) = &mut nt.hier.part {
+                    for p in &mut k.parts {
+                        if let partition::KeyPart::Expr(e) = p {
+                            changed |= re(e)?;
+                        }
+                    }
+                }
+            }
+            for x in drops.into_iter().flatten() {
+                nt.indexes.retain(|i| i.name != *x);
+                nt.uniques.retain(|u| u.name != *x); // (one CREATE UNIQUE INDEX made)
+                if nt.hier.clustered.as_deref() == Some(x.as_str()) {
+                    nt.hier.clustered = None;
+                }
+                nt.hier.index_reloptions.retain(|(i, _)| i != x);
+                for p in [btree::prefix(&t.name, x), format!("{UNIQ}/{}/{x}/", t.name)] {
+                    for r in v.prefix(&p)? {
+                        writes.push((r?.0, None));
+                    }
+                }
+                changed = true;
+            }
+            if changed {
+                let text = schema_json(&nt);
+                match at {
+                    Some(i) => writes[i].1 = Some(text),
+                    None => writes.push((key, Some(text))),
+                }
+            }
+            if let Some(ty) = new_ty {
+                for &i in &cols {
+                    nt.cols[i].ty = ty;
+                }
+                rewrite.push((t, nt));
+            }
+        }
+        // the rows' values of the type written again, and the index entries holding them made again: the old ones
+        // taken away (as the type was then, as the rows were read), then the new ones made (as it is now) and the
+        // unique ones checked
+        let mut claimed: HashMap<String, Option<String>> = HashMap::new();
+        let mut rows: Vec<(usize, String, Vec<Value>)> = vec![];
+        for (n, (t, nt)) in rewrite.iter().enumerate() {
+            let cols = holders(t);
+            let prefix = format!("{}/", t.name);
+            for r in v.prefix(&prefix)? {
+                let (k, raw) = r?;
+                let id = &k[prefix.len()..];
+                let old = decode_raw(t, id, &raw, None)?;
+                let mut now = old.clone();
+                let mut changed = false;
+                for &i in &cols {
+                    let Value::Text(s) = &old[i] else { continue };
+                    if let Some(x) = reshape(s) {
+                        now[i] = Value::Text(x);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    continue;
+                }
+                writes.push((k.clone(), Some(pack(&now, nt.layout()))));
+                for key in t.indexes.iter().flat_map(|ix| btree::entries(t, ix, &old, id)) {
+                    claimed.insert(key, None);
+                }
+                for u in &t.uniques {
+                    for key in uniq_key(t, u, &old).into_iter().chain(old_uniq_keys(t, u, &old)) {
+                        if v.get(&key)?.as_deref() == Some(id) {
+                            claimed.insert(key, None);
+                        }
+                    }
+                }
+                rows.push((n, id.to_string(), now));
+            }
+        }
+        for (n, id, now) in &rows {
+            let (t, nt) = &rewrite[*n];
+            for ix in &nt.indexes {
+                index_exprs_hold(nt, ix, now)?;
+            }
+            for key in nt.indexes.iter().flat_map(|ix| btree::entries(nt, ix, now, id)) {
+                claimed.insert(key, Some(id.clone()));
+            }
+            for u in &nt.uniques {
+                let Some(key) = uniq_key(nt, u, now) else { continue };
+                let holder = match claimed.get(&key) {
+                    Some(x) => x.clone(),
+                    None => v.get(&key)?.map(|x| x.to_string()),
+                };
+                if let Some(other) = holder.filter(|o| o != id) {
+                    let names = uniq_names(nt, u);
+                    let vals: Vec<String> =
+                        uniq_vals(nt, u, now).unwrap_or_default().iter().map(key_value_shown).collect();
+                    return Err(violation(
+                        UNIQUE,
+                        format!(
+                            "duplicate key value violates unique constraint \"{}\": ({})=({}) is already in {}/{}",
+                            u.name,
+                            names.join(", "),
+                            vals.join(", "),
+                            t.name,
+                            show_id(&other)
+                        ),
+                        &t.name,
+                        Some(&u.name),
+                        None,
+                        Some(key_detail(&names, &vals)),
+                    ));
+                }
+                claimed.insert(key, Some(id.clone()));
+            }
+        }
+        let mut idx: Vec<(String, Option<String>)> = claimed.into_iter().collect();
+        idx.sort(); // deterministic
+        writes.extend(idx);
+        Ok(writes)
+    }
+
+    /// ALTER TYPE ... RENAME TO or SET SCHEMA of composite type `name` (its row `j`), to `to`: its row under its new
+    /// name, and what names it following it, as Postgres's follow the type's oid: its typed tables, the columns of
+    /// it, the functions taking or returning it, and the domains over it and the composite types with an attribute
+    /// of it (each by name, and an array of it too). It is known by its new name before the writes are made, as the
+    /// tables' schemas name it.
+    fn move_composite(&self, v: &View, name: &str, to: &str, j: &Json) -> Result<hier::Writes> {
+        // views keep their columns' types by name
+        for r in v.prefix(&format!("{VIEWS}/"))? {
+            let (k, _) = r?;
+            let view = &k[VIEWS.len() + 1..];
+            if view_def(v, view)?.is_some_and(|d| d.types.iter().any(|t| t == name)) {
+                return err(
+                    UNSUPPORTED,
+                    format!(
+                        "can't rename type {name}: view \"{view}\" has a column of it; drop the view, rename, then make it again"
+                    ),
+                );
+            }
+        }
+        let ty = userdefs::sync_composite(v, to, Some(j));
+        let mut writes = vec![(type_key(name), None), (type_key(to), Some(j.to_string()))];
+        writes.extend(functions::retype(v, name, to)?);
+        for mut t in schemas(v)? {
+            let mut changed = false;
+            if t.hier.of_type.as_deref() == Some(name) {
+                t.hier.of_type = Some(to.to_string());
+                changed = true;
+            }
+            for c in t.cols.iter_mut().filter(|c| c.ty.composite_of().as_deref() == Some(name)) {
+                if let Some(ty) = ty {
+                    c.ty = ty;
+                    changed = true;
+                }
+            }
+            if changed {
+                writes.push((schema_key(&t.name), Some(schema_json(&t))));
+            }
+        }
+        for r in v.prefix("_sonos_types/")? {
+            let (k, raw) = r?;
+            if k == type_key(name) {
+                continue;
+            }
+            let mut d: Json = serde_json::from_str(&raw).unwrap_or_default();
+            let mut changed = false;
+            if let Some(base) = d["domain"]["base"].as_str().and_then(|b| domain::renamed_text(b, name, to)) {
+                d["domain"]["base"] = Json::from(base);
+                changed = true;
+            }
+            for f in d.get_mut("composite").and_then(Json::as_array_mut).into_iter().flatten() {
+                if let Some(t) = f[1].as_str().and_then(|t| domain::renamed_text(t, name, to)) {
+                    f[1] = Json::from(t);
+                    changed = true;
+                }
+            }
+            if changed {
+                writes.push((k.to_string(), Some(d.to_string())));
+            }
+        }
+        Ok(writes)
+    }
+
     /// See `Exec::paths`: by how many parents a change (of column `col`, or "" for a constraint) reaches the table.
     fn paths_of(&self, col: &str) -> u32 {
         self.paths.borrow().get(col).copied().unwrap_or(1).max(1)
@@ -54185,6 +57436,9 @@ impl Exec<'_> {
     fn alter_writes(&self, v: &View, table: &str, changes: &[Alter]) -> Result<Vec<(String, Option<String>)>> {
         let mut renamed = None;
         let mut t = need_table(v, table)?;
+        // how many times its storage and its indexes' were made anew, which follow its indexes' names
+        let gens_was = tablespace::Gens::load(v, table)?;
+        let mut gens = gens_was.clone();
         if !t.schema {
             return err(
                 WRONG_TYPE,
@@ -54225,34 +57479,37 @@ impl Exec<'_> {
         // (the rows' values of it, its DEFAULT's, have to be there and differ); ADD PRIMARY KEY USING INDEX: the
         // index given up (see `Alter::KeyUsingIndex`), then the key on its columns, under its name
         let expanded: Vec<Alter>;
-        let changes =
-            if (has_rows && !t.has_key() && changes.iter().any(|c| matches!(c, Alter::AddColumn(d, _) if d.primary)))
-                || changes.iter().any(|c| matches!(c, Alter::KeyUsingIndex(_, _, true, _)))
-            {
-                let index_cols = |ix: &str| -> Vec<String> {
-                    let ids = t.indexes.iter().find(|x| x.name == ix).map_or_else(Vec::new, |x| x.cols.clone());
-                    ids.iter().filter_map(|id| t.cols.iter().find(|c| c.id == *id)).map(|c| c.name.clone()).collect()
-                };
-                expanded = changes
-                    .iter()
-                    .flat_map(|c| match c {
-                        Alter::AddColumn(d, quiet) if d.primary && has_rows && !t.has_key() => vec![
-                            Alter::AddColumn(ColDef { primary: false, ..d.clone() }, *quiet),
-                            Alter::AddPrimaryKey(vec![d.name.clone()], None),
-                        ],
-                        Alter::KeyUsingIndex(ix, name, true, _) => vec![
-                            c.clone(),
-                            Alter::AddPrimaryKey(index_cols(ix), Some(name.clone().unwrap_or_else(|| ix.clone()))),
-                        ],
-                        c => vec![c.clone()],
-                    })
-                    .collect();
-                &expanded[..]
-            } else {
-                changes
+        let changes = if (has_rows
+            && !t.has_key()
+            && changes.iter().any(|c| matches!(c, Alter::AddColumn(d, _) if d.primary)))
+            || changes.iter().any(|c| matches!(c, Alter::KeyUsingIndex(_, _, true, _)))
+        {
+            let index_cols = |ix: &str| -> Vec<String> {
+                let ids = t.indexes.iter().find(|x| x.name == ix).map_or_else(Vec::new, |x| x.cols.clone());
+                ids.iter().filter_map(|id| t.cols.iter().find(|c| c.id == *id)).map(|c| c.name.clone()).collect()
             };
+            expanded = changes
+                .iter()
+                .flat_map(|c| match c {
+                    Alter::AddColumn(d, quiet) if d.primary && has_rows && !t.has_key() => vec![
+                        Alter::AddColumn(ColDef { primary: false, ..d.clone() }, *quiet),
+                        Alter::AddPrimaryKey(vec![d.name.clone()], None, None),
+                    ],
+                    Alter::KeyUsingIndex(ix, name, true, _) => vec![
+                        c.clone(),
+                        Alter::AddPrimaryKey(index_cols(ix), Some(name.clone().unwrap_or_else(|| ix.clone())), None),
+                    ],
+                    c => vec![c.clone()],
+                })
+                .collect();
+            &expanded[..]
+        } else {
+            changes
+        };
         // the index ADD PRIMARY KEY USING INDEX gives up, whose name the key takes (it is no other relation's)
         let mut converting: Option<String> = None;
+        // and the tablespace it is kept in, which the key's index is kept in then (it is the same index)
+        let mut converted_space: Option<i64> = None;
         // what the rows kept behind constraints and indexes (see `entry_delta`) need after the changes: the table
         // as it was, the constraints and indexes renamed along the way (their kind, old name, new name), the
         // columns whose values are kept another way now, and whether something here works their rows out as a
@@ -54263,8 +57520,9 @@ impl Exec<'_> {
         let mut fresh: Vec<String> = vec![]; // the CHECKs and foreign keys added (by name), whatever was named so
         let mut whole_entries = false;
         for change in changes {
-            // (a typed table's columns are its type's: as Postgres's ATSimplePermissions refuses changing them)
-            if t.hier.of_type.is_some() {
+            // (a typed table's columns are its type's: as Postgres's ATSimplePermissions refuses changing them, but
+            // where ALTER TYPE ... CASCADE changes them with the type's attributes)
+            if t.hier.of_type.is_some() && !OF_TYPE_CASCADE.get() {
                 let refused = match change {
                     Alter::AddColumn(..) => Some("cannot add column to typed table"),
                     Alter::DropColumn(..) => Some("cannot drop column from typed table"),
@@ -54713,13 +57971,7 @@ impl Exec<'_> {
                         );
                     }
                     t.cols[i].name = b.clone();
-                    // the views reading it name the column: written again to name it as renamed (one of a form not
-                    // written back is left as it is)
-                    let rn =
-                        viewdef::Renames { table: t.name.clone(), to_table: None, col: Some((a.clone(), b.clone())) };
-                    if let Some(follow) = self.renamed_dependents(v, &t.name, &rn)? {
-                        extra.extend(follow);
-                    }
+                    // (the views reading it, which name the column, follow it: see below)
                     // so do policies (see `rls::renamed_column`)
                     if v.core.has_row_security() {
                         extra.extend(rls::renamed_column(v, &t.name, a, b)?);
@@ -54807,6 +58059,11 @@ impl Exec<'_> {
                             "42710",
                             format!("constraint \"{b}\" for relation \"{}\" already exists", rel_part(table)),
                         );
+                    }
+                    // (its index is kept where it was)
+                    if indexed {
+                        t.hier.renamed_index(a, b);
+                        gens.renamed(a, b);
                     }
                     if self.inheriting.get() == hier::Inheriting::No
                         && t.checks.iter().any(|c| c.name == *a && c.inh > 0)
@@ -55009,7 +58266,7 @@ impl Exec<'_> {
                         t.hier.inherited.extend(given);
                     }
                 }
-                Alter::AddPrimaryKey(cols, named) => {
+                Alter::AddPrimaryKey(cols, named, space) => {
                     // (a column added before it in the statement: the rows are read with it)
                     if layout {
                         t.new_layout();
@@ -55055,6 +58312,11 @@ impl Exec<'_> {
                             None => new_pkey_name(v, &t)?.unwrap_or_else(|| format!("{}_pkey", rel_part(&t.name))),
                         };
                         let ids = at.iter().map(|&i| t.cols[i].id).collect();
+                        let space = match converted_space.take() {
+                            Some(s) => s,
+                            None => tablespace::place(v, space.as_deref(), 0, t.hier.part.is_some(), true)?,
+                        };
+                        t.hier.set_index_space(&name, space);
                         t.uniques.push(Unique { name, cols: ids, nnd: false, primary: true });
                         continue;
                     }
@@ -55071,6 +58333,14 @@ impl Exec<'_> {
                         }
                         None => new_pkey_name(v, &t)?, // (named for the table as it is now)
                     };
+                    // (where its index is kept: USING INDEX TABLESPACE's, else default_tablespace's; an index made the
+                    // key's is kept where it was)
+                    let pk = t.pkey_name();
+                    let space = match converted_space.take() {
+                        Some(s) => s,
+                        None => tablespace::place(v, space.as_deref(), 0, t.hier.part.is_some(), true)?,
+                    };
+                    t.hier.set_index_space(&pk, space);
                     let at = key_columns(&t, cols)?;
                     if t.hier.part.is_some() {
                         let ids: Vec<u32> = at.iter().map(|&i| t.cols[i].id).collect();
@@ -55144,6 +58414,13 @@ impl Exec<'_> {
                         }
                     }
                     t.hier.inherited.retain(|x| x != name && !(x == "*pkey" && *name == pkey));
+                    // (a key's or unique constraint's index goes with it, and where it was kept)
+                    if *name == pkey
+                        || t.uniques.iter().any(|u| u.name == *name && !t.indexes.iter().any(|x| x.name == u.name))
+                    {
+                        t.hier.forget_index(name);
+                        gens.forget(name);
+                    }
                     // the primary key: what depends on it goes with it (CASCADE) or keeps it (2BP01): the foreign
                     // keys that reference it, and the views whose GROUP BY it lets name the table's other columns
                     // (any view of the table that groups is taken for one: Postgres would refuse at least as often)
@@ -55788,6 +59065,8 @@ impl Exec<'_> {
                 // (Postgres does these without a word)
                 Alter::Noop(message) if !pg_exact() => notice("NOTICE", (*message).into()),
                 Alter::Noop(_) => {}
+                // (moved apart, by `set_tablespace`)
+                Alter::SetTablespace(_) => {}
                 Alter::SetSchema(schema) => {
                     need_schema(v, &qualify(schema, "x"))?;
                     let to = qualify(schema, rel_part(table));
@@ -55946,11 +59225,17 @@ impl Exec<'_> {
                         );
                     }
                     // the index is the constraint's from now on: a key is kept by its rows' own keys (ADD PRIMARY
-                    // KEY makes it, next), and a unique constraint's index is the constraint itself here
+                    // KEY makes it, next), and a unique constraint's index is the constraint itself here; it is kept
+                    // where it was, with its storage, under the constraint's name
                     t.indexes.retain(|y| y.name != *ix);
+                    let space = t.hier.index_space(ix);
+                    t.hier.forget_index(ix);
+                    t.hier.set_index_space(&to, space);
+                    gens.renamed(ix, &to);
                     if *primary {
                         t.uniques.retain(|y| y.name != *ix);
                         converting = Some(ix.clone());
+                        converted_space = Some(space);
                     } else if let Some(y) = t.uniques.iter_mut().find(|y| y.name == *ix) {
                         y.name = to.clone();
                     }
@@ -56057,10 +59342,12 @@ impl Exec<'_> {
                         return err(TABLE_EXISTS, format!("relation \"{to}\" already exists"));
                     }
                     let (mut found, unique) = (false, t.uniques.iter().any(|u| u.name == *from));
-                    // (its storage parameters go with it)
+                    // (its storage parameters go with it, and where it is kept)
                     for (x, _) in t.hier.index_reloptions.iter_mut().filter(|(x, _)| x == from) {
                         x.clone_from(to);
                     }
+                    t.hier.renamed_index(from, to);
+                    gens.renamed(from, to);
                     if let Some(x) = t.indexes.iter_mut().find(|x| x.name == *from) {
                         x.name = to.clone();
                         moved.push((btree::IDX, from.clone(), to.clone()));
@@ -56094,14 +59381,44 @@ impl Exec<'_> {
         if layout {
             t.new_layout();
         }
+        // its columns added, dropped or renamed: the views and materialized views reading it written again, so that
+        // each name in them still finds the column it found, as Postgres's views read columns by number (a column
+        // added whose name another takes shown by another, `t t(x, y, z_1)`; one of a form not written back is left
+        // as it is, one that goes with a column is gone)
+        let now: Vec<(String, Option<String>)> = t
+            .cols
+            .iter()
+            .map(|c| (c.name.clone(), before.cols.iter().find(|b| b.id == c.id).map(|b| b.name.clone())))
+            .collect();
+        let same = now.len() == before.cols.len() && now.iter().all(|(n, was)| was.as_ref() == Some(n));
+        if !same && renamed.is_none() {
+            let rn = viewdef::Renames { table: table.to_string(), to_table: None, col: None, cols: Some(now) };
+            let gone: Vec<String> = extra.iter().filter(|(_, x)| x.is_none()).map(|(k, _)| k.clone()).collect();
+            // (`table` as the change leaves it, against which a view that reads as it did is left as it is)
+            let columns: Vec<(String, Type, bool, Option<String>)> = t
+                .cols
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.name.clone(), c.ty, c.not_null || t.in_key(i), None))
+                .collect();
+            let typmods: Vec<(i64, i64)> = t.cols.iter().map(col_typmod).collect();
+            let after = |r: &mut TableInfo| {
+                r.columns.clone_from(&columns);
+                r.typmods.clone_from(&typmods);
+            };
+            let follow = self.column_dependents(v, table, &rn, &gone, &after)?;
+            extra.extend(follow);
+        }
         let mut writes = vec![];
         if let Some(to) = &renamed {
             // publications and statistics objects name it by its stored name: they follow it
             writes.extend(publication::renamed_table(v, table, to)?);
             writes.extend(statistics::renamed_table(v, table, to)?);
+            // and so do the functions of its row type (`f(t onek)`, RETURNS SETOF onek)
+            writes.extend(functions::retype(v, table, to)?);
             // views name the tables they read: written again to read it by its new name, as Postgres's follow it
-            let rn = viewdef::Renames { table: table.to_string(), to_table: Some(to.clone()), col: None };
-            match self.renamed_dependents(v, table, &rn)? {
+            let rn = viewdef::Renames { table: table.to_string(), to_table: Some(to.clone()), col: None, cols: None };
+            match self.renamed_dependents(v, table, &rn, None)? {
                 Some(follow) => writes.extend(follow),
                 None => {
                     let d = dependents(v, table)?.into_iter().next().unwrap_or_default();
@@ -56172,7 +59489,10 @@ impl Exec<'_> {
             }
         }
         match &renamed {
-            None => writes.push((schema_key(table), Some(schema_json(&t)))),
+            None => {
+                writes.push((schema_key(table), Some(schema_json(&t))));
+                writes.extend(gens.changed(&gens_was, table));
+            }
             Some(to) => {
                 // a new name moves every row to new keys
                 for r in v.prefix(&prefix)? {
@@ -56182,6 +59502,14 @@ impl Exec<'_> {
                 }
                 writes.push((schema_key(table), None));
                 writes.push((schema_key(to), Some(schema_json(&t))));
+                // (and its storage's generations, which a rename leaves)
+                let none = tablespace::Gens::default();
+                if gens_was != none {
+                    writes.push(none.write(table));
+                }
+                if gens != none {
+                    writes.push(gens.write(to));
+                }
             }
         }
         if (backfill || !rewritten.is_empty()) && has_rows {
@@ -56242,8 +59570,8 @@ impl Exec<'_> {
         Ok(writes)
     }
 
-    /// A select's row count, run for at most a few seconds: a statement that takes longer is explained by what it read
-    /// so far (0 rows).
+    /// A select's row count, run for at most a few seconds as one that changes nothing (see `dry_run`): a statement
+    /// that takes longer, or is stopped from changing something, is explained by what it read so far (0 rows).
     fn select_briefly(&self, s: &Select) -> Result<usize> {
         let limit = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let cap = || Some(Arc::new(Mem { cap: 256 << 20, used: Default::default() }));
@@ -56263,43 +59591,59 @@ impl Exec<'_> {
                     gone: None,
                     ctx: None,
                     mem: cap(),
+                    threads: 0,
                 });
                 (false, (None, None))
             }
         });
-        let r = unseen(|| self.select(s));
+        let r = dry_run(|| self.select(s).map(|o| o.rows.len()));
         STOP.with_borrow_mut(|st| match (had, st) {
             (true, Some(x)) => (x.deadline, x.mem) = old,
             (_, st) => *st = None,
         });
         match r {
-            Ok(o) => Ok(o.rows.len()),
+            Ok(n) => Ok(n.unwrap_or(0)),
             Err(e) if e.code == CANCELED || e.code == OUT_OF_MEMORY => Ok(0),
             Err(e) => Err(e),
         }
     }
 
-    /// EXPLAIN [ANALYZE]: the steps a statement takes and how each table is read, in Postgres's
-    /// text layout. Without ANALYZE a write isn't carried out (its rows are only found); with it,
-    /// the statement runs for real and the plan shows row counts and the time taken.
-    fn explain(&self, stmt: &Stmt, analyze: bool, pg_plan: bool, original: Option<&Stmt>) -> Result<Output> {
-        if analyze {
-            return self.explain_run(stmt, analyze, pg_plan, original);
+    /// How many rows of `table` an UPDATE or DELETE explained without ANALYZE would change, found by its WHERE as one
+    /// that changes nothing (see `dry_run`); 0 for a WHERE that could change something itself (see `safe::effects`),
+    /// which isn't run.
+    fn explain_matching(&self, table: &str, filter: Option<&Expr>) -> Result<usize> {
+        let v = self.db.view_tx(self.branch)?;
+        if filter.is_some_and(|f| safe::effects(&Stmt::Select(Box::new(select_of(f.clone()))), Some(&v))) {
+            return Ok(0);
         }
-        // without ANALYZE Postgres runs nothing: what the query is run here to see how it reads its tables sends no
-        // notices (a function's RAISE NOTICE, say)
-        let mark = NOTICES.with_borrow(Vec::len);
-        let out = self.explain_run(stmt, analyze, pg_plan, original);
-        NOTICES.with_borrow_mut(|n| n.truncate(mark));
-        out
+        Ok(dry_run(|| Ok(self.matching(&v, &mut need_table(&v, table)?, filter)?.len()))?.unwrap_or(0))
     }
 
-    fn explain_run(&self, stmt: &Stmt, analyze: bool, pg_plan: bool, original: Option<&Stmt>) -> Result<Output> {
-        // EXPLAIN (COSTS OFF): Postgres's own plan, where this can make it (see `plan`), from the query as written
+    /// EXPLAIN [ANALYZE]: the steps a statement takes and how each table is read, in Postgres's
+    /// text layout. Without ANALYZE nothing that changes anything is carried out: a write's rows are
+    /// only found, and a query only run where that changes nothing (see `safe::effects`); with it,
+    /// the statement runs for real and the plan shows row counts and the time taken.
+    fn explain(&self, stmt: &Stmt, analyze: bool, pg_plan: bool, original: Option<&Stmt>) -> Result<Output> {
+        // EXPLAIN (COSTS OFF) with chronos.explain = postgres: the plan PostgreSQL 16 would choose, where this can make
+        // it (see `plan`), from the query as written. Chronos may run the query another way, which the NOTICE says
+        // (exact mode, the regression suite's, says nothing, as Postgres says nothing)
         if pg_plan
             && !analyze
-            && let Ok(Some(lines)) = self.pg_plan(original.unwrap_or(stmt))
+            && explain_shows_postgres()
+            && let Ok(Some(Some(lines))) = dry_run(|| self.pg_plan(original.unwrap_or(stmt)))
         {
+            if !pg_exact() {
+                unkept();
+                NOTICES.with_borrow_mut(|n| {
+                    n.push(Notice {
+                        level: "NOTICE",
+                        code: "00000",
+                        message: "this is the plan PostgreSQL 16 would choose".into(),
+                        detail: Some("Chronos may run the query differently.".into()),
+                        hint: Some("SET chronos.explain = chronos shows how Chronos runs it.".into()),
+                    })
+                });
+            }
             let rows = lines.into_iter().map(|l| vec![Value::Text(l)]).collect();
             return Ok(Output {
                 typmods: vec![],
@@ -56308,6 +59652,18 @@ impl Exec<'_> {
                 tag: "EXPLAIN".into(),
             });
         }
+        if analyze {
+            return self.explain_run(stmt, analyze);
+        }
+        // without ANALYZE Postgres runs nothing: the query is run here only to see how it reads its tables, and only
+        // when that changes nothing (see `explain_run`); it sends no notices either
+        let mark = NOTICES.with_borrow(Vec::len);
+        let out = self.explain_run(stmt, analyze);
+        NOTICES.with_borrow_mut(|n| n.truncate(mark));
+        out
+    }
+
+    fn explain_run(&self, stmt: &Stmt, analyze: bool) -> Result<Output> {
         *self.trace.borrow_mut() = Some(vec![]);
         let start = std::time::Instant::now();
         let count = |o: Output| o.tag.rsplit(' ').next().and_then(|n| n.parse().ok()).unwrap_or(o.rows.len());
@@ -56340,15 +59696,14 @@ impl Exec<'_> {
                     };
                     nodes.push(kind.into());
                 }
-                // (without ANALYZE the query is only run to see how it reads its tables: for a few seconds; not one
-                // that takes or sets sequence values, which Postgres's EXPLAIN leaves as they are)
-                let moves = || {
-                    let shown = format!("{s:?}").to_lowercase();
-                    shown.contains("nextval") || shown.contains("setval")
-                };
+                // (without ANALYZE the query is only run to see how it reads its tables: for a few seconds, and only
+                // one that changes nothing, as Postgres's EXPLAIN runs nothing: not one that calls a function that may
+                // write, takes a sequence value or locks rows, see `safe::effects`; and what that doesn't see, a
+                // PL/pgSQL function's statements or a domain's CHECK, is stopped before it changes anything, see
+                // `select_briefly`)
                 let rows = if analyze {
                     self.select(s)?.rows.len()
-                } else if moves() {
+                } else if safe::effects(stmt, Some(&self.view()?)) {
                     0
                 } else {
                     self.select_briefly(s)?
@@ -56393,8 +59748,7 @@ impl Exec<'_> {
                         checks.as_deref(),
                     )?)
                 } else {
-                    let v = self.db.view_tx(self.branch)?;
-                    unseen(|| self.matching(&v, &mut need_table(&v, table)?, filter.as_ref()))?.len()
+                    self.explain_matching(table, filter.as_ref())?
                 };
                 (vec![format!("Update on {table}")], n)
             }
@@ -56409,13 +59763,17 @@ impl Exec<'_> {
                         checks.as_deref(),
                     )?)
                 } else {
-                    let v = self.db.view_tx(self.branch)?;
-                    unseen(|| self.matching(&v, &mut need_table(&v, table)?, filter.as_ref()))?.len()
+                    self.explain_matching(table, filter.as_ref())?
                 };
                 (vec![format!("Delete on {table}")], n)
             }
             Stmt::Locking(s, _) => {
-                let n = if analyze { self.select(s)?.rows.len() } else { unseen(|| self.select(s))?.rows.len() };
+                // (without ANALYZE its rows are read, not locked: only by a query that changes nothing itself)
+                let n = match analyze {
+                    true => self.select(s)?.rows.len(),
+                    false if safe::effects(&Stmt::Select(s.clone()), Some(&self.view()?)) => 0,
+                    false => dry_run(|| self.select(s).map(|o| o.rows.len()))?.unwrap_or(0),
+                };
                 (vec!["LockRows".to_string()], n)
             }
             Stmt::Merge(m) => {
@@ -56536,7 +59894,7 @@ impl Exec<'_> {
         (using, trgm): (Using, Option<&str>),
         only: bool,
         concurrently: bool,
-        options: &[String],
+        (options, space): (&[String], Option<&str>),
     ) -> Result<Output> {
         self.long_write(spill::work_mem(), |v, flush| {
             let mut t = need_table(v, table)?;
@@ -56585,6 +59943,9 @@ impl Exec<'_> {
                     format!("table \"{table}\" has no schema: indexes work on tables made with CREATE TABLE"),
                 );
             }
+            // TABLESPACE: where it is kept (else default_tablespace's), chosen before its columns are read, as
+            // Postgres's DefineIndex chooses it
+            let space = tablespace::place(v, space, 0, t.hier.part.is_some(), true)?;
             // a spatial index is a B-tree on each point's y then x: ST_DWithin reads the band of
             // y it can reach (see `geo_box`), and rechecks each row
             // (a gist index on another type finds no more than a btree does: it is one)
@@ -56795,19 +60156,27 @@ impl Exec<'_> {
                 hier::check_covers(&t, &ids, "UNIQUE")?;
             }
             t.indexes.push(ix.clone());
-            // (its storage parameters, pg_class.reloptions: kept by the table, by the index's name)
+            // (its storage parameters, pg_class.reloptions, and its tablespace: kept by the table, by the index's
+            // name)
             t.hier.index_reloptions.retain(|(x, _)| *x != name);
             if !options.is_empty() {
                 t.hier.index_reloptions.push((name.clone(), options.to_vec()));
             }
+            t.hier.forget_index(&name);
+            t.hier.set_index_space(&name, space);
+            // (a new index's storage is its first, whatever one of its name before had)
+            let was = tablespace::Gens::load(v, table)?;
+            let mut gens = was.clone();
+            gens.forget(&name);
             let u = unique.then_some(Unique { name, cols: ids, nnd, primary: false });
             t.uniques.extend(u.clone());
             // the entries first, a part at a time, then the schema that makes them the index's
             let mut writes = build_index(v, &t, Some(&ix), u.as_ref(), flush)?;
             writes.push((schema_key(table), Some(schema_json(&t))));
+            writes.extend(gens.changed(&was, table));
             // a partitioned table's partitions each get one, unless ON ONLY
             if t.hier.part.is_some() && !only {
-                writes.extend(hier::spread_index(v, &t, &ix, u.as_ref(), flush)?);
+                writes.extend(hier::spread_index(v, &t, &ix, u.as_ref(), space, flush)?);
             }
             Ok((writes, ()))
         })?;
@@ -56860,6 +60229,12 @@ impl Exec<'_> {
             t.indexes.retain(|x| x.name != name);
             t.ann.retain(|(n, _, _)| n != name);
             t.hier.index_reloptions.retain(|(x, _)| x != name);
+            t.hier.forget_index(name);
+            // (and how many times its storage was made anew: one made later by its name starts afresh)
+            let was = tablespace::Gens::load(v, &t.name)?;
+            let mut gens = was.clone();
+            gens.forget(name);
+            writes.extend(gens.changed(&was, &t.name));
             let mut gone = vec![btree::prefix(&t.name, name)];
             if t.uniques.iter().any(|u| u.name == name) {
                 t.uniques.retain(|u| u.name != name); // made by CREATE UNIQUE INDEX
@@ -62860,34 +66235,43 @@ fn using(s: &Select, tables: &[Table]) -> Result<Option<Select>> {
         return Ok(None);
     }
     let alias = |t: &Table| t.cols.first().map(|c| c.table.clone()).unwrap_or_default();
+    // (each column by its own table's name: a parenthesized join's keep their tables', see `sources`)
     let named = |t: &Table| -> Vec<(String, Expr)> {
-        let a = alias(t);
         t.cols
             .iter()
             .filter(|c| !c.hidden)
-            .map(|c| (c.name.clone(), Expr::Col(Some(a.clone()), c.name.clone())))
+            .map(|c| (c.name.clone(), Expr::Col(Some(c.table.clone()), c.name.clone())))
             .collect()
     };
     let mut s = s.clone();
     // what the tables joined so far show, in order: what * gives
     let mut shown = tables.first().map(named).unwrap_or_default();
-    let mut merged: HashMap<String, Expr> = HashMap::new();
+    // where the FROM item being joined starts in `shown`: a JOIN's left side is that item alone, as a JOIN binds
+    // tighter than a comma (`a, b JOIN c USING (x)` joins c to b)
+    let mut start = 0;
+    // each FROM item's USING columns, merged (the item being joined's last)
+    let mut merged: Vec<HashMap<String, Expr>> = vec![HashMap::new()];
     // USING (...) AS x: x and the join's USING columns, merged
     let mut aliased: Vec<(String, Vec<(String, Expr)>)> = vec![];
     for (k, j) in s.joins.iter_mut().enumerate() {
         let right = named(&tables[k + 1]);
+        if j.comma {
+            start = shown.len();
+            merged.push(HashMap::new());
+        }
+        let cur = merged.len() - 1;
         // a bare name in a later join's ON is an earlier USING column's joined value (`FULL JOIN ...
-        // USING (qq) JOIN tenk1 c ON qq = unique2`), and so are a USING alias's columns
-        if !merged.is_empty()
+        // USING (qq) JOIN tenk1 c ON qq = unique2`), one of its own FROM item's, and so are a USING alias's columns
+        if (!merged[cur].is_empty() || !aliased.is_empty())
             && let Some(on) = &j.on
         {
-            let bound = using_bare(on, &merged, &aliased);
+            let bound = using_bare(on, &merged[cur], &aliased);
             j.on = Some(bound);
         }
         if j.natural {
             // the columns both sides have, in the left side's order; none at all is a join on everything
             let mut common: Vec<String> = vec![];
-            for (n, _) in &shown {
+            for (n, _) in &shown[start..] {
                 if right.iter().any(|(x, _)| x == n) && !common.contains(n) {
                     common.push(n.clone());
                 }
@@ -62904,7 +66288,7 @@ fn using(s: &Select, tables: &[Table]) -> Result<Option<Select>> {
         }
         let (mut on, mut first) = (None, vec![]);
         for n in &j.using {
-            let mut left = shown.iter().filter(|(x, _)| x == n);
+            let mut left = shown[start..].iter().filter(|(x, _)| x == n);
             let le = match (left.next(), left.next()) {
                 (Some((_, e)), None) => e.clone(),
                 (Some(_), Some(_)) => {
@@ -62933,7 +66317,7 @@ fn using(s: &Select, tables: &[Table]) -> Result<Option<Select>> {
                 JoinKind::Full => Expr::Func(Func::Coalesce, vec![le, re.clone()]),
                 _ => le,
             };
-            merged.insert(n.clone(), m.clone());
+            merged[cur].insert(n.clone(), m.clone());
             first.push((n.clone(), m));
         }
         if let Some(x) = &j.using_as {
@@ -62945,7 +66329,9 @@ fn using(s: &Select, tables: &[Table]) -> Result<Option<Select>> {
         j.on = on;
         let rest =
             |cols: Vec<(String, Expr)>| cols.into_iter().filter(|(x, _)| !j.using.contains(x)).collect::<Vec<_>>();
-        shown = first.into_iter().chain(rest(shown)).chain(rest(right)).collect();
+        // (the items before this one keep their place)
+        let item = shown.split_off(start);
+        shown.extend(first.into_iter().chain(rest(item)).chain(rest(right)));
     }
     // a USING alias names only the USING columns: `x.t` for another column doesn't exist
     if !aliased.is_empty() {
@@ -62977,7 +66363,60 @@ fn using(s: &Select, tables: &[Table]) -> Result<Option<Select>> {
             return err(NO_COLUMN, m);
         }
     }
-    let bare = |e: &Expr| using_bare(e, &merged, &aliased);
+    // a bare name is a merged USING column only where no other column of its name is there to find: none of
+    // another FROM item (`a, b JOIN c USING (x)`, where a has an x too), nor another of its own; else it is
+    // ambiguous, as Postgres's 42702
+    let (mut bare_merged, mut ambiguous) = (HashMap::new(), vec![]);
+    for m in &merged {
+        for (n, e) in m {
+            match shown.iter().filter(|(x, _)| x == n).count() {
+                0 => {}
+                1 => {
+                    bare_merged.insert(n.clone(), e.clone());
+                }
+                _ => ambiguous.push(n.clone()),
+            }
+        }
+    }
+    if !ambiguous.is_empty() {
+        // (ORDER BY's name of an output column is that column)
+        let outputs: Vec<&String> = s
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Expr(_, Some(a)) | Item::Expr(Expr::Col(_, a), None) => Some(a),
+                _ => None,
+            })
+            .collect();
+        let mut hit: Option<String> = None;
+        let mut look = |e: &Expr| {
+            walk(e, &mut |x| {
+                if let Expr::Col(None, n) = x
+                    && hit.is_none()
+                    && ambiguous.contains(n)
+                {
+                    hit = Some(n.clone());
+                }
+            })
+        };
+        for it in &s.items {
+            if let Item::Expr(e, _) = it {
+                look(e);
+            }
+        }
+        for e in s.filter.iter().chain(&s.group).chain(&s.distinct_on).chain(s.having.iter()) {
+            look(e);
+        }
+        for (e, _) in &s.order {
+            if !matches!(e, Expr::Col(None, n) if outputs.contains(&n)) {
+                look(e);
+            }
+        }
+        if let Some(n) = hit {
+            return err("42702", format!("column reference \"{n}\" is ambiguous; say which table, e.g. t.{n}"));
+        }
+    }
+    let bare = |e: &Expr| using_bare(e, &bare_merged, &aliased);
     s.items = s
         .items
         .iter()
@@ -63122,8 +66561,9 @@ impl Plan {
         let mut starts = vec![];
         let mut cols = vec![];
         for t in tables {
-            // (subqueries without an alias have no name to clash: Postgres 16 takes any number)
-            let unnamed = t.cols.first().is_some_and(|c| c.table == "subquery");
+            // (subqueries without an alias have no name to clash: Postgres 16 takes any number; nor have
+            // parenthesized joins, whose merged USING columns go by the join's, see `sources`)
+            let unnamed = t.cols.first().is_some_and(|c| c.table == "subquery" || c.table == GROUP);
             if !unnamed
                 && tables
                     .iter()
@@ -63959,8 +67399,9 @@ fn reads(q: &Select, name: &str) -> bool {
 
 /// Makes table `name` in a recursive query's step the rows so far (with `base`'s columns), a copy
 /// of `cost` tokens each (see `spend`).
-/// Down into its FROM's subqueries too (and the WITH queries put in it), as Postgres takes the reference there; a WITH
-/// query's copy that reads the rows so far is then run each round, not kept from its first (see `Exec::plan_now`).
+/// Down into its FROM's subqueries too (and the WITH queries put in it, recursive ones among them), as Postgres takes
+/// the reference there; a WITH query's copy that reads the rows so far is then run each round, not kept from its first
+/// (see `Exec::plan_now`).
 /// Whether it found one.
 fn work(
     q: &mut Select,
@@ -63981,10 +67422,21 @@ fn work(
                 put = true;
             }
         } else if !src.working
-            && src.rec.is_none()
-            && let Some(sub) = &mut src.sub
+            && let Some(r) = &mut src.rec
+        {
+            // a WITH RECURSIVE query of the step's own (`(WITH RECURSIVE x AS (... UNION ALL SELECT * FROM q) SELECT *
+            // FROM x)`): its two parts, which it runs each round, and its first part's copy that gives its columns
+            let mut found = work(&mut r.base, name, names, base, cost, copied);
+            found |= work(&mut r.step, name, names, base, cost, copied);
+            if let Some(sub) = &mut src.sub {
+                found |= work(sub, name, names, base, cost, copied);
+            }
+            put |= found;
+        } else if let Some(sub) = &mut src.sub
             && work(sub, name, names, base, cost, copied)
         {
+            // (a nested WITH RECURSIVE query's rows so far are looked in too: their copy of its first part, which
+            // gives their columns, may read these)
             src.cte = 0;
             put = true;
         }
@@ -64064,6 +67516,9 @@ struct RecWalk<'a> {
     top_with: bool,
     seen: usize,
     found: Option<(RecPlace, usize)>,
+    /// the WITH queries walked (their ids, `Source::cte`): each is put in wherever it is read, but Postgres walks its
+    /// query once, in its WITH, so a reference in it counts once however many read it
+    walked: HashSet<u64>,
 }
 
 impl RecWalk<'_> {
@@ -64114,7 +67569,7 @@ impl RecWalk<'_> {
     }
 
     fn source(&mut self, s: &Source, at: RecPlace) {
-        if s.working || s.srf.is_some() {
+        if s.working || s.srf.is_some() || (s.cte != 0 && !self.walked.insert(s.cte)) {
             return;
         }
         match (&s.sub, &s.rec) {
@@ -64144,6 +67599,70 @@ impl RecWalk<'_> {
 /// A WITH query as the parser keeps it: name, column names, query, how it recurs, and the tokens
 /// a copy of it costs and how deep it nests (see `Parser::inlined`).
 type Cte = (String, Vec<String>, Select, Option<Rec>, (usize, usize, u64));
+
+/// What a query of a WITH RECURSIVE reads of the others (see `Parser::forward_dml`): the WITH queries put in it, by
+/// their ids (`Source::cte`; and those put in them, so what it reads through them), and the tables it names as they
+/// are (a WITH query not put in it). Walked as `reads_of` walks a statement; not into the query that types what a
+/// query that changes rows gives back (see `returning_select`), which names that one's table.
+#[derive(Default)]
+struct CteReads {
+    ids: HashSet<u64>,
+    names: Vec<String>,
+}
+
+impl CteReads {
+    fn stmt(&mut self, st: &Stmt) {
+        match st {
+            Stmt::Insert { query, .. } => query.iter().for_each(|q| self.select(q)),
+            Stmt::Update { from, .. } | Stmt::Delete { from, .. } => from.iter().for_each(|q| self.select(q)),
+            _ => {}
+        }
+        for e in exprs_of(st) {
+            self.expr(e);
+        }
+    }
+
+    fn select(&mut self, q: &Select) {
+        for src in q.from.iter().chain(q.joins.iter().map(|j| &j.src)) {
+            if src.working {
+                continue; // (the rows so far of the recursive query it is in)
+            }
+            if src.cte != 0 {
+                self.ids.insert(src.cte);
+            }
+            if src.cte & DML_CTE != 0 {
+                continue;
+            }
+            if src.sub.is_none() && src.rec.is_none() && src.srf.is_none() {
+                self.names.push(src.table.clone());
+            }
+            if let Some(sub) = &src.sub {
+                self.select(sub);
+            }
+            if let Some(r) = &src.rec {
+                self.select(&r.base);
+                self.select(&r.step);
+            }
+            for a in src.srf.iter().flat_map(|f| f.1.iter()) {
+                self.expr(a);
+            }
+        }
+        for (_, _, p) in &q.set {
+            self.select(p);
+        }
+        for e in select_exprs(q) {
+            self.expr(e);
+        }
+    }
+
+    fn expr(&mut self, e: &Expr) {
+        walk(e, &mut |x| {
+            if let Expr::Sub(sq) | Expr::Exists(sq, _) | Expr::InSub(_, sq, _) = x {
+                self.select(&sq.q);
+            }
+        });
+    }
+}
 
 /// The tables a statement reads, as it names them: the FROM and JOIN sources of its queries and
 /// subqueries (not the WITH queries that change rows, whose rows are ready), and what an UPDATE or
@@ -64699,9 +68218,22 @@ fn sources(v: &View, s: &Select, params: Option<&[Value]>) -> Result<Vec<Table>>
                     ),
                 );
             }
-            // (a parenthesized join's columns keep their tables' names)
-            let inner: Vec<Col> = match src.alias == GROUP {
-                true => sources(v, q, None)?.into_iter().flat_map(|t| t.cols).collect(),
+            // (a parenthesized join's columns keep their tables' names; where USING or NATURAL merged some, each of
+            // its sides' columns that `*` shows keeps its table's, a merged one the join's, which only its bare name
+            // finds: `p, q FULL JOIN r USING (x)` is such a join, see `Parser::comma_item`)
+            let inner: Vec<String> = match src.alias == GROUP {
+                true => {
+                    let tabs = sources(v, q, None)?;
+                    match using(q, &tabs)? {
+                        Some(u) => (u.items.iter())
+                            .map(|it| match it {
+                                Item::Expr(Expr::Col(Some(t), _), _) => t.clone(),
+                                _ => src.alias.clone(),
+                            })
+                            .collect(),
+                        None => tabs.into_iter().flat_map(|t| t.cols).map(|c| c.table).collect(),
+                    }
+                }
                 false => vec![],
             };
             let kept = !inner.is_empty() && inner.len() == found.len();
@@ -64715,7 +68247,7 @@ fn sources(v: &View, s: &Select, params: Option<&[Value]>) -> Result<Vec<Table>>
                     // (a char(n) or varchar column of the subquery stays one: a char(n)'s values held without their blanks)
                     chars: held_chars(widths.get(i).copied().flatten())
                         .filter(|_| matches!(*ty, Type::Text | Type::Array(25))),
-                    ..Col::new(if kept { &inner[i].table } else { &src.alias }, src.names.get(i).unwrap_or(n), *ty)
+                    ..Col::new(if kept { &inner[i] } else { &src.alias }, src.names.get(i).unwrap_or(n), *ty)
                 })
                 .collect();
             let mut t = Table::default_named(&src.alias);
@@ -64867,6 +68399,7 @@ enum HKey {
     Dec(i128, u32),
     BigDec(String, u32), // a numeric past 128 bits: its mantissa's digits and scale (see `Dec::parts`)
     Day(i32),            // a date later than any timestamp
+    Tuple(Vec<HKey>),    // several columns at once (a hash join on all of a join's equalities)
     Net(u8, u8, u128),
 }
 
@@ -66433,6 +69966,27 @@ mod tests {
         assert_eq!(parts_for(200_000), 48);
     }
 
+    /// An agent's max_threads caps the threads a statement's parallel parts run on (issue #43): with 1, every part
+    /// runs on the statement's own thread, the pool's helpers left to others.
+    #[test]
+    fn an_agents_max_threads_caps_a_parallel_run() {
+        use super::{STOP, Stop, par_run};
+        use std::sync::{Arc, atomic::AtomicBool};
+        let on = |threads: usize| {
+            let cancel = Arc::new(AtomicBool::new(false));
+            STOP.set(Some(Stop { deadline: None, cancel, gone: None, ctx: None, mem: None, threads }));
+            let ids = par_run(32, |_, _| {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                Ok(std::thread::current().id())
+            })
+            .unwrap();
+            STOP.set(None);
+            ids.into_iter().collect::<std::collections::HashSet<_>>().len()
+        };
+        assert_eq!(on(1), 1, "one thread: the statement's own");
+        assert!(on(2) <= 2);
+    }
+
     #[test]
     fn pooled_helpers_are_reused_and_survive_a_panic() {
         use super::{IDLE, par_run};
@@ -66469,7 +70023,7 @@ mod tests {
         use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
         LINGER.store(300, Ordering::Relaxed); // helpers slow to get back to the pool
         let cancel = Arc::new(AtomicBool::new(false));
-        STOP.set(Some(Stop { deadline: None, cancel: cancel.clone(), gone: None, ctx: None, mem: None }));
+        STOP.set(Some(Stop { deadline: None, cancel: cancel.clone(), gone: None, ctx: None, mem: None, threads: 0 }));
         let out = par_run(64, |i, _| {
             std::thread::sleep(std::time::Duration::from_millis(1));
             Ok(i)

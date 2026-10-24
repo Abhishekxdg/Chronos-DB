@@ -339,11 +339,9 @@ fn merges_are_written_to_postgres_first() {
     run(&db, MAIN, "merge world b1", &[]).unwrap(); // a person approves by merging it
     assert_eq!(pg_cell(&mut pg, "select score from leads where who = 'ada'"), "77.00");
 
-    // the ways straight into main are refused too
-    for q in ["undo merge of world w10", "restore world main to '-1 second'"] {
-        let e = run(&db, MAIN, q, &[]).unwrap_err();
-        assert!(e.message.contains("attached to Postgres"), "{q}: {}", e.message);
-    }
+    // the ways straight into main are refused too (an undo goes back through Postgres: see undo_of_a_merge_...)
+    let e = run(&db, MAIN, "restore world main to '-1 second'", &[]).unwrap_err();
+    assert!(e.message.contains("attached to Postgres"), "{}", e.message);
 
     // a Postgres that isn't the one attached: refused, nothing written
     let other = format!("{name}_other");
@@ -365,18 +363,24 @@ fn merges_are_written_to_postgres_first() {
     run(&db, MAIN, "drop world w13", &[]).unwrap();
     admin.batch_execute(&format!("drop database {other} with (force)")).unwrap();
 
-    // more than 10,000 rows in one merge: refused, said how
+    // more rows in one merge than CHRONOS_ATTACH_MAX_ROWS: refused, said how
+    unsafe { std::env::set_var("CHRONOS_ATTACH_MAX_ROWS", "10000") };
     run(&db, MAIN, "create world big", &[]).unwrap();
     run(&db, "big", "insert into accounts select 'a' || g, 'n' from generate_series(1, 10001) g", &[]).unwrap();
     let e = run(&db, MAIN, "merge world big", &[]).unwrap_err();
+    unsafe { std::env::remove_var("CHRONOS_ATTACH_MAX_ROWS") };
     assert!(e.message.contains("more than 10000"), "{}", e.message);
     run(&db, MAIN, "drop world big", &[]).unwrap();
 
-    // the schema changed in Postgres: the merge stops and names it
+    // a column added in Postgres: the merge stops until a refresh takes it
     pg.batch_execute("alter table accounts add column region text").unwrap();
     let e = change(&db, "w14", "update accounts set name = 'r' where id = 'acme'").unwrap();
+    assert!(e.message.contains("a refresh takes them") && e.message.contains("region"), "{}", e.message);
+    // a column retyped: the merge stops and names it, and only a new attach takes it
+    pg.batch_execute("alter table accounts alter column name type varchar(80)").unwrap();
+    let e = change(&db, "w15", "update accounts set name = 'r' where id = 'acme'").unwrap();
     assert!(
-        e.message.contains("changed in Postgres since the attach") && e.message.contains("region"),
+        e.message.contains("changed in Postgres since the attach") && e.message.contains("character varying(80)"),
         "{}",
         e.message
     );
@@ -751,6 +755,622 @@ fn a_row_added_in_postgres_after_an_empty_read_holds_the_merge() {
     run(&db, MAIN, "merge world ok", &[]).unwrap();
     assert_eq!(pg_cell(&mut pg, "select count(*) from leads where lower(email) = 'ada@x.com'"), "1");
     assert_eq!(run(&db, MAIN, "show outbox", &[]).unwrap().pop().unwrap().rows.len(), 1);
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+#[test]
+fn a_tenant_read_of_a_big_table_is_checked_by_the_rows_it_can_match() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("tenantread") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    // more rows than a read can be checked by reading the table whole (100,000); tenant 42 has 110, 73 open
+    pg.batch_execute(
+        "create table leads (id int primary key, org_id int not null, status text not null, name text);
+         create index on leads (org_id);
+         insert into leads select g, g % 1000, case when g % 3 = 0 then 'won' else 'open' end, 'lead ' || g
+             from generate_series(1, 110000) g;",
+    )
+    .unwrap();
+    let dir = folder("tenantread");
+    let (ok, out) = attach(&dir, &["--tables", "leads", "--yes"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    let read = "select count(*) from leads where org_id = 42 and status = 'open'";
+
+    // the app keeps writing other tenants' rows, and a row of tenant 42 the read couldn't match: no hold
+    run(&db, MAIN, "create world w with (check_reads = true)", &[]).unwrap();
+    assert_eq!(cell(&db, "w", read), "73");
+    run(&db, "w", "update leads set name = 'called' where id = 1042", &[]).unwrap();
+    pg.batch_execute(
+        "update leads set name = 'app' where org_id = 7; update leads set name = 'app' where id = 3042;
+         insert into leads values (200007, 7, 'open', 'new');",
+    )
+    .unwrap();
+    run(&db, MAIN, "merge world w", &[]).unwrap();
+    assert_eq!(pg_cell(&mut pg, "select name from leads where id = 1042"), "called");
+
+    // a row the read matched, changed in Postgres since: held, nothing written
+    run(&db, MAIN, "create world changed with (check_reads = true)", &[]).unwrap();
+    assert_eq!(cell(&db, "changed", read), "73");
+    run(&db, "changed", "update leads set name = 'again' where id = 1042", &[]).unwrap();
+    pg.batch_execute("update leads set status = 'won' where id = 2042").unwrap();
+    let e = run(&db, MAIN, "merge world changed", &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    assert!(e.message.contains("changed in Postgres since it forked"), "{}", e.message);
+    assert_eq!(pg_cell(&mut pg, "select name from leads where id = 1042"), "called", "nothing written");
+    run(&db, MAIN, "drop world changed", &[]).unwrap();
+
+    // a row the read would match now, added in Postgres since: held too
+    run(&db, MAIN, "create world added with (check_reads = true)", &[]).unwrap();
+    assert_eq!(cell(&db, "added", read), "73");
+    run(&db, "added", "update leads set name = 'again' where id = 1042", &[]).unwrap();
+    pg.batch_execute("insert into leads values (200042, 42, 'open', 'new')").unwrap();
+    let e = run(&db, MAIN, "merge world added", &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    assert!(e.message.contains("changed in Postgres since it forked"), "{}", e.message);
+    assert_eq!(pg_cell(&mut pg, "select name from leads where id = 1042"), "called", "nothing written");
+    run(&db, MAIN, "drop world added", &[]).unwrap();
+
+    // a key looked up that found no row, added in Postgres since with values the scan's filter doesn't match: held
+    // too (the table is read whole for it; this one has no more than 100,000 rows the check can read)
+    pg.batch_execute("delete from leads where id > 90000").unwrap();
+    chronos::attach::refresh(&db).unwrap();
+    run(&db, MAIN, "create world absent with (check_reads = true)", &[]).unwrap();
+    assert_eq!(cell(&db, "absent", read), "59");
+    assert_eq!(cell(&db, "absent", "select count(*) from leads where id = 95000"), "0");
+    run(&db, "absent", "update leads set name = 'again' where id = 1042", &[]).unwrap();
+    pg.batch_execute("insert into leads values (95000, 7, 'won', 'new')").unwrap();
+    let e = run(&db, MAIN, "merge world absent", &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    assert!(e.message.contains("changed in Postgres since it forked"), "{}", e.message);
+    assert_eq!(pg_cell(&mut pg, "select name from leads where id = 1042"), "called", "nothing written");
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+#[test]
+fn refresh_brings_main_up_to_postgres() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("refresh") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table leads (id int primary key, org_id int not null, name text, score numeric(10, 2),
+                             seen timestamptz);
+         insert into leads select g, g % 3, 'lead ' || g, g * 1.5, '2026-10-01 10:00:00+00'
+             from generate_series(1, 4500) g;",
+    )
+    .unwrap();
+    let dir = folder("refresh");
+    let (ok, out) = attach(&dir, &["--tables", "leads"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    // nothing changed: nothing to take (a row nobody changed compares equal, numeric and timestamptz included)
+    let r = chronos::attach::refresh(&db).unwrap();
+    assert_eq!(r.changed(), 0, "{:?}", r);
+    assert!(db.attached().unwrap().refreshed_at() > 0);
+
+    // Postgres changes straight: an update, an insert and a delete
+    pg.batch_execute(
+        "update leads set name = 'renamed' where id = 7;
+         insert into leads values (9001, 1, 'new', 1, now());
+         delete from leads where id = 4000;",
+    )
+    .unwrap();
+    // a world that changed one of those rows too
+    run(&db, MAIN, "create world w; use world w; update leads set name = 'mine' where id = 7", &[]).unwrap();
+    let r = chronos::attach::refresh(&db).unwrap();
+    assert_eq!(r.tables, vec![("leads".to_string(), 1, 1, 1)]);
+    assert_eq!(cell(&db, MAIN, "select name from leads where id = 7"), "renamed");
+    assert_eq!(cell(&db, MAIN, "select count(*) from leads where id = 9001"), "1");
+    assert_eq!(cell(&db, MAIN, "select count(*) from leads where id = 4000"), "0");
+    assert_eq!(cell(&db, MAIN, "select count(*) from leads"), "4500");
+    // the world's change of the same row is now a conflict, settled as any
+    let e = run(&db, MAIN, "merge world w", &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    run(&db, MAIN, "merge world w using ours", &[]).unwrap();
+    assert_eq!(pg_cell(&mut pg, "select name from leads where id = 7"), "mine");
+
+    // a table whose shape changed in Postgres other than by added columns is left as it was, and said
+    pg.batch_execute("alter table leads drop column seen").unwrap();
+    let r = chronos::attach::refresh(&db).unwrap();
+    assert_eq!(r.skipped.len(), 1, "{:?}", r);
+    assert!(r.skipped[0].contains("changed in Postgres since the attach"), "{:?}", r.skipped);
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+#[test]
+fn columns_added_in_postgres_come_over_at_refresh() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("widen") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table leads (id int primary key, name text);
+         insert into leads select g, 'lead ' || g from generate_series(1, 20) g;",
+    )
+    .unwrap();
+    let dir = folder("widen");
+    let (ok, out) = attach(&dir, &["--tables", "leads"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    // a world forked before Postgres has the columns
+    run(
+        &db,
+        MAIN,
+        "create world old; use world old; update leads set name = 'old 5' where id = 5;
+                    update leads set name = 'old 6' where id = 6; insert into leads (id, name) values (200, 'old new')",
+        &[],
+    )
+    .unwrap();
+    // the app's migration, and its first writes to the new columns
+    pg.batch_execute(
+        "alter table leads add column note text, add column status text not null default 'new';
+         update leads set status = 'won', note = 'called' where id = 5;",
+    )
+    .unwrap();
+    // until a refresh takes the columns, a merge touching the table is refused, and nothing is written
+    let e = run(&db, MAIN, "merge world old", &[]).unwrap_err();
+    assert!(e.message.contains("a refresh takes them"), "{}", e.message);
+    assert_eq!(pg_cell(&mut pg, "select name from leads where id = 6"), "lead 6");
+
+    let r = chronos::attach::refresh(&db).unwrap();
+    assert!(r.skipped.is_empty(), "{:?}", r);
+    assert_eq!(r.added, vec!["leads.note text".to_string(), "leads.status text".to_string()]);
+    // main took the columns (with Postgres's default), then the values Postgres has
+    assert_eq!(r.tables, vec![("leads".to_string(), 0, 1, 0)]);
+    assert_eq!(cell(&db, MAIN, "select status || ' ' || note from leads where id = 5"), "won called");
+    assert_eq!(cell(&db, MAIN, "select status || ' ' || coalesce(note, '-') from leads where id = 6"), "new -");
+    // the record keeps them: reopened, the folder still writes them back
+    drop(db);
+    let db = Db::open(&dir).unwrap();
+    assert_eq!(chronos::attach::refresh(&db).unwrap().changed(), 0);
+
+    // a world forked now sees the columns, and its writes of them reach Postgres
+    run(
+        &db,
+        MAIN,
+        "create world fresh; use world fresh; update leads set note = 'emailed' where id = 7;
+                    insert into leads (id, name) values (100, 'new lead')",
+        &[],
+    )
+    .unwrap();
+    run(&db, MAIN, "merge world fresh", &[]).unwrap();
+    assert_eq!(pg_cell(&mut pg, "select note from leads where id = 7"), "emailed");
+    assert_eq!(pg_cell(&mut pg, "select status from leads where id = 100"), "new");
+
+    // the world forked before never saw the columns: its writes leave them as Postgres has them
+    // (row 5: main took the columns' values from Postgres, the world changed its name: a conflict, settled here by
+    // keeping the world's row, which even so keeps what Postgres holds in the columns the world never had)
+    let e = run(&db, MAIN, "merge world old", &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    run(&db, MAIN, "merge world old using ours", &[]).unwrap();
+    assert_eq!(
+        pg_cell(&mut pg, "select name || ' ' || status || ' ' || note from leads where id = 5"),
+        "old 5 won called"
+    );
+    assert_eq!(
+        pg_cell(&mut pg, "select name || ' ' || status || ' ' || coalesce(note, '-') from leads where id = 6"),
+        "old 6 new -"
+    );
+    assert_eq!(pg_cell(&mut pg, "select status from leads where id = 200"), "new");
+    // and main holds what Postgres does
+    assert_eq!(
+        cell(&db, MAIN, "select name || ' ' || status || ' ' || note from leads where id = 5"),
+        "old 5 won called"
+    );
+    assert_eq!(chronos::attach::refresh(&db).unwrap().changed(), 0);
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+#[test]
+fn widening_keeps_not_null_and_survives_a_stop_before_its_record_is_saved() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("widen_nn") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table leads (id int primary key, name text);
+         insert into leads select g, 'lead ' || g from generate_series(1, 10) g;",
+    )
+    .unwrap();
+    let dir = folder("widen_nn");
+    let (ok, out) = attach(&dir, &["--tables", "leads"]);
+    assert!(ok, "{out}");
+    // a column added NULL, filled, then made NOT NULL: Postgres keeps no default for it
+    pg.batch_execute(
+        "alter table leads add column owner text; update leads set owner = 'bo';
+         alter table leads alter column owner set not null;",
+    )
+    .unwrap();
+    let record = std::fs::read(dir.join("attached")).unwrap();
+    let db = Db::open(&dir).unwrap();
+    let r = chronos::attach::refresh(&db).unwrap();
+    assert!(r.skipped.is_empty(), "{:?}", r);
+    assert_eq!(r.added, vec!["leads.owner text".to_string()]);
+    assert_eq!(cell(&db, MAIN, "select count(*) from leads where owner = 'bo'"), "10");
+    // NOT NULL here too, once main had the values: a world can't store a NULL Postgres would refuse at merge
+    run(&db, MAIN, "create world w", &[]).unwrap();
+    let e = run(&db, "w", "update leads set owner = null where id = 3", &[]).unwrap_err();
+    assert_eq!(e.code, "23502", "{}", e.message);
+
+    // stopped after main took the column, before the folder's record was saved: opened again with the old record,
+    // the next refresh finds the column again, adds nothing main has, and saves
+    drop(db);
+    std::fs::write(dir.join("attached"), &record).unwrap();
+    let db = Db::open(&dir).unwrap();
+    let r = chronos::attach::refresh(&db).unwrap();
+    assert!(r.skipped.is_empty(), "{:?}", r);
+    assert_eq!(r.added, vec!["leads.owner text".to_string()]);
+    assert_eq!(r.changed(), 0);
+    run(&db, MAIN, "create world w2; use world w2; update leads set owner = 'ada' where id = 4", &[]).unwrap();
+    run(&db, MAIN, "merge world w2", &[]).unwrap();
+    assert_eq!(pg_cell(&mut pg, "select owner from leads where id = 4"), "ada");
+    drop(db);
+    let db = Db::open(&dir).unwrap();
+    assert!(chronos::attach::refresh(&db).unwrap().added.is_empty());
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+#[test]
+fn a_column_added_with_a_default_worked_out_per_row_comes_over() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("widen_volatile") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table leads (id int primary key, name text);
+         insert into leads select g, 'lead ' || g from generate_series(1, 10) g;",
+    )
+    .unwrap();
+    let dir = folder("widen_volatile");
+    let (ok, out) = attach(&dir, &["--tables", "leads"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    // Postgres gives every row its own value; Chronos won't fill rows it has with such a default
+    pg.batch_execute("alter table leads add column ref uuid not null default gen_random_uuid()").unwrap();
+    let r = chronos::attach::refresh(&db).unwrap();
+    assert!(r.skipped.is_empty(), "{:?}", r);
+    assert_eq!(r.added, vec!["leads.ref uuid".to_string()]);
+    // the column came bare, took Postgres's values, then its default and NOT NULL
+    assert_eq!(r.tables, vec![("leads".to_string(), 0, 10, 0)]);
+    assert_eq!(
+        cell(&db, MAIN, "select ref::text from leads where id = 3"),
+        pg_cell(&mut pg, "select ref::text from leads where id = 3")
+    );
+    assert_eq!(chronos::attach::refresh(&db).unwrap().changed(), 0);
+    run(&db, MAIN, "create world w", &[]).unwrap();
+    let e = run(&db, "w", "update leads set ref = null where id = 3", &[]).unwrap_err();
+    assert_eq!(e.code, "23502", "{}", e.message);
+    // a row a world inserts gets its own value from the default, written as it is to Postgres
+    run(&db, "w", "insert into leads (id, name) values (50, 'new')", &[]).unwrap();
+    let mine = cell(&db, "w", "select ref::text from leads where id = 50");
+    assert_eq!(mine.len(), 36, "{mine}");
+    run(&db, MAIN, "merge world w", &[]).unwrap();
+    assert_eq!(pg_cell(&mut pg, "select ref::text from leads where id = 50"), mine);
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+#[test]
+fn reads_of_a_world_forked_before_columns_were_added_are_checked_as_it_saw_them() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("widen_reads") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table leads (id int primary key, name text, status text);
+         insert into leads select g, 'lead ' || g, 'new' from generate_series(1, 10) g;",
+    )
+    .unwrap();
+    let dir = folder("widen_reads");
+    let (ok, out) = attach(&dir, &["--tables", "leads"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    // worlds that check their reads, forked before Postgres has the column: one reads a row by key, one a range
+    for w in ["by_key", "by_range"] {
+        run(&db, MAIN, &format!("create world {w} with (check_reads = true)"), &[]).unwrap();
+    }
+    assert_eq!(cell(&db, "by_key", "select name from leads where id = 2"), "lead 2");
+    run(&db, "by_key", "update leads set status = 'ready' where id = 7", &[]).unwrap();
+    assert_eq!(cell(&db, "by_range", "select count(*) from leads where id < 5"), "4");
+    run(&db, "by_range", "update leads set status = 'ready' where id = 6", &[]).unwrap();
+    // the migration, a write to the new column of a row they read, and the refresh that takes it
+    pg.batch_execute("alter table leads add column owner text; update leads set owner = 'ada' where id = 2;").unwrap();
+    let r = chronos::attach::refresh(&db).unwrap();
+    assert_eq!(r.added, vec!["leads.owner text".to_string()], "{:?}", r);
+    // what they read is as they saw it: the column they never had doesn't count, and they merge
+    run(&db, MAIN, "merge world by_key", &[]).unwrap();
+    run(&db, MAIN, "merge world by_range", &[]).unwrap();
+    assert_eq!(pg_cell(&mut pg, "select status || ' ' || owner from leads where id = 2"), "new ada");
+    assert_eq!(pg_cell(&mut pg, "select count(*) from leads where status = 'ready'"), "2");
+    // and a column they did see, changed in Postgres, still holds such a world
+    run(&db, MAIN, "create world later with (check_reads = true)", &[]).unwrap();
+    pg.batch_execute("alter table leads add column score int").unwrap();
+    assert_eq!(cell(&db, "later", "select name from leads where id = 4"), "lead 4");
+    run(&db, "later", "update leads set status = 'ready' where id = 5", &[]).unwrap();
+    pg.batch_execute("update leads set name = 'renamed', score = 1 where id = 4").unwrap();
+    chronos::attach::refresh(&db).unwrap();
+    let e = run(&db, MAIN, "merge world later", &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    assert!(e.message.contains("since it forked"), "{}", e.message);
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+#[test]
+fn rows_triggers_write_to_other_tables_come_into_main_with_the_merge() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("triggers") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table accounts (id int primary key, name text, lead_count int not null default 0);
+         create table leads (id int primary key, account_id int references accounts, name text);
+         create table notes (id int primary key, lead_id int, body text);
+         create table audit (id int primary key, what text);
+         create sequence audit_ids;
+         create function leads_changed() returns trigger language plpgsql as $$
+         begin
+           if tg_op = 'INSERT' then
+             update accounts set lead_count = lead_count + 1 where id = new.account_id;
+             insert into audit values (nextval('audit_ids'), 'added lead ' || new.id);
+             return new;
+           else
+             update accounts set lead_count = lead_count - 1 where id = old.account_id;
+             delete from notes where lead_id = old.id;
+             return old;
+           end if;
+         end $$;
+         create trigger leads_changed after insert or delete on leads for each row execute function leads_changed();
+         insert into accounts values (1, 'acme', 0), (2, 'globex', 0);
+         insert into leads values (1, 1, 'ada'), (2, 1, 'bo');
+         update accounts set lead_count = 2 where id = 1;
+         insert into notes values (1, 2, 'call back'), (2, 1, 'hot');",
+    )
+    .unwrap();
+    let dir = folder("triggers");
+    let (ok, out) = attach(&dir, &["--tables", "accounts,leads,notes,audit"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+
+    // an insert: the trigger counts it on its account and writes an audit row; main has both at once
+    assert!(change(&db, "w1", "insert into leads values (3, 1, 'cy')").is_none());
+    assert_eq!(pg_cell(&mut pg, "select lead_count from accounts where id = 1"), "3");
+    assert_eq!(cell(&db, MAIN, "select lead_count from accounts where id = 1"), "3");
+    assert_eq!(
+        cell(&db, MAIN, "select string_agg(what, ', ' order by id) from audit"),
+        "added lead 1, added lead 2, added lead 3"
+    );
+    // a delete: the trigger takes the lead's notes with it; main loses them too
+    assert!(change(&db, "w2", "delete from leads where id = 2").is_none());
+    assert_eq!(pg_cell(&mut pg, "select count(*) from notes"), "1");
+    assert_eq!(cell(&db, MAIN, "select count(*) from notes"), "1");
+    assert_eq!(cell(&db, MAIN, "select lead_count from accounts where id = 1"), "2");
+    // main is as Postgres is: a world changing the account the triggers wrote merges with no conflict
+    assert!(change(&db, "w3", "update accounts set name = 'acme inc' where id = 1").is_none());
+    assert_eq!(pg_cell(&mut pg, "select name || ' ' || lead_count from accounts where id = 1"), "acme inc 2");
+    assert_eq!(chronos::attach::refresh(&db).unwrap().changed(), 0);
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+#[test]
+fn deferred_trigger_writes_and_a_crash_after_commit_still_reach_main() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: crash points are in debug builds only");
+        return;
+    }
+    let Some((mut pg, name, _url, _turn)) = throwaway("triggers_late") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table accounts (id int primary key, lead_count int not null default 0);
+         create table leads (id int primary key, account_id int, name text);
+         create function count_lead() returns trigger language plpgsql as $$
+         begin
+           update accounts set lead_count = lead_count + 1 where id = new.account_id;
+           return new;
+         end $$;
+         create constraint trigger count_lead after insert on leads deferrable initially deferred
+           for each row execute function count_lead();
+         create table audit (id int primary key, what text);
+         create sequence audit_ids;
+         create function audit_lead() returns trigger language plpgsql as $$
+         begin
+           begin
+             insert into audit values (nextval('audit_ids'), 'added lead ' || new.id);
+           exception when others then null;
+           end;
+           return new;
+         end $$;
+         create trigger audit_lead after insert on leads for each row execute function audit_lead();
+         insert into accounts values (1, 0);",
+    )
+    .unwrap();
+    let dir = folder("triggers_late");
+    let (ok, out) = attach(&dir, &["--tables", "accounts,leads,audit"]);
+    assert!(ok, "{out}");
+    // a trigger deferred to COMMIT, and one writing in a block with EXCEPTION (a subtransaction of its own): both
+    // reach main with the merge
+    let mut db = Db::open(&dir).unwrap();
+    assert!(change(&db, "w1", "insert into leads values (1, 1, 'ada')").is_none());
+    assert_eq!(pg_cell(&mut pg, "select lead_count from accounts where id = 1"), "1");
+    assert_eq!(cell(&db, MAIN, "select lead_count from accounts where id = 1"), "1");
+    assert_eq!(cell(&db, MAIN, "select string_agg(what, ', ' order by id) from audit"), "added lead 1");
+    assert!(!dir.join("attached.pending").exists());
+    // a crash right after Postgres committed, or after main made the merge but before it took what the triggers
+    // wrote: the pending record stays, and recovery takes it
+    for (n, at) in [(2, "after_commit"), (3, "before_trigger_refresh")] {
+        run(&db, MAIN, &format!("create world c{n}"), &[]).unwrap();
+        run(&db, &format!("c{n}"), &format!("insert into leads values ({n}, 1, 'lead {n}')"), &[]).unwrap();
+        drop(db);
+        let out = Command::new(env!("CARGO_BIN_EXE_chronos"))
+            .args(["-b", &format!("c{n}"), dir.to_str().unwrap(), "merge"])
+            .env("CHRONOS_ATTACH_CRASH", at)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{at}: it crashed");
+        assert!(dir.join("attached.pending").exists(), "{at}");
+        assert_eq!(pg_cell(&mut pg, "select lead_count from accounts where id = 1"), n.to_string());
+        let db2 = Db::open(&dir).unwrap();
+        let said = chronos::attach::resolve(&db2).unwrap().unwrap_or_default();
+        assert!(
+            said.contains("its triggers wrote in") && said.contains("accounts") && said.contains("audit"),
+            "{at}: {said}"
+        );
+        assert!(!dir.join("attached.pending").exists(), "{at}");
+        assert_eq!(cell(&db2, MAIN, "select lead_count from accounts where id = 1"), n.to_string(), "{at}");
+        assert_eq!(cell(&db2, MAIN, "select count(*) from audit"), n.to_string(), "{at}");
+        assert_eq!(cell(&db2, MAIN, "select count(*) from leads"), n.to_string(), "{at}");
+        drop(db2);
+        db = Db::open(&dir).unwrap();
+    }
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+#[test]
+fn a_row_a_world_forked_before_a_column_inserts_gets_postgress_default() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("widen_insert") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table leads (id int primary key, name text);
+         insert into leads select g, 'lead ' || g from generate_series(1, 5) g;",
+    )
+    .unwrap();
+    let dir = folder("widen_insert");
+    let (ok, out) = attach(&dir, &["--tables", "leads"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    // forked before the columns exist, and inserting after they do
+    run(&db, MAIN, "create world old", &[]).unwrap();
+    pg.batch_execute(
+        "alter table leads add column r float8 default random(), add column seen timestamptz not null default now()",
+    )
+    .unwrap();
+    let r = chronos::attach::refresh(&db).unwrap();
+    assert!(r.skipped.is_empty(), "{:?}", r);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    run(&db, "old", "insert into leads (id, name) values (50, 'new')", &[]).unwrap();
+    run(&db, MAIN, "merge world old", &[]).unwrap();
+    // Postgres filled them as it fills its own rows (a value of its own, the insert's time), and main holds the same
+    assert_eq!(
+        pg_cell(
+            &mut pg,
+            "select r is not null and seen > (select max(seen) from leads where id < 50) from leads where id = 50"
+        ),
+        "t"
+    );
+    let pg_row = pg_cell(&mut pg, "select r::text || ' ' || seen::text from leads where id = 50");
+    let ours = cell(&db, MAIN, "select r::text from leads where id = 50");
+    assert!(pg_row.starts_with(&ours), "main {ours}, Postgres {pg_row}");
+    assert_eq!(chronos::attach::refresh(&db).unwrap().changed(), 0, "main is as Postgres is");
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+#[test]
+fn undo_of_a_merge_into_main_goes_back_through_postgres() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("undo") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table leads (id int primary key, owner text);
+         insert into leads values (1, 'bo'), (2, 'bo'), (3, 'eve');",
+    )
+    .unwrap();
+    let dir = folder("undo");
+    let (ok, out) = attach(&dir, &["--tables", "leads"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    assert!(
+        change(&db, "w", "update leads set owner = 'ada' where owner = 'bo'; delete from leads where id = 3").is_none()
+    );
+    assert_eq!(pg_cell(&mut pg, "select string_agg(owner, ',' order by id) from leads"), "ada,ada");
+    run(&db, MAIN, "undo merge of world w", &[]).unwrap();
+    assert_eq!(pg_cell(&mut pg, "select string_agg(owner, ',' order by id) from leads"), "bo,bo,eve");
+    assert_eq!(cell(&db, MAIN, "select string_agg(owner, ',' order by id) from leads"), "bo,bo,eve");
+
+    // a row changed in Postgres since the merge: the undo is a conflict, and nothing is written
+    assert!(change(&db, "w2", "update leads set owner = 'zed' where id = 1").is_none());
+    pg.batch_execute("update leads set owner = 'pat' where id = 1").unwrap();
+    let e = run(&db, MAIN, "undo merge of world w2", &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    assert_eq!(pg_cell(&mut pg, "select owner from leads where id = 1"), "pat");
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+#[test]
+fn a_merge_bigger_than_one_part_is_written_in_one_transaction() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("parts") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table items (id int primary key, n int);
+         insert into items select g, 0 from generate_series(1, 12000) g;",
+    )
+    .unwrap();
+    let dir = folder("parts");
+    let (ok, out) = attach(&dir, &["--tables", "items", "--yes"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    assert!(
+        change(&db, "w", "update items set n = 1 where id <= 11000; insert into items select g, 2 from generate_series(12001, 12100) g")
+            .is_none()
+    );
+    assert_eq!(pg_cell(&mut pg, "select count(*) from items where n = 1"), "11000");
+    assert_eq!(pg_cell(&mut pg, "select count(*) from items"), "12100");
+    // a conflict in the last part: nothing of any part is written
+    run(&db, MAIN, "create world v; use world v; update items set n = 3", &[]).unwrap();
+    pg.batch_execute("update items set n = 9 where id = 12100").unwrap();
+    let e = run(&db, MAIN, "merge world v", &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    assert_eq!(pg_cell(&mut pg, "select count(*) from items where n = 3"), "0");
 
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();

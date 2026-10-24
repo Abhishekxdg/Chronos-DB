@@ -449,14 +449,14 @@ pub(super) struct Timing {
 }
 
 /// A call of function `f` starting: timed when `track_functions` counts it (`pl` counts PL/pgSQL's,
-/// `all` SQL functions' too).
+/// `all` SQL and C functions' too, as Postgres's fmgr has them).
 pub(super) fn calling(f: &super::functions::Function) -> Option<Timing> {
     let ctx = session()?;
     let counted = {
         let st = ctx.state.try_lock().ok()?;
         match setting(&st, "track_functions") {
             Some("all") => true,
-            Some("pl") => f.lang != super::functions::Lang::Sql,
+            Some("pl") => f.lang_name() == "plpgsql",
             _ => false,
         }
     };

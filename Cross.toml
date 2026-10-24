@@ -1,6 +1,6 @@
 # cross's build images, pinned by digest (the multi-arch index for cross 0.2.5's tag) so a
-# re-pushed tag can't change what builds the release. Update with cross in release.yml.
-# mimalloc's C code writes __DATE__ and __TIME__ into the binary; the release workflow sets
+# re-pushed tag can't change what builds the release. cloudbuild/release.yaml builds in the same images, by the same
+# digests: change both together. mimalloc's C code writes __DATE__ and __TIME__ into the binary; the release sets
 # SOURCE_DATE_EPOCH to the tagged commit's time, which GCC uses for them, so a commit builds the
 # same bytes every time. cross passes it into its container only when told to.
 [build.env]

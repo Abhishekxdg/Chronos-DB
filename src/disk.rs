@@ -377,6 +377,10 @@ pub(crate) struct Log {
     /// Set once the open succeeded: only then does dropping the log close it. A failed open must
     /// leave the log as it found it (a Close would mark a crash clean, and move the anchor on).
     pub(crate) live: std::sync::atomic::AtomicBool,
+    /// `Inner::end`, readable without the lock: how far the shipper has to go.
+    appended: AtomicU64,
+    /// Shipping to the remote, when there is one (see `wal_ship`).
+    pub(crate) ship: Option<Arc<crate::wal_ship::Ship>>,
     lock: File,
 }
 
@@ -551,6 +555,8 @@ impl Log {
             crypt,
             anchor: None,
             live: Default::default(),
+            appended: AtomicU64::new(0),
+            ship: None,
             lock,
         })
     }
@@ -607,6 +613,7 @@ impl Log {
             head.len() + p.len()
         };
         g.end += n as u64;
+        self.appended.store(g.end, Ordering::Relaxed);
         self.seg_bytes.fetch_add(n as u64, Ordering::Relaxed);
         self.unpublished.fetch_add(n as u64, Ordering::Relaxed);
         if g.pending.len() >= FLUSH_BYTES {
@@ -618,8 +625,15 @@ impl Log {
     /// Blocks until everything up to `upto` is as durable as the `SyncCommit` setting asks: on
     /// stable storage (`Full`), handed to the drive (`Normal`) or to the OS (`Off`). Concurrent
     /// callers share one fsync, and the fsync runs outside `inner`, so writers on other branches
-    /// never wait on disk.
+    /// never wait on disk. Then, with `wal_shipping = sync`, until it is in the remote too.
     pub(crate) fn sync(&self, upto: u64) {
+        self.sync_local(upto);
+        if let Some(ship) = &self.ship {
+            ship.wait(self, upto);
+        }
+    }
+
+    fn sync_local(&self, upto: u64) {
         let mut synced = self.synced.lock().unwrap();
         if *synced >= upto {
             return;
@@ -747,9 +761,20 @@ impl Log {
     /// Writes buffered records to the file and returns the live segment and its length: every
     /// record so far ends at or before it.
     pub(crate) fn cut(&self) -> io::Result<(u64, u64)> {
+        let (seg, off, _) = self.cut_end()?;
+        Ok((seg, off))
+    }
+
+    /// `cut`, and the position (as `append` returns them) of the last record before it.
+    pub(crate) fn cut_end(&self) -> io::Result<(u64, u64, u64)> {
         let mut g = self.inner.lock().unwrap();
         g.flush()?;
-        Ok((g.seg, g.off))
+        Ok((g.seg, g.off, g.end))
+    }
+
+    /// The position after the last record appended (as `append` returns them).
+    pub(crate) fn appended(&self) -> u64 {
+        self.appended.load(Ordering::Relaxed)
     }
 }
 
@@ -866,7 +891,11 @@ pub(crate) fn recover(
     };
     let mut last_close = None;
     let mut apply = |op: Op<String>| {
-        last_close = Some(matches!(op, Op::Close));
+        // the time and who is acting change nothing: a log of only those after a closed manifest
+        // (a new segment's first records, which a shipped log may hold) is still a clean close
+        if !matches!(op, Op::Clock(_) | Op::Actor(_)) {
+            last_close = Some(matches!(op, Op::Close));
+        }
         apply(op)
     };
     let segs = segments(dir)?;
@@ -1271,6 +1300,11 @@ pub(crate) fn check_log(dir: &Path, c: Option<&Crypt>) -> io::Result<u64> {
         }
     }
     Ok(records)
+}
+
+/// The log segment the folder's manifest starts replay at (1 with no manifest yet).
+pub(crate) fn manifest_first(dir: &Path, c: Option<&Crypt>) -> io::Result<u64> {
+    Ok(read_manifest(&dir.join("manifest"), c)?.map_or(1, |m| m.0))
 }
 
 pub(crate) fn read_manifest_at(path: &Path, c: Option<&Crypt>) -> io::Result<Option<(u64, bool, Vec<ManBranch>)>> {

@@ -140,6 +140,27 @@ fn policy_key(table: &str, name: &str) -> String {
     format!("{POLICIES}/{}/{name}", key_part(table))
 }
 
+/// The key `acl::MADE` keeps when policy `name` on `table` (as stored) was made under: `policy/<table>/<name>`, the
+/// table's part as `policy_key`'s.
+pub(crate) fn made_key(table: &str, name: &str) -> String {
+    format!("policy/{}/{name}", key_part(table))
+}
+
+/// What `acl::MADE` keeps for a policy, by statement `st`: CREATE POLICY's, the policy it is about to make (its
+/// `made_key`), when it isn't there yet.
+pub(crate) fn to_stamp(v: &View, st: &PolicyStmt) -> Result<Option<String>> {
+    let PolicyStmt::Create { name, table, .. } = st else { return Ok(None) };
+    let Ok(t) = need_table(v, table) else { return Ok(None) };
+    Ok(v.get(&policy_key(&t.name, name))?.is_none().then(|| made_key(&t.name, name)))
+}
+
+/// ALTER POLICY ... RENAME TO's (statement `st`): the policy's `made_key` before and after, worked out before it runs.
+pub(crate) fn stamp_moves(v: &View, st: &PolicyStmt) -> Vec<(String, String)> {
+    let PolicyStmt::Alter { name, table, rename: Some(to), .. } = st else { return vec![] };
+    let Ok(t) = need_table(v, table) else { return vec![] };
+    vec![(made_key(&t.name, name), made_key(&t.name, to))]
+}
+
 /// Whether `table` has row security enabled, and forced (pg_class.relrowsecurity and
 /// relforcerowsecurity).
 pub(crate) fn flags(v: &View, table: &str) -> Result<(bool, bool)> {
@@ -211,14 +232,66 @@ pub(crate) fn all(v: &View) -> Result<Vec<Policy>> {
 
 /// Whether world `v` has a table with row security on (reads and writes then look for theirs).
 pub(super) fn any(v: &View) -> Result<bool> {
+    if tenant().is_some() {
+        return Ok(true);
+    }
     Ok(v.core.has_row_security() && v.prefix(&format!("{RLS}/"))?.next().is_some())
+}
+
+// ---------------------------------------------------------------- an agent held to a tenant
+
+/// The tenant the running statement's agent is held to (see `crate::agents::Agent::tenant`): the condition, as SQL
+/// (`"org_id" = 42`), every row it reads or writes of a table with that column meets, whatever its role and whatever
+/// the table's own row security says. None: an agent with no tenant, or no agent.
+pub(crate) fn tenant() -> Option<Arc<str>> {
+    STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.as_ref()).and_then(|c| c.tenant.clone()))
+}
+
+/// Whether row security may limit the running statement: some table has had it, or its agent is held to a tenant.
+pub(super) fn possible(core: &crate::Core) -> bool {
+    core.has_row_security() || tenant().is_some()
+}
+
+/// The policy holding the running statement's agent to its tenant on `table` (see `tenant`), when the table has the
+/// tenant's column: for every command, every role, its condition both USING and WITH CHECK.
+fn tenant_policy(v: &View, table: &str) -> Result<Option<Policy>> {
+    let Some(cond) = tenant() else { return Ok(None) };
+    let col = cond.split_once(" = ").map_or("", |(c, _)| c);
+    let col = col.strip_prefix('"').and_then(|c| c.strip_suffix('"')).unwrap_or(col).replace("\"\"", "\"");
+    let Some(t) = load_world(v, table)? else { return Ok(None) };
+    if !t.cols.iter().any(|c| c.name == col) {
+        return Ok(None);
+    }
+    Ok(Some(Policy {
+        name: "chronos_tenant".into(),
+        table: table.into(),
+        cmd: '*',
+        permissive: true,
+        roles: vec![PUBLIC],
+        using: Some(cond.to_string()),
+        check: Some(cond.to_string()),
+        made: 0,
+    }))
+}
+
+/// The policies a read or write of `table` by `who` keeps to: the table's own, and, for an agent held to a tenant,
+/// its tenant's on top (one more that must hold where the table's own limit `who`; the only one where they don't).
+fn effective(v: &View, table: &str, who: &Who) -> Result<Vec<Policy>> {
+    let Some(mut t) = tenant_policy(v, table)? else { return policies(v, table) };
+    if !applies_own(v, table, Some(who), true)? {
+        return Ok(vec![t]);
+    }
+    t.permissive = false;
+    let mut ps = policies(v, table)?;
+    ps.push(t);
+    Ok(ps)
 }
 
 /// Whether statement `st` reads or writes a table with row security on, or a view (whose query may
 /// read one): only such a statement is looked at for policies, so one of other tables pays a lookup
 /// per table it names.
 pub(super) fn touched(v: &View, st: &Stmt) -> Result<bool> {
-    if !v.core.has_row_security() {
+    if !possible(v.core) {
         return Ok(false);
     }
     let mut names = vec![];
@@ -234,7 +307,7 @@ pub(super) fn touched(v: &View, st: &Stmt) -> Result<bool> {
     }
     let views = v.core.has_views();
     for n in names {
-        if flags(v, &n)?.0 || (views && view_def(v, &n)?.is_some()) {
+        if flags(v, &n)?.0 || (views && view_def(v, &n)?.is_some()) || tenant_policy(v, &n)?.is_some() {
             return Ok(true);
         }
     }
@@ -318,8 +391,17 @@ pub(crate) fn limits(v: &View, table: &str, who: Option<&Who>) -> Result<bool> {
     applies_as(v, table, who, true)
 }
 
-/// `applies`, with `row_security` on or off (`on`).
+/// `applies`, with `row_security` on or off (`on`). An agent held to a tenant is limited on every table with the
+/// tenant's column, whatever its role and whatever `row_security` says (see `tenant`).
 pub(crate) fn applies_as(v: &View, table: &str, who: Option<&Who>, on: bool) -> Result<bool> {
+    if tenant_policy(v, table)?.is_some() {
+        return Ok(true);
+    }
+    applies_own(v, table, who, on)
+}
+
+/// Whether the table's own row security limits `who` (`applies_as` without the tenant).
+fn applies_own(v: &View, table: &str, who: Option<&Who>, on: bool) -> Result<bool> {
     let (enable, force) = flags(v, table)?;
     if !enable {
         return Ok(false);
@@ -405,8 +487,11 @@ fn chosen<'a>(ps: &'a [Policy], cmd: char, who: &Who) -> (Vec<&'a Policy>, Vec<&
         .partition(|p| p.permissive)
 }
 
-/// Policies' conditions parsed, by their text (see `expr_of`).
-static PARSED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Expr>>> =
+/// Policies' conditions parsed, by their text (see `expr_of`), each with the composite types' shapes it was parsed
+/// with (a cast to one): parsed again where one is no longer its type's in the world looked up in (see
+/// `stale_record`), as a world's shape of a type is its own.
+#[allow(clippy::type_complexity)]
+static PARSED: std::sync::LazyLock<std::sync::Mutex<HashMap<String, (Expr, Vec<Type>)>>> =
     std::sync::LazyLock::new(Default::default);
 
 /// Most conditions `PARSED` keeps: past them it starts again (rather than track which were used last).
@@ -419,30 +504,38 @@ pub(super) fn forget_parsed() {
 
 /// A policy's condition (as SQL), parsed: its names as its maker's search_path found them (see
 /// `Parser::bind`), an unqualified one public's and a built-in function's the built-in, whatever the
-/// search_path of whoever reads. Parsed once for each text: the same text is the same condition, whoever reads.
+/// search_path of whoever reads. Parsed once for each text: the same text is the same condition, whoever reads (but
+/// for a cast to a composite type, whose shape is its world's: see `PARSED`).
 fn expr_of(text: &str) -> Result<Expr> {
-    if let Some(e) = PARSED.lock().unwrap_or_else(|e| e.into_inner()).get(text) {
-        return Ok(e.clone());
+    let hit = PARSED.lock().unwrap_or_else(|e| e.into_inner()).get(text).cloned();
+    if let Some((e, shapes)) = hit
+        && !shapes.iter().any(|t| stale_record(*t))
+    {
+        return Ok(e);
     }
-    let mut e = default_names(|| {
-        let mut p = Parser::new(lex(text)?);
-        p.pinned = true;
-        let e = p.expr()?;
-        if p.peek().is_some() {
-            return p.fail("expected the end of the policy's condition");
-        }
+    let (e, shapes) = userdefs::noting(|| -> Result<Expr> {
+        let mut e = default_names(|| {
+            let mut p = Parser::new(lex(text)?);
+            p.pinned = true;
+            let e = p.expr()?;
+            if p.peek().is_some() {
+                return p.fail("expected the end of the policy's condition");
+            }
+            Ok(e)
+        })?;
+        // (what it reads is the world's, whatever temporary tables have the names)
+        map_subqueries(&mut e, &mut |q| {
+            bind_sources(q);
+            Ok(true)
+        })?;
         Ok(e)
-    })?;
-    // (what it reads is the world's, whatever temporary tables have the names)
-    map_subqueries(&mut e, &mut |q| {
-        bind_sources(q);
-        Ok(true)
-    })?;
+    });
+    let e = e?;
     let mut parsed = PARSED.lock().unwrap_or_else(|e| e.into_inner());
     if parsed.len() >= MOST_PARSED {
         parsed.clear();
     }
-    parsed.insert(text.to_string(), e.clone());
+    parsed.insert(text.to_string(), (e.clone(), shapes));
     Ok(e)
 }
 
@@ -509,8 +602,15 @@ pub(super) fn read(v: &View, table: &str, who: Option<&Who>, locking: bool) -> R
     if !applies(v, table, who)? {
         return Ok(None);
     }
-    let who = who.expect("applies to a role");
-    let ps = policies(v, table)?;
+    let boot;
+    let who = match who {
+        Some(w) => w,
+        None => {
+            boot = Who::boot("chronos");
+            &boot
+        }
+    };
+    let ps = effective(v, table, who)?;
     let mut out = vec![];
     if locking {
         let (p, r) = chosen(&ps, 'w', who);
@@ -728,9 +828,16 @@ pub(super) fn write(
     if !applies(v, &table, who)? {
         return Ok(false);
     }
-    let who = who.expect("applies to a role");
+    let boot;
+    let who = match who {
+        Some(w) => w,
+        None => {
+            boot = Who::boot("chronos");
+            &boot
+        }
+    };
     let merging = MERGING.get();
-    let ps = policies(v, &table)?;
+    let ps = effective(v, &table, who)?;
     // (SELECT's policies count where SELECT is needed: a WHERE, SET or RETURNING that reads the table)
     let reads = acl::reads_target(v, st, &table)?;
     let (sp, sr) = chosen(&ps, 'r', who);

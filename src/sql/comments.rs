@@ -5,8 +5,9 @@
 //!
 //! Keys, with names as the catalog stores them (`app.orders` outside public):
 //! `table/<name>`, `view/<name>`, `materialized view/<name>`, `sequence/<name>`, `index/<name>`,
-//! `column/<table>/<column>`, `constraint/<table>/<constraint>`, `schema/<name>`, `type/<name>` (pg_description
-//! shows an enum type's) and `function/<name(argument types)>`.
+//! `column/<table>/<column>` (a composite type's attribute's too, `column/<type>/<attribute>`),
+//! `constraint/<table>/<constraint>`, `domain constraint/<domain>/<constraint>`, `schema/<name>`, `type/<name>`
+//! (pg_description shows an enum type's) and `function/<name(argument types)>`.
 //!
 //! A comment goes with its object: dropping the table, column or constraint drops it (`after`
 //! removes the rows whose object is gone), and renaming a table, a column or an index moves it.
@@ -157,6 +158,10 @@ pub(super) fn sql(key: &str, text: Option<&str>) -> Option<String> {
         "constraint" => {
             let (table, name) = rest.rsplit_once('/')?;
             format!("constraint {} on {}", ident(name), ident_rel(table))
+        }
+        "domain constraint" => {
+            let (domain, name) = rest.rsplit_once('/')?;
+            format!("constraint {} on domain {}", ident(name), ident_rel(domain))
         }
         _ => return None,
     };

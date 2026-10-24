@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "clients"
 from chronos import Chronos, ChronosError  # noqa: E402
 
 URL = os.environ.get("CHRONOS_URL", "http://127.0.0.1:7070")
-person = Chronos(URL, token=os.environ.get("CHRONOS_TOKEN"))  # the database's own user: you
+person = Chronos(URL, token=os.environ.get("CHRONOS_ADMIN_TOKEN"))  # the database's own user: you (none on loopback without tokens)
 
 
 def step(title):

@@ -135,12 +135,14 @@ What a matching checksum doesn't prove: that queries give the same results (run 
 chronos serve ./mydb                                         # loopback only, no password asked
 DATABASE_URL="postgres://app@127.0.0.1:5433/main"
 
-# from other machines: a token (24 characters or more) and TLS are required; the token is the password (any user name)
-CHRONOS_TOKEN=$(openssl rand -hex 24) chronos serve ./mydb --pg 0.0.0.0:5433 --tls-cert cert.pem --tls-key key.pem
-DATABASE_URL="postgres://app:${CHRONOS_TOKEN}@db-host:5433/main?sslmode=require"
+# from other machines: a token (24 characters or more) and TLS are required; the admin token is your application's
+# password (any user name): the server token lets a client in only as the guest
+export CHRONOS_TOKEN=$(openssl rand -hex 24) CHRONOS_ADMIN_TOKEN=$(openssl rand -hex 24)
+chronos serve ./mydb --pg 0.0.0.0:5433 --tls-cert cert.pem --tls-key key.pem
+DATABASE_URL="postgres://app:${CHRONOS_ADMIN_TOKEN}@db-host:5433/main?sslmode=require"
 ```
 
-Without `--token`, anyone who can reach the loopback port can log in as any user, superuser included. Over a network, use `--token` and TLS (`--tls-cert`, `--tls-key`); see [security](security.md) and [operations](operations.md#tls).
+Without any token, anyone who can reach the loopback port can log in as any user, superuser included. Over a network, use `--token` and TLS (`--tls-cert`, `--tls-key`), and the admin token for the application that owns the data; see [security](security.md) and [operations](operations.md#tls). Before 0.4 the server token was the database's own user: [upgrading](security.md#upgrading-from-03-the-server-token).
 
 **ORMs and drivers** connect as they do to Postgres:
 
@@ -157,7 +159,7 @@ The full list is on [Postgres compatibility](postgres-compatibility.md#known-gap
 - **`ALTER TABLE ... ADD COLUMN` with a default that differs per row** (`random()`, `gen_random_uuid()`, `serial`, a sequence's value, a function of your own) is refused (0A000) on a table that has rows, where Postgres fills each row: add the column, `UPDATE` it, then `ALTER COLUMN ... SET DEFAULT`. A constant, `now()` or `current_date` default works as in Postgres. Migration tools that add such columns to existing tables need that step by hand.
 - **History is kept for 1 hour by default.** Chronos keeps old versions of rows for time travel and undo. A new database keeps 1 hour (`alter system set history_retention = '30 days'` keeps more, at the cost of disk); a database made by an earlier release keeps the 30 days it had.
 - **Text sorts by bytes** (`COLLATE "C"`) unless a column has an ICU collation, where your Postgres probably used `en_US.UTF-8`. `ORDER BY name` can give a different order; give the column `collate "en-US-x-icu"` if it matters. `chronos import` says so first in its report when the source database's collation isn't `C`, `POSIX` or `C.UTF-8`, naming the collation to use.
-- **`EXPLAIN` output** has Postgres's shape only for simple plans; don't parse it.
+- **`EXPLAIN` output** shows how Chronos runs the statement, not Postgres's plan; don't parse it. `SET chronos.explain = postgres` makes `EXPLAIN (COSTS OFF)` of simple statements show PostgreSQL 16's plan, with a NOTICE (see [EXPLAIN](sql.md#explain)).
 - **Function signatures** in the catalog show `text` where a parameter was declared `varchar` (`\df`, `pg_get_function_arguments`).
 - **A multi-statement simple query** (`insert ...; insert ...;` in one string) commits statement by statement, where Postgres runs it as one implicit transaction. Wrap such strings in `BEGIN ... COMMIT`.
 - **Speed:** in the trials, point reads ran at about half Postgres's rate and writes at a fraction of it on the same machine. Measure your own workload before moving one that is sensitive to latency.

@@ -532,6 +532,12 @@ pub(super) fn writes(name: &str) -> bool {
     )
 }
 
+/// Whether a call of `name` only reads, changing nothing of the database's or the session's (no descriptor opened,
+/// moved or closed): what EXPLAIN without ANALYZE may run (see `CtxFn::changes`).
+pub(super) fn only_reads(name: &str) -> bool {
+    matches!(name, "lo_get" | "lo_tell" | "lo_tell64")
+}
+
 /// What a call of `name` gives.
 pub(super) fn result(name: &str) -> Type {
     match name {

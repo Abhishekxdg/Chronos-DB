@@ -9,7 +9,7 @@ The whole script is [examples/guides/agent-evaluation.sql](https://github.com/Ab
 ## Setup
 
 ```bash
-chronos serve evaldb
+CHRONOS_PROTECT_MAIN=off chronos serve evaldb   # the setup below writes main directly
 psql -v ON_ERROR_STOP=1 -f examples/guides/agent-evaluation.sql postgres://127.0.0.1:5433/main
 ```
 

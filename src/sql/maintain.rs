@@ -20,6 +20,8 @@ pub(super) enum Target {
     Schema(String),
     /// the whole database, or every table: nothing to look up
     Everything,
+    /// REINDEX DATABASE: the database's own indexes (not the catalogs', which REINDEX SYSTEM names as `Everything`)
+    Database,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -50,6 +52,8 @@ pub(super) struct Maintain {
     pub using: Option<String>,
     /// REINDEX CONCURRENTLY, which can't run in a transaction block
     pub concurrently: bool,
+    /// REINDEX (TABLESPACE name): where the indexes rebuilt are moved (see `tablespace`)
+    pub tablespace: Option<String>,
     /// VACUUM (with ANALYZE or not): what a skipped table's warning says it couldn't do
     pub vacuum: bool,
     /// VACUUM (PARALLEL n), n > 0: which a temporary table can't be vacuumed with
@@ -82,6 +86,8 @@ pub(super) enum Commented {
     Foreign(&'static str, String),
     /// a rule, table (ON table): its comment isn't kept, but both have to exist
     Rule(String, String),
+    /// a trigger, table (ON table): the same
+    Trigger(String, String),
     /// a type or domain, as stored (`app.mood`): pg_description shows the comment of an enum type
     Type(String),
     /// a function or procedure, by name and argument types (None: the one of that name)
@@ -323,6 +329,7 @@ impl Parser {
             targets,
             using: None,
             concurrently: false,
+            tablespace: None,
             vacuum: verb == Verb::Vacuum,
             parallel: workers > 0,
         })))
@@ -330,11 +337,14 @@ impl Parser {
 
     /// After REINDEX: `[(options)] {INDEX | TABLE | SCHEMA | DATABASE | SYSTEM} [CONCURRENTLY] name`.
     pub(super) fn reindex(&mut self) -> Result<Stmt> {
-        let mut concurrently = false;
+        let (mut concurrently, mut tablespace) = (false, None);
         if self.sym("(") {
             for (name, value, _) in self.options("REINDEX", &["concurrently", "tablespace", "verbose"])? {
                 if name == "concurrently" {
                     concurrently = !matches!(value.as_deref(), Some("false" | "off" | "0"));
+                }
+                if name == "tablespace" {
+                    tablespace = value;
                 }
             }
         }
@@ -354,7 +364,7 @@ impl Parser {
                 if !self.at_end() {
                     self.name()?; // (the database's name: only the one there is)
                 }
-                Target::Everything
+                if kind == "database" { Target::Database } else { Target::Everything }
             }
         };
         Ok(Stmt::Maintain(Box::new(Maintain {
@@ -362,6 +372,7 @@ impl Parser {
             targets: vec![target],
             using: None,
             concurrently,
+            tablespace,
             vacuum: false,
             parallel: false,
         })))
@@ -389,6 +400,7 @@ impl Parser {
             targets: vec![target],
             using,
             concurrently: false,
+            tablespace: None,
             vacuum: false,
             parallel: false,
         })))
@@ -469,6 +481,11 @@ impl Parser {
                 self.expect_kw("on")?;
                 Commented::Rule(name, self.qualified(false, Kind::Rel)?)
             }
+            "trigger" => {
+                let name = self.name()?;
+                self.expect_kw("on")?;
+                Commented::Trigger(name, self.qualified(false, Kind::Rel)?)
+            }
             "type" | "domain" => Commented::Type(self.qualified(false, Kind::Type)?),
             "function" | "procedure" => {
                 let procedure = kind == "procedure";
@@ -486,9 +503,9 @@ impl Parser {
                 self.expect_kw("object")?;
                 Commented::LargeObject(self.large_object_oid()?)
             }
-            "database" | "extension" | "routine" | "user" | "group" | "policy" | "trigger" | "subscription"
-            | "collation" | "conversion" | "language" | "operator" | "cast" | "transform" | "tablespace"
-            | "statistics" | "text" | "access" | "event" => {
+            "database" | "extension" | "routine" | "user" | "group" | "policy" | "subscription" | "collation"
+            | "conversion" | "language" | "operator" | "cast" | "transform" | "tablespace" | "statistics" | "text"
+            | "access" | "event" => {
                 // skip the name (a function's has a signature): up to IS outside parentheses
                 let mut depth = 0;
                 while let Some(t) = self.peek() {
@@ -605,22 +622,65 @@ fn no_column(column: &str, rel: &str) -> SqlError {
     }
 }
 
-/// VACUUM, ANALYZE and REINDEX: nothing to do, once the names check out. CLUSTER: see `cluster`.
+/// VACUUM and ANALYZE: nothing to do, once the names check out. REINDEX: what pg_class shows of a rebuild (see
+/// `rebuild`). CLUSTER: see `cluster`.
 pub(super) fn maintain(db: &Db, branch: &str, m: &Maintain) -> Result<Output> {
     if m.verb == Verb::Cluster {
         return cluster(db, branch, m);
     }
+    // REINDEX (TABLESPACE t): t is there and the role may create there, before anything is looked up (as Postgres's
+    // ExecReindex checks it); a catalog's indexes are neither moved nor rebuilt concurrently
+    let mut space = None;
+    if m.verb == Verb::Reindex {
+        if let Some(n) = &m.tablespace {
+            space = Some(super::tablespace::target(&db.view_tx(branch)?, n)?);
+        }
+        for target in &m.targets {
+            let (Target::Index(name) | Target::Rel(name, _)) = target else { continue };
+            let Some(first) = super::tablespace::system_index(name) else { continue };
+            // (the bootstrap superuser's, as every catalog is)
+            if let Some(w) = roles::checked()
+                && !w.has_privs_of(roles::BOOTSTRAP)
+            {
+                let noun = if matches!(target, Target::Index(_)) { "index" } else { "table" };
+                return err("42501", format!("must be owner of {noun} {}", rel_part(&text_rel(name))));
+            }
+            if m.concurrently {
+                return err(UNSUPPORTED, "cannot reindex system catalogs concurrently");
+            }
+            if space.is_some() {
+                return err(UNSUPPORTED, format!("cannot move system relation \"{first}\""));
+            }
+            return Ok(Output::tag(m.verb.tag()));
+        }
+    }
     let cat = Catalog::of(&db.core, branch)?;
+    // (REINDEX INDEX and SCHEMA: the index's owner, its table's, and the schema's, as Postgres's
+    // RangeVarCallbackForReindexIndex and ReindexMultipleTables ask, after the tablespace; REINDEX TABLE's is asked
+    // with the statement's privileges, see `acl`)
+    let who = if m.verb == Verb::Reindex { roles::checked() } else { None };
     for target in &m.targets {
         match target {
-            Target::Everything => {}
+            Target::Everything | Target::Database => {}
             Target::Schema(s) => {
                 if !cat.schemas.contains(s) && !matches!(s.as_str(), "public" | "pg_catalog" | "information_schema") {
                     return err("3F000", format!("schema \"{s}\" does not exist"));
                 }
+                if let Some(w) = &who {
+                    let o = super::acl::schema(&db.view_tx(branch)?, s)?;
+                    if !w.has_privs_of(o.owner) {
+                        return Err(o.not_owner());
+                    }
+                }
             }
             Target::Index(name) => match cat.named(name)?.and_then(|o| cat.find(o)) {
-                Some(Obj::Index(..)) => {}
+                Some(Obj::Index(r, _)) => {
+                    if let Some(w) = &who
+                        && !w.has_privs_of(cat.rel_acl(&cat.rels[r]).0)
+                    {
+                        return err("42501", format!("must be owner of index {}", rel_part(&text_rel(name))));
+                    }
+                }
                 Some(_) => return Err(wrong_kind(name, "an index")),
                 None => return Err(no_rel(name)),
             },
@@ -717,7 +777,113 @@ pub(super) fn maintain(db: &Db, branch: &str, m: &Maintain) -> Result<Output> {
             }
         }
     }
+    if m.verb == Verb::Reindex {
+        rebuild(db, branch, m, space)?;
+    }
     Ok(Output::tag(m.verb.tag()))
+}
+
+/// What REINDEX shows of the indexes it rebuilds (each named, or each of a table's; a partitioned table's or index's
+/// are its leaf partitions'): a new filenode each, and with TABLESPACE the tablespace they are moved to (see
+/// `tablespace::move_rel`). Their entries are always current here; this is what pg_class says of a rebuild, in the
+/// statement's transaction. A rebuild is written to the tables' filenode rows alone (see `tablespace::Gens`), so it
+/// merges with any change to their schemas; only a move changes a schema row.
+fn rebuild(db: &Db, branch: &str, m: &Maintain, space: Option<i64>) -> Result<()> {
+    db.batch_with::<(), SqlError>(branch, |v| {
+        let cat = Catalog::of(v.core, &v.branch)?;
+        // (table, index), each once
+        let mut todo: Vec<(String, String)> = vec![];
+        let mut add = |t: &str, x: &str| {
+            if !todo.iter().any(|(a, b)| a == t && b == x) {
+                todo.push((t.to_string(), x.to_string()));
+            }
+        };
+        // (the tables below a partitioned one that hold rows)
+        let leaves = |i: usize| {
+            let (mut out, mut stack) = (vec![], vec![i]);
+            while let Some(k) = stack.pop() {
+                let r = &cat.rels[k];
+                if r.kind != 'p' {
+                    out.push(k);
+                    continue;
+                }
+                stack.extend(r.hier.created.iter().filter_map(|n| cat.rels.iter().position(|x| x.name == *n)));
+            }
+            out
+        };
+        for target in &m.targets {
+            match target {
+                Target::Index(name) => {
+                    let Some(Obj::Index(r, x)) = cat.named(name)?.and_then(|o| cat.find(o)) else { continue };
+                    let owner = &cat.rels[r];
+                    if owner.kind == 'p' {
+                        for (kid, n) in hier::leaf_indexes(v, &need_table(v, &owner.name)?, &x.name)? {
+                            add(&kid.name, &n);
+                        }
+                    } else {
+                        add(&owner.name, &x.name);
+                    }
+                }
+                Target::Rel(name, _) => {
+                    let Ok(Some((i, _))) = find_rel(&cat, name) else { continue };
+                    for k in leaves(i) {
+                        for (_, x) in cat.idx.iter().filter(|(r, _)| *r == k) {
+                            add(&cat.rels[k].name, &x.name);
+                        }
+                    }
+                }
+                Target::Schema(s) => {
+                    for (r, x) in cat.idx.iter().filter(|(r, _)| schema_part(&cat.rels[*r].name) == s) {
+                        if cat.rels[*r].kind != 'p' {
+                            add(&cat.rels[*r].name, &x.name);
+                        }
+                    }
+                }
+                // REINDEX DATABASE: every index of the database's tables and materialized views the role owns (a
+                // partitioned table's are its partitions'), as Postgres 16's, which leaves the catalogs' to REINDEX
+                // SYSTEM; a session's temporary tables are a database of their own, not reached here
+                Target::Database => {
+                    for (r, x) in &cat.idx {
+                        let rel = &cat.rels[*r];
+                        if matches!(rel.kind, 'r' | 'm') && owns(v, &rel.name)? {
+                            add(&rel.name, &x.name);
+                        }
+                    }
+                }
+                // (REINDEX SYSTEM rebuilds the catalogs', which aren't shown here)
+                Target::Everything => {}
+            }
+        }
+        // (a relation every database shares is the only kind pg_global holds)
+        if space == Some(super::tablespace::GLOBAL) && m.concurrently && !todo.is_empty() {
+            return err(UNSUPPORTED, "cannot move non-shared relation to tablespace \"pg_global\"");
+        }
+        // (each table, its generations, and whether an index of it moved)
+        let mut tables: Vec<(Table, super::tablespace::Gens, bool)> = vec![];
+        for (table, index) in todo {
+            let at = match tables.iter().position(|(t, ..)| t.name == table) {
+                Some(k) => k,
+                None => {
+                    tables.push((need_table(v, &table)?, super::tablespace::Gens::load(v, &table)?, false));
+                    tables.len() - 1
+                }
+            };
+            let (t, gens, moved) = &mut tables[at];
+            if let Some(to) = space {
+                *moved |= super::tablespace::move_rel(t, Some(&index), to)?;
+            }
+            gens.bump_index(&index);
+        }
+        let mut writes = vec![];
+        for (t, gens, moved) in &tables {
+            if *moved {
+                writes.push((schema_key(&t.name), Some(schema_json(t))));
+            }
+            writes.push(gens.write(&t.name));
+        }
+        Ok((writes, ()))
+    })?;
+    Ok(())
 }
 
 /// Whether table `t` has an index named `ix`: its primary key's, a unique constraint's, or one CREATE INDEX made.
@@ -766,8 +932,8 @@ fn owns(v: &View, name: &str) -> Result<bool> {
 /// Whether a CLUSTER has to run outside a transaction block, as Postgres's does when it clusters several tables:
 /// without a table (every one clustered before), or of a partitioned table.
 /// What a REINDEX that can't run inside a transaction block is called in the error, as Postgres has it: one of a
-/// schema (`REINDEX SCHEMA`), or of a partitioned table or its index (each partition's is rebuilt in a transaction
-/// of its own: `REINDEX TABLE`, `REINDEX INDEX`). None: it may.
+/// schema or the database (`REINDEX SCHEMA`, `REINDEX DATABASE`), or of a partitioned table or its index (each
+/// partition's is rebuilt in a transaction of its own: `REINDEX TABLE`, `REINDEX INDEX`). None: it may.
 pub(super) fn reindex_alone(db: &Db, branch: &str, m: &Maintain) -> Result<Option<&'static str>> {
     if m.verb != Verb::Reindex {
         return Ok(None);
@@ -775,6 +941,7 @@ pub(super) fn reindex_alone(db: &Db, branch: &str, m: &Maintain) -> Result<Optio
     let cat = Catalog::of(&db.core, branch)?;
     Ok(match m.targets.first() {
         Some(Target::Schema(_)) => Some("REINDEX SCHEMA"),
+        Some(Target::Database) => Some("REINDEX DATABASE"),
         Some(Target::Rel(name, _)) => {
             matches!(find_rel(&cat, name), Ok(Some((_, r))) if r.kind == 'p').then_some("REINDEX TABLE")
         }
@@ -1017,6 +1184,22 @@ pub(super) fn comment(db: &Db, branch: &str, c: &Comment) -> Result<Output> {
         }
         Commented::Column(table, column) => {
             let cat = Catalog::of(&db.core, branch)?;
+            // (a composite type's attribute is a column of the type's relation)
+            let stored = text_named(table, Kind::Type);
+            let composite = (cat.enums.iter().position(|(n, _)| *n == stored))
+                .filter(|&k| cat.composites.get(k).is_some_and(Option::is_some));
+            if composite.is_some() && cat.named(table)?.is_none() {
+                if cat.composite_attnum(&stored, column).is_none() {
+                    return Err(no_column(column, &stored));
+                }
+                comments::set(
+                    db,
+                    branch,
+                    &format!("column/{stored}/{column}"),
+                    c.text.as_deref().filter(|t| !t.is_empty()),
+                )?;
+                return Ok(Output::tag("COMMENT"));
+            }
             match find_rel(&cat, table)? {
                 Some((_, r)) if !r.columns.iter().any(|c| c.0 == *column) => return Err(no_column(column, &r.name)),
                 Some((_, r)) => Some(format!("column/{}/{column}", r.name)),
@@ -1049,6 +1232,22 @@ pub(super) fn comment(db: &Db, branch: &str, c: &Comment) -> Result<Output> {
             }
             return Ok(Output::tag("COMMENT"));
         }
+        // (its text isn't kept either: triggers have no comments here)
+        Commented::Trigger(name, table) => {
+            let v = db.view_tx(branch)?;
+            let found = match load(&v, table)? {
+                Some(t) => t.triggers.iter().any(|x| x.name == *name),
+                // (a view's INSTEAD OF and statement triggers are kept as its rules: see `rules::view_triggers`)
+                None if view_def(&v, table)?.is_some() => {
+                    super::rules::view_triggers(&v, table)?.iter().any(|x| x.name == *name)
+                }
+                None => return err(NO_TABLE, format!("relation \"{}\" does not exist", rel_part(table))),
+            };
+            if !found {
+                return err("42704", format!("trigger \"{name}\" for table \"{}\" does not exist", rel_part(table)));
+            }
+            return Ok(Output::tag("COMMENT"));
+        }
         Commented::DomainConstraint(name, domain) => {
             let v = db.view_tx(branch)?;
             let j: Json = match v.get(&type_key(domain))? {
@@ -1061,11 +1260,12 @@ pub(super) fn comment(db: &Db, branch: &str, c: &Comment) -> Result<Output> {
             // its constraints: those CREATE DOMAIN named, and those ALTER DOMAIN ... ADD did
             let given = j["domain"]["constraint_names"].as_array().into_iter().flatten().filter_map(|n| n.as_str());
             let added = j["domain"]["named"].as_array().into_iter().flatten().filter_map(|n| n[0].as_str());
-            if !given.chain(added).any(|n| n == name.as_str()) {
+            // (one CREATE DOMAIN made without naming it is named `<domain>_check`, ...: see `domain::own_constraints`)
+            let (_, own) = super::domain::own_constraints(&j["domain"], domain);
+            if !given.chain(added).any(|n| n == name.as_str()) && !own.iter().any(|(n, _)| n == name) {
                 return err("42704", format!("constraint \"{name}\" for domain {} does not exist", shown_type(domain)));
             }
-            // (its text isn't kept: there is no row for a domain's constraint to keep it on)
-            return Ok(Output::tag("COMMENT"));
+            Some(format!("domain constraint/{domain}/{name}"))
         }
         Commented::LargeObject(oid) => {
             if !super::largeobj::exists_in(&db.view_tx(branch)?, *oid)? {

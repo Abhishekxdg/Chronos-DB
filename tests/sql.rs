@@ -2057,6 +2057,38 @@ fn insert_select() {
     assert_eq!(rows(&sql(&db, "select name from archive order by id")), ["Ada!", "Alan!", "Grace!", "Linus!"]);
 }
 
+/// A column's size is part of its type: DIFF names a change from varchar(5) to varchar(10), from
+/// numeric(10,2) to numeric(12,2) or from integer to smallint, and DIFF AS SQL carries it.
+#[test]
+fn diff_type_sizes() {
+    let db = Db::new();
+    sql(&db, "create table t (id int primary key, v varchar(5), n numeric(10,2), s int, w text)");
+    sql(&db, "insert into t values (1, 'abc', 1.5, 2, 'x')");
+    db.fork(MAIN, "x").unwrap();
+    let on = |b: &str, q: &str| run(&db, b, q, &[]).unwrap_or_else(|e| panic!("{q}: {e}")).pop().unwrap();
+    on("x", "alter table t alter column v type varchar(10)");
+    on("x", "alter table t alter column n type numeric(12,2)");
+    on("x", "alter table t alter column s type smallint");
+    on("x", "alter table t alter column w type varchar(20)");
+    let d = on("x", "diff world x");
+    let cols: Vec<String> = d.rows.iter().filter(|r| r[2].to_text() == "alter table").map(|r| r[5].to_text()).collect();
+    assert_eq!(
+        cols,
+        [
+            r#"["v: varchar(5) -> varchar(10)", "n: numeric(10,2) -> numeric(12,2)", "s: integer -> smallint", "w: text -> varchar(20)"]"#
+        ]
+    );
+    // run on a copy of main, the statements give x's types
+    let stmts: Vec<String> = on("x", "diff world x as sql").rows.iter().map(|r| r[0].to_text()).collect();
+    db.fork(MAIN, "y").unwrap();
+    for q in &stmts {
+        on("y", q);
+    }
+    let types = "select column_name, data_type, character_maximum_length, numeric_precision, numeric_scale \
+                 from information_schema.columns where table_name = 't' order by ordinal_position";
+    assert_eq!(rows(&on("y", types)), rows(&on("x", types)), "{}", stmts.join("\n"));
+}
+
 /// DIFF shows the columns each row changed and changes to tables themselves; DIFF AS SQL gives
 /// statements that, run on the world the diff starts from, make it equal to the one it ends at.
 #[test]
@@ -2155,7 +2187,9 @@ fn show_metrics() {
             "worlds"
         ]
         .map(get),
-        ["10", "2", "1", "1", "1", "1", "1", "1", "5", "1", "1"],
+        // (rows_written: CREATE TABLE's row and the row keeping when the table was made, two inserted, one updated,
+        // one deleted)
+        ["10", "2", "1", "1", "1", "1", "1", "1", "6", "1", "1"],
         "BEGIN's own world is no fork, and its COMMIT is a commit, not a merge"
     );
     let select = out.rows.iter().find(|r| r[0].to_text() == "select").unwrap();

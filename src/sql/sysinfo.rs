@@ -516,18 +516,25 @@ fn pages(bytes: i64, fill: f64) -> i64 {
 /// a tuple header each), and each index's entries. Chronos keeps rows and index entries as small
 /// rows of a tree, so the numbers are estimates in Postgres's units, from what is stored.
 fn relation_size(ctx: &Ctx, what: &str, a: &[Value]) -> Result<Value> {
-    if a[0] == Value::Null {
+    // (strict, as Postgres's: a NULL fork too gives NULL, not an invalid fork name)
+    if a.contains(&Value::Null) {
         return Ok(Value::Null);
     }
+    // (an oid that names no relation is NULL before the fork's name is read, as Postgres gives NULL for one dropped
+    // while a catalog scan reads it; a name that names none is regclass's error)
+    let Some(shown) = catalog::rel_shown(&a[0])? else {
+        let oid = matches!(a[0], Value::Int(_) | Value::Reg(..)) || a[0].to_text().trim().parse::<i64>().is_ok();
+        if oid {
+            return Ok(Value::Null);
+        }
+        return err(NO_TABLE, format!("relation \"{}\" does not exist", a[0].to_text()));
+    };
     if let Some(fork) = a.get(1) {
         let fork = fork.to_text();
         if !matches!(fork.as_str(), "main" | "fsm" | "vm" | "init") {
             return err("22023", format!("invalid fork name: \"{fork}\""));
         }
     }
-    let Some(shown) = catalog::rel_shown(&a[0])? else {
-        return err(NO_TABLE, format!("relation \"{}\" does not exist", a[0].to_text()));
-    };
     let v = ctx.core.view_tx(&ctx.world)?;
     let name = text_rel(&shown);
     // how many entries there are under a prefix, and the bytes of them (and of their keys)

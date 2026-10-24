@@ -211,7 +211,7 @@ A merge conflict gives the rows (each with `key`, `base`, `ours`, `theirs` and `
 |---|---|
 | 400 | bad input: a body that isn't JSON or lacks a field, an invalid value; merging `main`; for `sql`, any SQLSTATE not listed below (including 40001 and 57014) |
 | 401 | missing or wrong token (a token no agent has, or a disabled or dropped agent's) |
-| 403 | an agent or safe mode's guest may not (42501); `_sonos` tables; `/metrics` with an agent's token; any request with an `Origin` header (browsers); without a server token, a `Host` that isn't loopback |
+| 403 | an agent or the guest (a client with the server token) may not (42501); `_sonos` tables; `/metrics` with an agent's token, `merge_outcomes` with any but the admin token; any request with an `Origin` header (browsers); without a server token, a `Host` that isn't loopback |
 | 404 | no such world or row; for `sql`, 3D000 and 42P01; an unknown endpoint or operation |
 | 405 | not `POST` (only `/v1/health` and `/metrics` take `GET`) |
 | 409 | merge conflicts; a world that already exists or has forks; a stale world (55000); a constraint violation (23xxx) |

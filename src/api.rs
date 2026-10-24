@@ -7,8 +7,10 @@
 //! or row, 409 conflicts (merge conflicts come back as data), 500 storage.
 //!
 //! Listens on 127.0.0.1:7070 by default. Any other address needs a token (`--token` or
-//! CHRONOS_TOKEN), sent as `Authorization: Bearer <token>`. With `--safe`, a client without an
-//! agent's token acts as the guest agent (see `chronos::GUEST`) unless it sends the admin token.
+//! CHRONOS_TOKEN), sent as `Authorization: Bearer <token>`. A client that sends it, or no token on
+//! a server with an admin token, acts as the guest agent (see `chronos::GUEST`, `crate::Mode`);
+//! the admin token is the database's own user, and so is any client of a server with no token at
+//! all (loopback only), or with `--unsafe` the server's token.
 //! HTTPS with `--tls-cert` and `--tls-key` (see `tls`). Web pages are refused (see `admit`).
 //! ponytail: one shared database, no per-client limits.
 
@@ -89,6 +91,9 @@ pub fn serve(db: &Arc<Db>, listen: &str, auth: &crate::Auth, tls: Option<Arc<Ser
     http::serve(&l, tls, MAX_BODY, &headers, &|req| admit(db, auth, req).map_err(|e| reply(Err(e))), &|req, who| {
         if req.path == "/mcp" {
             return mcp(db, auth, req, who);
+        }
+        if let Some(op) = req.path.strip_prefix("/studio/api/") {
+            return studio(db, auth, req, who, op);
         }
         reply(handle(db, auth, req, who))
     });
@@ -185,12 +190,12 @@ fn handle(db: &Db, auth: &crate::Auth, req: &http::Request, (agent, admin): Who)
     if path == "/v1/health" {
         return Ok(json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }));
     }
-    // safe mode: only the admin token (or an agent's) gets past the guest's rights
-    let agent = if auth.safe && agent.is_none() && !admin { Some(chronos::GUEST.to_string()) } else { agent };
+    // the guest's rights, unless an agent's token or the admin token was sent (see `crate::Mode`)
+    let agent = if agent.is_none() && auth.guest(admin) { Some(chronos::GUEST.to_string()) } else { agent };
     if path == "/metrics" {
         // the guest may read them: its `read` right already gives it SHOW METRICS
         if agent.as_deref().is_some_and(|a| a != chronos::GUEST) {
-            return Err(fail(403, "metrics are for the server's token, not an agent's"));
+            return Err(fail(403, "metrics are for the server's or the admin token, not an agent's"));
         }
         let mut counters = db.counters();
         // client connections open now (HTTP and Postgres), not counting this one
@@ -213,9 +218,52 @@ fn handle(db: &Db, auth: &crate::Auth, req: &http::Request, (agent, admin): Who)
     }
 }
 
+/// `POST /studio/api/<op>`: the Studio's calls (the `/v1` ops, plus `tables`, `status`, `sessions`; see `studio`) over
+/// the server's own port, for a service that hosts the Studio's page itself (Chronos Cloud's dashboard). Off unless
+/// `--studio-api`, and then only with the admin token: it acts as the database's owner, so the caller is the one that
+/// decides which person may use it. A Studio call that names a path on this machine (`backup`) is refused by `studio`.
+fn studio(db: &Arc<Db>, auth: &crate::Auth, req: &http::Request, (_, admin): Who, op: &str) -> http::Response {
+    let json = |status, v: Value| http::Response {
+        status,
+        content_type: "application/json",
+        body: v.to_string().into_bytes(),
+        headers: String::new(),
+    };
+    if !auth.studio_api {
+        return json(404, json!({ "error": "the Studio API is off: serve with --studio-api" }));
+    }
+    if !admin {
+        return json(
+            403,
+            json!({ "error": "the Studio API takes the admin token: Authorization: Bearer <admin token>" }),
+        );
+    }
+    if req.method != "POST" {
+        return json(405, json!({ "error": format!("use POST /studio/api/{op} with a JSON body") }));
+    }
+    if op.is_empty() || op.contains('/') {
+        return json(404, json!({ "error": format!("no such Studio call {op:?}") }));
+    }
+    let args: Value = match std::str::from_utf8(&req.body) {
+        Ok(b) if b.trim().is_empty() => json!({}),
+        Ok(b) => match serde_json::from_str(b) {
+            Ok(v) => v,
+            Err(e) => return json(400, json!({ "error": format!("body is not JSON: {e}") })),
+        },
+        Err(_) => return json(400, json!({ "error": "the body must be UTF-8 JSON" })),
+    };
+    // the page asks who it is before anything else (as the keyed Studio answers it: it has the owner's key)
+    if op == "whoami" {
+        return json(200, json!({ "mode": "key", "user": null }));
+    }
+    let (status, body) = crate::studio::serve_line(db, &json!({ "op": op, "args": args }));
+    json(status, body)
+}
+
 /// `POST /mcp`: the MCP tools over HTTP (see `crate::mcp::http`), only ever as an agent: the one whose token came
-/// with the request, or the guest under `--safe`. The server's token is refused: an MCP client acting as the
-/// database's own user is `chronos mcp <folder>` on its machine, where the OS says who started it.
+/// with the request, or the guest (a client the server's token lets in, see `crate::Mode`). The admin token, and the
+/// server's with `--unsafe`, are refused: an MCP client acting as the database's own user is `chronos mcp <folder>`
+/// on its machine, where the OS says who started it.
 fn mcp(db: &Arc<Db>, auth: &crate::Auth, req: &http::Request, (agent, admin): Who) -> http::Response {
     let json = |status, v: Value| http::Response {
         status,
@@ -223,7 +271,7 @@ fn mcp(db: &Arc<Db>, auth: &crate::Auth, req: &http::Request, (agent, admin): Wh
         body: v.to_string().into_bytes(),
         headers: String::new(),
     };
-    let agent = if auth.safe && agent.is_none() && !admin { Some(chronos::GUEST.to_string()) } else { agent };
+    let agent = if agent.is_none() && auth.guest(admin) { Some(chronos::GUEST.to_string()) } else { agent };
     if req.method != "POST" {
         return json(
             405,
@@ -253,7 +301,14 @@ pub fn call_as(db: &Db, me: &chronos::Acting, op: &str, a: &Value) -> Result<Val
     let branch = s("branch").unwrap_or(chronos::MAIN);
     let _slot = if op == "sql" { None } else { db.slot(&me.agent)? }; // SQL takes one per statement
     match op {
-        "get" | "find" | "world" | "branches" | "worlds" | "history" | "diff" | "check_reads" => me.may_read(branch)?,
+        "get" | "find" | "world" | "branches" | "worlds" => me.may_read(branch)?,
+        "history" | "check_reads" => me.may_see_changes(branch)?,
+        "diff" => {
+            me.may_see_changes(branch)?;
+            if let Some(to) = s("to") {
+                me.may_see_changes(to)?;
+            }
+        }
         "put" | "delete" => me.may_write(branch, 1)?,
         "batch" => me.may_write(branch, a.get("rows").and_then(Value::as_array).map_or(0, Vec::len))?,
         "fork" => {
@@ -262,7 +317,7 @@ pub fn call_as(db: &Db, me: &chronos::Acting, op: &str, a: &Value) -> Result<Val
             let w = me.fork(from, name, a.get("meta").cloned().unwrap_or(Value::Null))?;
             return Ok(json!({ "ok": true, "world": world(&w) }));
         }
-        "merge" if a.get("dry_run").and_then(Value::as_bool) == Some(true) => me.may_read(branch)?,
+        "merge" if a.get("dry_run").and_then(Value::as_bool) == Some(true) => me.may_see_changes(branch)?,
         "merge" => match s("into") {
             Some(into) => me.may_merge_into(branch, into)?,
             None => me.may_merge(branch)?,
@@ -274,8 +329,10 @@ pub fn call_as(db: &Db, me: &chronos::Acting, op: &str, a: &Value) -> Result<Val
         "review" => {} // checked as it runs: the policy's reviewer, or an admin
         "sql" => return run_sql(db, a, Some(&me.agent.name)),
         "simulate" | "replay" => return simulate(db, op, a, Some(&me.agent.name)), // checked as it runs
-        // every agent's results, as /metrics are: the server's token only
-        "merge_outcomes" => return Err(fail(403, "merge outcomes are for the server's token, not an agent's")),
+        // every agent's results: the database's own user only (the admin token, or the server's with --unsafe)
+        "merge_outcomes" => {
+            return Err(fail(403, "merge outcomes are for the database's own user (the admin token), not an agent's"));
+        }
         _ => me.may_admin()?,
     }
     row_security(db, Some(&me.agent.name), op, a)?;
@@ -310,8 +367,13 @@ pub fn row_security(db: &Db, agent: Option<&str>, op: &str, a: &Value) -> Result
         _ => return Ok(()),
     };
     let names: Vec<&str> = tables.iter().map(String::as_str).collect();
+    let rows_as_they_are = !matches!(op, "diff" | "merge");
     for w in worlds {
         let refused = match agent {
+            Some(agent) if rows_as_they_are => match sql::tenant_refuses(db, agent, w, &names) {
+                Ok(None) => sql::row_security_refuses(db, agent, w, &names),
+                other => other,
+            },
             Some(agent) => sql::row_security_refuses(db, agent, w, &names),
             None => sql::masks_refuse(db, w, &names),
         };
@@ -330,6 +392,7 @@ fn run_sql(db: &Db, a: &Value, agent: Option<&str>) -> Result<Value, Fail> {
     // an agent's statements are checked one by one, as over the Postgres port
     let mut session = crate::Closing(sql::Session::new(branch), db); // closed however this ends
     session.0.agent = agent.map(String::from);
+    session.0.remote = true; // a client of the server: main's protection stays on for it
     session.0.client = Some(agent.unwrap_or("http").to_string()); // its reads are recorded (see `chronos::Read`)
     sql_in(db, a, session)
 }
@@ -341,6 +404,7 @@ pub fn run_sql_as_role(db: &Db, a: &Value, role: &str) -> Result<Value, Fail> {
     private_worlds(db, a)?;
     let branch = a.get("branch").and_then(Value::as_str).unwrap_or(chronos::MAIN);
     let mut session = crate::Closing(sql::Session::new(branch), db);
+    session.0.remote = true; // signed in over the network
     session.0.user = Some(role.to_string()); // current_user, session_user
     session.0.client = Some(role.to_string());
     session.0.log_in(db, role).and_then(|()| session.0.may_connect(db)).map_err(sql_fail)?;
@@ -498,7 +562,8 @@ fn agent(a: &chronos::Agent) -> Value {
         "name": a.name, "id": a.id, "can": a.can.iter().map(|c| c.name()).collect::<Vec<_>>(),
         "max_worlds": a.max_worlds, "writes_per_minute": a.writes_per_minute, "max_changes": a.max_changes,
         "world_ttl": a.world_ttl, "max_query_ms": a.max_query_ms, "max_concurrent": a.max_concurrent,
-        "max_memory_mb": a.max_memory_mb, "max_idle_ms": a.max_idle_ms, "created": a.created, "disabled": a.disabled, "policy": a.policy,
+        "max_memory_mb": a.max_memory_mb, "max_idle_ms": a.max_idle_ms, "max_threads": a.max_threads, "created": a.created, "disabled": a.disabled, "policy": a.policy,
+        "tenant": a.tenant_sql(), "expires": (a.expires > 0).then_some(a.expires),
         // made before agents had SCRAM verifiers: one login over HTTP with its token makes it one (see `admit`)
         "needs_http_login": a.verifier().is_none(),
     })
@@ -532,8 +597,11 @@ fn agent_spec(a: &Value) -> Result<chronos::AgentSpec, Fail> {
         max_concurrent: num("max_concurrent"),
         max_memory_mb: num("max_memory_mb"),
         max_idle_ms: num("max_idle_ms"),
+        max_threads: num("max_threads"),
         disabled: a.get("disabled").and_then(Value::as_bool),
         policy,
+        tenant: a.get("tenant").cloned(),
+        valid_for: num("valid_for"),
     })
 }
 
@@ -740,6 +808,29 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
             let at = db.checkpoint_world(need("branch")?, need("name")?)?;
             Ok(json!({ "ok": true, "at": at }))
         }
+        // a folder attached to Postgres: main takes Postgres's rows as they are now (see chronos::attach::refresh)
+        "refresh" => match db.attached() {
+            None => Err(fail(409, "this folder isn't attached to Postgres (chronos attach makes one that is)")),
+            Some(_) => chronos::attach::refresh(db).map(|r| r.to_json()).map_err(|e| fail(502, e)),
+        },
+        // what the folder is attached to, and how old main's rows are (no secret)
+        "attached" => Ok(match db.attached() {
+            None => json!({ "attached": false }),
+            Some(att) => json!({
+                "attached": true,
+                "source": att.source(),
+                "copied_at": att.at,
+                "refreshed_at": att.refreshed_at(),
+                "as_of": att.as_of(),
+                "pending": att.pending(),
+                "tables": att.tables().iter().map(|t| json!({
+                    "name": t.name,
+                    "postgres": t.pg,
+                    "key": t.key.iter().map(|&i| t.cols[i].name.clone()).collect::<Vec<_>>(),
+                    "columns": t.cols.iter().map(|c| json!({"name": c.name, "type": c.ty})).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            }),
+        }),
         "review" => {
             let verdict = match need("verdict")? {
                 "approve" => chronos::Verdict::Approve,
@@ -976,6 +1067,7 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                             "key": chronos::sql::show_key(&p.key), "outcome": p.outcome, "detail": p.detail, "delete": deletes(p),
                             "base": p.base.as_deref().map(row), "ours": p.ours.as_deref().map(row),
                             "theirs": p.theirs.as_deref().map(row), "result": p.result.as_deref().map(row),
+                            "columns": p.columns.as_ref().map(chronos::sql::column_changes),
                         })
                     })
                     .collect();

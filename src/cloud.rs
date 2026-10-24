@@ -3,7 +3,7 @@
 //!   chronos init                     in a project folder: sign in if needed, find or make the project's
 //!                                    database, and write .chronos/project.json, .mcp.json, .env and the
 //!                                    CLAUDE.md (and AGENTS.md) block. Safe to run again
-//!   chronos cloud login | logout     sign in with GitHub (device flow), or forget the API key
+//!   chronos cloud login | logout     sign in (a code you approve in the browser), or forget the API key
 //!   chronos cloud list               your org's projects and their databases
 //!   chronos cloud usage              this folder's project: disk, worlds, egress, awake time, against the plan
 //!   chronos cloud production on|off  this folder's project in production: agents' worlds wait for a person to
@@ -34,7 +34,7 @@ const MAX_REPLY: usize = 16 << 20;
 pub(crate) fn help() -> &'static str {
     "usage: chronos init [--no-open]        in a project folder: sign in if needed, find or make its Chronos Cloud database,
                                       and write .chronos/project.json, .mcp.json, .env and the CLAUDE.md block
-       chronos cloud login [--no-open]   sign in with GitHub (prints a code to enter in the browser)
+       chronos cloud login [--no-open]   sign in (prints a code to approve in the browser)
        chronos cloud logout              forget the API key kept in ~/.config/chronos/cloud.toml
        chronos cloud list                your org's projects and their databases
        chronos cloud usage               this folder's project: disk, worlds, egress, awake time, against the plan
@@ -325,6 +325,11 @@ impl Api {
     fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<(u16, Value), String> {
         let url = format!("{}{path}", self.base);
         let (status, raw) = send(method, &url, self.key.as_deref(), body).map_err(|e| {
+            // a read timeout is WouldBlock on macOS ("Resource temporarily unavailable") and TimedOut on Linux
+            let e = match e.kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => "no answer within 30 seconds".to_string(),
+                _ => e.to_string(),
+            };
             format!(
                 "can't reach the Chronos Cloud API at {}: {e} (check the network; CHRONOS_CLOUD_API sets another address)",
                 self.base
@@ -382,7 +387,8 @@ fn signed_in(config: &Config) -> Result<Api, String> {
 
 // ---- signing in --------------------------------------------------------------------------------
 
-/// GitHub's device flow through the API: print the code, open the browser, poll until it's entered.
+/// The device flow through the API: print the code, open the browser, poll until it's approved. A poll that gets
+/// no answer (a slow network, the API restarting) is tried again until the code expires.
 /// Saves the API key and the API's address it came from; returns the key.
 fn login(config: &mut Config, no_open: bool) -> Result<String, String> {
     let api = Api { base: config.api(), key: None };
@@ -404,7 +410,15 @@ fn login(config: &mut Config, no_open: bool) -> Result<String, String> {
     let until = Instant::now() + Duration::from_secs(expires);
     loop {
         std::thread::sleep(Duration::from_secs(interval));
-        let (status, body) = api.call("POST", "/v1/auth/device/poll", Some(&json!({ "device_code": device_code })))?;
+        let (status, body) =
+            match api.call("POST", "/v1/auth/device/poll", Some(&json!({ "device_code": device_code }))) {
+                Ok(r) => r,
+                Err(e) if Instant::now() < until => {
+                    eprintln!("chronos: {e}; trying again");
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
         match status {
             200 => {
                 let key = body.get("api_key").and_then(Value::as_str).unwrap_or("");

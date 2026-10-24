@@ -17659,6 +17659,8 @@ fn alter_table_through_hierarchies() {
 #[test]
 fn explain_costs_off_partition_pruning() {
     check_text(&[&[
+        // (the plan PostgreSQL would choose, as Chronos shows it when asked; Postgres takes the custom setting too)
+        "set chronos.explain = postgres",
         "create table ep_lp (a char) partition by list (a)",
         "create table ep_lp_default partition of ep_lp default",
         "create table ep_lp_ef partition of ep_lp for values in ('e', 'f')",
@@ -17752,6 +17754,8 @@ fn explain_costs_off_partition_pruning() {
 #[test]
 fn explain_costs_off_single_table_plans() {
     check_text(&[&[
+        // (the plan PostgreSQL would choose, as Chronos shows it when asked; Postgres takes the custom setting too)
+        "set chronos.explain = postgres",
         "create table ep_t (a int, b text, c numeric)",
         "explain (costs off) select 1",
         "explain (costs off) select * from ep_t",

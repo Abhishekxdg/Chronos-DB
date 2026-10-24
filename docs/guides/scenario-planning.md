@@ -9,7 +9,7 @@ The whole script is [examples/guides/scenario-planning.sql](https://github.com/A
 ## Setup
 
 ```bash
-chronos serve plandb
+CHRONOS_PROTECT_MAIN=off chronos serve plandb   # the setup below writes main directly
 psql -v ON_ERROR_STOP=1 -f examples/guides/scenario-planning.sql postgres://127.0.0.1:5433/main
 ```
 

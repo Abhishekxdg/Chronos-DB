@@ -243,6 +243,15 @@ fn time_travel_in_sql() {
     let mut old = Session::new(&past);
     assert_eq!(rows(&old.run(&db, "select count(*) from t", &[]).unwrap().pop().unwrap()), ["2"]);
     assert_eq!(old.run(&db, "insert into t values (9, 'x')", &[]).unwrap_err().code, "25006");
+    // ... or switch a session there and back, as the docs say: USE WORLD 'main@when'
+    let mut sw = Session::new(MAIN);
+    assert_eq!(sw.run(&db, &format!("use world '{past}'"), &[]).unwrap().pop().unwrap().tag, "SWITCH WORLD");
+    assert_eq!(rows(&sw.run(&db, "select count(*) from t", &[]).unwrap().pop().unwrap()), ["2"]);
+    assert_eq!(sw.run(&db, "insert into t values (9, 'x')", &[]).unwrap_err().code, "25006");
+    assert_eq!(sw.run(&db, "use world 'nope@-1 minute'", &[]).unwrap_err().code, "3D000");
+    assert_eq!(sw.run(&db, "use world 'main@not a time'", &[]).unwrap_err().code, "22023");
+    sw.run(&db, "switch world main", &[]).unwrap();
+    assert_eq!(rows(&sw.run(&db, "select count(*) from t", &[]).unwrap().pop().unwrap()), ["2"]);
 
     q("alter system set history_retention = '7 days'", &[]);
     assert_eq!(rows(&q("show history_retention", &[])), ["7 days"]);

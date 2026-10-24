@@ -12,9 +12,12 @@
 //! that has a password proves it knows it with SCRAM, or MD5 when it is an md5 hash, on loopback
 //! too. Any other name proves with SCRAM that it knows the server's token (or the admin token);
 //! without a server token (loopback only) it needs no password. With a server token, every name
-//! gets a SCRAM salt of its own, so the exchange doesn't tell which names exist. With `--safe`, a
-//! client that isn't an agent connects as the guest agent (see `chronos::GUEST`) unless its
-//! password is the admin token.
+//! gets a SCRAM salt of its own, so the exchange doesn't tell which names exist. A client that
+//! isn't an agent and proved the server's token (or, with an admin token configured, nothing) is
+//! the guest agent (see `chronos::GUEST`, `crate::Mode`); one that proved the admin token is the
+//! database's own user, as is every client of a server with no token at all, or with `--unsafe`
+//! one that proved the server's token. A role that proved its own password is that role, never
+//! the guest.
 //! psql's \d, \dt and \l work: their catalog queries are recognised and answered from Chronos's
 //! tables and branches (see `catalog`).
 //! With `--tls-cert` and `--tls-key` every connection must use TLS (psql's default, sslmode=prefer,
@@ -269,6 +272,7 @@ pub fn serve(db: &Db, listen: &str, auth: &crate::Auth, tls: Option<crate::tls::
         let login = Arc::new(login);
         login_deadline(&login); // and the whole login gets that long too
         let mut session = Session::new(chronos::MAIN);
+        session.remote = true; // a client of the server: main's protection stays on for it
         session.gone = Some(Arc::new(peer_gone(sock.clone())));
         let wake = wake_pipe().map(|(r, w)| {
             session.inbox.on_notify(move || {
@@ -910,7 +914,8 @@ impl Conn<'_> {
         // that it knows the admin or the server's token. A role without a password where the server
         // has a token goes through SCRAM doomed, as Postgres does: 28P01. Without a server token
         // (loopback only) other names need no password, and with only an admin token any cleartext
-        // password goes, the admin token lifting `--safe`. An agent with a role of its name logs in
+        // password goes, the admin token alone making the client the database's own user (see
+        // `crate::Mode`). An agent with a role of its name logs in
         // as the agent (the role lends it its privileges, see `roles::who`, not its password).
         let user = opts.get("user").cloned().unwrap_or_default();
         let agent = if user == chronos::GUEST { None } else { self.db.agent(&user).ok() };
@@ -923,6 +928,10 @@ impl Conn<'_> {
         let mock = tokens.mock(&user);
         let doomed = || Proof::Scram { secrets: vec![mock.clone()], doomed: true, tokens: false };
         let expired = !is_agent && matches!(kept, Some((_, true)));
+        // a role that proves its own password is that role, with the privileges it was given, never the guest: its
+        // password is a credential the database's own user made on purpose (an agent, or a name that proves a token,
+        // is what the guest stands in for)
+        let role_login = !is_agent && matches!(&kept, Some((Some(_), false)));
         let proof = match (&agent, kept) {
             // a disabled agent's exchange is doomed, as a wrong token's
             (Some(a), _) => match a.verifier() {
@@ -1044,8 +1053,8 @@ impl Conn<'_> {
             Some(app) => format!("{role} ({app})"),
             None => role.to_string(),
         });
-        if auth.safe && !admin && self.session.agent.is_none() {
-            self.session.agent = Some(chronos::GUEST.into()); // safe mode: the guest's rights
+        if self.session.agent.is_none() && !role_login && auth.guest(admin) {
+            self.session.agent = Some(chronos::GUEST.into()); // the guest's rights (see `crate::Mode`)
         }
         // psql connects to a database named after the user unless told otherwise: that means main
         self.session.branch = match opts.get("database").cloned().unwrap_or_default() {
@@ -1562,6 +1571,9 @@ impl Conn<'_> {
             let comments = sql::comments(self.db, self.session.target())?;
             let oids = sql::relation_oids(&tables.iter().map(|t| t.name.clone()).collect::<Vec<_>>());
             let by_oid = || oid.and_then(|o| oids.iter().position(|x| *x == o as i64)).and_then(|i| tables.get(i));
+            // a per-relation query of one of `tables`; another's (an index's, a composite type's) is the engine's to
+            // answer from its catalog, which has the same oids
+            let rel = by_oid().is_some();
             // (\dn and \dn+ are the engine's to answer, from pg_namespace: owners and privileges)
             Ok(Some(if q.contains("FROM pg_catalog.pg_database d") && !q.contains("\"Size\"") {
                 let cols = [
@@ -1729,16 +1741,10 @@ impl Conn<'_> {
                     out(&cols, rows)
                 }
             } else if q.contains("SELECT c.oid,") && q.contains("n.nspname,") {
-                let rows = tables
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, t)| matches(&t.name))
-                    .map(|(i, t)| {
-                        vec![text(&oids[i].to_string()), text(sql::schema_part(&t.name)), text(sql::rel_part(&t.name))]
-                    })
-                    .collect();
-                out(&["oid", "nspname", "relname"], rows)
-            } else if oid.is_some() && q.contains("c.relchecks, c.relkind") {
+                // \d's lookup of what a pattern names: every relation pg_class has (indexes, partitioned indexes and
+                // composite types too), as the engine answers it
+                return Ok(None);
+            } else if rel && q.contains("c.relchecks, c.relkind") {
                 let rows = by_oid()
                     .map(|t| {
                         let indexed = !t.indexes.is_empty();
@@ -1760,7 +1766,8 @@ impl Conn<'_> {
                         r.extend([
                             bool(t.hier.of.is_some()),
                             text(&opts),
-                            text("0"),
+                            // (its tablespace, 0 for the database's default: psql's "Tablespace:" footer)
+                            text(&t.hier.tablespace.to_string()),
                             // (a typed table's composite type, as regtype names it)
                             text(&t.hier.of_type.as_deref().map(sql::shown_type).unwrap_or_default()),
                             text(if t.unlogged { "u" } else { "p" }),
@@ -1790,10 +1797,7 @@ impl Conn<'_> {
                     "amname",
                 ];
                 out(&cols, rows)
-            } else if oid.is_some()
-                && q.contains("FROM pg_catalog.pg_attribute a")
-                && q.contains("WHERE a.attrelid = '")
-            {
+            } else if rel && q.contains("FROM pg_catalog.pg_attribute a") && q.contains("WHERE a.attrelid = '") {
                 let verbose = q.contains("a.attstorage"); // \d+ asks for storage and descriptions too
                 // (psql 14 and later also ask for the compression method and the statistics target)
                 let compressed = q.contains("a.attcompression");
@@ -1888,7 +1892,7 @@ impl Conn<'_> {
                     cols.push("col_description");
                 }
                 out(&cols, rows)
-            } else if oid.is_some() && q.contains("pg_catalog.pg_class c2, pg_catalog.pg_index i") {
+            } else if rel && q.contains("pg_catalog.pg_class c2, pg_catalog.pg_index i") {
                 // the primary key first, then the others by name
                 let mut rows = vec![];
                 if let Some(t) = by_oid() {
@@ -1929,7 +1933,8 @@ impl Conn<'_> {
                             con.map_or(Value::Null, |c| bool(c.defer.0)),
                             con.map_or(Value::Null, |c| bool(c.defer.1)),
                             bool(x.replident),
-                            text("0"),
+                            // (each index's tablespace: `, tablespace "t"` after it)
+                            text(&x.tablespace.to_string()),
                         ]);
                     }
                 }
@@ -1948,13 +1953,13 @@ impl Conn<'_> {
                     "reltablespace",
                 ];
                 out(&cols, rows)
-            } else if oid.is_some() && q.contains("r.contype = 'f'") && q.contains("r.conrelid = '") {
+            } else if rel && q.contains("r.contype = 'f'") && q.contains("r.conrelid = '") {
                 let rows = by_oid()
                     .map(|t| t.fks.iter().map(|(n, def)| vec![bool(true), text(n), text(def), text(&t.name)]).collect())
                     .unwrap_or_default();
                 out(&["sametable", "conname", "condef", "ontable"], rows)
             // (a partition's foreign keys are its own and those of the tables it is a partition of)
-            } else if oid.is_some() && q.contains("conrelid = relid") && q.contains("pg_partition_ancestors") {
+            } else if rel && q.contains("conrelid = relid") && q.contains("pg_partition_ancestors") {
                 let mut rows: Vec<(bool, String, String, String)> = vec![];
                 if let Some(t) = by_oid() {
                     let mut chain = vec![t];
@@ -1973,7 +1978,7 @@ impl Conn<'_> {
                 rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
                 let rows = rows.into_iter().map(|(s, n, d, o)| vec![bool(s), text(&n), text(&d), text(&o)]).collect();
                 out(&["sametable", "conname", "condef", "ontable"], rows)
-            } else if oid.is_some() && q.contains("confrelid IN") && q.contains("pg_partition_ancestors") {
+            } else if rel && q.contains("confrelid IN") && q.contains("pg_partition_ancestors") {
                 let mut rows: Vec<(String, String, String)> = vec![];
                 if let Some(t) = by_oid() {
                     // the tables whose foreign keys are on this one: it and those it is a partition of
@@ -2000,7 +2005,7 @@ impl Conn<'_> {
                 rows.sort();
                 let rows = rows.into_iter().map(|(n, o, d)| vec![text(&n), text(&o), text(&d)]).collect();
                 out(&["conname", "ontable", "condef"], rows)
-            } else if oid.is_some() && q.contains("FROM pg_catalog.pg_sequence") && q.contains("AS \"Type\"") {
+            } else if rel && q.contains("FROM pg_catalog.pg_sequence") && q.contains("AS \"Type\"") {
                 let rows: Vec<Vec<Value>> = by_oid()
                     .and_then(|t| t.sequence.clone())
                     .map(|(ty, start, min, max, inc, cycle)| {
@@ -2019,7 +2024,7 @@ impl Conn<'_> {
                     tag: format!("SELECT {}", rows.len()),
                     rows,
                 }
-            } else if oid.is_some() && q.contains("pg_catalog.pg_depend d") {
+            } else if rel && q.contains("pg_catalog.pg_depend d") {
                 // a sequence's owning column (OWNED BY, a serial's: `a`; an identity column's: `i`), as
                 // schema.table.column with each part as quote_ident writes it
                 let rows = by_oid()
@@ -2033,9 +2038,9 @@ impl Conn<'_> {
                     .into_iter()
                     .collect();
                 out(&["?column?", "deptype"], rows)
-            } else if oid.is_some() && q.contains("FROM pg_catalog.pg_rewrite r") {
+            } else if rel && q.contains("FROM pg_catalog.pg_rewrite r") {
                 out(&["rulename", "btrim"], vec![])
-            } else if oid.is_some() && q.contains("FROM pg_catalog.pg_trigger t") {
+            } else if rel && q.contains("FROM pg_catalog.pg_trigger t") {
                 let rows = by_oid()
                     .map(|t| {
                         // (a partition's copy of its parent's trigger says so: `, ON TABLE parent`)
@@ -2054,7 +2059,7 @@ impl Conn<'_> {
                     })
                     .unwrap_or_default();
                 out(&["tgname", "pg_get_triggerdef", "tgenabled", "tgisinternal", "parent"], rows)
-            } else if oid.is_some() && q.contains("pg_catalog.pg_policy") {
+            } else if rel && q.contains("pg_catalog.pg_policy") {
                 let opt = |s: &Option<String>| s.as_deref().map_or(Value::Null, text);
                 let rows = by_oid()
                     .map(|t| {
@@ -2076,7 +2081,7 @@ impl Conn<'_> {
                     })
                     .unwrap_or_default();
                 out(&["polname", "polpermissive", "array_to_string", "pg_get_expr", "pg_get_expr", "cmd"], rows)
-            } else if oid.is_some() && q.contains("pg_catalog.pg_statistic_ext") && q.contains("WHERE stxrelid = '") {
+            } else if rel && q.contains("pg_catalog.pg_statistic_ext") && q.contains("WHERE stxrelid = '") {
                 let rows = match by_oid() {
                     Some(t) => sql::table_statistics(self.db, self.session.target(), &t.name)?,
                     None => vec![],
@@ -2095,9 +2100,7 @@ impl Conn<'_> {
                     ],
                     rows,
                 )
-            } else if oid.is_some()
-                && q.contains("FROM pg_catalog.pg_publication p")
-                && q.contains("pg_relation_is_publishable")
+            } else if rel && q.contains("FROM pg_catalog.pg_publication p") && q.contains("pg_relation_is_publishable")
             {
                 // \d's "Publications:": the name, the table's WHERE and its column list
                 let found = match by_oid() {
@@ -3038,7 +3041,12 @@ mod tests {
     use super::*;
 
     fn tokens(server: Option<&str>, admin: Option<&str>) -> Tokens {
-        let auth = crate::Auth { token: server.map(String::from), admin: admin.map(String::from), safe: false };
+        let auth = crate::Auth {
+            token: server.map(String::from),
+            admin: admin.map(String::from),
+            mode: crate::Mode::Default,
+            studio_api: false,
+        };
         Tokens::new(&auth).unwrap()
     }
 

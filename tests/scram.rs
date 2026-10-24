@@ -39,7 +39,9 @@ fn folder(name: &str) -> PathBuf {
     dir
 }
 
-/// Starts a server in `dir` with these arguments (a token, TLS files).
+/// Starts a server in `dir` with these arguments (a token, TLS files). These tests are about how a
+/// login proves what it knows, so most pass `--unsafe`: the server token is then the database's
+/// own user, as it was before 0.4 (`tokens_and_the_guest` and tests/safe.rs cover the guest).
 fn start(dir: PathBuf, args: &[&str]) -> Server {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_chronos"));
     cmd.arg("serve").arg(dir.join("db")).args(args);
@@ -145,7 +147,7 @@ fn scram() -> (i32, Vec<String>) {
 
 #[test]
 fn roles_log_in_with_scram_or_md5() {
-    let s = start(folder("roles"), &["--token", "s3cret-s3cret-s3cret-s3cret"]);
+    let s = start(folder("roles"), &["--token", "s3cret-s3cret-s3cret-s3cret", "--unsafe"]);
     let p = s.pg;
     // a name that is no role proves with SCRAM that it knows the token, which never crosses the wire
     assert_eq!(asks(p, "admin"), scram());
@@ -378,6 +380,7 @@ fn tls_server(name: &str, key: &[&str], hash: &str) -> Server {
         &[
             "--token",
             "s3cret-s3cret-s3cret-s3cret",
+            "--unsafe",
             "--tls-cert",
             c.to_str().unwrap(),
             "--tls-key",
@@ -608,7 +611,7 @@ fn psql_logs_in_and_sets_passwords() {
     if !have_psql() {
         return;
     }
-    let s = start(folder("psql"), &["--token", "s3cret-s3cret-s3cret-s3cret"]);
+    let s = start(folder("psql"), &["--token", "s3cret-s3cret-s3cret-s3cret", "--unsafe"]);
     let url = |user: &str| format!("postgres://{user}@127.0.0.1:{}/main", s.pg);
     psql(&url("admin"), "s3cret-s3cret-s3cret-s3cret", "create role r4_psql login password 'first'").unwrap();
     assert_eq!(psql(&url("r4_psql"), "first", "select current_user").unwrap(), "r4_psql");
@@ -912,7 +915,7 @@ fn exchange(port: u16, user: &str) -> Seen {
 /// token, as before (the role lends it privileges, not a password).
 #[test]
 fn agents_log_in_with_scram() {
-    let s = start(folder("agents"), &["--token", "s3cret-s3cret-s3cret-s3cret"]);
+    let s = start(folder("agents"), &["--token", "s3cret-s3cret-s3cret-s3cret", "--unsafe"]);
     let p = s.pg;
     let mut admin = connect(p, "admin", Some("s3cret-s3cret-s3cret-s3cret")).unwrap();
     admin.batch_execute("create table t (id int primary key); insert into t values (1)").unwrap();
@@ -1071,7 +1074,7 @@ fn agents_from_before_verifiers_get_one_at_their_first_login() {
 /// proves nothing is 28P01 for each.
 #[test]
 fn names_are_not_told_apart() {
-    let s = start(folder("names"), &["--token", "s3cret-s3cret-s3cret-s3cret"]);
+    let s = start(folder("names"), &["--token", "s3cret-s3cret-s3cret-s3cret", "--unsafe"]);
     let p = s.pg;
     let mut admin = connect(p, "admin", Some("s3cret-s3cret-s3cret-s3cret")).unwrap();
     admin
@@ -1125,7 +1128,7 @@ fn names_are_not_told_apart() {
 fn wrong_passwords_back_off_per_address() {
     let dir = folder("backoff");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_chronos"));
-    cmd.arg("serve").arg(dir.join("db")).args(["--token", "s3cret-s3cret-s3cret-s3cret"]);
+    cmd.arg("serve").arg(dir.join("db")).args(["--token", "s3cret-s3cret-s3cret-s3cret", "--unsafe"]);
     cmd.env("CHRONOS_LOGIN_FREE_TRIES", "10"); // (the default; the tests' servers get more)
     let s = common::serve(&mut cmd, true);
     let s = Server { child: s.child, dir, pg: s.pg, http: s.http };
@@ -1187,7 +1190,7 @@ fn passwords_outside_ascii_are_prepared_as_postgres_prepares_them() {
         assert_eq!(chronos::sql::scram::verifier(pw, &v.salt, v.iterations), kept, "{pw:?}");
     }
 
-    let s = start(folder("saslprep"), &["--token", "s3cret-s3cret-s3cret-s3cret"]);
+    let s = start(folder("saslprep"), &["--token", "s3cret-s3cret-s3cret-s3cret", "--unsafe"]);
     let mut admin = connect(s.pg, "admin", Some("s3cret-s3cret-s3cret-s3cret")).unwrap();
     for (i, (pw, agrees)) in passwords.iter().enumerate() {
         let role = format!("r3c_prep{i}");

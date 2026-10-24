@@ -77,6 +77,8 @@ pub(crate) enum Kind {
     Server,
     /// a large object (see `largeobj`): owned by the role that made it, by its oid
     LargeObject,
+    /// a tablespace (see `tablespace`): its row is by its oid, its owner in its own record
+    Tablespace,
 }
 
 impl Kind {
@@ -93,6 +95,7 @@ impl Kind {
             Kind::Column => SELECT | INSERT | UPDATE | REFERENCES,
             Kind::Type | Kind::Fdw | Kind::Server => USAGE,
             Kind::LargeObject => SELECT | UPDATE,
+            Kind::Tablespace => CREATE,
             Kind::Extension => 0,
         }
     }
@@ -114,6 +117,7 @@ impl Kind {
             Kind::Fdw => "foreign-data wrapper",
             Kind::Server => "foreign server",
             Kind::LargeObject => "large object",
+            Kind::Tablespace => "tablespace",
         }
     }
 
@@ -251,6 +255,7 @@ pub(crate) fn key_of(kind: Kind, name: &str) -> String {
         Kind::Fdw => format!("fdw/{name}"),
         Kind::Server => format!("server/{name}"),
         Kind::LargeObject => format!("lo/{name}"),
+        Kind::Tablespace => format!("tablespace/{name}"),
         Kind::Database => "db".into(),
         Kind::Column => format!("col/{name}"),
     }
@@ -481,6 +486,11 @@ pub(crate) fn large_object(v: &View, oid: i64) -> Result<Obj> {
     let key = key_of(Kind::LargeObject, &oid.to_string());
     let e = entry(v, &key)?;
     Ok(Obj::new(Kind::LargeObject, key, oid.to_string(), e, BOOTSTRAP))
+}
+
+/// A tablespace (see `tablespace`), whose ACL row is `key` and whose owner its own record names.
+pub(crate) fn tablespace_obj(v: &View, key: &str, name: &str, owner: i64) -> Result<Obj> {
+    Ok(Obj::new(Kind::Tablespace, key.to_string(), name.to_string(), entry(v, key)?, owner))
 }
 
 /// The world itself, as a database.
@@ -1562,6 +1572,23 @@ fn ddl(v: &View, who: &Who, st: &Stmt) -> Result<()> {
         }
         Ok(())
     };
+    // an index's: its table's owner's (42501 `must be owner of index x`, as Postgres's aclcheck_error names it)
+    let own_index = |name: &str| -> Result<()> {
+        let cat = catalog::Catalog::of(v.core, &v.branch)?;
+        if let Some(catalog::Obj::Index(r, _)) = cat.named(name)?.and_then(|o| cat.find(o)) {
+            let t = cat.rels[r].name.clone();
+            if let Some(o) = rel(v, &t)?
+                && !owns(&o)
+            {
+                return Err(SqlError {
+                    code: "42501",
+                    message: format!("must be owner of index {}", rel_part(name)),
+                    info: None,
+                });
+            }
+        }
+        Ok(())
+    };
     match st {
         Stmt::Create { table, temp: false, constraints, cols, likes, hier, .. } => {
             in_schema(table)?;
@@ -1601,7 +1628,14 @@ fn ddl(v: &View, who: &Who, st: &Stmt) -> Result<()> {
             // USAGE on its columns' types
             use_type_names(v, who, query_types(v, query))?;
         }
-        Stmt::CreateSequence { name, .. } | Stmt::CreateType { name, .. } => in_schema(name)?,
+        Stmt::CreateSequence { name, .. } => in_schema(name)?,
+        Stmt::CreateType { name, composite, .. } => {
+            in_schema(name)?;
+            // (USAGE on its attributes' types)
+            for (_, t) in composite.iter().flatten() {
+                use_types(v, who, written_type(t))?;
+            }
+        }
         Stmt::CreateDomain { name, base, .. } => {
             in_schema(name)?;
             // (USAGE on its base type)
@@ -1687,27 +1721,17 @@ fn ddl(v: &View, who: &Who, st: &Stmt) -> Result<()> {
         Stmt::DropIndex { name, .. }
         | Stmt::RenameIndex { name, .. }
         | Stmt::IndexColumnAlter { name, .. }
-        | Stmt::AttachIndex { parent: name, .. } => {
-            let cat = catalog::Catalog::of(v.core, &v.branch)?;
-            if let Some(catalog::Obj::Index(r, _)) = cat.named(name)?.and_then(|o| cat.find(o)) {
-                let t = cat.rels[r].name.clone();
-                if let Some(o) = rel(v, &t)?
-                    && !owns(&o)
-                {
-                    return Err(SqlError {
-                        code: "42501",
-                        message: format!("must be owner of index {}", rel_part(name)),
-                        info: None,
-                    });
-                }
-            }
-        }
+        | Stmt::AttachIndex { parent: name, .. } => own_index(name)?,
         Stmt::DropTrigger { table, .. }
         | Stmt::RenameTrigger { table, .. }
         | Stmt::RenameRule { table, .. }
         | Stmt::Refresh { name: table, .. } => own_rel(table)?,
         Stmt::Alter { table, changes, .. } => {
             own_rel(table)?;
+            // (ALTER INDEX x SET TABLESPACE, SET (...): an index, which is no relation `rel` finds)
+            if rel(v, table)?.is_none() {
+                own_index(table)?;
+            }
             for c in changes {
                 match c {
                     // USAGE on a column's new type
@@ -1727,19 +1751,29 @@ fn ddl(v: &View, who: &Who, st: &Stmt) -> Result<()> {
                 }
             }
         }
-        // ALTER TYPE (ADD VALUE, RENAME VALUE, RENAME TO): its owner
-        Stmt::AlterType { name, .. } => {
+        // ALTER TYPE (ADD VALUE, RENAME VALUE, RENAME TO, SET SCHEMA, an attribute's change): its owner, and USAGE
+        // on the types the attributes it adds or changes are of
+        Stmt::AlterType { name, change } => {
             if let Some(o) = type_obj(v, name)?
                 && !owns(&o)
             {
                 return Err(o.not_owner());
             }
+            if let TypeChange::Attrs(changes) = change {
+                for (c, _) in changes {
+                    if let AttrChange::Add(_, t) | AttrChange::Type(_, t) = c {
+                        use_types(v, who, written_type(t))?;
+                    }
+                }
+            }
         }
         // COMMENT ON: the object's owner
         Stmt::Comment(c) => match &c.on {
             maintain::Commented::Rel(_, n) => own_rel(n)?,
-            // (a column's or a constraint's: Postgres's message calls the table a relation)
-            maintain::Commented::Column(n, _) | maintain::Commented::Constraint(_, n) => {
+            // (a column's, a constraint's or a trigger's: Postgres's message calls the table a relation)
+            maintain::Commented::Column(n, _)
+            | maintain::Commented::Constraint(_, n)
+            | maintain::Commented::Trigger(_, n) => {
                 if let Some(o) = rel(v, n)?
                     && !owns(&o)
                 {
@@ -1902,9 +1936,16 @@ fn ddl(v: &View, who: &Who, st: &Stmt) -> Result<()> {
 fn use_types(v: &View, who: &Who, tys: impl IntoIterator<Item = Type>) -> Result<()> {
     let names = tys.into_iter().filter_map(|t| match t {
         Type::Enum(i) => Some(enum_name(i)),
+        Type::Record(_) => t.composite_of().map(|n| n.to_string()),
         _ => None,
     });
     use_type_names(v, who, names)
+}
+
+/// The type a composite type's attribute is of, as written (`priv_testdomain1`, `int`), as the parser reads it:
+/// none where it doesn't read (the statement's own error says why).
+fn written_type(text: &str) -> Option<Type> {
+    lex(&format!("x {text}")).and_then(|t| Parser::new(t).column()).ok().map(|c| c.ty)
 }
 
 /// `use_types`, of types by their stored names.
@@ -2072,6 +2113,8 @@ pub(crate) enum On {
     Foreign(Kind, Vec<String>),
     /// LARGE OBJECT: their oids
     LargeObjects(Vec<i64>),
+    /// TABLESPACE: their names
+    Tablespaces(Vec<String>),
     /// ALTER DEFAULT PRIVILEGES: the objects roles will make
     Defaults(Box<Defaults>),
 }
@@ -2331,14 +2374,15 @@ impl Parser {
                 oids.push(self.large_object_oid()?);
             }
             On::LargeObjects(oids)
-        } else if self.is_kw("language") || self.is_kw("foreign") || self.is_kw("tablespace") || self.is_kw("parameter")
-        {
+        } else if self.kw("tablespace") {
+            On::Tablespaces(self.names_list()?)
+        } else if self.is_kw("language") || self.is_kw("foreign") || self.is_kw("parameter") {
             let w = if let Some(Tok::Word(w)) = self.peek() { w.to_uppercase() } else { String::new() };
             return err(
                 UNSUPPORTED,
                 format!(
-                    "GRANT and REVOKE ON {w} aren't supported: tables, sequences, schemas, functions, types, domains \
-                     and databases are"
+                    "GRANT and REVOKE ON {w} aren't supported: tables, sequences, schemas, functions, types, domains, \
+                     databases and tablespaces are"
                 ),
             );
         } else {
@@ -2602,6 +2646,12 @@ fn targets(v: &View, on: &On) -> Result<Vec<Obj>> {
                     return err("42704", format!("large object {oid} does not exist"));
                 }
                 out.push(large_object(v, oid)?);
+            }
+        }
+        On::Tablespaces(names) => {
+            for n in names {
+                let s = super::tablespace::named(v, n)?;
+                out.push(super::tablespace::obj(v, &s)?);
             }
         }
         On::Defaults(_) => {}
@@ -3180,28 +3230,7 @@ pub(crate) fn to_make(v: &View, st: &Stmt) -> Result<Option<Made>> {
     if roles::current().is_none() {
         return Ok(None);
     }
-    let made = |key: String, objtype: char| Made { key, objtype: Some(objtype), serials_of: None };
-    let rel = |name: &str, objtype: char| -> Result<Option<Made>> {
-        Ok((relation_kind(v, name)?.is_none()).then(|| made(key_of(Kind::Table, name), objtype)))
-    };
     Ok(match st {
-        Stmt::Create { table, temp: false, .. } | Stmt::CreateAs { table, temp: false, .. } => rel(table, 'r')?,
-        Stmt::CreateView { name, .. } => rel(name, 'r')?,
-        Stmt::CreateSequence { name, .. } => rel(name, 'S')?,
-        Stmt::CreateType { name, .. } | Stmt::CreateDomain { name, .. } => {
-            v.get(&type_key(name))?.is_none().then(|| made(key_of(Kind::Type, name), 'T'))
-        }
-        Stmt::CreateSchema { name, owner: None, .. } => {
-            (!namespaces(v)?.contains(name)).then(|| made(key_of(Kind::Schema, name), 'n'))
-        }
-        Stmt::CreateFunction(f, _, _) => {
-            v.get(&f.key())?.is_none().then(|| made(key_of(Kind::Function, &f.sig()), 'f'))
-        }
-        Stmt::CreateExtension { name, .. } => v.get(&pgcrypto::key(name))?.is_none().then(|| Made {
-            key: key_of(Kind::Extension, name),
-            objtype: None,
-            serials_of: None,
-        }),
         // a serial or identity column added (or a column made an identity one): its new sequence
         Stmt::Alter { table, changes, .. } => {
             let cols: Vec<String> = changes
@@ -3223,19 +3252,372 @@ pub(crate) fn to_make(v: &View, st: &Stmt) -> Result<Option<Made>> {
                 }),
             }
         }
+        _ => making(v, st)?.map(|(key, objtype)| Made { key, objtype, serials_of: None }),
+    })
+}
+
+/// The object statement `st` is about to make, when it isn't there yet: its row's key, and the kind of default
+/// privileges it starts with (None: an extension, which has none).
+fn making(v: &View, st: &Stmt) -> Result<Option<(String, Option<char>)>> {
+    let rel = |name: &str, objtype: char| -> Result<Option<(String, Option<char>)>> {
+        Ok((relation_kind(v, name)?.is_none()).then(|| (key_of(Kind::Table, name), Some(objtype))))
+    };
+    Ok(match st {
+        Stmt::Create { table, temp: false, .. } | Stmt::CreateAs { table, temp: false, .. } => rel(table, 'r')?,
+        Stmt::CreateView { name, .. } => rel(name, 'r')?,
+        Stmt::CreateSequence { name, .. } => rel(name, 'S')?,
+        Stmt::CreateType { name, .. } | Stmt::CreateDomain { name, .. } => {
+            v.get(&type_key(name))?.is_none().then(|| (key_of(Kind::Type, name), Some('T')))
+        }
+        Stmt::CreateSchema { name, owner: None, .. } => {
+            (!namespaces(v)?.contains(name)).then(|| (key_of(Kind::Schema, name), Some('n')))
+        }
+        Stmt::CreateFunction(f, _, _) => {
+            v.get(&f.key())?.is_none().then(|| (key_of(Kind::Function, &f.sig()), Some('f')))
+        }
+        Stmt::CreateExtension { name, .. } => {
+            v.get(&pgcrypto::key(name))?.is_none().then(|| (key_of(Kind::Extension, name), None))
+        }
         _ => None,
     })
 }
 
+// ---------------------------------------------------------------- the order objects are made in
+
+/// Where the order objects are made in is kept, as Postgres's oids keep it (each new one is past those before it):
+/// row `_sonos_made/<key>`, by `key_of`'s key (`rel/<name>`, `type/<name>`, `func/<signature>`, `ext/<name>`) or a
+/// policy's (`policy/<table>/<name>`: see `rls::made_key`), holds a count every world shares (see `stamp`), so what
+/// DROP ... CASCADE drops is listed in Postgres's order.
+/// An object made before it was kept has none; a rename moves its row and a drop drops it (`restamp`).
+pub(crate) const MADE: &str = "_sonos_made";
+
+/// Whether statement `st` may make an object whose making is kept (see `MADE`).
+pub(crate) fn may_stamp(st: &Stmt) -> bool {
+    matches!(
+        st,
+        Stmt::Create { temp: false, .. }
+            | Stmt::CreateAs { temp: false, .. }
+            | Stmt::CreateView { .. }
+            | Stmt::CreateSequence { .. }
+            | Stmt::CreateType { .. }
+            | Stmt::CreateDomain { .. }
+            | Stmt::CreateFunction(..)
+            | Stmt::CreateExtension { .. }
+    ) || matches!(st, Stmt::Policy(p) if matches!(**p, rls::PolicyStmt::Create { .. }))
+}
+
+/// The key (see `MADE`) of what statement `st` is about to make, when it isn't there yet: stamped once it is made.
+pub(crate) fn to_stamp(v: &View, st: &Stmt) -> Result<Option<String>> {
+    if let Stmt::Policy(p) = st {
+        return rls::to_stamp(v, p);
+    }
+    Ok(making(v, st)?.map(|(key, _)| key).filter(|k| !k.starts_with("schema/")))
+}
+
+/// Writes `row`, a stamp (see `Ride`), as a write of its own.
+fn stamp(db: &Db, branch: &str, row: (String, Option<String>)) -> Result<()> {
+    db.batch_with::<(), SqlError>(branch, |_| Ok((vec![row], ())))?;
+    Ok(())
+}
+
+/// The row that keeps that object `key` (see `MADE`) was made `at` (a count `Ride::start` took).
+fn stamp_row(key: &str, at: String) -> (String, Option<String>) {
+    (format!("{MADE}/{key}"), Some(at))
+}
+
+// ---------------------------------------------------------------- stamps written with the statement's own write
+
+/// What the running statement does to stamps (see `MADE`): the key of what it makes with the count taken for it, the
+/// stamps it renames (`stamp_moves`'s) and whether it may drop objects (`may_unstamp`). Each is done in the write that
+/// makes, renames or drops the object (see `riding`), so the statement stays one write and a crash keeps all of it or
+/// none of it, as Postgres's catalog rows commit with their statement's transaction.
+struct Riding {
+    core: usize,
+    branch: String,
+    make: Option<(String, String)>,
+    moves: Vec<(String, String)>,
+    dropping: bool,
+    /// the stamps moved so far, from and to, which no drop takes
+    moved: HashSet<String>,
+}
+
+thread_local! {
+    /// The running statements' (see `Riding`), the innermost last: a function's statements run inside another's.
+    static RIDING: std::cell::RefCell<Vec<Riding>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn core_id(core: &crate::Core) -> usize {
+    core as *const crate::Core as usize
+}
+
+/// A statement's `Riding`, from before it runs until `finish` (or it fails).
+pub(crate) struct Ride {
+    on: bool,
+}
+
+impl Ride {
+    /// For the statement about to run on `branch`: `make`, the key of what it makes (`to_stamp`'s), whose count is
+    /// taken now; `moves`, `stamp_moves`'s; `dropping`, `may_unstamp`'s.
+    pub(crate) fn start(
+        db: &Db,
+        branch: &str,
+        make: Option<String>,
+        moves: Vec<(String, String)>,
+        dropping: bool,
+    ) -> Result<Ride> {
+        if make.is_none() && moves.is_empty() && !dropping {
+            return Ok(Ride { on: false });
+        }
+        let make = match make {
+            Some(key) => Some((key, format!("{:020}", db.core.next_values(MADE, 1)?[0]))),
+            None => None,
+        };
+        let r = Riding { core: core_id(&db.core), branch: branch.into(), make, moves, dropping, moved: HashSet::new() };
+        RIDING.with_borrow_mut(|all| all.push(r));
+        Ok(Ride { on: true })
+    }
+
+    /// After the statement: the running role owns what it made (`owned`: see `made`), and what none of its writes did
+    /// to stamps is done now, in writes of their own (a stamp whose object no write made under the name looked for,
+    /// a drop no write's rows showed: see `restamp`).
+    pub(crate) fn finish(mut self, db: &Db, branch: &str, owned: Option<Made>) -> Result<()> {
+        let left = if self.on { RIDING.with_borrow_mut(Vec::pop) } else { None };
+        self.on = false;
+        let (stamped, moves, dropping) = match left {
+            Some(r) => (r.make.map(|(key, at)| stamp_row(&key, at)), r.moves, r.dropping),
+            None => (None, vec![], false),
+        };
+        match (owned, stamped) {
+            (Some(m), stamped) => made(db, branch, &m, stamped)?,
+            (None, Some(row)) => stamp(db, branch, row)?,
+            (None, None) => {}
+        }
+        restamp(db, branch, moves, dropping)
+    }
+}
+
+impl Drop for Ride {
+    fn drop(&mut self) {
+        if self.on {
+            RIDING.with_borrow_mut(Vec::pop);
+        }
+    }
+}
+
+/// The rows the running statement's stamps (see `Riding`) add to its write of `rows` to branch `b` of `core`, the
+/// branch as it is being `born` and `state`: the stamp of what it makes joins the write that makes it, a renamed
+/// stamp's move the one that makes what it is on under its new name, and a stamp's drop the one that drops its
+/// object.
+pub(crate) fn riding(
+    core: &crate::Core,
+    b: &str,
+    born: u64,
+    state: &dyn Fn() -> crate::State,
+    rows: &[(String, Option<String>)],
+) -> crate::Result<Vec<(String, Option<String>)>> {
+    RIDING.with_borrow_mut(|all| {
+        let Some(r) = all.last_mut().filter(|r| r.core == core_id(core) && r.branch == b) else { return Ok(vec![]) };
+        // (the objects' own rows this write changes, as it leaves them: see `alive`)
+        let defs: HashMap<&str, bool> =
+            rows.iter().filter(|(k, _)| defines(k)).map(|(k, v)| (k.as_str(), v.is_some())).collect();
+        if defs.is_empty() {
+            return Ok(vec![]);
+        }
+        let v = View { core, born, s: state(), branch: b.to_string(), reads: None };
+        let after = |k: &str| -> crate::Result<bool> {
+            match defs.get(k) {
+                Some(&there) => Ok(there),
+                None => Ok(v.get(k)?.is_some()),
+            }
+        };
+        let mut out: Vec<(String, Option<String>)> = vec![];
+        if let Some((key, at)) = &r.make
+            && alive(key, &after)? == Some(true)
+        {
+            out.push(stamp_row(key, at.clone()));
+            r.make = None;
+        }
+        let mut left = vec![];
+        for (from, to) in std::mem::take(&mut r.moves) {
+            let (fk, tk) = (format!("{MADE}/{from}"), format!("{MADE}/{to}"));
+            if fk != tk {
+                let at = v.get(&fk)?.map(|s| s.to_string());
+                let there = v.get(&tk)?.is_some();
+                // (a stamp on neither name: nothing to move)
+                if (at.is_some() || there) && alive(&to, &after)? != Some(true) {
+                    left.push((from, to));
+                    continue;
+                }
+                if at.is_some() {
+                    out.push((fk.clone(), None));
+                }
+                if at.is_some() || there {
+                    out.push((tk.clone(), at));
+                }
+            }
+            r.moved.extend([fk, tk]);
+        }
+        r.moves = left;
+        if r.dropping && defs.values().any(|there| !there) {
+            let prefix = format!("{MADE}/");
+            for row in v.prefix(&prefix)? {
+                let k = row?.0;
+                if r.moved.contains(&k) || out.iter().any(|(x, _)| *x == k) {
+                    continue;
+                }
+                if alive(&k[prefix.len()..], &after)? == Some(false) {
+                    out.push((k, None));
+                }
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// Whether the object stamp `key` (see `MADE`, without its prefix) is on is there, by `has` (whether a row is there):
+/// None for a kind of object not looked for.
+fn alive(key: &str, has: &dyn Fn(&str) -> crate::Result<bool>) -> crate::Result<Option<bool>> {
+    let Some((kind, name)) = key.split_once('/') else { return Ok(None) };
+    Ok(Some(match kind {
+        "rel" => has(&schema_key(name))? || has(&format!("{VIEWS}/{name}"))? || has(&format!("{SEQUENCES}/{name}"))?,
+        "type" => has(&type_key(name))?,
+        "func" => has(&format!("{}/{name}", functions::FUNCTIONS))?,
+        "ext" => has(&pgcrypto::key(name))?,
+        "policy" => has(&format!("{}/{name}", rls::POLICIES))?,
+        _ => return Ok(None),
+    }))
+}
+
+/// Whether row `key` is one `alive` looks for.
+fn defines(key: &str) -> bool {
+    [SCHEMAS, VIEWS, SEQUENCES, "_sonos_types", functions::FUNCTIONS, pgcrypto::EXTENSIONS, rls::POLICIES]
+        .iter()
+        .any(|p| key.strip_prefix(p).is_some_and(|rest| rest.starts_with('/')))
+}
+
+/// Where object `key` (see `MADE`) comes in the order objects were made, as a key that sorts in that order: empty
+/// for one made before that was kept.
+pub(crate) fn made_at(v: &View, key: &str) -> String {
+    v.get(&format!("{MADE}/{key}")).ok().flatten().map(|s| s.to_string()).unwrap_or_default()
+}
+
+/// Whether statement `st` renames an object whose making is kept (see `MADE`), or moves it to another schema.
+pub(crate) fn renames(st: &Stmt) -> bool {
+    match st {
+        Stmt::Alter { changes, .. } => changes.iter().any(|c| matches!(c, Alter::RenameTable(_) | Alter::SetSchema(_))),
+        Stmt::RenameView { .. }
+        | Stmt::AlterType { change: TypeChange::Rename(_), .. }
+        | Stmt::AlterDomain { change: DomainChange::Rename(_), .. } => true,
+        Stmt::AlterRoutine { action, .. } => {
+            matches!(action, functions::RoutineAlter::Rename(_) | functions::RoutineAlter::Schema(_))
+        }
+        Stmt::Policy(p) => matches!(**p, rls::PolicyStmt::Alter { rename: Some(_), .. }),
+        _ => false,
+    }
+}
+
+/// The stamps (see `MADE`) statement `st` (one that `renames`) is about to move with what they are on: (from, to)
+/// keys, worked out before it runs. A table's policies' stamps move with it.
+pub(crate) fn stamp_moves(v: &View, st: &Stmt) -> Result<Vec<(String, String)>> {
+    match st {
+        Stmt::Policy(p) => return Ok(rls::stamp_moves(v, p)),
+        // (to the name the rename stores it under, as ALTER TYPE's)
+        Stmt::AlterDomain { name, change: DomainChange::Rename(to) } => {
+            return Ok(vec![(key_of(Kind::Type, name), key_of(Kind::Type, to))]);
+        }
+        _ => {}
+    }
+    let mut out: Vec<(String, String)> =
+        renames_of(v, st)?.into_iter().filter(|(k, _)| !k.starts_with("col/")).collect();
+    let tables: Vec<(String, String)> = (out.iter())
+        .filter_map(|(a, b)| Some((a.strip_prefix("rel/")?.to_string(), b.strip_prefix("rel/")?.to_string())))
+        .collect();
+    for (from, to) in tables {
+        for p in rls::policies(v, &from)? {
+            out.push((rls::made_key(&from, &p.name), rls::made_key(&to, &p.name)));
+        }
+    }
+    Ok(out)
+}
+
+/// Whether statement `st` may drop objects whose making is kept (see `MADE`).
+pub(crate) fn may_unstamp(st: &Stmt) -> bool {
+    match st {
+        Stmt::Drop { .. }
+        | Stmt::DropObjects { .. }
+        | Stmt::DropSchema { .. }
+        | Stmt::DropFunction { .. }
+        | Stmt::DropType { .. }
+        | Stmt::DropExtension { .. }
+        | Stmt::DropOwned(..) => true,
+        // (DROP COLUMN ... CASCADE drops the views that read it; DROP COLLATION, SERVER and FOREIGN DATA WRAPPER ...
+        // CASCADE what is of them)
+        Stmt::Alter { changes, .. } => changes.iter().any(|c| matches!(c, Alter::DropColumn(..))),
+        Stmt::DropCollation { cascade, .. } => *cascade,
+        Stmt::Foreign(f) => matches!(**f, foreign::ForeignStmt::Drop { cascade: true, .. }),
+        Stmt::Policy(p) => matches!(**p, rls::PolicyStmt::Drop { .. }),
+        _ => false,
+    }
+}
+
+/// After a statement: moves the stamps it renamed (`stamp_moves`'s) and, `dropping` (see `may_unstamp`), drops those
+/// whose object is gone.
+fn restamp(db: &Db, branch: &str, moves: Vec<(String, String)>, dropping: bool) -> Result<()> {
+    if moves.is_empty() && !dropping {
+        return Ok(());
+    }
+    let v = db.core.view_tx(branch)?;
+    let mut writes: Vec<(String, Option<String>)> = vec![];
+    let mut moved = HashSet::new();
+    for (from, to) in moves {
+        let (from, to) = (format!("{MADE}/{from}"), format!("{MADE}/{to}"));
+        if from == to {
+            continue;
+        }
+        let at = v.get(&from)?.map(|s| s.to_string());
+        if at.is_some() {
+            writes.push((from.clone(), None));
+        }
+        // (one made before stamps were kept has none, and takes none a dropped object of its new name left)
+        if at.is_some() || v.get(&to)?.is_some() {
+            writes.push((to.clone(), at));
+        }
+        moved.extend([from, to]);
+    }
+    if dropping {
+        for r in v.prefix(&format!("{MADE}/"))? {
+            let k = r?.0;
+            // (a kind of object not looked for is there)
+            let live = alive(&k[MADE.len() + 1..], &|x: &str| -> crate::Result<bool> { Ok(v.get(x)?.is_some()) })?
+                .unwrap_or(true);
+            if !live && !moved.contains(&k) {
+                writes.push((k, None));
+            }
+        }
+    }
+    drop(v);
+    if writes.is_empty() {
+        return Ok(());
+    }
+    db.batch_with::<(), SqlError>(branch, |_| Ok((writes, ())))?;
+    Ok(())
+}
+
 /// Records that the running statement's role owns what it made (`to_make`'s), and the ACL its
 /// default privileges give it; a table's serial columns' sequences get theirs too.
-pub(crate) fn made(db: &Db, branch: &str, m: &Made) -> Result<()> {
-    let Some(owner) = roles::current().map(|w| w.oid) else { return Ok(()) };
+/// `stamped`: the stamp of what it made (see `stamp_row`) that no write of it took, in the same write.
+fn made(db: &Db, branch: &str, m: &Made, stamped: Option<(String, Option<String>)>) -> Result<()> {
+    let Some(owner) = roles::current().map(|w| w.oid) else {
+        return stamped.map_or(Ok(()), |row| stamp(db, branch, row));
+    };
     if let Some((table, cols)) = &m.serials_of {
+        if let Some(row) = stamped {
+            stamp(db, branch, row)?;
+        }
         return db.batch_with::<(), SqlError>(branch, |v| Ok((serials_made(v, table, cols)?, ()))).map(drop);
     }
     db.batch_with::<(), SqlError>(branch, |v| {
-        let mut writes = vec![];
+        let mut writes: Vec<(String, Option<String>)> = stamped.into_iter().collect();
         let (kind, name) = m.key.split_once('/').unwrap_or_default();
         let schema = match kind {
             "schema" => None,
@@ -3612,6 +3994,10 @@ fn depending(v: &View, reg: &roles::Registry, oid: i64) -> Result<Vec<(u8, Strin
             "fdw" => (5, format!("foreign-data wrapper {rest}")),
             "server" => (5, format!("server {rest}")),
             "lo" => (5, format!("large object {rest}")),
+            "tablespace" => {
+                let name = super::tablespace::name_of(v, rest.parse().ok()?).ok().flatten()?;
+                (5, format!("tablespace {name}"))
+            }
             _ => return None,
         })
     };
@@ -3644,6 +4030,8 @@ fn depending(v: &View, reg: &roles::Registry, oid: i64) -> Result<Vec<(u8, Strin
         (super::statistics::owned_by(v, oid)?.into_iter())
             .map(|n| (8, format!("owner of statistics object {}", shown_name(&n)))),
     );
+    // (and the tablespaces, whose owner is in their own rows too)
+    out.extend(super::tablespace::owned_by(v, oid)?.into_iter().map(|n| (5, format!("owner of tablespace {n}"))));
     out.sort_by_key(|(r, _)| *r);
     Ok(out)
 }
@@ -3891,6 +4279,11 @@ pub(crate) fn moves(v: &View, st: &Stmt) -> Result<Vec<(String, String)>> {
     if !v.core.has_privileges() {
         return Ok(vec![]);
     }
+    renames_of(v, st)
+}
+
+/// The keys (`key_of`'s) of what statement `st` is about to rename, as (from, to): `moves`'s, whatever keeps them.
+fn renames_of(v: &View, st: &Stmt) -> Result<Vec<(String, String)>> {
     let mut out = vec![];
     match st {
         Stmt::Alter { table, changes, .. } => {
@@ -3941,6 +4334,9 @@ pub(crate) fn moves(v: &View, st: &Stmt) -> Result<Vec<(String, String)>> {
         Stmt::AlterType { name, change: TypeChange::Rename(to) } => {
             // (to the name the rename stores it under)
             out.push((key_of(Kind::Type, name), key_of(Kind::Type, to)));
+        }
+        Stmt::AlterType { name, change: TypeChange::Schema(s) } => {
+            out.push((key_of(Kind::Type, name), key_of(Kind::Type, &qualify(s, rel_part(name)))));
         }
         Stmt::AlterRoutine { name, types, kind, action } => {
             let to = match action {

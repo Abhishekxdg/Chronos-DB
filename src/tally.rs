@@ -1,7 +1,9 @@
 //! What each agent's merges brought into main in the last hour: rows changed, rows deleted and
 //! effects queued, for merge policies' `rows_per_hour`, `deletes_per_hour` and `effects_per_hour`. `max_rows` and `max_deletes`
 //! judge one merge, so a job split across several worlds stays under them; these judge them
-//! together.
+//! together. An agent made `WITH (tenant = ...)` is counted with its tenant: every agent made
+//! for that tenant shares one count, so a product that makes an agent per run (as the agent
+//! gateway does) can't start the hour again with each run.
 //!
 //!   an agent's merge into main, judged by its policy ─> its rows and deletes, with the time
 //!   next merge ─> the last hour's, plus this one's, against the limits ─> over: a person looks
@@ -79,27 +81,71 @@ pub(crate) fn load(dir: &Path, crypt: Option<&crate::crypt::Crypt>) -> Tallies {
 }
 
 impl Core {
-    /// Rows, deletes and effects agent `agent`'s merges brought into main in the last hour.
+    /// Whose count agent `agent`'s merges go into: its tenant's, for an agent made `WITH (tenant
+    /// = ...)` (see the module docs), else its own. The tally's key, and the tenant in words.
+    pub(crate) fn tally_of(&self, agent: &str) -> (String, Option<String>) {
+        let a = self.agent(agent).ok();
+        let tenant =
+            a.as_ref().and_then(|a| Some((a.tenant.as_ref().and_then(crate::scope::tenant_key)?, a.tenant_sql()?)));
+        match tenant {
+            // the key as the tenant's scope compares it (42 and '42' are one tenant); no agent's name has a space,
+            // so it is never an agent's
+            Some((key, words)) => (format!("tenant {key}"), Some(words)),
+            None => (agent.to_string(), None),
+        }
+    }
+
+    /// Counts kept under a tenant agent's own name (saved before agents shared their tenant's count, see the module
+    /// docs) go into its tenant's, once, as the database opens: an agent that used its hour just before an upgrade
+    /// keeps it used. The agents are read from main, so this runs after the log is replayed.
+    pub(crate) fn migrate_tallies(&self) {
+        let keys: Vec<String> =
+            self.tallies.lock().unwrap().by.keys().filter(|k| !k.starts_with("tenant ")).cloned().collect();
+        let moves: Vec<(String, String)> = keys
+            .into_iter()
+            .filter_map(|k| {
+                let (to, tenant) = self.tally_of(&k);
+                tenant.map(|_| (k, to))
+            })
+            .collect();
+        if moves.is_empty() {
+            return;
+        }
+        let mut t = self.tallies.lock().unwrap();
+        for (from, to) in moves {
+            let Some(merges) = t.by.remove(&from) else { continue };
+            let bucket = t.by.entry(to).or_default();
+            let mut all: Vec<_> = bucket.drain(..).chain(merges).collect();
+            all.sort_by_key(|m| m.0);
+            bucket.extend(all);
+        }
+        t.dirty = true;
+    }
+
+    /// Rows, deletes and effects agent `agent`'s merges (or its tenant's: see `tally_of`) brought
+    /// into main in the last hour.
     pub(crate) fn hourly(&self, agent: &str) -> (u64, u64, u64) {
         let now = disk::now_ms();
+        let key = self.tally_of(agent).0;
         let t = self.tallies.lock().unwrap();
-        t.by.get(agent)
+        t.by.get(&key)
             .into_iter()
             .flatten()
             .filter(|m| m.0 + HOUR > now)
             .fold((0, 0, 0), |a, m| (a.0 + m.1, a.1 + m.2, a.2 + m.3))
     }
 
-    /// Counts a merge of agent `agent`'s into main: `rows` changed, `deletes` of them deletes,
-    /// `effects` queued.
-    pub(crate) fn count_merge(&self, agent: &str, rows: u64, deletes: u64, effects: u64) {
+    /// Counts a merge into main under tally `key` (an agent's, or its tenant's: see `tally_of`,
+    /// which the merge reads before taking main's locks, as this runs under them): `rows`
+    /// changed, `deletes` of them deletes, `effects` queued.
+    pub(crate) fn count_merge(&self, key: &str, rows: u64, deletes: u64, effects: u64) {
         if rows == 0 && effects == 0 {
             return;
         }
         let now = disk::now_ms();
         let mut t = self.tallies.lock().unwrap();
         t.prune(now);
-        t.by.entry(agent.to_string()).or_default().push_back((now, rows, deletes, effects));
+        t.by.entry(key.to_string()).or_default().push_back((now, rows, deletes, effects));
         t.dirty = true;
     }
 

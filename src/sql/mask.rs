@@ -450,7 +450,9 @@ pub(super) fn search(v: &View, table: &str) -> Result<()> {
 pub(super) fn output(views: &[&View], out: &mut Output) -> Result<()> {
     let Some(cols) = &out.columns else { return Ok(()) };
     let Some(t_at) = cols.iter().position(|c| c.0 == "table") else { return Ok(()) };
-    let json_at: Vec<usize> = cols.iter().enumerate().filter(|(_, c)| c.1 == Type::Json).map(|(i, _)| i).collect();
+    // (a dry run's `columns` names the columns each side changed: no values)
+    let json_at: Vec<usize> =
+        cols.iter().enumerate().filter(|(_, c)| c.1 == Type::Json && c.0 != "columns").map(|(i, _)| i).collect();
     let mut known: HashMap<String, Vec<(String, char)>> = HashMap::new();
     let mut key: Option<[u8; 32]> = None;
     for row in &mut out.rows {

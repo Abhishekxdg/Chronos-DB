@@ -154,7 +154,7 @@ pub(crate) fn limits(scope: &Json) -> (Option<u64>, Option<u64>) {
 
 /// A tenant as `{"column": c, "value": v}`: text `column = value` (a number, true or false, or
 /// text in single quotes) or a JSON object of one column and its value.
-fn tenant(val: &Json) -> Result<Json> {
+pub(crate) fn tenant(val: &Json) -> Result<Json> {
     let wrong = || bad("tenant must be text like 'org_id = 42' or 'region = ''eu''', or {\"org_id\": 42}".into());
     let (column, value) = match val {
         Json::Object(m) if m.len() == 1 => {
@@ -321,6 +321,20 @@ fn same(row: &Json, want: &Json) -> bool {
         }
 }
 
+/// A tenant (`{"column": c, "value": v}`, as an agent keeps it) as one text per tenant (see `tally`): a number,
+/// or text spelling a number as a number does (`'42'`), as that number, so `42` and `'42'` are one tenant; any
+/// other text as it is spelled, so `'042'` and `'42'` stay two, as `same` compares two texts exactly. (`same` also
+/// takes `'042'` for the number 42; no one text per tenant can follow both, and text ids keep their spelling.)
+pub(crate) fn tenant_key(t: &Json) -> Option<String> {
+    let col = t["column"].as_str()?;
+    let v = match &t["value"] {
+        Json::Number(n) => decimal(&n.to_string()).map(|d| format!("#{d}")),
+        Json::String(s) => decimal(s).filter(|d| d == s).map(|d| format!("#{d}")),
+        _ => None,
+    };
+    Some(format!("{col}={}", v.unwrap_or_else(|| t["value"].to_string())))
+}
+
 /// A plain decimal (`-012.50`) as one text per value (`-12.5`); None for anything else.
 fn decimal(s: &str) -> Option<String> {
     let s = s.trim();
@@ -342,7 +356,7 @@ fn decimal(s: &str) -> Option<String> {
 }
 
 /// A tenant's value as SQL writes it: `42`, `'eu'`.
-fn lit(v: &Json) -> String {
+pub(crate) fn lit(v: &Json) -> String {
     match v {
         Json::String(s) => format!("'{}'", s.replace('\'', "''")),
         v => v.to_string(),

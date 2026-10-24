@@ -125,6 +125,10 @@ pub struct Idx {
     pub(crate) colls: Vec<Option<Coll>>,
     /// each part's ` COLLATE c`, where its collation isn't its column's (or an expression's default)
     pub collate: Vec<String>,
+    /// pg_class.reltablespace (0: the database's default) and its storage's generation (see `hier::Hier::tablespace`
+    /// and `tablespace::Gens`, which `tables` gives it from)
+    pub tablespace: i64,
+    pub filenode: i64,
 }
 
 /// A table's constraints and indexes. A UNIQUE constraint makes an index of its name, as in
@@ -179,6 +183,7 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
         });
         let is_clustered = clustered(&name);
         let is_replident = replident(&name);
+        let pkey = name.clone();
         idx.push(Idx {
             name,
             unique: true,
@@ -196,6 +201,8 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
             replident: is_replident,
             colls: keys.iter().map(|&i| coll_of(t.cols[i].id)).collect(),
             collate: vec![],
+            tablespace: t.hier.index_space(&pkey),
+            filenode: 0,
         });
     }
     for u in t.uniques.iter().filter(|u| !t.indexes.iter().any(|x| x.name == u.name)) {
@@ -239,6 +246,8 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
             replident: replident(&u.name),
             colls: u.cols.iter().map(|&c| coll_of(c)).collect(),
             collate: vec![],
+            tablespace: t.hier.index_space(&u.name),
+            filenode: 0,
         });
     }
     for x in &t.indexes {
@@ -278,11 +287,21 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
         let from = up.as_ref().filter(|_| given(&x.name)).and_then(|p| {
             if unique {
                 p.uniques.iter().find(|pu| same_cols(&pu.cols, &x.cols)).map(|pu| pu.name.clone())
+            } else if let Some(up) = t.hier.index_up(&x.name).filter(|u| p.indexes.iter().any(|px| px.name == *u)) {
+                // (the one it was made as a copy of, or attached to)
+                Some(up.to_string())
             } else {
-                p.indexes
+                // (of several alike, the partition's are its parent's in the order both were made)
+                let alike = |a: &btree::Index| a.exprs == x.exprs && a.filter == x.filter;
+                let rank = t
+                    .indexes
                     .iter()
-                    .find(|px| same_cols(&px.cols, &x.cols) && px.exprs == x.exprs && px.filter == x.filter)
-                    .map(|px| px.name.clone())
+                    .take_while(|y| y.name != x.name)
+                    .filter(|y| given(&y.name) && y.cols == x.cols && alike(y))
+                    .count();
+                let mut ups = p.indexes.iter().filter(|px| same_cols(&px.cols, &x.cols) && alike(px));
+                let first = ups.clone().next();
+                ups.nth(rank).or(first).map(|px| px.name.clone())
             }
         });
         let pred_pretty = x.filter.as_deref().map(|f| pretty_def(f, &t.cols));
@@ -326,6 +345,8 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
             replident: replident(&x.name),
             colls,
             collate,
+            tablespace: t.hier.index_space(&x.name),
+            filenode: 0,
         });
     }
     for (name, c, ops) in &t.ann {
@@ -351,6 +372,8 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
             replident: false,
             colls: vec![None],
             collate: vec![],
+            tablespace: t.hier.index_space(name),
+            filenode: 0,
         });
     }
     for f in &t.fks {
@@ -792,6 +815,10 @@ pub(crate) struct Catalog {
     pub(super) enum_orders: Vec<Vec<f64>>,
     /// for each of `enums` that is a domain: whether it is NOT NULL, and its own CHECKs (name, condition)
     pub(super) domains: Vec<Option<DomainFacts>>,
+    /// for each of `enums`, its typtype by its row (see `type_kind`)
+    pub(super) type_kinds: Vec<char>,
+    /// for each of `enums` that is a composite type: its attributes (name, type as written)
+    pub(super) composites: Vec<Option<Vec<(String, String)>>>,
     /// each table column that has a default, as (relation, column)
     pub(super) defaults: Vec<(usize, usize)>,
     /// the views and materialized views (each has a `_RETURN` rule), by relation
@@ -818,6 +845,8 @@ pub(crate) struct Catalog {
     pub(super) extensions: Vec<(String, String, String)>,
     /// the event triggers, by name, with their rows (see `userdefs::event_triggers`)
     pub(super) evts: Vec<(String, Json)>,
+    /// the tablespaces, Postgres's two first (see `tablespace`)
+    pub(super) spaces: Vec<super::tablespace::Space>,
     /// the oids of the relations, indexes, constraints, schemas, enum types, collations and row types, worked out
     /// from their names (see `Named`)
     pub(super) named: Named,
@@ -838,6 +867,8 @@ pub(crate) struct Named {
     pub(super) enums: Vec<i64>,
     pub(super) colls: Vec<i64>,
     pub(super) rows: Vec<i64>,
+    /// the composite types' relations (pg_class relkind `c`), each with its place in `enums`
+    pub(super) comps: Vec<(usize, i64)>,
     by: HashMap<i64, Slot>,
 }
 
@@ -851,6 +882,8 @@ enum Slot {
     Enum(usize),
     Coll(usize),
     Row(usize),
+    /// a composite type's relation, by its type's place in `enums`
+    Comp(usize),
 }
 
 /// The kinds' ranges: the first at 2^26, each 2^26 long.
@@ -897,6 +930,13 @@ impl Named {
         let enums = named_oids(4, &c.enums.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), true);
         let colls = named_oids(5, &c.colls.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(), false);
         let rows = named_oids(6, &rel_names, true);
+        // (a composite type's relation has an oid of a kind of its own, so making one moves no table's; kinds 7 to 10
+        // meet the foreign objects' range, see `foreign::name_oids`. A shell type has none, as Postgres's has none)
+        let made: Vec<usize> = (0..c.enums.len())
+            .filter(|&k| c.composites.get(k).is_some_and(Option::is_some) && !c.is_shell(k))
+            .collect();
+        let comp_oids = named_oids(11, &made.iter().map(|&k| c.enums[k].0.clone()).collect::<Vec<_>>(), false);
+        let comps: Vec<(usize, i64)> = made.into_iter().zip(comp_oids).collect();
         let mut by = HashMap::new();
         let mut add =
             |oids: &[i64], slot: fn(usize) -> Slot| by.extend(oids.iter().enumerate().map(|(k, o)| (*o, slot(k))));
@@ -907,7 +947,8 @@ impl Named {
         add(&enums, Slot::Enum);
         add(&colls, Slot::Coll);
         add(&rows, Slot::Row);
-        Named { rels, idx, cons, schemas, enums, colls, rows, by }
+        by.extend(comps.iter().map(|&(k, o)| (o, Slot::Comp(k))));
+        Named { rels, idx, cons, schemas, enums, colls, rows, comps, by }
     }
 }
 
@@ -977,14 +1018,19 @@ impl Catalog {
             funcs.push(functions::Function::from_raw(&r?.1)?);
         }
         let (mut enums, mut domains, mut enum_orders) = (vec![], vec![], vec![]);
+        let (mut type_kinds, mut composites) = (vec![], vec![]);
         for r in v.prefix("_sonos_types/")? {
             let (k, raw) = r?;
             let j: Json = serde_json::from_str(&raw).unwrap_or_default();
             let labels = j["enum"].as_array().into_iter().flatten().filter_map(|l| l.as_str().map(String::from));
             let name = k["_sonos_types/".len()..].to_string();
             domains.push(j.get("domain").filter(|d| d.is_object()).map(|d| super::domain::own_constraints(d, &name)));
+            composites.push(j["composite"].as_array().map(|fs| {
+                fs.iter().filter_map(|f| Some((f[0].as_str()?.to_string(), f[1].as_str()?.to_string()))).collect()
+            }));
             let labels: Vec<String> = labels.collect();
             enum_orders.push(super::enum_orders(&j, labels.len()));
+            type_kinds.push(type_kind(&j));
             enums.push((name, labels));
         }
         let mut defaults = vec![];
@@ -1009,6 +1055,7 @@ impl Catalog {
         let colls = super::collation::all(&v)?;
         let extensions = super::pgcrypto::extensions(&v)?;
         let evts = super::userdefs::event_triggers(&v)?;
+        let spaces = super::tablespace::load(&v)?;
         let mut cat = Catalog {
             colls,
             rels,
@@ -1021,6 +1068,8 @@ impl Catalog {
             enums,
             enum_orders,
             domains,
+            type_kinds,
+            composites,
             defaults,
             rewrites,
             triggers,
@@ -1033,6 +1082,7 @@ impl Catalog {
             reg,
             extensions,
             evts,
+            spaces,
             named: Named::default(),
         };
         cat.named = Named::of(&cat);
@@ -1052,6 +1102,8 @@ impl Catalog {
             enums: vec![],
             enum_orders: vec![],
             domains: vec![],
+            type_kinds: vec![],
+            composites: vec![],
             defaults: vec![],
             rewrites: vec![],
             triggers: vec![],
@@ -1065,6 +1117,7 @@ impl Catalog {
             colls: vec![],
             extensions: vec![],
             evts: vec![],
+            spaces: vec![],
             named: Named::default(),
         }
     }
@@ -1089,14 +1142,17 @@ impl Catalog {
                 rel_named(rest).is_some_and(|r| Self::comment_kind(r.kind) == Some(kind))
             }
             "index" => self.idx.iter().any(|(r, x)| qualify(schema_part(&self.rels[*r].name), &x.name) == rest),
-            "column" => self.rels.iter().any(|r| {
-                rest.strip_prefix(&r.name)
-                    .and_then(|c| c.strip_prefix('/'))
-                    .is_some_and(|c| r.columns.iter().any(|x| x.0 == c))
-            }),
+            "column" => {
+                self.rels.iter().any(|r| {
+                    rest.strip_prefix(&r.name)
+                        .and_then(|c| c.strip_prefix('/'))
+                        .is_some_and(|c| r.columns.iter().any(|x| x.0 == c))
+                }) || rest.rsplit_once('/').is_some_and(|(t, c)| self.composite_attnum(t, c).is_some())
+            }
             "constraint" => self.cons.iter().any(|(r, c)| {
                 rest.strip_prefix(&self.rels[*r].name).and_then(|n| n.strip_prefix('/')).is_some_and(|n| n == c.name)
             }),
+            "domain constraint" => rest.rsplit_once('/').is_some_and(|(d, n)| self.domain_check_oid(d, n).is_some()),
             "schema" => {
                 matches!(rest, "public" | "pg_catalog" | "information_schema") || self.schemas.iter().any(|s| s == rest)
             }
@@ -1126,10 +1182,23 @@ impl Catalog {
                     .iter()
                     .position(|(r, x)| qualify(schema_part(&self.rels[*r].name), &x.name) == rest)
                     .map(|k| (self.idx_oid(k), 1259, 0)),
-                "column" => self.rels.iter().enumerate().find_map(|(i, r)| {
-                    let c = rest.strip_prefix(&r.name)?.strip_prefix('/')?;
-                    Some((self.rel_oid(i), 1259, r.attnum(r.columns.iter().position(|x| x.0 == c)?)))
-                }),
+                "column" => self
+                    .rels
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, r)| {
+                        let c = rest.strip_prefix(&r.name)?.strip_prefix('/')?;
+                        Some((self.rel_oid(i), 1259, r.attnum(r.columns.iter().position(|x| x.0 == c)?)))
+                    })
+                    // (a composite type's attribute: a column of its relation)
+                    .or_else(|| {
+                        let (t, c) = rest.rsplit_once('/')?;
+                        let (k, n) = self.composite_attnum(t, c)?;
+                        Some((self.comp_oid(k)?, 1259, n))
+                    }),
+                "domain constraint" => {
+                    rest.rsplit_once('/').and_then(|(d, n)| self.domain_check_oid(d, n)).map(|o| (o, 2606, 0))
+                }
                 "constraint" => self.cons.iter().enumerate().find_map(|(k, (r, c))| {
                     let n = rest.strip_prefix(&self.rels[*r].name)?.strip_prefix('/')?;
                     (n == c.name).then(|| (self.con_oid(k), 2606, 0))
@@ -1189,6 +1258,17 @@ impl Catalog {
             }
             (None, Some(Slot::Schema(k))) if sub == 0 && is("pg_namespace") => format!("schema/{}", self.schemas[*k]),
             (None, Some(Slot::Enum(k))) if sub == 0 && is("pg_type") => format!("type/{}", self.enums[*k].0),
+            // (a composite type's attribute, a column of its relation)
+            (None, Some(Slot::Comp(k))) if sub > 0 && is("pg_class") => {
+                let fields = self.composites.get(*k)?.as_ref()?;
+                let (attr, _) = fields.get(usize::try_from(sub - 1).ok()?)?;
+                format!("column/{}/{attr}", self.enums[*k].0)
+            }
+            // (a domain's constraint)
+            (None, None) if sub == 0 && is("pg_constraint") && self.domain_checks().iter().any(|d| d.0 == oid) => {
+                let (_, k, n, _) = self.domain_checks().into_iter().find(|d| d.0 == oid)?;
+                format!("domain constraint/{}/{n}", self.enums[k].0)
+            }
             // (a publication's, by name)
             (None, _) if sub == 0 && is("pg_publication") => {
                 let (_, k) = super::publication::publication_oids(self).into_iter().find(|(o, _)| *o == oid)?;
@@ -1264,6 +1344,19 @@ impl Catalog {
         named.into_iter().zip(oids).map(|((k, n, text), oid)| (oid, k, n, text)).collect()
     }
 
+    /// The oid of check `name` of domain `domain` (its stored name), if it has one so named.
+    fn domain_check_oid(&self, domain: &str, name: &str) -> Option<i64> {
+        self.domain_checks().into_iter().find(|(_, k, n, _)| self.enums[*k].0 == domain && *n == name).map(|d| d.0)
+    }
+
+    /// Composite type `name`'s (its stored name) attribute `attr`: the type's place in `enums`, and the attribute's
+    /// number.
+    pub(super) fn composite_attnum(&self, name: &str, attr: &str) -> Option<(usize, i64)> {
+        let k = self.enums.iter().position(|(n, _)| n == name)?;
+        let at = self.composites.get(k)?.as_ref()?.iter().position(|(a, _)| a == attr)?;
+        Some((k, at as i64 + 1))
+    }
+
     pub(crate) fn find(&self, oid: i64) -> Option<Obj<'_>> {
         match self.named.by.get(&oid) {
             Some(Slot::Rel(i)) => Some(Obj::Rel(*i)),
@@ -1299,6 +1392,11 @@ impl Catalog {
         self.named.rows[i]
     }
 
+    /// The oid of composite type `k`'s relation (`k` its place in `enums`; `pg_type.typrelid`), if it is one.
+    pub(crate) fn comp_oid(&self, k: usize) -> Option<i64> {
+        self.named.comps.iter().find(|(c, _)| *c == k).map(|(_, o)| *o)
+    }
+
     /// The relation whose row type (or, with `array`, that type's array type) has this oid.
     pub(super) fn row_type_of(&self, oid: i64, array: bool) -> Option<usize> {
         match self.named.by.get(&(oid - i64::from(array))) {
@@ -1307,12 +1405,19 @@ impl Catalog {
         }
     }
 
-    /// The enum type (its place in `enums`) whose oid this is, or with `array` whose array type's.
+    /// The enum type (its place in `enums`) whose oid this is, or with `array` whose array type's (a shell type has
+    /// none).
     pub(super) fn enum_at(&self, oid: i64, array: bool) -> Option<usize> {
         match self.named.by.get(&(oid - i64::from(array))) {
-            Some(Slot::Enum(k)) => Some(*k),
+            Some(Slot::Enum(k)) if !(array && self.is_shell(*k)) => Some(*k),
             _ => None,
         }
+    }
+
+    /// Whether type `k` (its place in `enums`) is a shell type, `CREATE TYPE name` not yet filled in: as Postgres's,
+    /// it has no relation and no array type (see `type_kind`).
+    pub(super) fn is_shell(&self, k: usize) -> bool {
+        self.type_kinds.get(k) == Some(&'p')
     }
 
     /// Whether this oid is an enum type's (or its array type's).
@@ -1712,6 +1817,146 @@ fn index_tree_rows(cat: &Catalog, name: &str, start: usize) -> Vec<Vec<Value>> {
     out
 }
 
+/// A type's typtype, its element type if it is a true array, and its base type if it is a domain (see `TYPE_SHAPES`).
+type TypeShape = (char, Option<i64>, i64);
+
+/// Postgres's built-in types (pg_type's rows, see `catalog_schema`) as IsBinaryCoercible asks of them, by oid: the
+/// typtype, the element type of a true array (typelem set, typcategory `A`), and the base type of a domain.
+static TYPE_SHAPES: std::sync::LazyLock<HashMap<i64, TypeShape>> = std::sync::LazyLock::new(|| {
+    let cols = catalog_schema::columns("pg_type");
+    let at = |n: &str| cols.iter().position(|(c, _)| c == n);
+    let (Some(o), Some(kind), Some(category), Some(elem), Some(base)) =
+        (at("oid"), at("typtype"), at("typcategory"), at("typelem"), at("typbasetype"))
+    else {
+        return HashMap::new();
+    };
+    let int = |v: &Value| if let Value::Int(n) = v { *n } else { 0 };
+    (catalog_schema::builtin_rows("pg_type").iter())
+        .map(|r| {
+            let array = int(&r[elem]) != 0 && r[category].to_text() == "A";
+            (int(&r[o]), (r[kind].to_text().chars().next().unwrap_or('b'), array.then(|| int(&r[elem])), int(&r[base])))
+        })
+        .collect()
+});
+
+/// Postgres's built-in casts that are binary-coercible (castmethod `b`) and implicit (castcontext `i`): (source,
+/// target).
+static BINARY_CASTS: std::sync::LazyLock<HashSet<(i64, i64)>> = std::sync::LazyLock::new(|| {
+    let cols = catalog_schema::columns("pg_cast");
+    let at = |n: &str| cols.iter().position(|(c, _)| c == n);
+    let (Some(s), Some(t), Some(context), Some(method)) =
+        (at("castsource"), at("casttarget"), at("castcontext"), at("castmethod"))
+    else {
+        return HashSet::new();
+    };
+    let int = |v: &Value| if let Value::Int(n) = v { *n } else { 0 };
+    (catalog_schema::builtin_rows("pg_cast").iter())
+        .filter(|r| r[context].to_text() == "i" && r[method].to_text() == "b")
+        .map(|r| (int(&r[s]), int(&r[t])))
+        .collect()
+});
+
+/// The typtype of a type made with CREATE TYPE or CREATE DOMAIN, by its row: a domain's `d`, an enum's `e` (one with
+/// no labels too), a composite type's `c` (one of no attributes too, whose row says `"empty": true`; a shell type's,
+/// `CREATE TYPE name`, whose fields are none and whose row doesn't, `p`: see `sql::shell_row`), a range type's `r` and
+/// a base type's `b`.
+fn type_kind(j: &Json) -> char {
+    match (j["composite"].as_array(), j["range"].is_object()) {
+        _ if j.get("domain").is_some_and(Json::is_object) => 'd',
+        _ if j.get("enum").is_some() => 'e',
+        (Some(fields), _) if fields.is_empty() && j["empty"] != true => 'p',
+        (Some(_), _) => 'c',
+        (None, true) => 'r',
+        (None, false) => 'b',
+    }
+}
+
+/// Type `oid`'s typtype and, for a true array, its element type: a built-in type's, or one made here (an enum, a
+/// domain, a composite, range or base type, a relation's row type, and their arrays); None for an oid no type has.
+fn type_shape(cat: &Catalog, oid: i64) -> Option<(char, Option<i64>)> {
+    if let Some(&(kind, elem, _)) = TYPE_SHAPES.get(&oid) {
+        return Some((kind, elem));
+    }
+    // a range type made with CREATE TYPE ... AS RANGE, and its multirange, by the oids `range` gives them
+    if let Ok(o) = u32::try_from(oid) {
+        if super::range::kind(o).is_some() {
+            return Some(('r', None));
+        }
+        if super::range::of_multi(o).is_some() {
+            return Some(('m', None));
+        }
+    }
+    // (the catalog keeps each type made with CREATE TYPE or CREATE DOMAIN with the enums)
+    if let Some(k) = cat.enum_at(oid, false) {
+        return Some((cat.type_kinds.get(k).copied().unwrap_or('b'), None));
+    }
+    if cat.enum_at(oid, true).is_some() || cat.row_type_of(oid, true).is_some() {
+        return Some(('b', Some(oid - 1)));
+    }
+    cat.row_type_of(oid, false).map(|_| ('c', None))
+}
+
+/// getBaseType: the type a domain is over, through any domains it is over in turn; any other type is its own.
+fn base_type(cat: &Catalog, mut oid: i64) -> i64 {
+    for _ in 0..64 {
+        let base = match TYPE_SHAPES.get(&oid) {
+            Some(&(_, _, base)) => base,
+            None => cat
+                .enum_at(oid, false)
+                .filter(|&k| cat.domains.get(k).is_some_and(Option::is_some))
+                .and_then(|k| with_world_view(|v| super::domain::base_of(v, &cat.enums[k].0)).ok().flatten())
+                .and_then(|text| reg_oid(cat, Reg::Type, &text).ok())
+                .unwrap_or(0),
+        };
+        if base == 0 || base == oid {
+            break;
+        }
+        oid = base;
+    }
+    oid
+}
+
+/// The regression tests' library's binary_coercible(source, target), Postgres's IsBinaryCoercible: whether a value of
+/// type `source` is one of type `target` with no conversion. The same type is; any is one of `any`, `anyelement` and
+/// `anycompatible`; a domain is its base type; the polymorphic types take what they say (an array, an enum, a range,
+/// ...), and `record` a composite type; else only a cast WITHOUT FUNCTION that is implicit makes one.
+fn binary_coercible(cat: &Catalog, source: i64, target: i64) -> bool {
+    const ANY: i64 = 2276;
+    const ANYELEMENT: i64 = 2283;
+    const ANYCOMPATIBLE: i64 = 5077;
+    const ANYARRAY: i64 = 2277;
+    const ANYCOMPATIBLEARRAY: i64 = 5078;
+    const ANYNONARRAY: i64 = 2776;
+    const ANYCOMPATIBLENONARRAY: i64 = 5079;
+    const ANYENUM: i64 = 3500;
+    const ANYRANGE: i64 = 3831;
+    const ANYCOMPATIBLERANGE: i64 = 5080;
+    const ANYMULTIRANGE: i64 = 4537;
+    const ANYCOMPATIBLEMULTIRANGE: i64 = 4538;
+    const RECORD: i64 = 2249;
+    const RECORDARRAY: i64 = 2287;
+    if source == target || matches!(target, ANY | ANYELEMENT | ANYCOMPATIBLE) {
+        return true;
+    }
+    let source = if source != 0 { base_type(cat, source) } else { source };
+    if source == target {
+        return true;
+    }
+    let (kind, elem) = type_shape(cat, source).unwrap_or(('b', None));
+    let held = match target {
+        ANYARRAY | ANYCOMPATIBLEARRAY => elem.is_some(),
+        ANYNONARRAY | ANYCOMPATIBLENONARRAY => elem.is_none(),
+        ANYENUM => kind == 'e',
+        ANYRANGE | ANYCOMPATIBLERANGE => kind == 'r',
+        ANYMULTIRANGE | ANYCOMPATIBLEMULTIRANGE => kind == 'm',
+        RECORD => kind == 'c',
+        // (an array of a domain over a composite type too: Postgres's ISCOMPLEX follows the domain)
+        RECORDARRAY => elem.and_then(|e| type_shape(cat, base_type(cat, e))).is_some_and(|(k, _)| k == 'c'),
+        _ => false,
+    };
+    held || BINARY_CASTS.contains(&(source, target))
+}
+
 /// The catalog's functions: regclass (a name or oid to the relation's name, or to its oid),
 /// to_regclass, pg_get_constraintdef, pg_get_indexdef, pg_table_is_visible, current_schemas.
 pub(super) fn call(f: CtxFn, a: &[Value]) -> Result<Value> {
@@ -1759,6 +2004,19 @@ pub(super) fn call(f: CtxFn, a: &[Value]) -> Result<Value> {
     }
     if f == CtxFn::InputValid {
         return Ok(Bool(read_as(&cat, &a[0].to_text(), &a[1].to_text())?.is_ok()));
+    }
+    if f == CtxFn::BinaryCoercible {
+        let oid = |v: &Value| match v {
+            Reg(o, _) => Some(*o),
+            v => match coerce(v.clone(), Type::BigInt) {
+                Ok(Int(o)) => Some(o),
+                _ => None,
+            },
+        };
+        return Ok(match (oid(&a[0]), a.get(1).and_then(oid)) {
+            (Some(source), Some(target)) => Bool(binary_coercible(&cat, source, target)),
+            _ => Null,
+        });
     }
     if f == CtxFn::FormatType {
         let Int(oid) = coerce(a[0].clone(), Type::BigInt)? else { return Ok(Null) };
@@ -1888,6 +2146,59 @@ pub(super) fn call(f: CtxFn, a: &[Value]) -> Result<Value> {
                 .map_or(Null, |k| Reg(cat.idx_oid(k), super::Reg::Class)),
             _ => Null,
         },
+        // a relation's pg_class.relfilenode, null for one with no storage of its own (a view, a partitioned table or
+        // index, a foreign table). The argument is a regclass: a name of none is its error, an oid of none null.
+        CtxFn::RelationFilenode => {
+            let o = match &a[0] {
+                Int(n) => int_oid(*n)?,
+                Reg(o, _) => *o,
+                v => reg_oid(&cat, super::Reg::Class, &v.to_text())?,
+            };
+            match cat.find(o) {
+                Some(Obj::Rel(i)) => match cat.rels[i].kind {
+                    'v' | 'p' | 'f' => Null,
+                    _ => Int(super::tablespace::filenode(cat.rel_oid(i), cat.rels[i].hier.filenode)),
+                },
+                Some(Obj::Index(r, x)) if cat.rels[r].kind != 'p' => {
+                    let k = cat.idx.iter().position(|(q, y)| *q == r && y.name == x.name);
+                    k.map_or(Null, |k| Int(super::tablespace::filenode(cat.idx_oid(k), x.filenode)))
+                }
+                _ => Null,
+            }
+        }
+        // and the relation of a filenode in a tablespace (0 the database's default), as Postgres's
+        // RelidByRelfilenumber: none for a temporary one, which isn't mapped. Both are oids: text read as oidin reads
+        // it (`0x67F`, `-1` wrapped around; not as a relation's name, as a regclass is), an integer as its cast to an
+        // oid takes it (22003 past 32 bits), and the function is strict: a NULL tablespace is none, not the default.
+        CtxFn::FilenodeRelation => {
+            let as_oid = |v: &Value| match v {
+                Null => Ok(None),
+                Int(n) => int_oid(*n).map(Some),
+                Reg(o, _) => Ok(Some(*o)),
+                v => super::oid_in(&v.to_text()).map(Some),
+            };
+            let (Some(space), Some(node)) = (as_oid(&a[0])?, a.get(1).map(as_oid).transpose()?.flatten()) else {
+                return Ok(Null);
+            };
+            let space = if space == super::tablespace::DEFAULT { 0 } else { space };
+            let temp = |name: &str| schema_part(name) == TEMP_SCHEMA;
+            let rel = cat.rels.iter().enumerate().find(|(i, r)| {
+                !matches!(r.kind, 'v' | 'p' | 'f')
+                    && !temp(&r.name)
+                    && r.hier.tablespace == space
+                    && super::tablespace::filenode(cat.rel_oid(*i), r.hier.filenode) == node
+            });
+            if let Some((i, _)) = rel {
+                return Ok(Reg(cat.rel_oid(i), super::Reg::Class));
+            }
+            let index = cat.idx.iter().enumerate().find(|(k, (r, x))| {
+                cat.rels[*r].kind != 'p'
+                    && !temp(&cat.rels[*r].name)
+                    && x.tablespace == space
+                    && super::tablespace::filenode(cat.idx_oid(*k), x.filenode) == node
+            });
+            index.map_or(Null, |(k, _)| Reg(cat.idx_oid(k), super::Reg::Class))
+        }
         // (a built-in function's from its line in builtin_procs.tsv)
         CtxFn::FunctionArgs(identity) => {
             let o = oid(&a[0])?;
@@ -2026,6 +2337,11 @@ pub(super) fn call(f: CtxFn, a: &[Value]) -> Result<Value> {
 /// The name format_type gives the built-in type whose `typname` is `typname` (`int4` is `integer`), if Chronos knows it.
 pub(super) fn builtin_type_shown(typname: &str) -> Option<&'static str> {
     PG_TYPES.iter().find(|(_, _, names)| names.contains(&typname)).map(|t| t.1)
+}
+
+/// Whether `typname` names one of Postgres's built-in types (as `typname` or another name it reads).
+pub(super) fn is_builtin_type_name(typname: &str) -> bool {
+    PG_TYPES.iter().any(|(_, _, names)| names.contains(&typname))
 }
 
 /// Postgres's types by name and oid: (oid, the name `regtype` shows, the names it reads).
@@ -2786,7 +3102,8 @@ fn type_named(cat: &Catalog, text: &str) -> Result<i64> {
     }
     if dims > 0 {
         let e = type_named(cat, &elem)?;
-        let array = if cat.enum_at(e, false).is_some() || cat.row_type_of(e, false).is_some() {
+        // (a shell type has none)
+        let array = if cat.enum_at(e, false).is_some_and(|k| !cat.is_shell(k)) || cat.row_type_of(e, false).is_some() {
             Some(e + 1)
         } else {
             ARRAYS
@@ -2859,8 +3176,10 @@ fn type_named(cat: &Catalog, text: &str) -> Result<i64> {
     if let Some(o) = user(plain) {
         return Ok(o);
     }
-    // `_mood`, `_t`: the array type of one made here
-    if let Some(o) = plain.strip_prefix('_').and_then(user) {
+    // `_mood`, `_t`: the array type of one made here (a shell type has none)
+    if let Some(o) = plain.strip_prefix('_').and_then(user)
+        && cat.enum_at(o, false).is_none_or(|k| !cat.is_shell(k))
+    {
         return Ok(o + 1);
     }
     Err(missing(bare))
@@ -3446,7 +3765,7 @@ pub(super) fn rows(branch: &str, name: &str, cat: &Catalog) -> Option<Rows> {
                         t(&value),
                         Null,
                         t("Customized Options"),
-                        t(""),
+                        t(if name == "chronos.explain" { super::EXPLAIN_SETTING_ABOUT } else { "" }),
                         Null,
                         t(if read_only { "internal" } else { "user" }),
                         t("string"),

@@ -28,6 +28,8 @@ pub(super) enum Scalar {
     /// ARRAY[[1, 2], [3, 4]]: arrays of a dimension below, made one of more dimensions
     ArrayNest,
     TablespaceLocation,
+    /// the regression tests' library's test_canonicalize_path(path): see `canonicalize_path`
+    CanonicalizePath,
     /// `a *< b` and the other record image comparisons (args: a, b, the operator, the two record types' places):
     /// see `super::record_image`
     RecordImage,
@@ -441,8 +443,10 @@ pub(super) fn lookup(name: &str) -> Option<(Scalar, std::ops::RangeInclusive<usi
         "textcat" => (Concat, 2..=2),
         // pg_stat_statements's: forget the statistics (see `stmtstats`) of a user, a database, a query id (0: any)
         "pg_stat_statements_reset" => (StatReset, 0..=3),
-        // (there are no tablespaces but the default ones, which are in the data folder: '')
+        // (where a tablespace is: see `tablespace::location`)
         "pg_tablespace_location" => (TablespaceLocation, 1..=1),
+        // (the body of the regression tests' C function test_canonicalize_path: see `functions::regress_c`)
+        "__canonicalize_path" => (CanonicalizePath, 1..=1),
         // intarray's
         "icount" => (IntArr(intarray::ICOUNT), 1..=1),
         "sort" => (IntArr(intarray::SORT), 1..=2),
@@ -1277,6 +1281,49 @@ fn text(v: &Value) -> String {
     }
 }
 
+/// A path as Postgres 16's canonicalize_path writes it (src/port/path.c, as on Unix), for the regression tests'
+/// library's test_canonicalize_path: no trailing or doubled slashes, no `.` parts, each `..` taking away the part
+/// before it (never above `/`, and kept at the start of a relative path), and `.` for a relative path left empty.
+fn canonicalize_path(path: &str) -> String {
+    let mut collapsed = String::with_capacity(path.len());
+    for c in path.chars() {
+        if c == '/' && collapsed.ends_with('/') {
+            continue;
+        }
+        collapsed.push(c);
+    }
+    if collapsed.len() > 1 && collapsed.ends_with('/') {
+        collapsed.pop();
+    }
+    if collapsed.is_empty() {
+        return collapsed;
+    }
+    let absolute = collapsed.starts_with('/');
+    // the parts kept, and how many of them are names a later `..` may take away
+    let (mut parts, mut names): (Vec<&str>, usize) = (vec![], 0);
+    for part in collapsed.split('/').skip(usize::from(absolute)) {
+        match part {
+            "." | "" => {}
+            ".." if names > 0 => {
+                parts.pop();
+                names -= 1;
+            }
+            ".." if absolute => {}
+            ".." => parts.push(part),
+            _ => {
+                parts.push(part);
+                names += 1;
+            }
+        }
+    }
+    let joined = parts.join("/");
+    match (absolute, joined.is_empty()) {
+        (true, _) => format!("/{joined}"),
+        (false, true) => ".".into(),
+        (false, false) => joined,
+    }
+}
+
 /// Characters `set` doesn't hold, trimmed from `s`'s start and/or end.
 fn trim(s: &str, set: &str, start: bool, end: bool) -> String {
     let set: Vec<char> = set.chars().collect();
@@ -1812,21 +1859,29 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
         BinaryCast => return binary_cast(a),
         XidFn(_) => return super::xid::call(f, a),
         TimeTzFn(_) => return super::timetz::call(f, a),
-        StatReset => return super::stmtstats::reset(a, super::stmtstats::world_oids),
+        StatReset => {
+            super::dry_refusal(|| "pg_stat_statements_reset()".into())?; // (see `sql::dry_run`)
+            return super::stmtstats::reset(a, super::stmtstats::world_oids);
+        }
         Mask(m) => return super::mask::apply(m, a),
         Spelled(_) => return Ok(a.first().cloned().unwrap_or(Null)),
         // (read as their operators: see `builtin_call`)
         JsonOpFn(_) => return err("42883", "a jsonb operator's function is read as the operator"),
-        // (the default ones, pg_default and pg_global, and 0 for the database's: in the data folder; there are no
-        // others, whose link Postgres would fail to find)
+        // (the default ones, pg_default and pg_global, and 0 for the database's: in the data folder; one made in place
+        // is a directory of it, the others their LOCATION; an oid of none has no link for Postgres to find). The
+        // argument is an oid: text read as oidin reads it, an integer as its cast to an oid takes it.
         TablespaceLocation => {
-            return match &a[0] {
-                Null => Ok(Null),
-                Int(0 | 1663 | 1664) => Ok(Text(String::new())),
-                v => {
-                    let oid = v.to_text().parse::<i64>().map_or_else(|_| v.to_text(), |o| (o as u32).to_string());
-                    err("58P01", format!("could not stat file \"pg_tblspc/{oid}\": No such file or directory"))
-                }
+            let o = match &a[0] {
+                Null => return Ok(Null),
+                Int(n) => super::catalog::int_oid(*n)?,
+                Reg(o, _) => *o,
+                v => super::oid_in(&v.to_text())?,
+            };
+            let found = super::catalog::current_catalog().ok().and_then(|cat| super::tablespace::location(&cat, o));
+            return match (found, o) {
+                (Some(l), _) => Ok(Text(l)),
+                (None, 0 | 1663 | 1664) => Ok(Text(String::new())),
+                (None, _) => err("58P01", format!("could not stat file \"pg_tblspc/{o}\": No such file or directory")),
             };
         }
         RecordImage => return super::record_image(a),
@@ -2468,6 +2523,7 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
             Text(s.repeat(n))
         }
         Reverse => Text(s().chars().rev().collect()),
+        CanonicalizePath => Text(canonicalize_path(&s())),
         Translate => {
             // each character of the second text is replaced by the third's at its place, or dropped
             // if the third is shorter (a character named twice takes its first place)

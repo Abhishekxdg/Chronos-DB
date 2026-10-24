@@ -28,24 +28,39 @@ fail() {
 run >"$t/out" 2>&1 || fail "a good release installs: $(cat "$t/out")"
 "$t/bin/chronos" | grep -q -- "-" || fail "the installed binary runs"
 
-# CHRONOS_VERIFY=1: a fake cosign that vouches (only for the release workflow's identity, GitHub's
-# OIDC issuer and the downloaded bundle: $COSIGN_WANT) or refuses; with no cosign at all, it fails
+# CHRONOS_VERIFY=1: a fake cosign that vouches (only for the release builds' service account, $COSIGN_ACCOUNT, through
+# Google's OIDC issuer; or the GitHub release workflow's identity, $COSIGN_WANT, through GitHub's; each for the
+# downloaded bundle) or refuses; with no cosign at all, it fails
 mkdir -p "$t/cosign"
 cat >"$t/cosign/cosign" <<'COSIGN'
 #!/bin/sh
 [ "$1 $2" = "verify-blob --bundle" ] && [ -f "$3" ] || exit 1
 bundle=$3
 shift 3
-[ "$*" = "--certificate-oidc-issuer https://token.actions.githubusercontent.com $COSIGN_WANT ${bundle%.sigstore.json}" ] ||
+[ -n "${COSIGN_ACCOUNT:-}" ] &&
+    [ "$*" = "--certificate-identity $COSIGN_ACCOUNT --certificate-oidc-issuer https://accounts.google.com ${bundle%.sigstore.json}" ] &&
+    exit 0
+[ "$*" = "--certificate-oidc-issuer https://token.actions.githubusercontent.com ${COSIGN_WANT:-} ${bundle%.sigstore.json}" ] ||
     { echo "cosign got: $*" >&2; exit 1; }
 COSIGN
 chmod +x "$t/cosign/cosign"
 rm -rf "$t/bin"
-COSIGN_WANT='--certificate-identity-regexp=^https://github\.com/__SIGNER__/\.github/workflows/release\.yml@refs/tags/v' \
-    PATH="$t/cosign:$PATH" CHRONOS_VERIFY=1 run >"$t/out" 2>&1 || fail "a signed build installs: $(cat "$t/out")"
-if COSIGN_WANT=other PATH="$t/cosign:$PATH" CHRONOS_VERIFY=1 run >"$t/out" 2>&1; then fail "cosign refusing other arguments must fail"; fi
-# a tagged copy pins the signature to its tag's workflow, and leaves only chronos in the install dir
-sed -e "s|__REPO__|o/r|g" -e "s|__SIGNER__|s/e|g" -e "s|__VERSION__|v9.9.9|g" "$root/install.sh" >"$t/tagged.sh"
+(COSIGN_ACCOUNT=__SIGNER_ACCOUNT__ PATH="$t/cosign:$PATH" CHRONOS_VERIFY=1 run) >"$t/out" 2>&1 ||
+    fail "a build signed by the release builds' account installs: $(cat "$t/out")"
+rm -rf "$t/bin"
+# (and one signed by the GitHub release workflow, as releases up to v0.4.1 are)
+(COSIGN_WANT='--certificate-identity-regexp=^https://github\.com/__SIGNER__/\.github/workflows/release\.yml@refs/tags/v' \
+    PATH="$t/cosign:$PATH" CHRONOS_VERIFY=1 run) >"$t/out" 2>&1 || fail "a signed build installs: $(cat "$t/out")"
+if (COSIGN_WANT=other PATH="$t/cosign:$PATH" CHRONOS_VERIFY=1 run) >"$t/out" 2>&1; then fail "cosign refusing other arguments must fail"; fi
+# a tagged copy names the account that signs, and pins an older signature to its tag's workflow; it leaves only
+# chronos in the install dir
+sed -e "s|__REPO__|o/r|g" -e "s|__SIGNER_ACCOUNT__|rel@p.iam.gserviceaccount.com|g" -e "s|__SIGNER__|s/e|g" \
+    -e "s|__VERSION__|v9.9.9|g" "$root/install.sh" >"$t/tagged.sh"
+rm -rf "$t/bin"
+COSIGN_ACCOUNT=rel@p.iam.gserviceaccount.com PATH="$t/cosign:$PATH" CHRONOS_VERIFY=1 CHRONOS_BASE_URL="file://$t/rel" \
+    CHRONOS_INSTALL_DIR="$t/bin" sh "$t/tagged.sh" >"$t/out" 2>&1 || fail "a tagged build signed by the account installs: $(cat "$t/out")"
+if (COSIGN_ACCOUNT=other@p.iam.gserviceaccount.com PATH="$t/cosign:$PATH" CHRONOS_VERIFY=1 CHRONOS_BASE_URL="file://$t/rel" \
+    CHRONOS_INSTALL_DIR="$t/bin2" sh "$t/tagged.sh") >"$t/out" 2>&1; then fail "another account's signature must fail"; fi
 rm -rf "$t/bin"
 COSIGN_WANT='--certificate-identity=https://github.com/s/e/.github/workflows/release.yml@refs/tags/v9.9.9' \
     PATH="$t/cosign:$PATH" CHRONOS_VERIFY=1 CHRONOS_BASE_URL="file://$t/rel" CHRONOS_INSTALL_DIR="$t/bin" sh "$t/tagged.sh" >"$t/out" 2>&1 ||
@@ -53,7 +68,7 @@ COSIGN_WANT='--certificate-identity=https://github.com/s/e/.github/workflows/rel
 [ "$(ls -A "$t/bin")" = chronos ] || fail "only chronos is left in the install dir: $(ls -A "$t/bin")"
 printf '#!/bin/sh\nexit 1\n' >"$t/cosign/cosign"
 rm -rf "$t/bin"
-if PATH="$t/cosign:$PATH" CHRONOS_VERIFY=1 run >"$t/out" 2>&1; then fail "an unsigned build must fail"; fi
+if (PATH="$t/cosign:$PATH" CHRONOS_VERIFY=1 run) >"$t/out" 2>&1; then fail "an unsigned build must fail"; fi
 grep -q "no valid signature" "$t/out" || fail "the error says no valid signature: $(cat "$t/out")"
 [ ! -e "$t/bin/chronos" ] || fail "an unsigned build installs nothing"
 # without cosign: a PATH of links to every other command
@@ -64,8 +79,9 @@ mkdir -p "$t/nocosign"
 done; done)
 if (PATH="$t/nocosign" CHRONOS_VERIFY=1 run) >"$t/out" 2>&1; then fail "CHRONOS_VERIFY=1 without cosign must fail"; fi
 grep -q "needs cosign" "$t/out" || fail "the error says cosign is needed: $(cat "$t/out")"
-# (bash in POSIX mode keeps a function call's assignments: CHRONOS_VERIFY=1 above lingers)
-PATH="$t/cosign:$PATH" CHRONOS_VERIFY=0 run >"$t/out" 2>&1 || fail "without CHRONOS_VERIFY, cosign isn't asked: $(cat "$t/out")"
+# (a call of `run` with assignments before it is in a subshell: bash in POSIX mode, macOS's sh, keeps a function
+# call's assignments, so CHRONOS_VERIFY=1, and the fake uname and curl below on PATH, would linger)
+(PATH="$t/cosign:$PATH" CHRONOS_VERIFY=0 run) >"$t/out" 2>&1 || fail "without CHRONOS_VERIFY, cosign isn't asked: $(cat "$t/out")"
 
 rm -rf "$t/bin"
 sed 's/^\(.\)/0\1/; s/^\(.\{64\}\)./\1/' "$t/rel/SHA256SUMS" >"$t/sums" && mv "$t/sums" "$t/rel/SHA256SUMS"
@@ -84,7 +100,7 @@ grep -q "has no entry" "$t/out" || fail "the error says no entry: $(cat "$t/out"
 mkdir -p "$t/fake"
 printf '#!/bin/sh\ncase "$1" in -s) echo FreeBSD ;; -m) echo amd64 ;; esac\n' >"$t/fake/uname"
 chmod +x "$t/fake/uname"
-if PATH="$t/fake:$PATH" run >"$t/out" 2>&1; then fail "an unsupported OS must fail"; fi
+if (PATH="$t/fake:$PATH" run) >"$t/out" 2>&1; then fail "an unsupported OS must fail"; fi
 grep -q "/issues" "$t/out" || fail "the error points to the issues: $(cat "$t/out")"
 
 # a copy published with a release installs that release, unless CHRONOS_VERSION says otherwise:

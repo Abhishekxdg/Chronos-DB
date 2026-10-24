@@ -52,8 +52,9 @@ pub(crate) const REVIEW: &str = "_sonos_review";
 /// How often a world's merge was refused, by kind (see `Core::note_refusal`).
 pub(crate) const REFUSALS: &str = "_sonos_refusals";
 
-/// Who `chronos serve --safe` takes a client without an agent's token for: an agent with the
-/// default rights (read, fork, change the worlds it forked), shared by all such clients.
+/// Who `chronos serve` takes a client with the server token for (every client that isn't an agent
+/// or the admin token, with `--safe`): an agent with the default rights (read, fork, change the
+/// worlds it forked), shared by all such clients.
 pub const GUEST: &str = "guest";
 /// Who the database's own background work is logged as: discarding expired and idle worlds.
 pub const SYSTEM: &str = "system";
@@ -148,10 +149,21 @@ pub struct Agent {
     /// dropped and the transaction rolled back, its locks let go: its
     /// idle_in_transaction_session_timeout can't go past it (0: no limit)
     pub max_idle_ms: u64,
+    /// the most threads one of its statements may run on (a parallel scan's parts), its own included, so a heavy
+    /// scan leaves the other cores to everyone else (0: as many as the server's pool lends)
+    pub max_threads: u64,
     pub created: u64,
     pub disabled: bool,
     /// the merge policy its merges keep to (see `MergePolicy`); None: its rights alone decide
     pub policy: Option<String>,
+    /// the one tenant it works for, `{"column": c, "value": v}` (see `tenant_sql`): in every world it reads and
+    /// changes only rows of tables with that column that hold that value, as if a policy said so whatever its
+    /// role, and every world it forks is declared that tenant's (see `scope`). None: any rows its rights reach
+    pub tenant: Option<Json>,
+    /// when its token stops working (ms since 1970); 0: never
+    pub expires: u64,
+    /// when its token was last rotated (ms since 1970); 0: never rotated since it was created
+    pub rotated: u64,
     token_hash: String,
     /// its token's SCRAM-SHA-256 verifier (see `sql::scram`), made when the token was issued; None
     /// for an agent made before agents had one, until it logs in with its token (`upgrade_agent`)
@@ -170,15 +182,32 @@ pub struct AgentSpec {
     pub max_concurrent: Option<u64>,
     pub max_memory_mb: Option<u64>,
     pub max_idle_ms: Option<u64>,
+    pub max_threads: Option<u64>,
     pub disabled: Option<bool>,
     /// a merge policy's name; "" takes the agent's away
     pub policy: Option<String>,
+    /// its tenant (text `'org_id = 42'`, or `{"org_id": 42}`); null takes it away
+    pub tenant: Option<Json>,
+    /// how long from now its token works, in ms; 0: no end
+    pub valid_for: Option<u64>,
 }
 
 impl Agent {
-    /// Whether the agent may do `c` (an admin may do anything; a disabled agent nothing).
+    /// Whether the agent may do `c` (an admin may do anything; a disabled or expired agent nothing).
     pub fn may(&self, c: Can) -> bool {
-        !self.disabled && (self.can.contains(&c) || self.can.contains(&Can::Admin))
+        !self.disabled && !self.expired() && (self.can.contains(&c) || self.can.contains(&Can::Admin))
+    }
+
+    /// Whether its token stopped working (see `expires`).
+    pub fn expired(&self) -> bool {
+        self.expires > 0 && disk::now_ms() >= self.expires
+    }
+
+    /// Its tenant's condition as SQL (`"org_id" = 42`), for the rows it may read and change; None without one.
+    pub fn tenant_sql(&self) -> Option<String> {
+        let t = self.tenant.as_ref()?;
+        let col = t["column"].as_str()?;
+        Some(format!("\"{}\" = {}", col.replace('"', "\"\""), crate::scope::lit(&t["value"])))
     }
 
     fn to_json(&self) -> String {
@@ -186,9 +215,10 @@ impl Agent {
             "id": self.id, "can": self.can.iter().map(|c| c.name()).collect::<Vec<_>>(),
             "max_worlds": self.max_worlds, "writes_per_minute": self.writes_per_minute,
             "max_changes": self.max_changes, "world_ttl": self.world_ttl, "max_query_ms": self.max_query_ms,
-            "max_concurrent": self.max_concurrent, "max_memory_mb": self.max_memory_mb, "max_idle_ms": self.max_idle_ms,
+            "max_concurrent": self.max_concurrent, "max_memory_mb": self.max_memory_mb, "max_idle_ms": self.max_idle_ms, "max_threads": self.max_threads,
             "created": self.created,
             "disabled": self.disabled, "policy": self.policy, "token_hash": self.token_hash, "scram": self.scram,
+            "tenant": self.tenant, "expires": self.expires, "rotated": self.rotated,
         })
         .to_string()
     }
@@ -208,9 +238,13 @@ impl Agent {
             max_concurrent: n("max_concurrent"),
             max_memory_mb: n("max_memory_mb"),
             max_idle_ms: n("max_idle_ms"),
+            max_threads: n("max_threads"),
             created: n("created"),
             disabled: j["disabled"].as_bool().unwrap_or(false),
             policy: j["policy"].as_str().map(String::from),
+            tenant: j.get("tenant").filter(|t| t.is_object()).cloned(),
+            expires: n("expires"),
+            rotated: n("rotated"),
             token_hash: j["token_hash"].as_str()?.into(),
             scram: j["scram"].as_str().map(String::from),
         })
@@ -230,9 +264,13 @@ impl Agent {
             max_concurrent: 0,
             max_memory_mb: 0,
             max_idle_ms: 0,
+            max_threads: 0,
             created: 0,
             disabled: false,
             policy: None,
+            tenant: None,
+            expires: 0,
+            rotated: 0,
             token_hash: String::new(), // matches no token
             scram: None,
         }
@@ -261,9 +299,23 @@ impl Agent {
         self.max_concurrent = spec.max_concurrent.unwrap_or(self.max_concurrent);
         self.max_memory_mb = spec.max_memory_mb.unwrap_or(self.max_memory_mb);
         self.max_idle_ms = spec.max_idle_ms.unwrap_or(self.max_idle_ms);
+        self.max_threads = spec.max_threads.unwrap_or(self.max_threads);
         self.disabled = spec.disabled.unwrap_or(self.disabled);
         if let Some(p) = &spec.policy {
             self.policy = (!p.is_empty()).then(|| p.clone());
+        }
+        match &spec.tenant {
+            None => {}
+            Some(Json::Null) => self.tenant = None,
+            Some(t) => self.tenant = Some(crate::scope::tenant(t)?),
+        }
+        match spec.valid_for {
+            None => {}
+            Some(0) => self.expires = 0,
+            Some(ms) if ms > WORLD_TTL_MAX => {
+                return Err(bad(format!("valid_for is at most {WORLD_TTL_MAX} ms (100 years); 0 means no end")));
+            }
+            Some(ms) => self.expires = disk::now_ms() + ms,
         }
         Ok(())
     }
@@ -514,9 +566,13 @@ impl Core {
             max_concurrent: 0,
             max_memory_mb: 0,
             max_idle_ms: 0,
+            max_threads: 0,
             created: disk::now_ms(),
             disabled: false,
             policy: None,
+            tenant: None,
+            expires: 0,
+            rotated: 0,
             token_hash: hash(&token),
             scram: Some(scram),
         };
@@ -552,6 +608,31 @@ impl Core {
         a.apply(spec)?;
         self.put_agent(&a)?;
         Ok(a)
+    }
+
+    /// Issues agent `name` a fresh token; returns it, shown only now (keep it). The old token
+    /// stops working at once. Everything else about the agent — its name, id, capabilities,
+    /// quotas, policy and the worlds it owns — is unchanged, so nothing that referred to it
+    /// breaks. When it was rotated is recorded (`rotated`, shown by SHOW AGENT PRIVILEGES).
+    pub fn rotate_agent_token(&self, name: &str) -> Result<String> {
+        self.rotate_agent_token_with(name, crate::sql::scram::ITERATIONS)
+    }
+
+    /// `rotate_agent_token`, the new token's SCRAM verifier made with `iterations` (a session's
+    /// `scram_iterations`).
+    pub fn rotate_agent_token_with(&self, name: &str, iterations: u32) -> Result<String> {
+        if name == GUEST || name == SYSTEM {
+            return Err(bad(format!("'{name}' has no token to rotate")));
+        }
+        let mut a = self.agent(name)?; // errors if there's no such agent
+        let token = new_token()?;
+        let scram = crate::sql::scram::fresh(&token, iterations)
+            .map_err(|e| Error::Constraint { code: e.code, message: e.message })?;
+        a.token_hash = hash(&token);
+        a.scram = Some(scram);
+        a.rotated = disk::now_ms();
+        self.put_agent(&a)?;
+        Ok(token)
     }
 
     /// Writes agent `a`'s row, checking in the same step that its merge policy exists: an agent
@@ -654,7 +735,7 @@ impl Core {
         let h = hash(token);
         self.agents()?
             .into_iter()
-            .find(|a| a.token_hash == h && !a.disabled)
+            .find(|a| a.token_hash == h && !a.disabled && !a.expired())
             .ok_or_else(|| refused("no agent has that token".into()))
     }
 
@@ -673,6 +754,9 @@ impl Core {
         let agent = self.agent(name)?;
         if agent.disabled {
             return Err(refused(format!("agent {name} is disabled")));
+        }
+        if agent.expired() {
+            return Err(refused(format!("agent {name}'s token expired (valid_for)")));
         }
         Ok(Acting { core: self, _as: disk::acting_as(name), agent })
     }
@@ -1012,10 +1096,12 @@ impl Core {
         Ok(Outcomes { since, rows })
     }
 
-    /// Counts a refused merge of world `b` in its metadata (`REFUSALS`), by kind: rows both sides changed, rows
-    /// it relied on changed since (a stale read), or a merge check or CHECK constraint the result breaks. Not a
-    /// transaction's world (its COMMIT conflicting is no agent's merge), and not a hold (`REVIEW` records those).
-    /// A count that can't be written is let go: the merge's own error is what the caller gets.
+    /// Counts a refused merge of world `b` in its metadata (`REFUSALS`), by kind: rows both sides changed (with
+    /// main, or in an attached folder with Postgres), rows it relied on changed since (a stale read), or a merge
+    /// check or CHECK constraint the result breaks. Not a transaction's world (its COMMIT conflicting is no agent's
+    /// merge), not a hold (`REVIEW` records those), and not the other refusals sharing 40001 (a scope changed
+    /// meanwhile, Postgres busy). A count that can't be written is let go: the merge's own error is what the caller
+    /// gets.
     pub(crate) fn note_refusal(&self, b: &str, e: &Error) {
         let kind = match e {
             _ if b.starts_with("_tx_") => return,
@@ -1023,7 +1109,8 @@ impl Core {
             Error::Constraint { code: "40001", message } if message.starts_with("both sides changed table") => {
                 "conflicts"
             }
-            Error::Constraint { code: "40001", .. } => "stale_reads",
+            e if crate::attach::is_conflict(e) => "conflicts",
+            e if crate::stale::is_stale(e) => "stale_reads",
             Error::Constraint { code: "23514", .. } => "checks",
             _ => return,
         };
@@ -1043,9 +1130,10 @@ pub struct MergePolicy {
     pub max_rows: Option<u64>,
     /// most rows one merge may delete
     pub max_deletes: Option<u64>,
-    /// most rows an agent's merges into main may change in an hour, this one's included (see `tally`)
+    /// most rows an agent's merges into main may change in an hour, this one's included (see `tally`; an agent
+    /// held to a tenant shares the count with every agent made for that tenant)
     pub rows_per_hour: Option<u64>,
-    /// most rows an agent's merges into main may delete in an hour, this one's included
+    /// most rows an agent's merges into main may delete in an hour, this one's included (shared as `rows_per_hour`)
     pub deletes_per_hour: Option<u64>,
     /// a merge deleting more rows than this waits for a person, who approves it only by giving the count it deletes
     /// (`MERGE WORLD x CONFIRM DELETES n`): a big delete is approved by someone who read the number
@@ -1325,20 +1413,25 @@ impl MergePolicy {
         }
         let (rows, deletes, effects) = counts(diff);
         let (had_rows, had_deletes, had_effects) = core.hourly(agent);
+        // an agent held to a tenant is counted with every agent made for it (see `tally`)
+        let whose = match core.tally_of(agent).1 {
+            Some(t) => format!("merges for tenant {t}"),
+            None => "its merges".to_string(),
+        };
         let mut out = vec![];
         if let Some(n) = self.rows_per_hour.filter(|n| had_rows + rows > *n) {
             out.push(format!(
-                "changes {rows} rows, and its merges changed {had_rows} in the last hour (at most {n} an hour)"
+                "changes {rows} rows, and {whose} changed {had_rows} in the last hour (at most {n} an hour)"
             ));
         }
         if let Some(n) = self.deletes_per_hour.filter(|n| had_deletes + deletes > *n) {
             out.push(format!(
-                "deletes {deletes} rows, and its merges deleted {had_deletes} in the last hour (at most {n} an hour)"
+                "deletes {deletes} rows, and {whose} deleted {had_deletes} in the last hour (at most {n} an hour)"
             ));
         }
         if let Some(n) = self.effects_per_hour.filter(|n| had_effects + effects > *n) {
             out.push(format!(
-                "queues {effects} effects, and its merges queued {had_effects} in the last hour (at most {n} an hour)"
+                "queues {effects} effects, and {whose} queued {had_effects} in the last hour (at most {n} an hour)"
             ));
         }
         out
@@ -1357,6 +1450,8 @@ impl MergePolicy {
                 // the database's own rows behind indexes, constraints and counters follow the
                 // rows they're for
                 _ if crate::sql::internal(&c.key) => continue,
+                // (and when an object was made, kept beside it, follows the object)
+                _ if crate::sql::made_row(&c.key) => continue,
                 // effects queued for main (see `outbox`): no rows or schema of the parent change, but
                 // things that happen outside the database once they land, so they're counted too
                 _ if crate::outbox::entry(&c.key) => {
@@ -1826,6 +1921,39 @@ impl Acting<'_> {
         self.need(Can::Read, "read")
     }
 
+    /// Whether the agent may see world `w`'s changes as rows (a diff, its history, a dry run of its merge, what it
+    /// read, its review): those show rows as they are, whatever tenant they are, so an agent held to a tenant sees
+    /// them only of the worlds it forked itself (its own rows: what it could change). Others: as `may_read`.
+    pub fn may_see_changes(&self, w: &str) -> Result<()> {
+        self.may_read(w)?;
+        if self.agent.tenant.is_none() {
+            return Ok(());
+        }
+        let name = w.split_once('@').map_or(w, |(n, _)| n);
+        if self.core.world(name)?.owner.as_deref() == Some(self.agent.name.as_str()) {
+            return Ok(());
+        }
+        Err(refused(format!(
+            "agent {} works for one tenant ({}): it sees the changes of the worlds it forked, not {name}'s; read rows \
+             with SQL, which shows its tenant's",
+            self.agent.name,
+            self.agent.tenant_sql().unwrap_or_default()
+        )))
+    }
+
+    /// For an agent held to a tenant, what lists every world's or agent's doings (SHOW REVIEWS, SHOW AUDIT, SHOW
+    /// HISTORY, merge outcomes): row keys and reasons of other tenants' worlds, refused. Others: allowed.
+    pub fn may_list_all(&self, what: &str) -> Result<()> {
+        match &self.agent.tenant {
+            None => Ok(()),
+            Some(_) => Err(refused(format!(
+                "agent {} works for one tenant ({}): {what} lists other tenants' worlds",
+                self.agent.name,
+                self.agent.tenant_sql().unwrap_or_default()
+            ))),
+        }
+    }
+
     /// Whether the agent may change world `w` by `rows` more rows now: its right to, its write
     /// rate, and the world's change quota. An agent keeping to a merge policy changes main only
     /// by merging, where the policy is checked: else `write_main` would get around it.
@@ -1977,6 +2105,20 @@ impl Acting<'_> {
         };
         crate::reserved_keys(&meta)?; // only the database sets its own keys (owner, expiry, last use, ...)
         crate::stale::from_meta(&mut meta)?;
+        // an agent held to a tenant forks only that tenant's worlds: declared so, whatever it says
+        if let Some(t) = &self.agent.tenant {
+            let mine = json!({ t["column"].as_str().unwrap_or_default(): t["value"].clone() });
+            if let Some(said) = meta.get("tenant")
+                && crate::scope::tenant(said)? != *t
+            {
+                return Err(refused(format!(
+                    "agent {} works for tenant {} only: a world it forks can't be declared another's",
+                    self.agent.name,
+                    self.agent.tenant_sql().unwrap_or_default()
+                )));
+            }
+            meta.insert("tenant".into(), mine);
+        }
         crate::scope::from_meta(self.core, from, &mut meta)?;
         let policy = self.core.policy_of(&self.agent)?;
         if policy.as_ref().is_some_and(|p| p.check_reads) {

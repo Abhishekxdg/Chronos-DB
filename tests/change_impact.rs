@@ -271,6 +271,18 @@ fn critical_readers_come_first_and_hold_agents_merges() {
     bot.run(&db, "create world b3; use world b3; unmark reader billing; use world main", &[]).unwrap();
     let e = bot.run(&db, "merge world b3", &[]).unwrap_err();
     assert!(e.message.contains("changes the schema: critical billing"), "{}", e.message);
+    // settled by columns with main's side, only what reaches main is judged: the world's status change, which
+    // main's own status wins over, doesn't hold the merge; its change to who, which billing doesn't read, merges
+    bot.run(
+        &db,
+        "create world b4; use world b4; update leads set status = 'new', who = 'y' where id = 3; use world main",
+        &[],
+    )
+    .unwrap();
+    run(&db, MAIN, "update leads set status = 'new' where id = 3", &[]).unwrap();
+    bot.run(&db, "merge world b4 by columns using theirs", &[]).unwrap();
+    let r = run(&db, MAIN, "select status, who from leads where id = 3", &[]).unwrap().pop().unwrap();
+    assert_eq!((r.rows[0][0].to_text(), r.rows[0][1].to_text()), ("new".into(), "y".into()));
     // a policy that allows it
     run(&db, MAIN, "alter merge policy p set (critical = true)", &[]).unwrap();
     bot.run(&db, "merge world b1", &[]).unwrap();

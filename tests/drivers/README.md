@@ -2,8 +2,8 @@
 
 Each folder or file here is one client talking to `chronos serve` over the Postgres protocol, the way an
 application would: make a table, write rows with typed parameters, read them back, use a transaction, and read
-a constraint error's SQLSTATE. `.github/workflows/drivers.yml` runs them all (nightly, on request, and on pull
-requests that change this folder).
+a constraint error's SQLSTATE. `cloudbuild/drivers.yaml` runs them all in GCP Cloud Build (nightly, on request, and
+on pull requests that change this folder).
 
 Each takes the server from `CHRONOS_URL` (default `postgres://tester@127.0.0.1:5433/main`) and prints `ok` last.
 

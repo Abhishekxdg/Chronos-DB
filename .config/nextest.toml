@@ -7,6 +7,9 @@ slow-timeout = { period = "120s" }
 
 [test-groups]
 oracle = { max-threads = 1 }
+# tests that build values up to the engine's 1 GB limit on purpose (to see it refused): one at a time, so a small
+# machine (Cloud Build's 8 GB) isn't asked for several GB at once
+bounded = { max-threads = 1 }
 
 # These compare against the reference Postgres at host=/tmp (skipped without one) under database or schema
 # names that are the same in every process: in one process their tests took turns through a Mutex, and as
@@ -14,3 +17,7 @@ oracle = { max-threads = 1 }
 [[profile.default.overrides]]
 filter = "binary(pgdiff) | binary(schemas) | binary(read_committed) | binary(pgcompat) | binary(copy) | binary(pg_dump) | binary(pgcrypto) | binary(scram) | binary(advisory) | binary(studio_screens)"
 test-group = "oracle"
+
+[[profile.default.overrides]]
+filter = "binary(review2_caps)"
+test-group = "bounded"

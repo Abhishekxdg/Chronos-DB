@@ -5,6 +5,9 @@
 //!   s3://bucket/prefix   credentials and endpoint from the usual AWS_* environment variables
 //!                        (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_ENDPOINT,
 //!                        AWS_ALLOW_HTTP=true for a local MinIO)
+//!   gs://bucket/prefix   Google Cloud Storage, credentials from GOOGLE_SERVICE_ACCOUNT (a key
+//!                        file), CHRONOS_GCS_TOKEN_FILE (a bearer token another process keeps
+//!                        fresh in a file) or the machine's own service account
 //!   file:///some/dir     a local folder standing in for a bucket (tests, NFS)
 //!
 //! One writer per prefix, enforced by a lease: a `lease` object created only if absent and naming
@@ -12,12 +15,14 @@
 //! owner re-checks its lease before publishing each manifest, so a writer that was taken over
 //! stops publishing (fencing). Closing releases the lease.
 //! ponytail: the re-check and the publish are two requests, not one conditional write, so a
-//! takeover landing between them can still lose to one last manifest.
+//! takeover landing between them can still lose to one last manifest. The log is fenced without
+//! that gap (see `wal_ship`), and a checkpoint publishes only after its log is.
 
 use std::io;
 
 #[cfg(feature = "s3")]
 mod imp {
+    use futures::{StreamExt, TryStreamExt};
     use object_store::path::Path;
     use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
     use std::io;
@@ -28,6 +33,32 @@ mod imp {
         prefix: Path,
         rt: tokio::runtime::Runtime,
         url: String,
+    }
+
+    /// A bearer token in a file that something else keeps fresh (`CHRONOS_GCS_TOKEN_FILE`): Chronos
+    /// Cloud's host agent writes one that reaches only the database's own prefix. Read at each request.
+    #[derive(Debug)]
+    struct TokenFile(std::path::PathBuf);
+
+    impl object_store::CredentialProvider for TokenFile {
+        type Credential = object_store::gcp::GcpCredential;
+
+        // what #[async_trait] would write, without the dependency
+        fn get_credential<'a, 'b>(
+            &'a self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = object_store::Result<Arc<Self::Credential>>> + Send + 'b>>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            Box::pin(async move {
+                let bearer = std::fs::read_to_string(&self.0).map_err(|e| object_store::Error::Generic {
+                    store: "GCS",
+                    source: format!("reading the token in {}: {e}", self.0.display()).into(),
+                })?;
+                Ok(Arc::new(object_store::gcp::GcpCredential { bearer: bearer.trim().to_string() }))
+            })
+        }
     }
 
     fn err(e: object_store::Error) -> io::Error {
@@ -50,12 +81,23 @@ mod imp {
                     .build()
                     .map_err(|e| bad(&e.to_string()))?;
                 (Arc::new(s3), Path::from(prefix))
+            } else if let Some(rest) = url.strip_prefix("gs://") {
+                let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+                if bucket.is_empty() {
+                    return Err(bad("expected gs://bucket/prefix"));
+                }
+                let mut b = object_store::gcp::GoogleCloudStorageBuilder::from_env().with_bucket_name(bucket);
+                if let Some(f) = std::env::var_os("CHRONOS_GCS_TOKEN_FILE") {
+                    b = b.with_credentials(Arc::new(TokenFile(f.into())));
+                }
+                let gcs = b.build().map_err(|e| bad(&e.to_string()))?;
+                (Arc::new(gcs), Path::from(prefix))
             } else if let Some(dir) = url.strip_prefix("file://") {
                 std::fs::create_dir_all(dir)?;
                 let fs = object_store::local::LocalFileSystem::new_with_prefix(dir).map_err(|e| bad(&e.to_string()))?;
                 (Arc::new(fs), Path::from(""))
             } else {
-                return Err(bad("use s3://bucket/prefix or file:///path"));
+                return Err(bad("use s3://bucket/prefix, gs://bucket/prefix or file:///path"));
             };
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
             Ok(Remote { store, prefix, rt, url: url.into() })
@@ -104,6 +146,34 @@ mod imp {
             }
         }
 
+        /// Several objects at once (16 requests in flight), in the order asked; None for one that
+        /// doesn't exist.
+        pub fn get_many(&self, names: &[String]) -> io::Result<Vec<Option<Vec<u8>>>> {
+            let gets = names.iter().map(|n| async move {
+                match self.store.get(&self.path(n)).await {
+                    Ok(r) => r.bytes().await.map(|b| Some(b.to_vec())),
+                    Err(object_store::Error::NotFound { .. }) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            });
+            self.rt.block_on(futures::stream::iter(gets).buffered(16).try_collect()).map_err(err)
+        }
+
+        /// Names and sizes of the objects directly under the prefix whose names sort after
+        /// `after`: the stores that can start a listing there (S3, GCS) don't list the rest.
+        pub fn list_after(&self, after: &str) -> io::Result<Vec<(String, u64)>> {
+            let found: Vec<_> = self
+                .rt
+                .block_on(self.store.list_with_offset(Some(&self.prefix), &self.path(after)).try_collect())
+                .map_err(err)?;
+            let direct = |p: &Path| p.prefix_match(&self.prefix).is_some_and(|rest| rest.count() == 1);
+            Ok(found
+                .into_iter()
+                .filter(|m| direct(&m.location))
+                .filter_map(|m| Some((m.location.filename()?.to_string(), m.size)))
+                .collect())
+        }
+
         /// Names and sizes of the objects directly under the prefix: not in folders below it
         /// (`s3://b/db/sub/pack-00000007` is another database's pack, not this one's).
         pub fn list(&self) -> io::Result<Vec<(String, u64)>> {
@@ -150,6 +220,12 @@ mod imp {
         pub fn list(&self) -> io::Result<Vec<(String, u64)>> {
             match *self {}
         }
+        pub fn list_after(&self, _: &str) -> io::Result<Vec<(String, u64)>> {
+            match *self {}
+        }
+        pub fn get_many(&self, _: &[String]) -> io::Result<Vec<Option<Vec<u8>>>> {
+            match *self {}
+        }
     }
 }
 
@@ -184,6 +260,34 @@ pub fn owner(dir: &std::path::Path) -> io::Result<String> {
 /// Where a folder notes the last manifest it knows the remote has (its hash): one it published
 /// or started from.
 const SEEN: &str = "remote.seen";
+
+/// The folder's own settings (`ALTER SYSTEM`'s, kept in files beside the database): published with
+/// each checkpoint as one object, `folder-settings`, so a database opened in another folder (moved
+/// to another host, or taken over) keeps them.
+const SETTINGS: [&str; 4] = ["settings", "retention", "sync", "wal_shipping"];
+
+/// The `folder-settings` object for folder `dir`: each settings file it has, by name.
+pub fn settings_object(dir: &std::path::Path) -> Vec<u8> {
+    let files: serde_json::Map<String, serde_json::Value> = SETTINGS
+        .iter()
+        .filter_map(|n| Some((n.to_string(), std::fs::read_to_string(dir.join(n)).ok()?.into())))
+        .collect();
+    serde_json::Value::Object(files).to_string().into_bytes()
+}
+
+/// Writes the remote's settings into `dir`, for those it has no file of yet (a fresh folder).
+pub(crate) fn take_settings(remote: &Remote, dir: &std::path::Path) -> io::Result<()> {
+    let Some(b) = remote.get("folder-settings")? else { return Ok(()) };
+    let Ok(serde_json::Value::Object(files)) = serde_json::from_slice(&b) else { return Ok(()) };
+    for (n, v) in files {
+        if let (true, Some(text)) = (SETTINGS.contains(&n.as_str()), v.as_str())
+            && !dir.join(&n).exists()
+        {
+            crate::disk::write_file(&dir.join(&n), text.as_bytes())?;
+        }
+    }
+    Ok(())
+}
 
 fn digest(manifest: &[u8]) -> String {
     crate::pages::hex(blake3::hash(manifest).as_bytes())
@@ -236,37 +340,57 @@ pub fn adopt(remote: &Remote, dir: &std::path::Path, takeover: bool) -> io::Resu
             )));
         }
         set_aside = true;
-        let aside = dir.join(format!("stale-{}", crate::disk::now_ms()));
-        fs::create_dir(&aside)?;
-        for e in fs::read_dir(dir)? {
-            let name = e?.file_name();
-            let n = name.to_string_lossy();
-            if ["manifest", "history", "pages", SEEN].contains(&n.as_ref()) || n.starts_with("wal-") {
-                fs::rename(dir.join(&name), aside.join(&name))?;
-            }
-        }
-        crate::disk::sync_dir(dir)?;
+        set_aside_database(dir)?;
+    }
+    if ours.is_none() || set_aside {
+        take_settings(remote, dir)?;
     }
     crate::disk::write_file(&dir.join("manifest"), &theirs)?;
     saw(dir, &theirs)?;
     Ok(set_aside)
 }
 
+/// Moves this folder's database (manifest, history, pages, log) into `stale-<ms>`, kept, not
+/// deleted: for a folder that fell behind its remote, opened with takeover.
+pub(crate) fn set_aside_database(dir: &std::path::Path) -> io::Result<()> {
+    use std::fs;
+    let aside = dir.join(format!("stale-{}", crate::disk::now_ms()));
+    fs::create_dir(&aside)?;
+    for e in fs::read_dir(dir)? {
+        let name = e?.file_name();
+        let n = name.to_string_lossy();
+        if ["manifest", "history", "pages", SEEN].contains(&n.as_ref()) || n.starts_with("wal-") {
+            fs::rename(dir.join(&name), aside.join(&name))?;
+        }
+    }
+    crate::disk::sync_dir(dir)
+}
+
 fn holder(remote: &Remote) -> io::Result<Option<String>> {
     Ok(remote.get("lease")?.map(|b| String::from_utf8_lossy(&b).into_owned()))
 }
 
+/// How `acquire` got the lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lease {
+    /// Nobody held it.
+    Free,
+    /// This owner did already, from before a crash.
+    Held,
+    /// From another owner (`takeover`): that writer must be fenced off.
+    TakenOver,
+}
+
 /// Takes the lease for `owner`, or explains who holds it. `takeover` replaces another owner's.
-/// True if `owner` held it already (from before a crash).
-pub fn acquire(remote: &Remote, owner: &str, takeover: bool) -> io::Result<bool> {
+pub fn acquire(remote: &Remote, owner: &str, takeover: bool) -> io::Result<Lease> {
     let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "this machine".into());
     let me = format!("{owner}\n{host}, pid {}", std::process::id());
     if remote.put_new("lease", me.clone().into_bytes())? {
-        return Ok(false);
+        return Ok(Lease::Free);
     }
     match holder(remote)? {
-        Some(h) if h.lines().next() == Some(owner) => remote.put("lease", me.into_bytes()).map(|()| true), // ours, from before a crash
-        Some(_) if takeover => remote.put("lease", me.into_bytes()).map(|()| false),
+        Some(h) if h.lines().next() == Some(owner) => remote.put("lease", me.into_bytes()).map(|()| Lease::Held), // ours, from before a crash
+        Some(_) if takeover => remote.put("lease", me.into_bytes()).map(|()| Lease::TakenOver),
         Some(h) => Err(io::Error::other(format!(
             "{} is open elsewhere ({}); if that process is gone, open with takeover",
             remote.url(),

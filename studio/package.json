@@ -1,7 +1,7 @@
 {
   "name": "chronos-studio",
   "private": true,
-  "version": "0.3.2",
+  "version": "0.4.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -18,6 +18,6 @@
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
     "typescript": "^5.8.0",
-    "vite": "^7.0.0"
+    "vite": "^7.3.7"
   }
 }

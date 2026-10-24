@@ -398,9 +398,6 @@ impl Def {
                     ..Default::default()
                 })),
             }),
-            "default_tablespace" if !matches!(lower.as_str(), "" | "pg_default") => {
-                err("22023", format!("tablespace \"{value}\" does not exist"))
-            }
             _ => Ok(value),
         }
     }

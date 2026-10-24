@@ -87,43 +87,627 @@ pub(super) fn casts_of(t: Type) -> Vec<(Type, Type)> {
     DEFS.lock().unwrap().casts.iter().filter(|c| c.from == t || c.to == t).map(|c| (c.from, c.to)).collect()
 }
 
-/// Composite types made with CREATE TYPE name AS (...): by name, and the name of each one's record shape.
-static COMPOSITES: Mutex<Vec<(String, Type)>> = Mutex::new(vec![]);
+/// A composite type's row as `Composites` keeps it: its name, its fields (name, type as written), and whether it is one
+/// of no attributes that is no shell type (made `AS ()`, or ALTER TYPE dropped the last; see `sql::shell_row`).
+type Row = (String, Vec<(String, String)>, bool);
 
+/// A world's composite types' rows as they are stored, each one's key and text, in key order: two states with the same
+/// texts have the same types, which tells them apart without the rows read as JSON (see `read_in`).
+type Texts = Vec<(String, Val)>;
+
+/// Composite types (made with CREATE TYPE name AS (...)) as the process knows them from a world's rows: the rows, by
+/// name, and each one's record shape (its own: see `Type::composite_record`), by which a schema or a function read with
+/// an older one is told (see `sql::stale_record`). A row with a field of a type that isn't there has no shape. Shared
+/// by the worlds whose rows are the same (a fork's and a transaction's are mostly their parent's), until one's change.
+#[derive(Clone, Default)]
+struct Types {
+    rows: Vec<Row>,
+    shapes: Vec<(String, Type)>,
+    /// the texts of the rows they were read from (see `Texts`); None once changed otherwise (see `Composites::set`)
+    texts: Option<Texts>,
+}
+
+/// A world's composite types (see `Types`), and how they were read in.
+#[derive(Clone, Default)]
+struct Composites {
+    types: Arc<Types>,
+    /// how many times they were changed: rows read before a change made since don't undo it (see `read_in`)
+    changes: u64,
+    /// the state of the world they were read from, or last found to match the rows of: a view of that very state has
+    /// them without its rows read again (see `read_in`, `as_of`). None once a statement changed them (see `define`).
+    at: Option<crate::Stamp>,
+}
+
+impl Composites {
+    fn of(types: Types, at: Option<crate::Stamp>) -> Composites {
+        Composites { types: Arc::new(types), changes: 0, at }
+    }
+
+    fn shape(&self, name: &str) -> Option<Type> {
+        self.types.shapes.iter().find(|(n, _)| n == name).map(|(_, t)| *t)
+    }
+
+    fn row(&self, name: &str) -> Option<&Row> {
+        self.types.rows.iter().find(|r| r.0 == name)
+    }
+
+    /// Type `name`'s row made `row` (None: gone), and its shape `shape` (these types alone: see `Types`).
+    fn set(&mut self, name: &str, row: Option<Row>, shape: Option<Type>) {
+        let types = Arc::make_mut(&mut self.types);
+        types.rows.retain(|r| r.0 != name);
+        types.rows.extend(row);
+        types.rows.sort();
+        types.shapes.retain(|(n, _)| n != name);
+        types.shapes.extend(shape.map(|t| (name.to_string(), t)));
+        types.texts = None;
+    }
+
+    /// `other`'s types put in place of these of their names, `only_new`: only those of names these have none of.
+    fn take(&mut self, other: &Composites, only_new: bool) {
+        for r in &other.types.rows {
+            if !(only_new && self.row(&r.0).is_some()) {
+                self.set(&r.0, Some(r.clone()), other.shape(&r.0));
+            }
+        }
+    }
+}
+
+/// Each world's composite types, by its database (`Core::uid`) and its name (see `key_of`): a world reads its own, so
+/// an ALTER TYPE in a fork changes the type there only. A world's are read in from its rows when first looked up
+/// (`fill`), again before a script or a statement is parsed where its state moved on since (`hydrate_composites`),
+/// and where a statement finds its row changed (`sync_composite`); they are forgotten with the world
+/// (`forget_worlds`).
+static WORLDS: LazyLock<Mutex<HashMap<u64, HashMap<String, Composites>>>> = LazyLock::new(Default::default);
+
+/// What any world made known last of each name: what lookups outside any world find (a row shown as JSON by the
+/// key-value API), as the process knew composite types before each world had its own; and the types it took last,
+/// which are not taken again (most worlds share their parent's: see `known_anywhere`).
+static ANY: LazyLock<Mutex<(Composites, Option<Arc<Types>>)>> = LazyLock::new(Default::default);
+
+thread_local! {
+    /// The world `in_world` reads a view of (its database's uid and key, see `key_of`): lookups find its composite
+    /// types rather than the running session's.
+    static READING: std::cell::RefCell<Option<(u64, String)>> = const { std::cell::RefCell::new(None) };
+    /// The composite types of the view as it was that `in_world` reads (see `Held`): lookups find these first.
+    static HELD: std::cell::RefCell<Option<Held>> = const { std::cell::RefCell::new(None) };
+    /// The composite types `settle` is working out: lookups find these meanwhile (they are no world's yet).
+    static BUILDING: std::cell::RefCell<Option<Composites>> = const { std::cell::RefCell::new(None) };
+    /// The shapes `composite` gave while `noting`.
+    static NOTED: std::cell::RefCell<Option<Vec<Type>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The composite types of a view `in_world` reads that is `as_it_was`: a merge's result, the world it goes into as the
+/// merge found it, a world as it was. They are those of its own state's rows (see `as_of`), held for that `in_world`
+/// alone, so that no session meanwhile, of its world or of another, changes them under it; found the first time they
+/// are looked up, as most of what reads such a view (a merge of rows of no composite type) needs none.
+struct Held {
+    uid: u64,
+    /// its database, to read the view's rows by (none while the log is replayed: its types are then found at once)
+    core: std::sync::Weak<crate::Core>,
+    born: u64,
+    s: crate::State,
+    branch: String,
+    types: Option<Composites>,
+}
+
+/// Puts a thread-local back as it was once dropped, on a panic too (a pooled helper thread runs on).
+struct Restore<T: 'static>(&'static std::thread::LocalKey<std::cell::RefCell<Option<T>>>, Option<T>);
+
+impl<T: 'static> Drop for Restore<T> {
+    fn drop(&mut self) {
+        self.0.set(self.1.take());
+    }
+}
+
+/// Whether `v` is of a world as it was (`name@when`, or as a merge would leave it) or of a state of no world (a merge's
+/// result, or the world it goes into as the merge found it: see `Core::merge`): its composite types are those of its
+/// own rows (see `as_of`), which may be others than its world has now.
+fn as_it_was(v: &View) -> bool {
+    v.born == crate::PAST || v.branch.is_empty()
+}
+
+/// What `v`'s world's composite types are kept by: its database's uid and its name; `name@` for a view `as_it_was`
+/// (`@` for one of no world), whose types are those of the state it read last (see `as_of`).
+fn key_of(v: &View) -> (u64, String) {
+    let name = if as_it_was(v) { format!("{}@", v.branch) } else { v.branch.clone() };
+    (v.core.uid, name)
+}
+
+/// `f` of world `key`'s composite types, where they have been read in.
+fn kept<T>(key: &(u64, String), f: impl FnOnce(&Composites) -> T) -> Option<T> {
+    WORLDS.lock().unwrap().get(&key.0).and_then(|w| w.get(&key.1)).map(f)
+}
+
+/// Whether `v` is of the running session's temporary tables' database, which has no types of its own: the types of
+/// its tables' columns are the session's world's (see `catalog::at_home`).
+fn temporary(v: &View) -> bool {
+    TEMP.with_borrow(|t| t.as_ref().is_some_and(|(db, _)| std::ptr::eq(v.core, &*db.core)))
+}
+
+/// `key_of` a session's world, by its name.
+fn session_key(core: &crate::Core, world: &str) -> (u64, String) {
+    let name = world.split_once('@').map_or_else(|| world.to_string(), |(n, _)| format!("{n}@"));
+    (core.uid, name)
+}
+
+/// The world lookups find composite types in now: `in_world`'s, else the running session's; None outside both.
+fn reading() -> Option<(u64, String)> {
+    READING
+        .with_borrow(Clone::clone)
+        .or_else(|| SESSION.with_borrow(|s| s.as_ref().map(|(core, w)| session_key(core, w))))
+}
+
+/// `f` of the composite types lookups find now: `settle`'s while it works; those `in_world` holds for a view as it
+/// was; else the world's, read in from its rows the first time they're looked up; else (outside any world) what any
+/// world made known.
+fn looked_up<T>(f: impl Fn(&Composites) -> T) -> T {
+    if let Some(t) = BUILDING.with_borrow(|b| b.as_ref().map(&f)) {
+        return t;
+    }
+    if let Some(c) = held() {
+        return f(&c);
+    }
+    let Some(key) = reading() else { return f(&ANY.lock().unwrap().0) };
+    if !key.1.ends_with('@')
+        && let Some(t) = kept(&key, &f)
+    {
+        return t;
+    }
+    // (the session's world, read in as its database has it, or a world it reads as it was, as that state has it:
+    // `in_world`'s was read in as it began)
+    let session = SESSION.with_borrow(Clone::clone).filter(|(core, w)| session_key(core, w) == key);
+    match session.as_ref().and_then(|(core, w)| core.view_tx(w).ok()) {
+        Some(v) if as_it_was(&v) => f(&as_of(&v)),
+        Some(v) => f(&fill(&v)),
+        None => f(&ANY.lock().unwrap().0),
+    }
+}
+
+/// The composite types `in_world` holds now for a view as it was (see `Held`), found the first time they're looked up.
+fn held() -> Option<Composites> {
+    let todo = HELD.with_borrow(|h| {
+        let h = h.as_ref()?;
+        Some(h.types.clone().ok_or_else(|| (h.core.clone(), h.born, h.s.clone(), h.branch.clone())))
+    })?;
+    let (core, born, s, branch) = match todo {
+        Ok(types) => return Some(types),
+        Err(view) => view,
+    };
+    // (its database is open while a view of it is read)
+    let types = core.upgrade().map(|core| as_of(&View { core: &core, born, s, branch, reads: None }));
+    let types = types.unwrap_or_default();
+    HELD.with_borrow_mut(|h| {
+        if let Some(h) = h {
+            h.types = Some(types.clone());
+        }
+    });
+    Some(types)
+}
+
+/// The composite types' rows of `v` as they are stored (see `Texts`).
+fn texts_of(v: &View) -> Texts {
+    let Ok(rows) = v.prefix("_sonos_types/") else { return vec![] };
+    rows.flatten().filter(|(_, raw)| raw.contains("\"composite\"")).collect()
+}
+
+/// The composite types' rows `texts` (see `texts_of`), by name.
+fn rows_of(texts: &Texts) -> Vec<Row> {
+    let mut out: Vec<Row> = (texts.iter())
+        .filter_map(|(k, raw)| {
+            let j: Json = serde_json::from_str(raw).ok()?;
+            let fields = fields_of(&j)?;
+            let empty = fields.is_empty() && !shell_row(&j);
+            Some((k["_sonos_types/".len()..].to_string(), fields, empty))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A type row's composite fields (name, type as written); None for another kind of type's row.
+fn fields_of(j: &Json) -> Option<Vec<(String, String)>> {
+    let fields = j["composite"].as_array()?;
+    Some(fields.iter().filter_map(|f| Some((f[0].as_str()?.to_string(), f[1].as_str()?.to_string()))).collect())
+}
+
+/// The composite types of `rows`, each a record of its fields read as types, worked out in passes: one with an
+/// attribute of another is made once that one is, with its shape (so one with an attribute of a type ALTER TYPE
+/// changed takes the change). A row with a field of a type that isn't there has none.
+fn settle(rows: &[Row]) -> Types {
+    let building = Composites::of(Types { rows: rows.to_vec(), ..Default::default() }, None);
+    let was = Restore(&BUILDING, BUILDING.replace(Some(building)));
+    for _ in 0..=rows.len() {
+        let mut changed = false;
+        for (name, fields, _) in rows {
+            let Some(t) = shape_of(name, fields) else { continue };
+            BUILDING.with_borrow_mut(|b| {
+                if let Some(b) = b
+                    && b.shape(name) != Some(t)
+                {
+                    b.set(name, b.row(name).cloned(), Some(t));
+                    changed = true;
+                }
+            });
+        }
+        if !changed {
+            break;
+        }
+    }
+    let made = BUILDING.take().unwrap_or_default();
+    drop(was);
+    Arc::unwrap_or_clone(made.types)
+}
+
+/// The composite types of `v`'s rows (`texts`, see `texts_of`): those of another world of its database whose rows are
+/// the same (a fork's, or a transaction's, are mostly its parent's, and a merge's result the world's it goes into),
+/// rather than worked out again.
+fn made_of(v: &View, texts: Texts) -> Composites {
+    let found = |same: &dyn Fn(&Types) -> bool| {
+        let all = WORLDS.lock().unwrap();
+        all.get(&v.core.uid).and_then(|w| w.values().find(|c| same(&c.types)).map(|c| c.types.clone()))
+    };
+    let at = Some(v.s.stamp());
+    let same = found(&|t| t.texts.as_ref() == Some(&texts));
+    if let Some(types) = same {
+        return Composites { types, changes: 0, at };
+    }
+    let rows = rows_of(&texts);
+    let same = found(&|t| t.rows == rows);
+    let types = match same {
+        Some(t) => Types { texts: Some(texts), ..(*t).clone() },
+        None => Types { texts: Some(texts), ..settle(&rows) },
+    };
+    Composites::of(types, at)
+}
+
+/// Makes composite types `c` known to lookups outside any world (see `ANY`), unless they're the ones it took last.
+fn known_anywhere(c: &Composites) {
+    let mut any = ANY.lock().unwrap();
+    if any.1.as_ref().is_some_and(|t| Arc::ptr_eq(t, &c.types)) {
+        return;
+    }
+    any.0.take(c, false);
+    any.1 = Some(c.types.clone());
+}
+
+/// `v`'s world's composite types read in from its rows, and kept for its lookups (unless another thread kept them
+/// first: those are given).
+fn fill(v: &View) -> Composites {
+    let key = key_of(v);
+    let made = made_of(v, texts_of(v));
+    known_anywhere(&made);
+    let mut all = WORLDS.lock().unwrap();
+    all.entry(key.0).or_default().entry(key.1).or_insert(made).clone()
+}
+
+/// The composite types of `v`, a view `as_it_was`: those kept for its key where they were read from its very state,
+/// else read from its rows and kept for the next view of that state (a merge reads its result through several, a
+/// merge by columns one for each row).
+fn as_of(v: &View) -> Composites {
+    let key = key_of(v);
+    let found = kept(&key, Clone::clone);
+    if let Some(c) = found.filter(|c| c.at.as_ref().is_some_and(|s| v.s.is(s))) {
+        return c;
+    }
+    let made = made_of(v, texts_of(v));
+    WORLDS.lock().unwrap().entry(key.0).or_default().insert(key.1, made.clone());
+    made
+}
+
+/// `v`'s world's composite types made what its rows have, where they differ (read in anew, those whose rows are gone
+/// forgotten): unless they were changed since they had made `before` changes, as one may be that `v` is too old to
+/// have the row of (made meanwhile, by another session); then only the types of names they have none of are taken.
+/// Whether they matched `v`'s rows (were changed meanwhile, or now are). Nothing is read where they were read from
+/// `v`'s very state, or found to match it, before; nor read as JSON where they were from the same texts.
+fn read_in(v: &View, before: Option<u64>) -> bool {
+    let key = key_of(v);
+    if kept(&key, |c| c.at.as_ref().is_some_and(|s| v.s.is(s))) == Some(true) {
+        return true;
+    }
+    let texts = texts_of(v);
+    match matched(&key, v, &texts, |t| t.texts.as_ref() == Some(&texts)) {
+        Some(true) => return true,
+        // (a world's first: nothing was read with them yet, so nothing parsed need be parsed again)
+        None => {
+            let made = made_of(v, texts);
+            known_anywhere(&made);
+            WORLDS.lock().unwrap().entry(key.0).or_default().entry(key.1).or_insert(made);
+            return true;
+        }
+        Some(false) => {}
+    }
+    // (or the same rows: a statement changed them since they were read)
+    let rows = rows_of(&texts);
+    if matched(&key, v, &texts, |t| t.rows == rows) == Some(true) {
+        return true;
+    }
+    let made = Composites::of(Types { texts: Some(texts), ..settle(&rows) }, Some(v.s.stamp()));
+    known_anywhere(&made);
+    {
+        let mut all = WORLDS.lock().unwrap();
+        let world = all.entry(key.0).or_default();
+        match world.get_mut(&key.1) {
+            Some(c) if Some(c.changes) == before => *c = Composites { changes: c.changes + 1, ..made },
+            Some(c) => {
+                c.take(&made, true);
+                c.changes += 1;
+                c.at = None; // (what no one state has)
+                return false;
+            }
+            None => {
+                world.insert(key.1, made);
+            }
+        }
+    }
+    composites_changed();
+    true
+}
+
+/// Whether world `key`'s composite types are those of `v`'s rows `texts`, as `same` tells (None where none are kept):
+/// those that are are marked as read from `v`'s state.
+fn matched(key: &(u64, String), v: &View, texts: &Texts, same: impl Fn(&Types) -> bool) -> Option<bool> {
+    let mut all = WORLDS.lock().unwrap();
+    let c = all.get_mut(&key.0).and_then(|w| w.get_mut(&key.1))?;
+    if !same(&c.types) {
+        return Some(false);
+    }
+    c.at = Some(v.s.stamp());
+    if c.types.texts.as_ref() != Some(texts) {
+        Arc::make_mut(&mut c.types).texts = Some(texts.clone());
+    }
+    Some(true)
+}
+
+/// Reads the running session's world's composite types in again where its rows changed (another session's ALTER
+/// TYPE or DROP TYPE, a merge, a rebase), before a script or a statement of it is parsed: unless its state is the one
+/// they were read from, or last found to match, which reads no row. (A world the session reads as it was has its
+/// state's own: see `as_of`.)
+pub(super) fn hydrate_composites() {
+    let Some(key) = reading().filter(|k| !k.1.ends_with('@')) else { return };
+    // (tried again where the types changed while the rows were read: a statement of another session made one)
+    for _ in 0..3 {
+        let before = kept(&key, |c| c.changes);
+        if with_path_view(|v| read_in(v, before)) != Some(false) {
+            return;
+        }
+    }
+}
+
+/// World `world` of `core`'s composite types read in again from its rows as they are now, where the process has read
+/// them in: its rows were changed other than by its own sessions' DDL (a merge into it, a rebase, a write through the
+/// API, RESTORE, UNDO MERGE), which lookups that go by what was read in would otherwise miss until a session of it
+/// next parses a statement. Tried again where they changed while the rows were read, as in `hydrate_composites`.
+pub(super) fn reread(core: &crate::Core, world: &str) {
+    let key = (core.uid, world.to_string());
+    for _ in 0..3 {
+        let Some(before) = kept(&key, |c| c.changes) else { return };
+        let Ok(v) = core.view_tx(world) else { return };
+        if read_in(&v, Some(before)) {
+            return;
+        }
+    }
+}
+
+/// World `child` of `core` merged whole into `parent` (a transaction's commit, a savepoint's release, MERGE WORLD):
+/// its composite types are forgotten with it, and the parent's read in again (see `reread`) where the merge may have
+/// changed them. A transaction's DDL of a type reads its types in (see `sync_composite`), so one whose are not known
+/// changed none; a world's own may have, before the database was opened.
+pub(super) fn merged(core: &crate::Core, child: &str, parent: Option<&str>) {
+    let (mine, same) = {
+        let mut all = WORLDS.lock().unwrap();
+        let Some(w) = all.get_mut(&core.uid) else { return };
+        w.remove(&format!("{child}@"));
+        let mine = w.remove(child);
+        // (whether the child's are the parent's, where the parent's are known)
+        let same = parent
+            .and_then(|p| w.get(p))
+            .map(|p| mine.as_ref().is_some_and(|c| Arc::ptr_eq(&c.types, &p.types) || c.types.rows == p.types.rows));
+        (mine.is_some(), same)
+    };
+    let Some(parent) = parent else { return };
+    match (mine, same) {
+        (true, Some(false)) => reread(core, parent), // (an ALTER TYPE there, say)
+        // (the parent's not read in yet, a transaction's under a savepoint released: read in now, as the merge left
+        // its rows, so that its own merge tells whether they changed)
+        (true, None) => {
+            if let Ok(v) = core.view_tx(parent) {
+                fill(&v);
+            }
+        }
+        (false, Some(_)) if !child.starts_with(TX_PREFIX) => reread(core, parent),
+        _ => {}
+    }
+}
+
+/// `f`, with composite types looked up in `v`'s world: read in from its rows first if they aren't yet. A view
+/// `as_it_was` (a merge's, one of a world as it was) has those of its own state's rows, held for `f` (see `Held`), and
+/// so do the views of that very state `f` reads through. A table's schema read from `v`.
+pub(super) fn in_world<T>(v: &View, f: impl FnOnce() -> T) -> T {
+    if temporary(v) {
+        return f();
+    }
+    if as_it_was(v) {
+        if HELD.with_borrow(|h| h.as_ref().is_some_and(|h| h.uid == v.core.uid && h.s.same(&v.s))) {
+            return f();
+        }
+        let core = v.core.me.get().cloned();
+        let types = core.is_none().then(|| as_of(v)); // (no `Db` of it yet: the log being replayed)
+        let held = Held {
+            uid: v.core.uid,
+            core: core.unwrap_or_default(),
+            born: v.born,
+            s: v.s.clone(),
+            branch: v.branch.clone(),
+            types,
+        };
+        let _was = Restore(&HELD, HELD.replace(Some(held)));
+        return f();
+    }
+    let key = key_of(v);
+    if kept(&key, |_| ()).is_none() {
+        fill(v);
+    }
+    // (a world's view read inside one as it was: the world's types, not those held)
+    let _held = Restore(&HELD, HELD.take());
+    let _was = Restore(&READING, READING.replace(Some(key)));
+    f()
+}
+
+/// Composite type `name`'s record shape, as the world lookups read has it (see `looked_up`).
 pub(super) fn composite(name: &str) -> Option<Type> {
-    COMPOSITES.lock().unwrap().iter().find(|(n, _)| n == name).map(|(_, t)| *t)
+    let t = current(name)?;
+    note(t);
+    Some(t)
 }
 
+/// `composite`, without noting it (see `noting`).
+pub(super) fn current(name: &str) -> Option<Type> {
+    looked_up(|c| c.shape(name))
+}
+
+/// Notes shape `t` for `noting` (not one `settle` is working out).
+fn note(t: Type) {
+    if BUILDING.with_borrow(Option::is_some) {
+        return;
+    }
+    NOTED.with_borrow_mut(|n| {
+        if let Some(n) = n
+            && !n.contains(&t)
+        {
+            n.push(t);
+        }
+    });
+}
+
+/// `f`, and the composite types' shapes it found by name (see `composite`): what a function is read with, so it is
+/// read again once one is no longer its type's (see `functions::from_raw`).
+pub(super) fn noting<T>(f: impl FnOnce() -> T) -> (T, Vec<Type>) {
+    let was = Restore(&NOTED, NOTED.replace(Some(vec![])));
+    let out = f();
+    let noted = NOTED.take().unwrap_or_default();
+    drop(was);
+    (out, noted)
+}
+
+/// Whether `t`, a composite type's shape, is no longer the shape `v`'s world has the type in (see
+/// `sql::stale_record`).
+pub(super) fn stale_in(v: &View, t: Type) -> bool {
+    let Some(n) = t.composite_of() else { return false };
+    if temporary(v) {
+        return stale_record(t);
+    }
+    if as_it_was(v) {
+        return in_world(v, || current(&n)) != Some(t);
+    }
+    let now = kept(&key_of(v), |c| c.shape(&n));
+    now.unwrap_or_else(|| fill(v).shape(&n)) != Some(t)
+}
+
+/// The composite type `t` is a shape of, by name: the type it was made for, where the world lookups read has one of
+/// that name (whatever its shape now: `t` may be its shape before an ALTER TYPE, or another world's).
 pub(super) fn composite_name(t: Type) -> Option<String> {
-    COMPOSITES.lock().unwrap().iter().find(|(_, x)| *x == t).map(|(n, _)| n.clone())
+    let n = t.composite_of()?;
+    looked_up(|c| c.shape(&n).is_some()).then(|| n.to_string())
 }
 
-/// Makes a composite type known (its fields read as types), if they all resolve.
-pub(super) fn register_composite(name: &str, fields: &[(String, String)]) {
+/// Composite type `name`'s record type of these fields (read as types), if they all resolve. (Made, not known: see
+/// `sync_composite`.)
+pub(super) fn shape_of(name: &str, fields: &[(String, String)]) -> Option<Type> {
     let mut fs = vec![];
     for (n, t) in fields {
         let read = || Parser::new(lex(&format!("x {t}")).ok()?).column().ok().map(|c| c.ty);
-        let Some(t) = Type::from_name(t).or_else(|| composite(t)).or_else(read) else { return };
-        fs.push((n.clone(), t));
+        fs.push((n.clone(), Type::from_name(t).or_else(|| composite(t)).or_else(read)?));
     }
-    let t = Type::record(fs);
-    let mut all = COMPOSITES.lock().unwrap();
-    match all.iter_mut().find(|(n, _)| n == name) {
-        // (a shell type, `CREATE TYPE name`, filled in)
-        Some((_, was)) if *was == Type::record(vec![]) => *was = t,
-        Some(_) => {}
-        None => all.push((name.to_string(), t)),
+    Some(Type::composite_record(name, fs))
+}
+
+/// Composite type `name` known in `v`'s world as its type row `row` there has it now (forgotten where there is none,
+/// or one of another kind of type): what a statement that reads the row does, which may have changed since the world's
+/// types were read in (by an ALTER TYPE, here or in a session of the world; a merge). The types with an attribute of
+/// it are made again with its new shape. Its shape now, if its fields resolve. (A view `as_it_was` has its rows'
+/// types, `row` among them, which nothing reading it changes.)
+pub(super) fn sync_composite(v: &View, name: &str, row: Option<&Json>) -> Option<Type> {
+    let now = row.and_then(|j| {
+        let fields = fields_of(j)?;
+        let empty = fields.is_empty() && !shell_row(j);
+        Some((name.to_string(), fields, empty))
+    });
+    if temporary(v) {
+        return current(name);
+    }
+    if as_it_was(v) {
+        return in_world(v, || composite(name));
+    }
+    let key = key_of(v);
+    let found = kept(&key, |c| (c.row(name).cloned(), c.shape(name)));
+    let (was, shape) = found.unwrap_or_else(|| {
+        let c = fill(v);
+        (c.row(name).cloned(), c.shape(name))
+    });
+    let t = if was == now { shape } else { define(&key, name, now) };
+    if let Some(t) = t {
+        note(t);
+    }
+    t
+}
+
+/// Composite type `name` known in `v`'s world no longer: it was dropped, or another type is made by its name.
+pub(super) fn forget_composite(v: &View, name: &str) {
+    sync_composite(v, name, None);
+}
+
+/// Composite type `name`'s row in world `key` made `now` (None: gone), and the world's shapes worked out again from
+/// its rows: those that changed (its own, those with an attribute of it) are put in place, as the others may have
+/// been changed meanwhile. Its shape now.
+fn define(key: &(u64, String), name: &str, now: Option<Row>) -> Option<Type> {
+    let base = kept(key, Clone::clone).unwrap_or_default();
+    let mut rows = base.types.rows.clone();
+    rows.retain(|r| r.0 != name);
+    rows.extend(now.clone());
+    rows.sort();
+    let made = Composites::of(settle(&rows), None);
+    let t = made.shape(name);
+    let changed: Vec<(&str, Option<Row>, Type)> = (made.types.shapes.iter())
+        .filter(|(n, s)| n != name && base.shape(n) != Some(*s))
+        .map(|(n, s)| (n.as_str(), made.row(n).cloned(), *s))
+        .collect();
+    let apply = |c: &mut Composites| {
+        c.set(name, now.clone(), t);
+        for (n, row, s) in &changed {
+            c.set(n, row.clone(), Some(*s));
+        }
+    };
+    {
+        let mut all = WORLDS.lock().unwrap();
+        let c = all.entry(key.0).or_default().entry(key.1.clone()).or_default();
+        apply(c);
+        c.changes += 1;
+        c.at = None; // (no longer just what a state of the world has: read again from the next)
+    }
+    apply(&mut ANY.lock().unwrap().0);
+    composites_changed();
+    t
+}
+
+/// Forgets the composite types of database `uid`'s worlds that were dropped or merged (and theirs as they were): a
+/// world made again by one of their names reads its own in.
+pub(super) fn forget_worlds(uid: u64, worlds: &[&str]) {
+    if let Some(w) = WORLDS.lock().unwrap().get_mut(&uid) {
+        for n in worlds {
+            w.remove(*n);
+            w.remove(&format!("{n}@"));
+        }
     }
 }
 
-/// Forgets composite type `name`: a type of that name is being made anew (one of the name was dropped).
-pub(super) fn forget_composite(name: &str) {
-    COMPOSITES.lock().unwrap().retain(|(n, _)| n != name);
+/// Forgets the composite types of database `uid`'s worlds: it closed.
+pub(super) fn forget_database(uid: u64) {
+    WORLDS.lock().unwrap().remove(&uid);
 }
 
-/// Whether `name` is a shell type (`CREATE TYPE name`): a composite of no fields yet.
+/// Whether `name` is a shell type (`CREATE TYPE name`): a composite of no fields yet (not one of none, see `Row`).
 pub(super) fn is_shell(name: &str) -> bool {
-    composite(name).is_some_and(|t| t == Type::record(vec![]))
+    looked_up(|c| c.shape(name).is_some() && c.row(name).is_some_and(|(_, f, empty)| f.is_empty() && !empty))
 }
 
 #[derive(Default)]
@@ -220,6 +804,14 @@ fn op_call_name(sym: &str, binary: bool, def: &OpDef) -> String {
     } else {
         format!("{OP_CALL}{sym}:{}", u8::from(binary))
     }
+}
+
+/// The functions a placeholder call may stand for, every one of the operators sharing its symbol; None for a call
+/// that isn't one.
+pub(super) fn op_funcs(name: &str) -> Option<Vec<String>> {
+    let (sym, bin) = name.strip_prefix(OP_CALL)?.rsplit_once(':')?;
+    let d = DEFS.lock().unwrap();
+    Some(d.ops.iter().filter(|o| o.sym == sym && o.left.is_some() == (bin == "1")).map(|o| o.func.clone()).collect())
 }
 
 /// The function a placeholder call stands for, given its arguments' types: the operator whose declared types match
@@ -1247,7 +1839,7 @@ pub(super) fn start(i: u8) -> Result<Value> {
 
 impl Parser {
     /// Whether a CREATE, DROP or ALTER (its first word taken) is of a foreign-data wrapper, server, user mapping or
-    /// foreign table.
+    /// foreign table, or of another object `named_stmt` reads (a publication, a tablespace, ...).
     pub(super) fn foreign_object(&self) -> bool {
         let w = |n: usize| matches!(self.t.get(self.i + n), Some(Tok::Word(w)) if w == "foreign");
         let at = |n: usize, x: &str| matches!(self.t.get(self.i + n), Some(Tok::Word(w)) if w == x);
@@ -1257,6 +1849,7 @@ impl Parser {
             || at(0, "publication")
             || at(0, "subscription")
             || at(0, "statistics")
+            || at(0, "tablespace")
             || (at(0, "operator") && (at(1, "class") || at(1, "family")))
     }
 
@@ -1268,6 +1861,9 @@ impl Parser {
         }
         if self.kw("statistics") {
             return self.statistics(verb);
+        }
+        if self.kw("tablespace") {
+            return self.tablespace(verb);
         }
         let (what, kind, tag): (&str, &str, &str) = if self.kw("publication") {
             ("publication", "pub", "PUBLICATION")

@@ -16,13 +16,40 @@ fn rows(s: &mut Session, db: &Db, q: &str) -> Vec<String> {
     out.last().unwrap().rows.iter().map(|r| r.iter().map(text).collect::<Vec<_>>().join("|")).collect()
 }
 
+/// Whether `got` is `want`. The expected digits are Postgres's on Linux (glibc); macOS's math library rounds some
+/// results to another float (`atand(-0.9)` ends ...667 there, ...666 on Linux: two floats apart), so on macOS a number
+/// may be one or two floats from the expected one (same sign: `-0` is not `0`); every other cell is exact.
+fn same(got: &[String], want: &[&str]) -> bool {
+    let next_to = |g: &str, w: &str| match (g.parse::<f64>(), w.parse::<f64>()) {
+        (Ok(g), Ok(w)) => {
+            g.is_finite()
+                && w.is_finite()
+                && g.is_sign_negative() == w.is_sign_negative()
+                && (1..=2).contains(&g.to_bits().abs_diff(w.to_bits()))
+        }
+        _ => false,
+    };
+    got.len() == want.len()
+        && got.iter().zip(want).all(|(g, w)| {
+            g == w || {
+                let (g, w): (Vec<&str>, Vec<&str>) = (g.split('|').collect(), w.split('|').collect());
+                cfg!(target_os = "macos")
+                    && g.len() == w.len()
+                    && g.iter().zip(&w).all(|(g, w)| g == w || next_to(g, w))
+            }
+        })
+}
+
 /// Statements run in order in one session: a query's rows, or the SQLSTATE of the statement
 /// Postgres refuses.
 fn script(steps: &[(&str, Result<&[&str], &str>)]) {
     let (db, mut s) = (Db::new(), Session::new(MAIN));
     for (q, want) in steps {
         match want {
-            Ok(rows_want) => assert_eq!(&rows(&mut s, &db, q), rows_want, "{q}"),
+            Ok(rows_want) => {
+                let got = rows(&mut s, &db, q);
+                assert!(same(&got, rows_want), "{q}\n  left: {got:?}\n right: {rows_want:?}");
+            }
             Err(code) => {
                 let e = s.run(&db, q, &[]).expect_err(q);
                 assert_eq!(&e.code, code, "{q}: {}", e.message);

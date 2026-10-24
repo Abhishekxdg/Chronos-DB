@@ -1,6 +1,6 @@
 -- Let agents merge on their own, within rules (docs/guides/merge-policies.md).
 -- Against a fresh database:
---   chronos serve shopdb
+--   CHRONOS_PROTECT_MAIN=off chronos serve shopdb   (this setup writes main directly)
 --   psql -v ON_ERROR_STOP=1 -f examples/guides/merge-policies.sql postgres://127.0.0.1:5433/main
 \set ON_ERROR_STOP 1
 -- how to come back as yourself after acting as the agent

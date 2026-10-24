@@ -186,9 +186,12 @@ class Chronos:
               only_tables: Optional[list] = None, only_keys: Optional[list] = None,
               version: Optional[int] = None, target: Optional[int] = None) -> int:
         """Applies this branch to its parent and deletes it. Raises ChronosError (409) with .conflicts
-        (each with "explain") if both changed the same rows: retry with resolve="ours" or "theirs",
-        columns=True (combine rows where the sides changed different columns), or picks
-        ({"table/id": "ours" | "theirs" | row dict | None}). Also raises if the branch lost writes
+        (each with "explain") if both changed the same rows; merging the same way again fails the same
+        way. Settle them, safest first: columns=True combines rows where the sides changed different
+        columns, and with resolve="ours" or "theirs" too picks that side only for the columns both
+        changed; picks ({"table/id": "ours" | "theirs" | row dict | None}) settles single rows;
+        resolve without columns takes whole rows, overwriting the other side's changes to other
+        columns. Also raises if the branch lost writes
         in a server crash (redo them; confirm=True merges it as it is after a crash).
         only_tables / only_keys ("table/id") merge just those rows, and into merges into another
         branch instead of the parent; either way this branch stays.
@@ -209,9 +212,10 @@ class Chronos:
                 into: Optional[str] = None, only_tables: Optional[list] = None,
                 only_keys: Optional[list] = None) -> dict:
         """What merge() would do, row by row, changing nothing: {"rows": [{"key", "outcome",
-        "detail", "base", "ours", "theirs", "result"}], "conflicts": n, "blocked": reason or None,
+        "detail", "base", "ours", "theirs", "result", "columns"}], "conflicts": n, "blocked": reason or None,
         "version": the branch's, "target": the world merged into's}. merge(version=..., target=...)
-        with them merges only what this showed."""
+        with them merges only what this showed. "columns", for a row both sides changed: {"here",
+        "there", "both"}, the columns each changed since the fork (None otherwise)."""
         return self._call("merge", resolve=resolve, columns=columns or None, picks=picks, into=into,
                           only_tables=only_tables, only_keys=only_keys, dry_run=True)
 

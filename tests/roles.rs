@@ -27,7 +27,7 @@ fn start(name: &str, token: Option<&str>) -> (Server, u16) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_chronos"));
     cmd.args(["serve", dir.to_str().unwrap()]);
     if let Some(t) = token {
-        cmd.args(["--token", t]);
+        cmd.args(["--token", t, "--unsafe"]); // the token as the database's own user, as before 0.4
     }
     let s = common::serve(&mut cmd, true);
     (Server(s.child, dir), s.pg)

@@ -10,11 +10,11 @@ chronos init
 ```
 
 ```
-chronos: to sign in to Chronos Cloud, open https://github.com/login/device and enter the code WDJB-MJHT
+chronos: to sign in to Chronos Cloud, open https://chronos.2090.tech/device and enter the code WDJB-MJHT
 chronos: signed in as ada (key saved in /home/ada/.config/chronos/cloud.toml)
 chronos: project myapp (prj_...), database db_... (running, asia-south1)
-chronos: DATABASE_URL=postgres://app:****@chronos.endpoints.<project>.cloud.goog:5432/main?sslmode=require&options=endpoint%3Ddb_... (in .env)
-chronos: MCP https://chronos.endpoints.<project>.cloud.goog/?project=prj_...
+chronos: DATABASE_URL=postgres://app:****@db.chronos.2090.tech:5432/main?sslmode=require&options=endpoint%3Ddb_... (in .env)
+chronos: MCP https://db.chronos.2090.tech/?project=prj_...
 chronos: wrote .chronos/project.json, .mcp.json, .env, .gitignore, CLAUDE.md
 Open Claude Code here and ask it to build.
 ```
@@ -23,14 +23,14 @@ Then open Claude Code in the folder and ask for what you want ("add user account
 
 ## What `chronos init` does
 
-1. **Signs in**, the first time: GitHub's device flow. It prints a code and opens the browser (`open` on macOS, `xdg-open` on Linux; elsewhere, or with `--no-open`, open the printed address yourself). The API key is kept in `~/.config/chronos/cloud.toml`, readable only by you.
+1. **Signs in**, the first time: it prints a code to approve at chronos.2090.tech/device (signed in with an email code or GitHub) and opens the browser (`open` on macOS, `xdg-open` on Linux; elsewhere, or with `--no-open`, open the printed address yourself). The API key is kept in `~/.config/chronos/cloud.toml`, readable only by you.
 2. **Finds or makes the project's database.** A folder with `.chronos/project.json` is linked already: that project is used. Otherwise a project named after the folder is made, matched to the git remote (`origin`, without any credential in its URL), so a second run, or a clone of the same repository, gets the same database. New accounts are on the free plan: 2 databases.
 3. **Writes the project's files**, merging into what is there and never replacing it:
 
 | File | What is written |
 |---|---|
 | `.chronos/project.json` | `{"project_id", "name"}`: the link, no secrets. Commit it, so teammates and CI reach the same database |
-| `.mcp.json` | the `chronos` server in `mcpServers` (`{"type": "http", "url": "https://chronos.endpoints.<project>.cloud.goog/?project=prj_..."}`); other servers are kept |
+| `.mcp.json` | the `chronos` server in `mcpServers` (`{"type": "http", "url": "https://db.chronos.2090.tech/?project=prj_..."}`); other servers are kept |
 | `.env` | `DATABASE_URL=...` for the app, pointing at `main`: the line is replaced if there is one, else added; other lines are kept. A new `.env` is readable only by you |
 | `.gitignore` | `.env`, unless it is ignored already |
 | `CLAUDE.md`, and `AGENTS.md` if there is one | a short block between `<!-- chronos:begin -->` and `<!-- chronos:end -->`: the database is Chronos Cloud; change the schema or data in a world, run the app's tests against the world, show the diff, then merge. The rest of the file is kept; a second run replaces only the block |

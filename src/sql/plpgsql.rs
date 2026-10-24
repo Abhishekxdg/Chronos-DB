@@ -611,6 +611,29 @@ struct P<'f> {
 
 /// The type of `table.column` (or `schema.table.column`), with a numeric's precision and scale: what `%TYPE` names.
 pub(super) fn column_type(parts: &[String]) -> Result<(Type, Option<(u32, i32)>)> {
+    let c = referenced_column(parts)?;
+    Ok((c.ty, c.numeric))
+}
+
+/// A `table.column%TYPE` in a function's signature: the column's type, and the NOTICE Postgres's LookupTypeName
+/// gives of it as CREATE FUNCTION runs, the reference as written and the type by its SQL name (`type reference
+/// t.c%TYPE converted to integer`).
+pub(super) fn type_reference(parts: &[String]) -> Result<(Type, String)> {
+    let c = referenced_column(parts)?;
+    // (format_type's name, without the length or precision it may have; an array's with `[]`)
+    let brackets = if matches!(c.ty, Type::Array(_)) { "[]" } else { "" };
+    let shown = match (&c.domain, c.chars) {
+        (Some(d), _) => shown_name(d),
+        (None, Some((_, true))) => format!("character{brackets}"),
+        (None, Some((_, false))) => format!("character varying{brackets}"),
+        _ if c.small => "smallint".into(),
+        _ => c.ty.pg_name().into_owned(),
+    };
+    Ok((c.ty, format!("type reference {}%TYPE converted to {shown}", parts.join("."))))
+}
+
+/// The column `table.column` (`%TYPE`) names, its table found as a query's is.
+fn referenced_column(parts: &[String]) -> Result<Col> {
     let [table @ .., column] = parts else { return err(SYNTAX, "expected table.column%TYPE") };
     if table.is_empty() {
         return err("42704", format!("type \"{column}\" does not exist"));
@@ -620,10 +643,9 @@ pub(super) fn column_type(parts: &[String]) -> Result<(Type, Option<(u32, i32)>)
         [.., t] => find_named(t, super::Kind::Rel),
         [] => unreachable!(),
     };
-    let found = with_path_view(|v| -> Result<(Type, Option<(u32, i32)>)> {
+    let found = with_path_view(|v| -> Result<Col> {
         let t = need_table(v, &name)?;
-        let c = &t.cols[col_index(&t.cols, column)?];
-        Ok((c.ty, c.numeric))
+        Ok(t.cols[col_index(&t.cols, column)?].clone())
     });
     found.unwrap_or_else(|| err(UNSUPPORTED, "%TYPE needs a database to look the column up in"))
 }
@@ -1476,12 +1498,12 @@ impl P<'_> {
             "commit" | "rollback" | "call" => return refuse("COMMIT in a function, ROLLBACK and CALL"),
             // DDL written out: run as the dynamic statement it is (variables in it are not filled in)
             "create" | "drop" | "alter" | "truncate" | "grant" | "revoke" => return self.ddl_as_execute(),
-            // SET LOCAL of a setting: run as set_config (see `statement`), for the transaction (or the function's
-            // call, under its own SET clauses). A SET or RESET of the session's settings isn't run from a function yet.
-            "set" if matches!(self.p.t.get(self.p.i + 1), Some(Tok::Word(l)) if l == "local") => {
-                return self.sql(false);
-            }
-            "copy" | "set" | "reset" | "show" | "notify" | "listen" | "vacuum" | "analyze" | "lock" => {
+            // SET [LOCAL] of a setting: run as set_config (see `statement`), for the transaction (or the function's
+            // call, under its own SET clauses) or the session. RESET isn't run from a function yet.
+            "set" => return self.sql(false),
+            // EXPLAIN's lines, as PERFORM or a query's rows (`FOR ln IN EXPLAIN ...` is a FOR loop's)
+            "explain" => return self.sql(false),
+            "copy" | "reset" | "show" | "notify" | "listen" | "vacuum" | "analyze" | "lock" => {
                 return refuse(&w.to_uppercase());
             }
             _ => {}
@@ -1813,9 +1835,10 @@ impl P<'_> {
             return Ok(S::ForCursor { rec, var: c, cur: Box::new(cur), args, body: body? });
         }
         let execute = self.p.is_kw("execute");
-        // (a query: SELECT, WITH, or VALUES's rows, `FOR t IN VALUES ('a'), ('b') LOOP`)
+        // (a query: SELECT, WITH, VALUES's rows, `FOR t IN VALUES ('a'), ('b') LOOP`, or EXPLAIN's lines,
+        // `FOR ln IN EXPLAIN (ANALYZE, COSTS OFF) SELECT ... LOOP`)
         let values = self.p.is_kw("values") && matches!(self.p.t.get(self.p.i + 1), Some(Tok::Sym("(")));
-        if execute || values || self.p.is_kw("select") || self.p.is_kw("with") {
+        if execute || values || self.p.is_kw("select") || self.p.is_kw("with") || self.p.is_kw("explain") {
             let target = match &names[..] {
                 [r] if self.kind(r) == Some(Kind::Record) => Target::Record(r.clone()),
                 _ if names.iter().all(|n| self.kind(n) == Some(Kind::Scalar)) => Target::Vars(names),
@@ -1837,8 +1860,8 @@ impl P<'_> {
                 return err(SYNTAX, "INTO in a FOR loop's query: the loop's variables get its rows");
             }
             let query = self.statement(toks)?;
-            if !matches!(query, Stmt::Select(_) | Stmt::Locking(..)) {
-                return err(UNSUPPORTED, "a FOR loop's query must be a SELECT here");
+            if !matches!(query, Stmt::Select(_) | Stmt::Locking(..) | Stmt::Explain { .. }) {
+                return err(UNSUPPORTED, "a FOR loop's query must be a SELECT or EXPLAIN here");
             }
             self.p.expect_kw("loop")?;
             return Ok(S::ForQuery { target, query: Box::new(query), body: self.loop_body()?, text });
@@ -2110,8 +2133,8 @@ impl P<'_> {
         if q.peek().is_some() {
             return q.fail("expected the end of the statement");
         }
-        // SET LOCAL name = value: set_config's call, as Postgres runs a utility statement there
-        if let Stmt::SetVar { name, value, local: local @ true } = &s {
+        // SET [LOCAL] name = value: set_config's call, as Postgres runs a utility statement there
+        if let Stmt::SetVar { name, value, local } = &s {
             let args = vec![
                 Expr::Lit(Value::Text(name.clone())),
                 value.clone().map_or(Expr::Lit(Value::Null), |v| Expr::Lit(Value::Text(v))),
@@ -2127,6 +2150,7 @@ impl P<'_> {
                 | Stmt::Update { .. }
                 | Stmt::Delete { .. }
                 | Stmt::Merge(_)
+                | Stmt::Explain { .. }
         ) {
             return err(UNSUPPORTED, format!("{} isn't supported in PL/pgSQL functions", functions::what(&s)));
         }
@@ -2650,7 +2674,7 @@ fn quoted_param(v: &Value) -> String {
 }
 
 /// `e` with `line` after its CONTEXT lines (the innermost first, as Postgres collects them).
-fn with_context(mut e: SqlError, line: &str) -> SqlError {
+pub(super) fn with_context(mut e: SqlError, line: &str) -> SqlError {
     if line.is_empty() {
         return e;
     }
@@ -2742,6 +2766,15 @@ impl Frame<'_> {
             }
         };
         format!("<unnamed portal {n}>")
+    }
+
+    /// Refused under EXPLAIN without ANALYZE (see `sql::dry_run`) where the session keeps the cursors PL/pgSQL opens:
+    /// opening one, moving it or closing it changes the session.
+    fn cursor_change(&self) -> Result<()> {
+        match session() {
+            Some(_) => super::dry_refusal(|| "a cursor's OPEN, FETCH, MOVE or CLOSE".into()),
+            None => Ok(()),
+        }
     }
 
     /// `f` with a bound cursor's arguments set: each a variable of its parameter's name and type, the values worked
@@ -3089,7 +3122,7 @@ impl Frame<'_> {
     fn query_eval(&mut self, e: &E) -> Result<(Value, Option<Type>)> {
         // a subquery of a table with row security (or of a view) runs as a statement, which has its
         // policies put in (and its views expanded) for whoever runs it each time
-        if self.x.db.core.has_row_security() && rls::touched(&self.x.view()?, &e.sel)? {
+        if rls::possible(&self.x.db.core) && rls::touched(&self.x.view()?, &e.sel)? {
             return self.bound_eval(e);
         }
         self.settle();
@@ -3682,17 +3715,27 @@ impl Frame<'_> {
             // (DDL and the rest: run as they are, giving no rows)
             _ => false,
         };
+        // (SELECT ... INTO a table, not CREATE TABLE AS: a function's static CREATE TABLE AS comes as EXECUTE's
+        // 'CREATE ...' too, see `ddl_as_execute`)
+        let select_into =
+            matches!(st, Stmt::CreateAs { .. }) && !matches!(lex(&sql)?.first(), Some(Tok::Word(w)) if w == "create");
         if rows && !returns {
-            let tag = match &st {
-                Stmt::CreateAs { .. }
-                    if sql.trim_start().get(..6).is_some_and(|w| w.eq_ignore_ascii_case("select")) =>
-                {
-                    "SELECT INTO"
-                }
-                s => functions::what(s),
-            };
+            let tag = if select_into { "SELECT INTO" } else { functions::what(&st) };
             let e = SqlError { code: SYNTAX, message: format!("{tag} query does not return tuples"), info: None };
             return Err(Frame::statement_context(e, &sql));
+        }
+        // EXECUTE of a SELECT INTO is refused, as Postgres's is (pl_exec.c, SPI_OK_SELINTO), before it makes the
+        // table Postgres's error would roll back. (Postgres raises it once SPI has run the statement, with no
+        // `SQL statement` context: the function's line alone.)
+        if select_into {
+            return Err(SqlError {
+                code: UNSUPPORTED,
+                message: "EXECUTE of SELECT ... INTO is not implemented".into(),
+                info: Some(Box::new(Violation {
+                    hint: Some("You might want to use EXECUTE ... INTO or EXECUTE CREATE TABLE ... AS instead.".into()),
+                    ..Violation::default()
+                })),
+            });
         }
         let select = matches!(st, Stmt::Select(_) | Stmt::Locking(..) | Stmt::Explain { .. });
         let out = self.x.with_params(&vals, &types, self.x.readonly).run_body(&st, false)?;
@@ -4129,6 +4172,7 @@ impl Frame<'_> {
                 };
             }
             S::Open { var, query, dynamic, args, scroll, constant, text } => {
+                self.cursor_change()?;
                 let name = match self.find(var).map(|i| self.vals[i].clone()) {
                     // a refcursor with no name yet is given a new portal's, unless it is CONSTANT
                     Some(Value::Null) | None => {
@@ -4152,6 +4196,7 @@ impl Frame<'_> {
                 self.open(name, out, *scroll, text, query.as_deref());
             }
             S::Fetch { var, go, into } => {
+                self.cursor_change()?;
                 let name = match self.find(var).map(|i| self.vals[i].clone()) {
                     Some(Value::Null) | None => return err("22004", format!("cursor variable \"{var}\" is null")),
                     Some(v) => v.to_text(),
@@ -4196,6 +4241,7 @@ impl Frame<'_> {
                 self.set("found", Value::Bool(found))?;
             }
             S::Close(var) => {
+                self.cursor_change()?;
                 let name = match self.find(var).map(|i| self.vals[i].clone()) {
                     Some(Value::Null) | None => return err("22004", format!("cursor variable \"{var}\" is null")),
                     Some(v) => v.to_text(),
@@ -4207,6 +4253,7 @@ impl Frame<'_> {
             // FOR over a bound cursor: it is opened under its variable's portal name (a new one if it has none, the
             // variable NULL again after), read, and closed
             S::ForCursor { rec, var, cur, args, body } => {
+                self.cursor_change()?;
                 let label = self.label.take();
                 let named = self.find(var).map(|i| self.vals[i].clone()).filter(|v| *v != Value::Null);
                 let name = match &named {

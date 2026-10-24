@@ -459,6 +459,9 @@ fn mcp_instructions_follow_the_merge_right() {
     for flags in [&["--allow-merge"][..], &["--agent", "own"], &["--agent", "any"]] {
         let t = instructions(flags);
         assert!(t.contains("call merge yourself"), "{flags:?}: {t}");
+        // conflicts: settled by columns first, a whole side last
+        let (cols, whole) = (t.find("by_columns=true combines"), t.find("resolve without by_columns takes whole rows"));
+        assert!(cols.is_some() && whole.is_some() && cols < whole, "{flags:?}: {t}");
         assert!(!t.contains("you can't merge") && !t.contains("chronos <database folder> merge"), "{flags:?}: {t}");
         assert!(t.contains("needs a person's review") && t.contains("stop, and tell the person"), "{flags:?}: {t}");
     }
@@ -630,15 +633,62 @@ fn shared_folder() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A world name with a dash, unquoted in SQL, gets told how to write it (agents fork such names).
+/// A world name with a dash works unquoted in SQL too (agents fork such names, and write them as they are).
 #[test]
-fn dashed_world_names_say_to_quote() {
+fn dashed_world_names_work_unquoted() {
     let dir = std::env::temp_dir().join(format!("chronos-dash-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let (ok, _, err) = chronos(&dir, &[], "fork task-1\nuse main\nmerge world task-1;\n");
+    let (ok, out, err) = chronos(&dir, &[], "fork add-todos-2\nuse main\nmerge world add-todos-2;\n");
+    assert!(ok, "unquoted: {out}{err}");
+    let (ok, out, err) = chronos(&dir, &[], "fork task-1\nuse main\nmerge world 'task-1';\n");
+    assert!(ok, "quoted: {out}{err}");
+    // a dash with nothing name-like after it still says how to write it
+    let (ok, _, err) = chronos(&dir, &[], "merge world task-;\n");
     assert!(!ok && err.contains("world names with a dash need quotes, like 'task-...'"), "{err}");
-    let (ok, out, err) = chronos(&dir, &[], "merge world 'task-1';\n");
-    assert!(ok, "the quoted form works: {out}{err}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The shell's diff (and MCP's) puts a table made in a world in words, not as the catalog's JSON row.
+#[test]
+fn diff_shows_a_new_table_in_words() {
+    let dir = std::env::temp_dir().join(format!("chronos-diff-schema-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (ok, out, err) = chronos(
+        &dir,
+        &[],
+        "fork w\ncreate table todos (id int primary key, title text not null);\ninsert into todos values (1, 'a');\ndiff\n",
+    );
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("+ create table todos (id integer not null, title text not null"), "{out}");
+    // the primary key is part of the definition: `id int primary key` doesn't read as `id int not null`
+    assert!(out.contains(r#"primary key "id""#), "{out}");
+    assert!(out.contains("+ todos/1"), "{out}");
+    assert!(!out.contains("_sonos_tables"), "{out}");
+    // an altered table (one main has): the new column whole, its default and not null included
+    let (ok, out, err) = chronos(
+        &dir,
+        &[],
+        "use main\ncreate table tags (id int primary key);\nfork w2\nalter table tags add column rank int not null default 1;\ndiff\n",
+    );
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("~ alter table tags: +rank integer not null") && out.contains("default"), "{out}");
+    // dropping a table's only check shows what was dropped
+    let (ok, out, err) = chronos(
+        &dir,
+        &[],
+        "use main\ncreate table prices (id int primary key, amount int, constraint positive check (amount > 0));\nfork w3\nalter table prices drop constraint positive;\ndiff\n",
+    );
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("~ alter table prices: -check") && out.contains("amount > 0"), "{out}");
+    // a type DIFF has no words for still shows, with its definition
+    let (ok, out, err) = chronos(&dir, &[], "use w\ncreate type mood as enum ('happy', 'sad');\ndiff\n");
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("+ type mood") && out.contains("happy"), "{out}");
+    // a view has no columns to list: its definition shows, so two different queries never read the same
+    let (ok, out, err) =
+        chronos(&dir, &[], "use w\ncreate view open_todos as select id from todos where id > 7;\ndiff\n");
+    assert!(ok, "{out}{err}");
+    assert!(out.contains("+ create view open_todos") && out.contains("id > 7"), "{out}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -717,6 +767,7 @@ fn mcp_merge_tools() {
         call(18, "sql", r#"{"sql":"update t set a = 'u' where id = 1","branch":"u"}"#),
         call(19, "sql", r#"{"sql":"update t set a = 'main' where id = 1"}"#),
         call(20, "merge", r#"{"branch":"u"}"#),
+        call(21, "merge", r#"{"branch":"u","by_columns":true}"#),
     ];
     let r = mcp(&dir, &["--allow-merge"], &script);
     let text = |id: usize| r[id - 1]["result"]["content"][0]["text"].as_str().unwrap().to_string();
@@ -740,6 +791,14 @@ fn mcp_merge_tools() {
         text(20).contains("1 conflict") && text(20).contains("by_columns=true") && text(20).contains("merge_preview"),
         "{}",
         text(20)
+    );
+    assert!(text(20).contains("safest first") && text(20).contains("the same call again fails"), "{}", text(20));
+    // by columns, the same column still conflicts: told how to pick a side for it
+    assert_eq!(r[20]["result"]["isError"], true);
+    assert!(
+        text(21).contains("both changed a") && text(21).contains("resolve=\"ours\"|\"theirs\" too"),
+        "{}",
+        text(21)
     );
 
     // safe mode: previews and its own checkpoints, but no approvals and nobody else's worlds

@@ -6,17 +6,19 @@ Chronos DB has three ways in (Postgres, HTTP, MCP), one identity model (the data
 
 The short version: **agents can't write `main`, and a person approves merges.** An agent works in worlds it forks; someone with the right to merge reads the diff and merges it. Everything below is how that's enforced, and where it isn't yet.
 
+**Since 0.4, the server token lets a client in as the guest.** A client that proves the server token (`--token`, `CHRONOS_TOKEN`) reads, forks and changes only the guest's own worlds; it can't write `main`, merge, or manage agents. The database's own user over the network is the **admin token** (`--admin-token`, `CHRONOS_ADMIN_TOKEN`), a separate credential to keep away from agents. With no token at all (loopback only), every client is the database's own user, as before: nothing could have leaked. `--unsafe` makes the server token the database's own user, as every server ran before 0.4 (see [upgrading from 0.3](#upgrading-from-03-the-server-token)).
+
 ## Who can do what
 
 | Who | How they're identified | Reads | Writes | Merges into `main` | Agents, settings, backups |
 |---|---|---|---|---|---|
-| **The database's own user** (a person) | the shell; a loopback client when the server has no token; the server token (`--token`); the admin token (`--admin-token`); `chronos mcp --allow-merge` | everything | everything | yes | yes |
+| **The database's own user** (a person) | the shell; a loopback client when the server has no token at all; the admin token (`--admin-token`); the server token only with `--unsafe`; `chronos mcp --allow-merge` | everything | everything | yes | yes |
 | **An agent**, default rights | its own token; `chronos mcp --agent NAME` | every world | only worlds it forked | no | no |
 | **An agent** with more rights | its own token | every world | what its `can` list allows | with `merge_own` (its worlds) or `merge` (any) | with `admin` |
-| **The guest** (`chronos serve --safe`) | any HTTP or Postgres client without an agent's token or the admin token | every world | only worlds `guest` forked (shared by every guest) | no | no |
+| **The guest** | any HTTP or Postgres client with the server token (`--token`), or with no token on a server that has an admin token; with `--safe`, every client that isn't an agent, a role with its password, or the admin token | every world | only worlds `guest` forked (shared by every guest) | no | no |
 | **`chronos mcp`**, default safe mode | the process on stdio | every world | only worlds forked in this MCP session | no | no |
 | **Someone on the network** | nothing | nothing on a non-loopback address: a token is required (HTTP `401`, Postgres `28P01`) | nothing | no | no |
-| **Anything on the same machine** | nothing | with no server token, loopback clients are the database's own user (the guest with `--safe`), browser pages included (see [known limitations](#known-limitations-dont-expose-to-untrusted-networks-yet)) | same | same | same |
+| **Anything on the same machine** | nothing | with no token at all, loopback clients are the database's own user (the guest with `--safe`), browser pages included (see [known limitations](#known-limitations-dont-expose-to-untrusted-networks-yet)) | same | same | same |
 | **Processes of the same OS user** | the folder and its Unix socket | everything: the files, and the socket `chronos` uses to share an open folder | everything | yes | yes |
 
 - **Reads aren't restricted.** Anyone who may read reads every world, `main` and the past included. There are no per-table, per-row or per-world read rights.
@@ -31,23 +33,27 @@ The user name chooses how the client proves who it is. An agent proves with SCRA
 
 | Server started with | Client connects as | Gets |
 |---|---|---|
-| no `--token` (loopback only) | any user but a role with a password, no password asked | the database's own user, or the role |
+| no token at all (loopback only) | any user but a role with a password, no password asked | the database's own user, or the role |
 | no `--token` | `user=<agent>`, `password=<its token>` | that agent |
-| `--token T` | any user but a role or an agent, `password=T` | the database's own user |
+| `--token T` | any user but a role or an agent, `password=T` | the guest (the database's own user with `--unsafe`) |
+| `--token T --admin-token A` | any user but a role or an agent, `password=A` | the database's own user |
 | `--token T` | `user=<agent>`, `password=<its token>` | that agent |
 | any | `user=<role>`, `password=<its password>` | that role, with its privileges |
 | `--token T`, or an agent user | a wrong or missing password | refused: `28P01 password authentication failed for user "..."` (an agent made by an older Chronos, on loopback without `--token`, before its first login: `28P01 wrong password: use the server's token, or the agent's`) |
 | any | from an address with more than 10 wrong passwords lately | refused at once until it has waited: `28P01 too many failed logins from this address: try again in N s` |
 | `--token T` | a role without a password | refused: `28P01`, as Postgres refuses it |
-| `--safe` | anyone who isn't an agent or the admin token (the server token included) | the guest |
-| `--safe --admin-token A` | any user, `password=A` | the database's own user |
+| `--safe` | anyone who isn't an agent, a role with its password, or the admin token (the server token included, loopback without a token too) | the guest |
+| `--admin-token A` (with or without `--safe`) | any user, `password=A` | the database's own user |
 
 ```bash
-psql "postgres://anyone:$CHRONOS_TOKEN@db.internal:5433/main"      # the server token
-psql "postgres://bot:chronos_4f…@db.internal:5433/agent_7"         # agent bot, on its world agent_7
+psql "postgres://anyone:$CHRONOS_ADMIN_TOKEN@db.internal:5433/main"   # the admin token: the database's own user
+psql "postgres://anyone:$CHRONOS_TOKEN@db.internal:5433/main"         # the server token: the guest
+psql "postgres://bot:chronos_4f…@db.internal:5433/agent_7"            # agent bot, on its world agent_7
 ```
 
 - **With `--admin-token` and no `--token`,** every connection is asked for a password (it may be the admin token), and one that is neither the admin token nor an agent's just makes the client the guest.
+- **With `--token` and no `--admin-token`,** nobody over the network is the database's own user: the shell on the database's machine (`chronos <folder>`) is. `chronos serve` says so as it starts.
+- **A role that proves its own password is that role,** with the privileges it was given, never the guest: a role's password is a credential the database's own user made on purpose. The guest stands in for a name that proves only the server token.
 - **Agents and the guest never read the passwords roles keep** (`pg_authid.rolpassword` and `pg_shadow.passwd` are 42501 to them, as to a role that isn't a superuser), so they can't answer a role's MD5 challenge with its hash.
 - **A disabled or dropped agent** can't log in (`28P01`, after the same SCRAM exchange as a wrong token). An open session of an agent that's disabled is refused from its next statement.
 - **An agent's name takes only its token**, not the server's or admin token (a role's name takes only its password). An agent with a role of its name logs in as the agent; the role's password doesn't log that name in.
@@ -65,17 +71,19 @@ Clients send `Authorization: Bearer <token>` (the word `Bearer`, one space, the 
 | Request | Gets |
 |---|---|
 | `GET /v1/health` | always answered, no auth |
-| no header, server has no `--token` (loopback only) | the database's own user; the guest with `--safe` |
+| no header, server has no token at all (loopback only) | the database's own user; the guest with `--safe` |
+| no header, server has `--admin-token` but no `--token` | the guest |
 | no header, server has `--token` | `401 missing token` |
-| the server token | the database's own user; the guest with `--safe` |
+| the server token | the guest; the database's own user with `--unsafe` |
 | the admin token (`--admin-token` or `CHRONOS_ADMIN_TOKEN`) | the database's own user |
 | an enabled agent's token | that agent |
 | any other token (a typo, a disabled or dropped agent's), even with no server token | `401 wrong token` |
 | any token, from an address that sent more than 10 wrong ones lately (see [Postgres](#postgres-chronos-serve-port-5433)) | `429 too many wrong tokens from this address` until it has waited |
 | an agent (or the guest) doing what it may not | `403` |
-| `GET /metrics` with an agent's token | `403`; it needs the server token if the server has one |
+| `GET /metrics` with an agent's token | `403`; it takes the server token (the guest may read them) or the admin token |
+| `POST /v1/merge_outcomes` with the server token (the guest's) or an agent's | `403`; it takes the admin token, or no token on a server with none |
 
-In safe mode, the guest can read `/metrics`, as its `read` right already gives it `SHOW METRICS`. Everything else is `POST /v1/<op>`; see [HTTP API](http-api.md#auth-and-exposure). Every response says `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`, and over TLS `Strict-Transport-Security: max-age=31536000`. A request naming a session's transaction world (`_tx_…`) as its `branch`, `from`, `into`, `world` or the like is `404 no world`, an agent's `sql`, `simulate` and `replay` included.
+The guest can read `/metrics`, as its `read` right already gives it `SHOW METRICS`. Everything else is `POST /v1/<op>`; see [HTTP API](http-api.md#auth-and-exposure). Every response says `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`, and over TLS `Strict-Transport-Security: max-age=31536000`. A request naming a session's transaction world (`_tx_…`) as its `branch`, `from`, `into`, `world` or the like is `404 no world`, an agent's `sql`, `simulate` and `replay` included.
 
 ### Tokens and flags
 
@@ -83,16 +91,28 @@ In safe mode, the guest can read `/metrics`, as its `read` right already gives i
 |---|---|---|
 | `--listen 127.0.0.1:7070` | | HTTP address (the default is loopback) |
 | `--pg 127.0.0.1:5433` or `--pg off` | | Postgres address (the default is loopback) |
-| `--token T` | `CHRONOS_TOKEN` | the server token, at least 24 characters. Any address that isn't loopback refuses to start without one: `refusing to listen on … without a token` |
-| `--safe` | | clients that aren't agents are the guest |
-| `--admin-token A` | `CHRONOS_ADMIN_TOKEN` | with `--safe`: the database's own user; at least 24 characters too |
+| `--token T` | `CHRONOS_TOKEN` | the server token, at least 24 characters: lets a client in as the guest. Any address that isn't loopback refuses to start without one: `refusing to listen on … without a token` |
+| `--admin-token A` | `CHRONOS_ADMIN_TOKEN` | the admin token, at least 24 characters too: the database's own user over the network |
+| `--safe` | | every client that isn't an agent or the admin token is the guest, loopback without a token included |
+| `--unsafe` | | the server token is the database's own user, as before 0.4; warned about at start on an address other machines can reach, unless `protect_main` is on. Not with `--safe` |
 | `--tls-cert`, `--tls-key` | `CHRONOS_TLS_CERT`, `CHRONOS_TLS_KEY` | TLS on both ports; both or neither. Any address that isn't loopback refuses to start without them: `refusing to listen on … without TLS` |
 | `--insecure-no-tls` | | listen on an address that isn't loopback without TLS anyway, with a warning at start: only where something else encrypts the connection (a VPN, a TLS proxy in front, a container port published only on `127.0.0.1`) |
 | | `CHRONOS_LOGIN_FREE_TRIES` | wrong passwords or tokens an address gets before it must wait (10) |
 
 - **Loopback** means every address the name resolves to is a loopback one (`127.x.x.x`, `::1`, `localhost`). Give numeric addresses to be sure.
 - **Pass tokens in the environment, not on the command line:** a token passed as `--token` shows in the process list (`ps`) to every user of the machine. `CHRONOS_TOKEN=$(openssl rand -hex 24) chronos serve ...`, or from a secrets file your service manager reads.
-- **The server and admin tokens** are whatever strings you choose, kept only in the process; the server refuses to start with one shorter than 24 characters, or with `change-me` (the placeholder older examples used). Make them with `openssl rand -hex 24`. Changing one takes a restart.
+- **The server and admin tokens** are whatever strings you choose, kept only in the process; the server refuses to start with one shorter than 24 characters, with `change-me` (the placeholder older examples used), or with the same string for both (the guest's token would be the database's own user's). Make each with `openssl rand -hex 24`. Changing one takes a restart.
+
+#### Upgrading from 0.3: the server token
+
+Before 0.4 the server token was the database's own user: whoever held it wrote `main`, merged, and made agents. Since 0.4 it is the guest's, so after the upgrade:
+
+- A `psql` or `DATABASE_URL` login with `CHRONOS_TOKEN` as the password still works, as the guest: `CREATE TABLE`, writes to `main`, `MERGE`, `CREATE AGENT` and `ALTER SYSTEM` now fail with `42501`, and over HTTP with `403`. The server says why as it starts: `the server token is the guest's`.
+- **For people and the application that owns the data:** set `CHRONOS_ADMIN_TOKEN` (`openssl rand -hex 24`) and give them that as the password or bearer token instead. Keep it out of agents' reach.
+- **For agents:** nothing changes; each has its own token (`CREATE AGENT`).
+- **To run exactly as before,** pass `--unsafe`: the server token is the database's own user again. `chronos serve` then warns at start on an address other machines can reach, as 0.2 and 0.3 did.
+- **`--safe` still works** and means what it did: every client that isn't an agent or the admin token is the guest, loopback without a token too. `--safe --admin-token A` from a 0.3 deployment behaves the same in 0.4, but for one thing: a role that logs in with its own password is now that role (it was the guest under `--safe` in 0.3).
+- **A role with a password** (`CREATE ROLE app LOGIN PASSWORD '...'`) logs in as that role, with its privileges, in every mode: an application connecting as its own role keeps working.
 
 ### MCP (`chronos mcp <folder>`)
 
@@ -197,11 +217,16 @@ All are off (`0`) by default, for agents and for the guest.
 | `max_concurrent` | its statements and HTTP requests running at once | refused, `53300` | 429 |
 | `max_memory_mb` | rows one of its statements holds (joined rows, a join's other side, its result); its sorts, groups and joins spill at a quarter of it | stopped, `53200` | 413 |
 | `max_idle_ms` | how long a Postgres connection of its sits idle inside a transaction. It may lower its `idle_in_transaction_session_timeout`, never raise it past this | connection dropped (FATAL `25P03`), its transaction rolled back and its locks let go | |
+| `max_threads` | threads one of its statements runs on, its own included: a big scan is split into parts run at once, by default on as many cores as the server's pool lends; `1` runs them one after another on one core, leaving the rest to everyone else | slower, never refused | |
 
 - **`max_changes` counts a transaction at `COMMIT`,** so one huge transaction uses memory before it's refused.
 - **`max_memory_mb` counts rows,** not every structure: a `GROUP BY`'s groups and a window's rows aren't counted (see [operations](operations.md#memory-and-spilling-to-disk)).
 - **The rate limiter and `max_concurrent`** are counted in memory: a restart resets them.
 - **Agents hold connections while their model thinks.** A request over HTTP or MCP holds nothing between calls; an agent on `psql` or a Postgres driver holds its connection, and a transaction it has open, across every model call, which can take seconds. Point agents at [HTTP](http-api.md) or [MCP](reference/mcp.md) where you can. Where they use the Postgres protocol, set `max_idle_ms` (`ALTER AGENT bot SET (max_idle_ms = '30s')`) so one that stops mid-transaction lets its rows go; `idle_session_timeout` (`SET`, or `options=-c idle_session_timeout=5min` in its connection string) also drops a connection idle outside a transaction, freeing its slot.
+- **Keeping one agent's heavy scan from slowing everyone else:** a world isolates data, not CPU, so an agent's
+  unfiltered scan in its own world competes with main's traffic. `max_threads` (say `2`) caps how many cores one of its
+  statements takes, `max_concurrent` how many statements it runs at once, and `max_query_ms` how long each may run.
+  There is no priority between statements yet: an agent's statement that runs gets its share of the CPU as any other.
 - **The guest has no quotas,** and all guests share one set of worlds. Bound what it can do with the server-wide limits below.
 
 ## Protecting `main`
@@ -216,6 +241,7 @@ merge world agent_7;             -- as the database's own user
 drop world agent_7;              -- or not
 ```
 
+- **New served databases protect `main`:** a folder `chronos serve` makes starts with `protect_main` on, so `main`'s rows change only by merging a world, for every token, the server's included (definitions, `RESTORE` and `UNDO` still go straight in). Only the database's own shell on its machine (`chronos <folder>`, then `ALTER SYSTEM SET protect_main = off`) turns it off: an agent, or a client of the server over Postgres or HTTP, is refused (`42501`), so a leaked token can't turn it off first. `CHRONOS_PROTECT_MAIN=off` makes a new folder without it; folders made by the library, `chronos import` or the shell start with it off, as before.
 - **Approving means merging,** as the database's own user or an agent allowed to; merges a policy refuses wait in `SHOW REVIEWS`. Approve the version you read (`MERGE WORLD w AT VERSION n`, HTTP `merge` with `version`, Studio does it for you): an agent that keeps writing to its world while you review doesn't get its later writes merged with it. `merge_own` with `write_main` lets an agent publish its own work to `main` with no one looking. The database's own user and admins can write `main` directly unless `protect_main` is on; `chronos serve` warns as it starts when other machines can reach it with such a token (no `--safe`, `protect_main` off).
 - **MCP:** without flags, agents can't merge; `--allow-merge` gives the MCP session everything, not just merging. Prefer `--agent NAME` with `merge_own` (plus `write_main` to publish to `main`) when an agent should publish.
 - **Crashes can't make a merge publish less than was written:** merges check the world's version, and worlds open during a crash are flagged until someone confirms them (see [concepts](concepts.md#versions-and-crashes)).
@@ -330,9 +356,10 @@ Not recorded: who, when it's the database's own user (the shell, the server or a
 ## A hardened deployment
 
 1. Keep both ports on loopback unless something else must reach them; then give a numeric address, `CHRONOS_TOKEN` (`openssl rand -hex 24`, in the environment, not on the command line) and TLS. In a container, publish the ports on the host's loopback (`-p 127.0.0.1:5432:5432`) unless TLS is on.
-2. Run with `--safe --admin-token`, so clients without an agent's token are the guest; keep the admin token for people.
-   Without `--safe`, the server token is the database's own user: whoever holds it changes `main` directly, with no
-   world and no review. `chronos serve` says so as it starts on an address other machines can reach.
+2. Set `CHRONOS_ADMIN_TOKEN` and keep it for people: the server token lets a client in as the guest, and the admin
+   token is the database's own user. Never pass `--unsafe` on a server agents can reach: it makes the server token
+   the database's own user, so whoever holds it changes `main` directly, with no world and no review (`chronos serve`
+   says so as it starts on an address other machines can reach).
 3. **Keep the server and admin tokens out of agents' reach:** not in an agent's environment, its container, a `.env`
    file its tools can read, or a repository it works in. An agent connects with its own token only.
 4. `ALTER SYSTEM SET protect_main = on`, so `main`'s rows change only by merging a world, for everyone, the admin
@@ -353,7 +380,7 @@ An agent's rights hold for what it asks the database, not for what it runs. An a
 - **Give the container the agent's token and nothing else.** Not the folder, not the folder's socket directory (`$TMPDIR/chronos-<uid>/`), not the server token or the admin token. Pass the token in the environment, and make one agent per container, with only the rights it needs (the default `read,fork,write_own` can't write `main` or merge) and its quotas (`max_worlds`, `world_ttl`, `writes_per_minute`, `max_query_ms`).
 - **Connect with the token, not the folder.** Over MCP, point the client at `chronos serve`'s `/mcp` with `Authorization: Bearer $BOT_TOKEN` ([MCP over HTTP](reference/mcp.md#over-http-chronos-serve)); over Postgres, `postgres://bot:$BOT_TOKEN@<host>:5433/agent_7`; over HTTP, the same bearer token. `chronos mcp <folder>` opens the folder (or its socket) and takes an agent's name, not its token, so it doesn't belong in the container.
 - **Let the container reach the server, and nothing else private.** A container on Docker's default bridge can still reach the host and its network. If you reject private and link-local addresses from containers (in the `DOCKER-USER` chain and on the agents' bridge, IPv6 too: `fc00::/7`, `fe80::/10`; link-local covers the cloud metadata address `169.254.169.254`), allow the Chronos server's address and port before those rules, and DNS if the container's resolver is on the host. Rules like these are wiped when the VM or host restarts, so put them where every start applies them again. Chronos doesn't install them.
-- **Serve on an address the container can reach,** with the token and TLS (`serve` refuses an address that isn't loopback without them, unless `--insecure-no-tls` says a private network carries it): the bridge's address on the host, or a network shared with the agent's container. Run it with `--safe --admin-token`, so a client without an agent's token is the guest.
+- **Serve on an address the container can reach,** with the token and TLS (`serve` refuses an address that isn't loopback without them, unless `--insecure-no-tls` says a private network carries it): the bridge's address on the host, or a network shared with the agent's container. A client with the server token is the guest; keep the admin token out of the container.
 - **Reads aren't scoped yet.** The agent reads every world, `main`, its history and other agents' worlds included. Keep out of the database what the agent mustn't see, and let the network rules decide where it can send what it reads.
 
 ## Known limitations (don't expose to untrusted networks yet)

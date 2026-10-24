@@ -43,7 +43,7 @@ fn dry_run_explains_and_changes_nothing() {
     let before = rows(&q(&db, MAIN, "select id, name, email, age from t order by id"));
     let plan = q(&db, MAIN, "merge world x dry run");
     let cols: Vec<String> = plan.columns.clone().unwrap().into_iter().map(|c| c.0).collect();
-    assert_eq!(cols, ["table", "id", "outcome", "detail", "base", "ours", "theirs", "result", "postgres"]);
+    assert_eq!(cols, ["table", "id", "outcome", "detail", "base", "ours", "theirs", "result", "postgres", "columns"]);
     // (led by a line per table: rows deleted, updated, inserted)
     assert_eq!(plan.rows[0][2].to_text(), "summary");
     assert_eq!(plan.rows[0][3].to_text(), "0 deleted, 1 updated, 0 inserted");
@@ -92,6 +92,104 @@ fn settle_row_by_row_and_by_columns() {
     assert!(db.world("x").is_err(), "merged");
     // a row given with a column left out gets it filled in as by an INSERT
     assert!(q(&db, MAIN, "select at from t where id = 'd'").rows[0][0] != Value::Null);
+}
+
+/// BY COLUMNS with a side: in a row both changed, the side named wins only the columns both changed, and each
+/// column only one side changed keeps that side's value. A whole side (USING OURS alone) still takes the whole row.
+/// A dry run says, per row, the columns each side changed and what each choice discards.
+#[test]
+fn by_columns_with_a_side_settles_per_column() {
+    let db = Db::new();
+    q(&db, MAIN, "create table p (id int primary key, name text, email text, age int)");
+    q(&db, MAIN, "insert into p select i, 'Ada', 'a@x', 36 from generate_series(1, 5) i");
+    // each world changes its own row's name and age; main, every row's email and age
+    for (w, id) in [("w1", 1), ("w2", 2), ("w3", 3), ("w4", 4)] {
+        db.fork(MAIN, w).unwrap();
+        q(&db, w, &format!("update p set name = 'Ada L.', age = 37 where id = {id}"));
+    }
+    // and one sets row 5's age to what main sets it to: the same change, which no choice discards
+    db.fork(MAIN, "w5").unwrap();
+    q(&db, "w5", "update p set name = 'Ada L.', age = 40 where id = 5");
+    q(&db, MAIN, "update p set email = 'ada@y', age = 40");
+    let row = |id: i32| rows(&q(&db, MAIN, &format!("select name, email, age from p where id = {id}"))).join("");
+
+    // the conflict, column by column
+    let plan = q(&db, MAIN, "merge world w1 dry run");
+    let r = plan.rows.iter().find(|r| r[2].to_text() == "conflict").unwrap();
+    assert_eq!(
+        r[3].to_text(),
+        "both changed age; only here: name; only the parent: email. USING OURS overwrites the parent's age, email, \
+         BY COLUMNS USING OURS only age; USING THEIRS drops this world's age, name, BY COLUMNS USING THEIRS only age"
+    );
+    let cols: serde_json::Value = serde_json::from_str(&r[9].to_text()).unwrap();
+    assert_eq!(cols, serde_json::json!({ "here": ["age", "name"], "there": ["age", "email"], "both": ["age"] }));
+    let e = chronos::sql::run(&db, MAIN, "merge world w1", &[]).unwrap_err();
+    assert!(e.message.contains("that side wins only the columns both changed"), "{}", e.message);
+
+    let plan = q(&db, MAIN, "merge world w5 dry run");
+    let r = plan.rows.iter().find(|r| r[2].to_text() == "conflict").unwrap();
+    assert_eq!(
+        r[3].to_text(),
+        "both changed age; only here: name; only the parent: email. USING OURS overwrites the parent's email, \
+         BY COLUMNS USING OURS nothing; USING THEIRS drops this world's name, BY COLUMNS USING THEIRS nothing"
+    );
+    assert_eq!(q(&db, MAIN, "merge world w5 by columns using ours").tag, "MERGE 1");
+    assert_eq!(row(5), "Ada L.|ada@y|40");
+
+    // previewed, then merged: ours wins age, and main's email stays
+    let plan = q(&db, MAIN, "merge world w1 by columns using ours dry run");
+    let r = plan.rows.iter().find(|r| r[1].to_text() == "1").unwrap();
+    assert_eq!(r[2].to_text(), "by columns ours");
+    assert!(r[3].to_text().starts_with("both changed age; only here: name"), "{}", r[3].to_text());
+    assert!(r[7].to_text().contains("\"email\": \"ada@y\""), "{}", r[7].to_text());
+    assert_eq!(q(&db, MAIN, "merge world w1 by columns using ours").tag, "MERGE 1");
+    assert_eq!(row(1), "Ada L.|ada@y|37");
+
+    // theirs wins age, and the world's name comes in
+    assert_eq!(q(&db, MAIN, "merge world w2 by columns using theirs").tag, "MERGE 1");
+    assert_eq!(row(2), "Ada L.|ada@y|40");
+
+    // a whole side is the whole row: main's email goes back to the fork's
+    assert_eq!(q(&db, MAIN, "merge world w3 using ours").tag, "MERGE 1");
+    assert_eq!(row(3), "Ada L.|a@x|37");
+
+    // a table that merges by columns settles per column with a side too
+    q(&db, MAIN, "alter table p set (merge_by_columns = true)");
+    assert_eq!(q(&db, MAIN, "merge world w4 using ours").tag, "MERGE 1");
+    assert_eq!(row(4), "Ada L.|ada@y|37");
+}
+
+/// A world that adds a column and fills it in a row main changed too: combined by columns, the row is stored as the
+/// merged table reads it, with the new column, not refused (or taken whole) for a column main's table doesn't have yet.
+#[test]
+fn by_columns_with_a_column_the_world_added() {
+    let db = Db::new();
+    q(&db, MAIN, "create table p (id int primary key, name text, email text, age int)");
+    q(&db, MAIN, "insert into p values (1, 'Ada', 'a@x', 36), (2, 'Bo', 'b@x', 20)");
+    db.fork(MAIN, "w").unwrap();
+    q(&db, "w", "alter table p add column note text");
+    q(&db, "w", "update p set name = 'Ada L.', note = 'vip' where id = 1");
+    q(&db, "w", "update p set age = 21, note = 'new' where id = 2");
+    q(&db, MAIN, "update p set email = 'ada@y' where id = 1");
+    q(&db, MAIN, "update p set email = 'bo@y', age = 22 where id = 2");
+    let plan = q(&db, MAIN, "merge world w by columns using ours dry run");
+    let outcome = |id: &str| plan.rows.iter().find(|r| r[1].to_text() == id).map(|r| r[2].to_text());
+    assert_eq!(outcome("1").as_deref(), Some("by columns"));
+    assert_eq!(outcome("2").as_deref(), Some("by columns ours"));
+    q(&db, MAIN, "merge world w by columns using ours");
+    assert_eq!(
+        rows(&q(&db, MAIN, "select id, name, email, age, note from p order by id")),
+        ["1|Ada L.|ada@y|36|vip", "2|Bo|bo@y|21|new"]
+    );
+
+    // a column the world drops, which main changed in a row the world changed too: main's side wins it, but the
+    // merged table hasn't got it, so the row keeps the world's other change rather than becoming main's whole row
+    db.fork(MAIN, "d").unwrap();
+    q(&db, "d", "alter table p drop column note");
+    q(&db, "d", "update p set name = 'Ada Lovelace' where id = 1");
+    q(&db, MAIN, "update p set note = 'gold' where id = 1");
+    q(&db, MAIN, "merge world d by columns using theirs");
+    assert_eq!(rows(&q(&db, MAIN, "select id, name, email, age from p where id = 1")), ["1|Ada Lovelace|ada@y|36"]);
 }
 
 /// A table set to merge by columns: in any merge into a world that has the setting, a row whose

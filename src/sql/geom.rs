@@ -1771,6 +1771,26 @@ fn arg(t: Type, v: &Value) -> Result<Arg> {
 /// A geometric function by its name (`center(x)`, `area(x)`, ..., and the prefix operators `@@`, `@-@`, `#`,
 /// `?-`, `?|`), with its arguments' types.
 pub(super) fn function(name: &str, tys: &[Type], a: &[Value]) -> Result<Value> {
+    // a call named after a geometric type with one string, `box('4,4,4,4')`, is that type's cast, as Postgres
+    // takes a function call that names a type (func_get_detail's FUNCDETAIL_COERCION)
+    if let ([Type::Text], [v]) = (tys, a) {
+        let to = match name {
+            "point" => Some(Type::Point),
+            "lseg" => Some(Type::Lseg),
+            "line" => Some(Type::Line),
+            "box" => Some(Type::Box),
+            "path" => Some(Type::Path),
+            "polygon" => Some(Type::Polygon),
+            "circle" => Some(Type::Circle),
+            _ => None,
+        };
+        if let Some(to) = to {
+            return match v {
+                Value::Null => Ok(Value::Null),
+                v => Ok(Value::Text(canonical(to, &v.to_text())?)),
+            };
+        }
+    }
     let mut args = vec![];
     for (i, v) in a.iter().enumerate() {
         args.push(arg(tys.get(i).copied().unwrap_or(Type::Text), v)?);

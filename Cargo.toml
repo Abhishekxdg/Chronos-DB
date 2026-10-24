@@ -1,6 +1,6 @@
 [package]
 name = "chronos"
-version = "0.3.2"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.90"
 description = "An embeddable database for AI agents: instant copy-on-write branches, merge, and fast search"
@@ -38,7 +38,7 @@ libc = "0.2.189"
 lz4_flex = "0.14.0"
 md-5 = "0.11.0"
 miniz_oxide = "0.9.1"
-object_store = { version = "0.14.2", features = ["aws"], optional = true }
+object_store = { version = "0.14.2", features = ["aws", "gcp"], optional = true }
 ring = "0.17.14"
 ripemd = "0.2.0"
 roaring = "0.11.5"
@@ -74,7 +74,7 @@ tokio = "1.53.1"
 tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring", "tls12"] }
 
 [features]
-# cloud storage for pages (S3, R2, MinIO, ...): cargo build --features s3
+# cloud storage for pages and the log (S3, GCS, R2, MinIO, ...): cargo build --features s3
 s3 = ["dep:object_store", "dep:tokio", "dep:futures"]
 shuttle = ["dep:shuttle"]
 

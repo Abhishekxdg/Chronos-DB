@@ -14,7 +14,8 @@ set -eu
 # everything runs from main at the end, so a download cut off halfway runs nothing
 main() {
 REPO="__REPO__" # filled in by the release workflow: where the releases are
-SIGNER="__SIGNER__" # and the repository whose release workflow signs them
+SIGNER_ACCOUNT="__SIGNER_ACCOUNT__" # and the Google service account whose release builds sign them (GCP Cloud Build)
+SIGNER="__SIGNER__" # and the repository whose GitHub release workflow signed those up to v0.4.1
 VERSION="${CHRONOS_VERSION:-__VERSION__}" # so is its tag; a copy from the repo installs latest
 case "$VERSION" in
 latest | __*) rel=latest/download ref= ;;
@@ -55,16 +56,19 @@ got=$(sha "$tmp/$file")
 if [ "${CHRONOS_VERIFY:-}" = 1 ]; then
     command -v cosign >/dev/null || fail "CHRONOS_VERIFY=1 needs cosign: https://docs.sigstore.dev/cosign/system_config/installation/"
     curl -fsSL "$BASE/$file.sigstore.json" -o "$tmp/$file.sigstore.json" || fail "could not download $BASE/$file.sigstore.json"
-    # signed only by the release workflow, through GitHub's OIDC issuer, for this tag (latest: a v tag)
+    # signed only by the release builds' service account, through Google's OIDC issuer; or, for the releases made
+    # before those (up to v0.4.1), by the GitHub release workflow, through GitHub's, for this tag (latest: a v tag)
     wf="https://github.com/$SIGNER/.github/workflows/release.yml"
     if [ -n "$ref" ]; then
         id="--certificate-identity=$wf@$ref"
     else
         id="--certificate-identity-regexp=^$(printf %s "$wf" | sed 's/\./\\./g')@refs/tags/v"
     fi
-    cosign verify-blob --bundle "$tmp/$file.sigstore.json" \
-        --certificate-oidc-issuer https://token.actions.githubusercontent.com "$id" "$tmp/$file" >/dev/null 2>&1 ||
-        fail "$file has no valid signature from $SIGNER's release workflow; nothing was installed"
+    cosign verify-blob --bundle "$tmp/$file.sigstore.json" --certificate-identity "$SIGNER_ACCOUNT" \
+        --certificate-oidc-issuer https://accounts.google.com "$tmp/$file" >/dev/null 2>&1 ||
+        cosign verify-blob --bundle "$tmp/$file.sigstore.json" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$id" "$tmp/$file" >/dev/null 2>&1 ||
+        fail "$file has no valid signature from Chronos DB's release builds; nothing was installed"
 fi
 
 tar -xzf "$tmp/$file" -C "$tmp"

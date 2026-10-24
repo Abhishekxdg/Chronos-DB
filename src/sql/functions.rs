@@ -236,6 +236,16 @@ pub(super) struct Function {
     pub(super) tuning: Tuning,
     /// a SQL-standard body's form (see `StdForm`)
     pub(super) std_form: StdForm,
+    /// the NOTICEs Postgres gives of the `table.column%TYPE` references in its signature as CREATE FUNCTION runs
+    /// (`type reference t.c%TYPE converted to integer`), in order; not kept
+    pub(super) type_notes: Vec<String>,
+    /// the composite types' shapes it was read with, by their names (its body's variables', its casts' too): read
+    /// again once one is no longer its type's (see `from_raw`); not kept
+    shapes: Vec<Type>,
+    /// made with LANGUAGE C AS 'file', 'symbol' as one of the C trigger functions of the regression tests' libraries
+    /// (see `regress_c`): the library file and the symbol, which pg_proc shows as probin and prosrc. It runs as that
+    /// C does, in place of its body (see `Exec::run_code`)
+    pub(super) c_trigger: Option<(String, String)>,
     code: Code,
 }
 
@@ -384,6 +394,9 @@ impl Function {
         if let Some(a) = &self.std_form {
             j["atomic"] = serde_json::json!(a);
         }
+        if let Some(c) = &self.c_trigger {
+            j["c_trigger"] = serde_json::json!(c);
+        }
         j
     }
 
@@ -435,6 +448,9 @@ impl Function {
                 parallel: j["parallel"].as_str().and_then(|p| p.chars().next()),
             },
             std_form: serde_json::from_value(j["atomic"].clone()).ok().flatten(),
+            type_notes: vec![],
+            shapes: vec![],
+            c_trigger: serde_json::from_value(j["c_trigger"].clone()).ok().flatten(),
             code: Code::Sql(vec![]),
         };
         f.compile()?;
@@ -448,8 +464,18 @@ impl Function {
         // then PARSED_FUNCS)
         // (one with SET search_path is bound along that path, in a world whose relations its names find, as the
         // running role sees it for a SECURITY INVOKER one: one for each, see `compile` and `own_path_key`)
+        // (and its composite types as they are now, not as they were before an ALTER TYPE, nor as another world has
+        // them: its signature's and those its body was read with)
         let held = |f: &Arc<Function>| {
+            let stale_ret = match &f.ret {
+                Ret::Value(t) | Ret::SetOf(t) => super::stale_record(*t),
+                Ret::Table(c) => c.iter().any(|(_, t)| super::stale_record(*t)),
+                _ => false,
+            };
             f.args.iter().all(|(_, t)| !matches!(t, Type::Enum(i) if enum_of(*i).map(hold_enum).is_err()))
+                && !stale_ret
+                && !f.args.iter().any(|(_, t)| super::stale_record(*t))
+                && !f.shapes.iter().any(|t| super::stale_record(*t))
         };
         let keyed = |f: &Function| match f.own_path() {
             Some(p) => format!("{raw}\0{}", super::own_path_key(p, !f.definer)),
@@ -472,7 +498,8 @@ impl Function {
             }
         }
         let j: Json = serde_json::from_str(raw).unwrap_or_default();
-        let f = Arc::new(Function::from_json(&j)?);
+        let (f, shapes) = userdefs::noting(|| Function::from_json(&j));
+        let f = Arc::new(Function { shapes, ..f? });
         let key = keyed(&f);
         let mut c = PARSED_FUNCS.lock().unwrap();
         if c.len() >= 1024 {
@@ -509,21 +536,46 @@ impl Function {
             }
             tag = format!("$f{i}$");
         }
+        // (a C trigger function as it was made: its library and symbol)
+        let lit = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let body = match &self.c_trigger {
+            Some((file, symbol)) => format!("{}, {}", lit(file), lit(symbol)),
+            None => format!("{tag}{}{tag}", self.body),
+        };
         format!(
-            "create or replace function {}({}) returns {} language {} {}{}{}{} as {tag}{}{tag};",
+            "create or replace function {}({}) returns {} language {} {}{}{}{} as {body};",
             ident_rel(&self.name),
             args.join(", "),
             match &self.ret {
                 Ret::RowsOf(t) if self.single => ident_rel(t),
                 r => r.sql(),
             },
-            if self.lang == Lang::Sql { "sql" } else { "plpgsql" },
+            self.lang_name(),
             self.volatility.name(),
             if self.strict { " strict" } else { "" },
             if self.definer { " security definer" } else { "" },
             self.config_sql(),
-            self.body
         )
+    }
+
+    /// Its language as pg_language names it: `c` for a C trigger function (see `c_trigger`), else its body's.
+    pub(super) fn lang_name(&self) -> &'static str {
+        match (&self.c_trigger, self.lang) {
+            (Some(_), _) => "c",
+            (None, Lang::Sql) => "sql",
+            (None, Lang::PlPgSql) => "plpgsql",
+        }
+    }
+
+    /// What pg_proc's prosrc shows: a C trigger function's symbol (see `c_trigger`), else its body.
+    pub(super) fn src(&self) -> &str {
+        self.c_trigger.as_ref().map_or(&self.body, |(_, symbol)| symbol)
+    }
+
+    /// The procost it has made without COST, as Postgres's CreateFunction gives it: 1 for a C function (see
+    /// `c_trigger`), 100 for a SQL or PL/pgSQL one.
+    pub(super) fn default_cost(&self) -> f64 {
+        if self.c_trigger.is_some() { 1.0 } else { 100.0 }
     }
 
     /// Its SET clauses as CREATE FUNCTION writes them: ` set search_path to 'app', 'pg_temp'`.
@@ -1091,8 +1143,10 @@ impl Parser {
         Ok(name)
     }
 
-    /// A parameter: `[IN] [name] type [DEFAULT expr | = expr]`; its default as SQL text.
-    fn fn_arg(&mut self) -> Result<(Option<String>, Type, Option<String>, ArgMode)> {
+    /// A parameter: `[IN] [name] type [DEFAULT expr | = expr]`; its default as SQL text, and the NOTICE a
+    /// `table.column%TYPE` gives (see `plpgsql::type_reference`).
+    #[allow(clippy::type_complexity)]
+    fn fn_arg(&mut self) -> Result<(Option<String>, Type, Option<String>, ArgMode, Option<String>)> {
         // the mode before the name, or after it (`a variadic int[]`, `f2 out anyelement`), as Postgres's func_arg
         let mode_word = |p: &Self, k: usize| matches!(p.t.get(k), Some(Tok::Word(w)) if matches!(w.as_str(), "in" | "out" | "inout" | "variadic"));
         let named_first = !mode_word(self, self.i)
@@ -1112,7 +1166,7 @@ impl Parser {
         if let Some(name) = first {
             let ty = self.ty()?;
             let default = if self.kw("default") || self.sym("=") { Some(self.default_expr()?.1) } else { None };
-            return Ok((Some(name), ty, default, mode));
+            return Ok((Some(name), ty, default, mode, None));
         }
         // [name] table.column%TYPE: the column's type
         let pct = (self.i..self.t.len())
@@ -1133,9 +1187,9 @@ impl Parser {
                 parts.push(self.name()?);
             }
             self.i = at + 2;
-            let (ty, _) = plpgsql::column_type(&parts)?;
+            let (ty, note) = plpgsql::type_reference(&parts)?;
             let default = if self.kw("default") || self.sym("=") { Some(self.default_expr()?.1) } else { None };
-            return Ok((name, ty, default, mode));
+            return Ok((name, ty, default, mode, Some(note)));
         }
         let alone = self.attempt(|p| {
             let t = p.ty()?;
@@ -1147,11 +1201,12 @@ impl Parser {
             None => (Some(self.name()?), self.ty()?),
         };
         let default = if self.kw("default") || self.sym("=") { Some(self.default_expr()?.1) } else { None };
-        Ok((name, ty, default, mode))
+        Ok((name, ty, default, mode, None))
     }
 
-    /// `table.column%TYPE`, if that is next: the column's type.
-    fn pct_type(&mut self) -> Result<Option<Type>> {
+    /// `table.column%TYPE`, if that is next: the column's type, and the NOTICE Postgres gives of the reference (see
+    /// `plpgsql::type_reference`).
+    fn pct_type(&mut self) -> Result<Option<(Type, String)>> {
         let mut k = self.i;
         while matches!(self.t.get(k), Some(Tok::Word(_) | Tok::Ident(_))) && self.t.get(k + 1) == Some(&Tok::Sym(".")) {
             k += 2;
@@ -1168,17 +1223,24 @@ impl Parser {
             parts.push(self.name()?);
         }
         self.i += 2;
-        Ok(Some(plpgsql::column_type(&parts)?.0))
+        Ok(Some(plpgsql::type_reference(&parts)?))
     }
 
-    fn fn_returns(&mut self) -> Result<Ret> {
-        if let Some(t) = self.pct_type()? {
+    /// What RETURNS says; a `%TYPE` reference's NOTICE is added to `notes`.
+    fn fn_returns(&mut self, notes: &mut Vec<String>) -> Result<Ret> {
+        if let Some((t, note)) = self.pct_type()? {
+            notes.push(note);
             return Ok(Ret::Value(t));
         }
         if self.kw("setof") {
             // SETOF record: rows whose columns the OUT parameters, or the call's column list, name
             if self.kw("record") {
                 return Ok(Ret::Table(vec![]));
+            }
+            // SETOF table.column%TYPE: rows of the column's type
+            if let Some((t, note)) = self.pct_type()? {
+                notes.push(note);
+                return Ok(Ret::SetOf(t));
             }
             // a name that isn't a built-in type: an enum, or a table's rows (see `create_function`)
             return Ok(Ret::SetOf(self.ty()?));
@@ -1216,9 +1278,12 @@ impl Parser {
         let mut variadic = false;
         // each parameter's name and mode so far, for interpret_function_parameter_list's checks
         let mut seen: Vec<(Option<String>, ArgMode)> = vec![];
+        // the NOTICEs its `%TYPE` references give, parameters first (see `Function::type_notes`)
+        let mut type_notes = vec![];
         if !self.sym(")") {
             loop {
-                let (n, t, d, mode) = self.fn_arg()?;
+                let (n, t, d, mode, note) = self.fn_arg()?;
+                type_notes.extend(note);
                 if mode != ArgMode::Out && variadic {
                     return err("42P13", "VARIADIC parameter must be the last input parameter");
                 }
@@ -1314,7 +1379,7 @@ impl Parser {
                     let setof = self.is_kw("setof");
                     let record = matches!(self.t.get(self.i + usize::from(setof)), Some(Tok::Word(w)) if w == "record");
                     (ret_setof, ret_record) = (setof, record);
-                    ret = Some(self.fn_returns()?);
+                    ret = Some(self.fn_returns(&mut type_notes)?);
                 }
             } else if self.kw("language") {
                 let l = match self.next() {
@@ -1458,12 +1523,20 @@ impl Parser {
         }
         // LANGUAGE C: one of the regression tests' library's functions that are here, run as the SQL that calls it;
         // any other C function isn't
+        let mut c_trigger = None;
         let body = match (c_lang, body) {
             (true, Some(file)) => {
                 let symbol = c_symbol.clone().unwrap_or_else(|| rel_part(&name).to_string());
                 let types: Vec<Type> = args.iter().map(|a| a.1).collect();
                 match regress_c(&file, &symbol, &types) {
-                    Some(sql) => Some(sql),
+                    Some((l, sql)) => {
+                        lang = Some(l);
+                        // (a C trigger function is kept as the C it is, which runs when it fires: see `c_trigger_of`)
+                        if C_TRIGGERS.iter().any(|(s, _)| *s == symbol) {
+                            c_trigger = Some((file, symbol));
+                        }
+                        Some(sql)
+                    }
                     None => {
                         return err(
                             UNSUPPORTED,
@@ -1553,6 +1626,9 @@ impl Parser {
             config,
             tuning,
             std_form,
+            type_notes,
+            shapes: vec![],
+            c_trigger,
             code: Code::Sql(vec![]),
         };
         f.compile()?;
@@ -1630,6 +1706,9 @@ impl Parser {
             config: vec![],
             tuning: Tuning::default(),
             std_form: None,
+            type_notes: vec![],
+            shapes: vec![],
+            c_trigger: None,
             code: Code::Sql(vec![]),
         };
         f.compile()?;
@@ -1695,7 +1774,7 @@ impl Parser {
             let mut ts = vec![];
             if !self.sym(")") {
                 loop {
-                    let (_, t, _, mode) = self.fn_arg()?;
+                    let (_, t, _, mode, _) = self.fn_arg()?;
                     if mode != ArgMode::Out {
                         ts.push(t);
                     }
@@ -2164,15 +2243,26 @@ impl Function {
 }
 
 /// The functions taking or returning enum type `name`.
+/// A stored function read for what it names (its types, its signature), not to run: not through `from_raw`'s cache,
+/// which keeps a function with its own search_path bound in the world reading it, and a DROP or ALTER reading it
+/// there would leave that binding for its next call, made before the statement's change.
+fn stored(raw: &str) -> Result<Arc<Function>> {
+    let j: Json = serde_json::from_str(raw).unwrap_or_default();
+    Ok(Arc::new(Function::from_json(&j)?))
+}
+
 pub(super) fn using_type(v: &View, name: &str) -> Result<Vec<Arc<Function>>> {
     let is = |t: &Type| match t {
-        Type::Enum(i) => *enum_type(*i).name == *name,
+        // (by its name: a table's row type is a name not looked up, `f(t onek)`)
+        Type::Enum(i) => enum_name(*i) == name,
         Type::Base(i) => userdefs::base_name(*i) == name,
+        // a composite type's record (RETURNS SETOF it and RETURNS TABLE of it too)
+        Type::Record(_) => t.composite_of().as_deref() == Some(name),
         _ => false,
     };
     let mut out = vec![];
     for r in v.prefix(&format!("{FUNCTIONS}/"))? {
-        let f = Function::from_raw(&r?.1)?;
+        let f = stored(&r?.1)?;
         let ret = match &f.ret {
             Ret::Value(t) | Ret::SetOf(t) => is(t),
             Ret::Table(c) => c.iter().any(|(_, t)| is(t)),
@@ -2185,11 +2275,25 @@ pub(super) fn using_type(v: &View, name: &str) -> Result<Vec<Arc<Function>>> {
     Ok(out)
 }
 
-/// The rows of the functions taking or returning enum type `from`, for it renamed `to`: a
-/// function is kept under its name and argument types.
+/// The functions that take or give a table's or view's row type: `f(t onek)`, RETURNS onek, RETURNS SETOF onek (as
+/// Postgres's pg_depend has them on the relation's type), oldest first.
+pub(super) fn using_row_type(v: &View, rel: &str) -> Result<Vec<Arc<Function>>> {
+    let mut out = using_type(v, rel)?;
+    for r in v.prefix(&format!("{FUNCTIONS}/"))? {
+        let f = stored(&r?.1)?;
+        if matches!(&f.ret, Ret::RowsOf(t) if t == rel) && !out.iter().any(|g| g.key() == f.key()) {
+            out.push(f);
+        }
+    }
+    out.sort_by_key(|f| f.oid);
+    Ok(out)
+}
+
+/// The rows of the functions taking or returning type `from` (an enum, or a table's or view's row type, RETURNS SETOF
+/// a table included), for it renamed `to`: a function is kept under its name and argument types.
 pub(super) fn retype(v: &View, from: &str, to: &str) -> Result<Vec<(String, Option<String>)>> {
     let mut writes = vec![];
-    for f in using_type(v, from)? {
+    for f in using_row_type(v, from)? {
         let mut j = f.to_json();
         let rename = |x: &mut Json| {
             if x.as_str() == Some(from) {
@@ -2200,7 +2304,7 @@ pub(super) fn retype(v: &View, from: &str, to: &str) -> Result<Vec<(String, Opti
             rename(&mut a[1]);
         }
         let r = &mut j["returns"];
-        for k in ["value", "setof"] {
+        for k in ["value", "setof", "rows_of"] {
             if let Some(x) = r.get_mut(k) {
                 rename(x);
             }
@@ -2613,12 +2717,23 @@ fn choose(
         }
         return Ok((f.clone(), order.clone()));
     }
+    // (a parameter of a table's or view's row type, `f(t pair)`, is compared as that row's record, as a whole-row
+    // argument has it, so `f(p)` picks f(pair) beside f(integer); only for choosing: the function keeps its types)
+    let as_row = |t: Type| match t {
+        Type::Enum(i) if enum_type(i).labels.is_none() => with_path_view(|v| match v.get(&type_key(&enum_name(i))) {
+            Ok(None) => row_type_named(v, t).ok().flatten(),
+            _ => None,
+        })
+        .flatten()
+        .unwrap_or(t),
+        t => t,
+    };
     let cands = same
         .iter()
         .map(|(f, order)| {
             let mut taking = vec![None; args.len()];
             for (at, &i) in order.iter().enumerate().filter(|(_, i)| **i != usize::MAX) {
-                taking[i] = Some(f.args[at].1);
+                taking[i] = Some(as_row(f.args[at].1));
             }
             ((f, order), taking)
         })
@@ -3087,7 +3202,16 @@ impl Binder<'_> {
             }
             (None, Some(v)) => {
                 let fs = named(v, &c.name)?;
-                let given = tys(&args);
+                // (a table named where a value is wanted, `f(t)`, is its row: of the record its columns make, as
+                // Postgres's whole-row Var has the table's row type, so it chooses f(t onek) beside f(integer))
+                let given: Vec<Option<Type>> = (tys(&args).into_iter().zip(&c.args))
+                    .map(|(g, a)| match self.table_row(a) {
+                        Some(of) => Some(Type::record(
+                            of.iter().map(|&i| (self.cols[i].name.clone(), self.cols[i].ty)).collect(),
+                        )),
+                        None => g,
+                    })
+                    .collect();
                 let (f, packed) = match pick_call(&c.name, &fs, &given) {
                     Ok(found) => found,
                     // CALL of what no procedure is: a built-in function (or aggregate) is one that isn't a procedure,
@@ -3117,6 +3241,19 @@ impl Binder<'_> {
                                 })),
                             },
                         });
+                    }
+                    // a call that names a built-in type, of one quoted literal (`tsquery('a & b')`), is that type's
+                    // cast, as Postgres takes it when no function of the name matches the call, other ones of the
+                    // name notwithstanding (func_get_detail's FUNCDETAIL_COERCION)
+                    // (a name of another schema isn't a built-in type's: `app.int4('1')` is no cast)
+                    Err(e)
+                        if e.code == NO_FUNCTION
+                            && matches!(&args[..], [Expr::Lit(Value::Text(_))])
+                            && (!written(&c.name).contains('.') || schema_part(written(&c.name)) == "pg_catalog")
+                            && super::builtin_type_named(rel_part(written(&c.name))).is_some() =>
+                    {
+                        let to = super::builtin_type_named(rel_part(written(&c.name))).expect("checked");
+                        return self.go(&Expr::Cast(Box::new(args[0].clone()), to), in_agg);
                     }
                     // one of Postgres's own functions called by its name, which is its C symbol too
                     // (`int4smaller(a, b)`): what it does, as SQL (see `userdefs::internal_sql`)
@@ -3325,9 +3462,28 @@ fn select_list_srfs(v: &View, q: &mut Select) {
     }
     match q.from {
         None => q.from = Some(src),
-        Some(_) => {
-            q.joins.push(Join { kind: JoinKind::Cross, src, on: None, using: vec![], natural: false, using_as: None })
-        }
+        Some(_) => q.joins.push(Join {
+            kind: JoinKind::Cross,
+            src,
+            on: None,
+            using: vec![],
+            natural: false,
+            using_as: None,
+            comma: true,
+        }),
+    }
+}
+
+/// The table whose rows a call in FROM of `name` with `n` arguments gives, when it calls a function made with
+/// CREATE FUNCTION that returns them (RETURNS [SETOF] t): its columns are the table's as they are now.
+pub(super) fn rows_of_call(v: &View, name: &str, n: usize) -> Option<String> {
+    if name.contains(COLDEFS) {
+        return None;
+    }
+    let (f, _) = pick_call(name, &named(v, name).ok()?, &vec![None; n]).ok()?;
+    match &f.ret {
+        Ret::RowsOf(t) => Some(t.clone()),
+        _ => None,
     }
 }
 
@@ -3447,6 +3603,9 @@ fn visit_select(
         if let Item::Expr(x, _) = it {
             visit_expr(x, e, q)?;
         }
+    }
+    for x in &mut s.distinct_on {
+        visit_expr(x, e, q)?;
     }
     for src in s.from.iter_mut().chain(s.joins.iter_mut().map(|j| &mut j.src)) {
         if let Some(sub) = &mut src.sub {
@@ -4080,6 +4239,14 @@ impl Exec<'_> {
     }
 
     fn run_code(&self, f: &Arc<Function>, args: Vec<Value>, trig: Option<plpgsql::Trig>) -> Result<Returned> {
+        // (a C trigger function of the regression tests' libraries runs as its C does: see `regress_c`; called other
+        // than by a row trigger, it fails as the C does, never running the body it is kept with)
+        if let Some(c) = c_trigger_of(f) {
+            return match &trig {
+                Some(t) => self.c_trigger(c, t).map(Returned::Record),
+                None => Err(elog(c.not_fired())),
+            };
+        }
         match &f.code {
             Code::Sql(stmts) => self.run_sql_function(f, stmts, args),
             Code::Pl(b) => plpgsql::run(self, f, b, args, trig),
@@ -4089,7 +4256,14 @@ impl Exec<'_> {
     /// `t`, an enum's labels looked up if the parser only knew its name.
     pub(super) fn resolved(&self, t: Type) -> Result<Type> {
         match t {
-            Type::Enum(i) if enum_type(i).labels.is_none() => resolve_type(&self.view()?, t),
+            // (a parameter may be of a table's or view's row type, `f(t onek)`: a record of its columns)
+            Type::Enum(i) if enum_type(i).labels.is_none() => {
+                let v = self.view()?;
+                match resolve_type(&v, t) {
+                    Err(e) if e.code == "42704" => row_type_named(&v, t)?.ok_or(e),
+                    r => r,
+                }
+            }
             t => Ok(t),
         }
     }
@@ -4153,6 +4327,24 @@ impl Exec<'_> {
                 };
                 let from: Vec<Type> = columns.iter().flatten().map(|c| c.1).collect();
                 let mut rows = rows;
+                // a table's row type given as one composite value (`select row($1, $2)::int8_tbl`): its fields, as
+                // Postgres takes a final SELECT of one column of the function's row type; told by the column's type,
+                // so a table of one text column still takes a text value as it is
+                if let (Ret::RowsOf(t), [Type::Record(_)]) = (ret, &from[..]) {
+                    let n = need_table(&self.view()?, t)?.cols.len();
+                    for r in rows.iter_mut() {
+                        let fields = match &r[..] {
+                            [Value::Null] => Some(vec![Value::Null; n]),
+                            [Value::Text(s)] => super::composite_fields(s)
+                                .filter(|fs| fs.len() == n)
+                                .map(|fs| fs.into_iter().map(|x| x.map_or(Value::Null, Value::Text)).collect()),
+                            _ => None,
+                        };
+                        if let Some(fs) = fields {
+                            *r = fs;
+                        }
+                    }
+                }
                 for (j, _) in to.iter().enumerate().filter(|(_, t)| super::takes_text(**t)) {
                     let f = (from.get(j).copied()).filter(|t| t.reg_like());
                     for v in rows.iter_mut().filter_map(|r| r.get_mut(j)).filter(|_| f.is_some()) {
@@ -4197,13 +4389,23 @@ impl Exec<'_> {
             )?;
         }
         if enums || f.args.iter().any(|a| a.0.is_some()) {
+            // (which parameters are rows: of a composite type, or a table's row type, `f(t onek)`)
+            let rows: Vec<bool> = f
+                .args
+                .iter()
+                .map(|a| match a.1 {
+                    Type::Record(_) => true,
+                    t @ Type::Enum(_) => matches!(self.resolved(t), Ok(Type::Record(_))),
+                    _ => false,
+                })
+                .collect();
             substitute(&self.view()?, &mut out, &mut |e, cols| {
                 let i = match e {
                     Expr::Col(None, n) if n.starts_with("\0$") => n[2..].parse::<usize>().ok().map(|k| k - 1),
                     Expr::Col(None, n) if !cols.contains(n) => f.arg_named(n),
                     Expr::Col(Some(q), n) if *q == f.name => f.arg_named(n),
                     // (p).f, p a composite parameter: its field f
-                    Expr::Col(Some(q), n) if f.arg_named(q).is_some_and(|k| matches!(f.args[k].1, Type::Record(_))) => {
+                    Expr::Col(Some(q), n) if f.arg_named(q).is_some_and(|k| rows[k]) => {
                         let k = f.arg_named(q).unwrap_or_default();
                         *e = Expr::Func(Func::FieldOf, vec![param(k), Expr::Lit(Value::Text(n.clone()))]);
                         return Ok(());
@@ -4224,6 +4426,10 @@ impl Exec<'_> {
     // ------------------------------------------------------------ DDL
 
     pub(super) fn create_function(&self, f: &Function, replace: bool, procedure: bool) -> Result<Output> {
+        // (its `%TYPE` references, as Postgres says them when it looks the signature's types up)
+        for n in &f.type_notes {
+            super::notice("NOTICE", n.clone());
+        }
         // (what plpgsql.extra_warnings and extra_errors say of its body, as Postgres's compiler says it when made)
         if let Code::Pl(b) = &f.code {
             plpgsql::created(b)?;
@@ -4235,7 +4441,8 @@ impl Exec<'_> {
         // a shell type (`CREATE TYPE name` alone) in its signature: Postgres's notices, the type to be filled in by
         // the CREATE TYPE these functions are for
         let shell = |t: &Type| {
-            (*t == Type::record(vec![]))
+            t.fields()
+                .is_some_and(|f| f.is_empty())
                 .then(|| userdefs::composite_name(*t))
                 .flatten()
                 .filter(|n| userdefs::is_shell(n))
@@ -4261,21 +4468,27 @@ impl Exec<'_> {
                 })
             };
             let missing = |t: &Type| err("42704", format!("type \"{}\" does not exist", type_named(t)));
+            // a relation's row type by its name as the search_path finds it, as a query's relation is (one outside
+            // public is stored schema-qualified)
+            let rel_named = |t: &Type| {
+                let n = type_named(t);
+                if n.contains('.') { n } else { super::find_named(&n, super::Kind::Rel) }
+            };
             let rows_of = match &f.ret {
-                Ret::SetOf(t) if !known(t)? && load(v, &type_named(t))?.is_some_and(|t| t.schema) => {
+                Ret::SetOf(t) if !known(t)? && load(v, &rel_named(t))?.is_some_and(|t| t.schema) => {
                     let mut j = f.to_json();
-                    j["returns"] = serde_json::json!({ "rows_of": type_named(t) });
+                    j["returns"] = serde_json::json!({ "rows_of": rel_named(t) });
                     Some(Function::from_json(&j)?)
                 }
                 // a table's row type, not SETOF: one row of its columns (see `Function::single`)
-                Ret::Value(t) if !known(t)? && load(v, &type_named(t))?.is_some_and(|t| t.schema) => {
+                Ret::Value(t) if !known(t)? && load(v, &rel_named(t))?.is_some_and(|t| t.schema) => {
                     let mut j = f.to_json();
-                    j["returns"] = serde_json::json!({ "rows_of": type_named(t) });
+                    j["returns"] = serde_json::json!({ "rows_of": rel_named(t) });
                     j["single"] = Json::Bool(true);
                     Some(Function::from_json(&j)?)
                 }
                 Ret::SetOf(t) | Ret::Value(t) if !known(t)? => {
-                    if matches!(f.ret, Ret::Value(_)) && load(v, &type_named(t))?.is_some() {
+                    if matches!(f.ret, Ret::Value(_)) && load(v, &rel_named(t))?.is_some() {
                         let n = type_named(t);
                         return err(
                             UNSUPPORTED,
@@ -4292,7 +4505,15 @@ impl Exec<'_> {
                 }
                 _ => None,
             };
-            if let Some((_, t)) = f.args.iter().find(|(_, t)| !matches!(known(t), Ok(true))) {
+            // (an argument may be of a table's or view's row type, `hobbies(person)`; by its bare name, as a call
+            // looks the argument's type up by it)
+            let relation = |t: &Type| -> Result<bool> {
+                let n = type_named(t);
+                Ok(load(v, &n)?.is_some_and(|t| t.schema) || super::view_def(v, &n)?.is_some())
+            };
+            if let Some((_, t)) =
+                f.args.iter().find(|(_, t)| !matches!(known(t), Ok(true)) && !matches!(relation(t), Ok(true)))
+            {
                 return missing(t);
             }
             let f = rows_of.as_ref().unwrap_or(f);
@@ -5198,6 +5419,9 @@ pub(super) fn instance(f: &Arc<Function>, given: &[Option<Type>], sure: bool) ->
         config: f.config.clone(),
         tuning: f.tuning,
         std_form: f.std_form.clone(),
+        type_notes: vec![],
+        shapes: vec![],
+        c_trigger: f.c_trigger.clone(),
         code: Code::Sql(vec![]),
     };
     g.compile()?;
@@ -5706,16 +5930,484 @@ pub(super) fn row_fields(t: Type) -> Option<Vec<(String, Type)>> {
     }
 }
 
-/// The SQL that runs `symbol` of C library `file`, for the functions of the regression tests' library (regress.so,
-/// regress.dylib) that are here, with the parameters they take; None for any other.
-fn regress_c(file: &str, symbol: &str, args: &[Type]) -> Option<String> {
+/// The SQL that runs `symbol` of C library `file`, for the functions of the regression tests' libraries that are here
+/// (regress.so or regress.dylib, and contrib/spi's refint and autoinc, which triggers.sql loads), with the parameters
+/// they take; None for any other.
+fn regress_c(file: &str, symbol: &str, args: &[Type]) -> Option<(Lang, String)> {
     let base = file.rsplit('/').next().unwrap_or(file);
-    if base != "regress" && !base.starts_with("regress.") {
-        return None;
-    }
-    match (symbol, args) {
+    let lib = base.split('.').next().unwrap_or(base);
+    let sql = |s: &str| Some((Lang::Sql, s.to_string()));
+    match (lib, symbol, args) {
         // the point where two paths first cross (see `geom`)
-        ("interpt_pp", [Type::Path, Type::Path]) => Some("select __interpt_pp($1::path, $2::path)".into()),
+        ("regress", "interpt_pp", [Type::Path, Type::Path]) => sql("select __interpt_pp($1::path, $2::path)"),
+        // an emp row whose salary is over 699 (regress.c's overpaid)
+        ("regress", "overpaid", [_]) => sql("select $1.salary > 699"),
+        // a name spelled backwards (regress.c's reverse_name)
+        ("regress", "reverse_name", [_]) => sql("select reverse($1::text)::name"),
+        // a trigger that gives back the row it fired on, unchanged: the new one for INSERT, else the old one
+        // (regress.c's trigger_return_old, which returns tg_trigtuple)
+        ("regress", "trigger_return_old", []) => {
+            Some((Lang::PlPgSql, "begin if tg_op = 'INSERT' then return new; end if; return old; end".into()))
+        }
+        // a path as Postgres's canonicalize_path writes it (src/port/path.c: see `funcs::canonicalize_path`)
+        ("regress", "test_canonicalize_path", [Type::Text]) => sql("select __canonicalize_path($1)"),
+        // whether a value of one type reads as another's with no conversion (IsBinaryCoercible: see
+        // `catalog::binary_coercible`)
+        ("regress", "binary_coercible", [Type::Oid, Type::Oid]) => sql("select __binary_coercible($1, $2)"),
+        // ttdummy's switch, the session's, giving the state it was in (see `Exec::ttdummy`)
+        ("regress", "set_ttdummy", [Type::Int]) => sql("select __set_ttdummy($1)"),
+        // the trigger functions, run as their C does when they fire (see `Exec::c_trigger`)
+        ("regress", "ttdummy", []) | ("autoinc", "autoinc", []) => Some((Lang::PlPgSql, c_trigger_body(symbol))),
+        ("refint", "check_primary_key" | "check_foreign_key", []) => Some((Lang::PlPgSql, c_trigger_body(symbol))),
         _ => None,
     }
+}
+
+/// A trigger function in C of the regression tests' libraries that is here: regress.c's ttdummy, and contrib/spi's
+/// autoinc (autoinc.c), check_primary_key and check_foreign_key (refint.c).
+#[derive(Clone, Copy, PartialEq)]
+enum CTrigger {
+    TtDummy,
+    AutoInc,
+    CheckPrimaryKey,
+    CheckForeignKey,
+}
+
+const C_TRIGGERS: [(&str, CTrigger); 4] = [
+    ("ttdummy", CTrigger::TtDummy),
+    ("autoinc", CTrigger::AutoInc),
+    ("check_primary_key", CTrigger::CheckPrimaryKey),
+    ("check_foreign_key", CTrigger::CheckForeignKey),
+];
+
+impl CTrigger {
+    /// What its C's elog says called other than by the trigger manager (autoinc.c's alone names no function).
+    fn not_fired(self) -> &'static str {
+        match self {
+            CTrigger::TtDummy => "ttdummy: not fired by trigger manager",
+            CTrigger::AutoInc => "not fired by trigger manager",
+            CTrigger::CheckPrimaryKey => "check_primary_key: not fired by trigger manager",
+            CTrigger::CheckForeignKey => "check_foreign_key: not fired by trigger manager",
+        }
+    }
+}
+
+/// The PL/pgSQL body a function of C trigger `symbol` is kept with, which isn't run: the C is, failing as it does
+/// called other than by a row trigger (see `Exec::run_code`). It doesn't say what the function is (a PL/pgSQL
+/// function of the same body is one, run as it is written): what it was made as does (see `Function::c_trigger`).
+fn c_trigger_body(symbol: &str) -> String {
+    format!("begin raise exception '{symbol}: not fired by trigger manager'; end")
+}
+
+/// The C trigger function `f` was made as, if it is one (see `Function::c_trigger`).
+fn c_trigger_of(f: &Function) -> Option<CTrigger> {
+    let (_, symbol) = f.c_trigger.as_ref()?;
+    C_TRIGGERS.iter().find(|(s, _)| s == symbol).map(|(_, c)| *c)
+}
+
+/// A C function's elog(ERROR, ...): an internal error, XX000.
+fn elog(message: impl Into<String>) -> SqlError {
+    SqlError { code: "XX000", message: message.into(), info: None }
+}
+
+/// ERRCODE_TRIGGERED_ACTION_EXCEPTION, 09000, which contrib/spi's triggers raise.
+fn triggered_action(message: String, detail: Option<String>) -> SqlError {
+    SqlError {
+        code: "09000",
+        message,
+        info: detail.map(|d| Box::new(Violation { detail: Some(d), ..Violation::default() })),
+    }
+}
+
+/// Column `name` of the trigger's table, as SPI_fnumber finds it: its place, None where there is none.
+fn spi_fnumber(t: &Table, name: &str) -> Option<usize> {
+    t.cols.iter().position(|c| c.name == name && !c.hidden)
+}
+
+/// refint's error for a key column the trigger's table hasn't.
+fn no_attribute(name: &str, t: &Table) -> SqlError {
+    SqlError {
+        code: NO_COLUMN,
+        message: format!("there is no attribute \"{name}\" in relation \"{}\"", rel_part(&t.name)),
+        info: None,
+    }
+}
+
+/// nextval of sequence `name` (as a text names one: `DirectFunctionCall1(nextval, ...)`), cut to an int4 as the C
+/// functions take it.
+fn nextval_int4(name: &str) -> Result<i64> {
+    match coerce(ctx_call(CtxFn::NextVal, &[Value::Text(name.into())])?, Type::BigInt)? {
+        Value::Int(n) => Ok(i64::from(n as i32)),
+        _ => Ok(0),
+    }
+}
+
+/// A text as quote_literal_cstr writes it: in single quotes, each doubled, and as an E'' string doubling each
+/// backslash where it has one.
+fn quote_literal_cstr(s: &str) -> String {
+    match s.contains('\\') {
+        true => format!("E'{}'", s.replace('\\', "\\\\").replace('\'', "''")),
+        false => format!("'{}'", s.replace('\'', "''")),
+    }
+}
+
+/// SPI_prepare of `sql`, a C function's statement: parsed, one statement; an error out of that has the statement in
+/// its CONTEXT (see `spi_error`).
+fn spi_prepare(sql: &str) -> Result<Statement> {
+    let parsed = super::parse(sql).and_then(|mut stmts| match stmts.pop().filter(|_| stmts.is_empty()) {
+        Some(st) => Ok(st),
+        None => err(SYNTAX, "a C function's statement is one statement"),
+    });
+    parsed.map_err(|e| spi_error(e, sql))
+}
+
+/// What SPI_prepare's parse analysis checks of `st`, a statement refint prepared, before anything runs it: that its
+/// table is there (as running it finds one) and has each of the key's columns `cols` (each as the parser reads it
+/// written alone: one written otherwise, and a view's, are left to running it), as Postgres's message says.
+fn spi_analyze(v: &View, st: &Statement, cols: &[String]) -> Result<()> {
+    let Some(name) = st.table_name() else { return Ok(()) };
+    if load(v, name)?.is_none() && view_def(v, name)?.is_some() {
+        return Ok(());
+    }
+    let Some(t) = st.table(v)? else { return Ok(()) };
+    for c in cols.iter().filter_map(|c| folded_name(c)) {
+        if !t.cols.iter().any(|x| x.name == c && !x.hidden) {
+            return err(NO_COLUMN, format!("column \"{c}\" does not exist"));
+        }
+    }
+    Ok(())
+}
+
+/// A name as the parser reads it written alone: a quoted one as it is between its quotes (each `""` a `"`), a plain
+/// one in lower case (ASCII letters only, as downcase_identifier); None for anything else.
+fn folded_name(s: &str) -> Option<String> {
+    if let Some(q) = s.strip_prefix('"').and_then(|q| q.strip_suffix('"')).filter(|q| !q.is_empty()) {
+        return Some(q.replace("\"\"", "\""));
+    }
+    let mut cs = s.chars();
+    let starts = cs.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || !c.is_ascii());
+    let plain = starts && cs.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii());
+    plain.then(|| s.to_ascii_lowercase())
+}
+
+/// An error out of a statement a C function ran through SPI: with the statement in its CONTEXT, as SPI's error
+/// callback says it, unless it points into the statement (a syntax error's position, kept as it is).
+fn spi_error(e: SqlError, sql: &str) -> SqlError {
+    match e.info.as_ref().is_some_and(|i| i.position.is_some()) {
+        true => e,
+        false => plpgsql::with_context(e, &format!("SQL statement \"{sql}\"")),
+    }
+}
+
+/// Whether set_ttdummy(0) turned ttdummy off in this session (see `__set_ttdummy`).
+fn ttdummy_off() -> bool {
+    STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.clone())).is_some_and(|c| c.state.lock().unwrap().ttdummy_off)
+}
+
+impl Exec<'_> {
+    /// Runs C trigger function `c` on the row trigger `tr` fired for, as its C does: the row it gives back, None
+    /// for NULL (a BEFORE trigger's row skipped). As a C function's, its errors have no PL/pgSQL line in their
+    /// CONTEXT, only the statement it ran through SPI that one came out of (see `spi`).
+    fn c_trigger(&self, c: CTrigger, tr: &plpgsql::Trig) -> Result<Option<Vec<Value>>> {
+        match c {
+            CTrigger::TtDummy => self.ttdummy(tr),
+            CTrigger::AutoInc => autoinc(tr),
+            CTrigger::CheckPrimaryKey => self.check_primary_key(tr),
+            CTrigger::CheckForeignKey => self.check_foreign_key(tr),
+        }
+    }
+
+    /// Runs `sql` as a C function prepares a statement and runs it through SPI (see `spi_prepare` and `spi_execp`).
+    fn spi(&self, sql: &str, vals: &[Value], types: &[Option<Type>]) -> Result<(Output, usize)> {
+        self.spi_execp(&spi_prepare(sql)?, sql, vals, types)
+    }
+
+    /// Runs `st`, prepared from `sql`, as SPI_execp does: its `$1`, ... the values `vals`, of the types `types` (its
+    /// sources typed by them too, as a SQL function's are by its parameters': see `run_sql_function`); an error out
+    /// of it has the statement in its CONTEXT (see `spi_error`). Its output, and how many rows it read or wrote
+    /// (SPI_processed).
+    fn spi_execp(&self, st: &Statement, sql: &str, vals: &[Value], types: &[Option<Type>]) -> Result<(Output, usize)> {
+        let declared: Vec<Type> = types.iter().map(|t| t.unwrap_or(Type::Text)).collect();
+        let was = super::PARAM_TYPES.replace(declared);
+        let ran = self.with_params(vals, types, self.readonly).run_body(&st.0, false);
+        super::PARAM_TYPES.set(was);
+        let out = ran.map_err(|e| spi_error(e, sql))?;
+        let n = match st.0 {
+            Stmt::Select(_) => out.rows.len(),
+            _ => out.tag.rsplit(' ').next().and_then(|n| n.parse().ok()).unwrap_or(0),
+        };
+        Ok((out, n))
+    }
+
+    /// regress.c's ttdummy(start, stop), a BEFORE UPDATE OR DELETE row trigger keeping a table's past rows, each
+    /// valid from its int4 `start` to its `stop` (999999 for the current one). While set_ttdummy has it on, an
+    /// UPDATE of a current row inserts the new row, starting at nextval('ttdummy_seq'), and closes the old one there
+    /// in its place; a DELETE of one inserts it closed there, and deletes it; an UPDATE or DELETE of a past row is
+    /// skipped, and one changing `start` or `stop` refused. Off, rows pass as they are.
+    fn ttdummy(&self, tr: &plpgsql::Trig) -> Result<Option<Vec<Value>>> {
+        const INFINITY: i64 = 999_999;
+        let (t, x) = (tr.table, tr.trigger);
+        if !x.row {
+            return Err(elog("ttdummy: must be fired for row"));
+        }
+        if !x.before {
+            return Err(elog("ttdummy: must be fired before event"));
+        }
+        if tr.event == Event::Insert {
+            return Err(elog("ttdummy: cannot process INSERT event"));
+        }
+        let trigtuple = tr.old.unwrap_or_default();
+        let newtuple = if tr.event == Event::Update { tr.new } else { None };
+        if ttdummy_off() {
+            return Ok(Some(newtuple.unwrap_or(trigtuple).to_vec()));
+        }
+        let relname = rel_part(&t.name);
+        if x.args.len() != 2 {
+            return Err(elog(format!("ttdummy ({relname}): invalid (!= 2) number of arguments {}", x.args.len())));
+        }
+        let mut at = [0; 2];
+        for (i, a) in x.args.iter().enumerate() {
+            let Some(k) = spi_fnumber(t, a) else {
+                return Err(elog(format!("ttdummy ({relname}): there is no attribute {a}")));
+            };
+            if t.cols[k].ty != Type::Int {
+                return Err(elog(format!("ttdummy ({relname}): attribute {a} must be of integer type")));
+            }
+            at[i] = k;
+        }
+        let int = |row: &[Value], i: usize| -> Result<i64> {
+            match coerce(row[at[i]].clone(), Type::BigInt)? {
+                Value::Int(n) => Ok(n),
+                _ => Err(elog(format!("ttdummy ({relname}): {} must be NOT NULL", x.args[i]))),
+            }
+        };
+        let (oldon, oldoff) = (int(trigtuple, 0)?, int(trigtuple, 1)?);
+        if let Some(new) = newtuple {
+            let (newon, newoff) = (int(new, 0)?, int(new, 1)?);
+            if oldon != newon || oldoff != newoff {
+                return err(
+                    UNSUPPORTED,
+                    format!(
+                        "ttdummy ({relname}): you cannot change {} and/or {} columns (use set_ttdummy)",
+                        x.args[0], x.args[1]
+                    ),
+                );
+            }
+            if newoff != INFINITY {
+                return Ok(None);
+            }
+        } else if oldoff != INFINITY {
+            return Ok(None);
+        }
+        let stamp = nextval_int4("ttdummy_seq")?;
+        // the row it inserts: the new one starting now, or the deleted one ending now
+        let mut vals = newtuple.unwrap_or(trigtuple).to_vec();
+        if newtuple.is_some() {
+            vals[at[0]] = Value::Int(stamp);
+            vals[at[1]] = Value::Int(INFINITY);
+        } else {
+            vals[at[1]] = Value::Int(stamp);
+        }
+        let shown: Vec<usize> = (0..t.cols.len()).filter(|&i| !t.cols[i].hidden).collect();
+        let places: Vec<String> = (1..=shown.len()).map(|i| format!("${i}")).collect();
+        let sql = format!("INSERT INTO {relname} VALUES ({})", places.join(", "));
+        let params: Vec<Value> = shown.iter().map(|&i| vals[i].clone()).collect();
+        let types: Vec<Option<Type>> = shown.iter().map(|&i| Some(t.cols[i].ty)).collect();
+        self.spi(&sql, &params, &types)?;
+        let mut kept = trigtuple.to_vec();
+        if newtuple.is_some() {
+            kept[at[1]] = Value::Int(stamp);
+        }
+        Ok(Some(kept))
+    }
+
+    /// refint.c's check_primary_key(fkcol, ..., pktable, pkcol, ...), a row trigger of INSERT or UPDATE: the row's
+    /// key (unless a column of it is NULL) has to be one `pktable` has, else 09000.
+    fn check_primary_key(&self, tr: &plpgsql::Trig) -> Result<Option<Vec<Value>>> {
+        let (t, x) = (tr.table, tr.trigger);
+        if !x.row {
+            return Err(elog("check_primary_key: must be fired for row"));
+        }
+        if tr.event == Event::Delete {
+            return Err(elog("check_primary_key: cannot process DELETE events"));
+        }
+        let tuple = tr.new.unwrap_or_default();
+        let args = &x.args;
+        if args.len() % 2 != 1 {
+            return Err(elog("check_primary_key: odd number of arguments should be specified"));
+        }
+        let nkeys = args.len() / 2;
+        let relname = &args[nkeys];
+        let (mut vals, mut types) = (vec![], vec![]);
+        for a in &args[..nkeys] {
+            let Some(k) = spi_fnumber(t, a) else { return Err(no_attribute(a, t)) };
+            if tuple[k] == Value::Null {
+                return Ok(Some(tuple.to_vec()));
+            }
+            vals.push(tuple[k].clone());
+            types.push(Some(t.cols[k].ty));
+        }
+        let mut sql = format!("select 1 from {relname} where ");
+        for i in 1..=nkeys {
+            sql.push_str(&format!("{} = ${i} ", args[i + nkeys]));
+            if i < nkeys {
+                sql.push_str("and ");
+            }
+        }
+        let (_, found) = self.spi(&sql, &vals, &types)?;
+        if found == 0 {
+            return Err(triggered_action(
+                "tuple references non-existent key".into(),
+                Some(format!("Trigger \"{}\" found tuple referencing non-existent key in \"{relname}\".", x.name)),
+            ));
+        }
+        Ok(Some(tuple.to_vec()))
+    }
+
+    /// refint.c's check_foreign_key(nrefs, action, pkcol, ..., fktable, fkcol, ..., ...), a row trigger of DELETE or
+    /// UPDATE of a referenced table: where the row's key (none of it NULL; for an UPDATE, one that changed) is one
+    /// the `nrefs` referencing tables have, `restrict` refuses it (09000), `cascade` deletes their rows (for an
+    /// UPDATE gives them the new key) and `setnull` sets their key to NULL, each saying how many rows it changed.
+    fn check_foreign_key(&self, tr: &plpgsql::Trig) -> Result<Option<Vec<Value>>> {
+        let (t, x) = (tr.table, tr.trigger);
+        if !x.row {
+            return Err(elog("check_foreign_key: must be fired for row"));
+        }
+        if tr.event == Event::Insert {
+            return Err(elog("check_foreign_key: cannot process INSERT events"));
+        }
+        let trigtuple = tr.old.unwrap_or_default();
+        let newtuple = if tr.event == Event::Update { tr.new } else { None };
+        let given = || Ok(Some(newtuple.unwrap_or(trigtuple).to_vec()));
+        let args = &x.args;
+        if args.len() < 5 {
+            return Err(elog(format!("check_foreign_key: too short {} (< 5) list of arguments", args.len())));
+        }
+        let nrefs = match coerce(Value::Text(args[0].clone()), Type::Int)? {
+            Value::Int(n) => n,
+            _ => 0,
+        };
+        if nrefs < 1 {
+            return Err(elog(format!("check_foreign_key: {nrefs} (< 1) number of references specified")));
+        }
+        let action = args[1].chars().next().map_or(' ', |c| c.to_ascii_lowercase());
+        if !matches!(action, 'r' | 'c' | 's') {
+            return Err(elog(format!("check_foreign_key: invalid action {}", args[1])));
+        }
+        let (rest, nrefs) = (&args[2..], nrefs as usize);
+        let nkeys = rest.len().saturating_sub(nrefs) / (nrefs + 1);
+        if nkeys == 0 || rest.len() != nrefs + nkeys * (nrefs + 1) {
+            return Err(elog(format!(
+                "check_foreign_key: invalid number of arguments {} for {nrefs} references",
+                args.len()
+            )));
+        }
+        let (mut vals, mut types, mut places, mut same) = (vec![], vec![], vec![], true);
+        for a in &rest[..nkeys] {
+            let Some(k) = spi_fnumber(t, a) else { return Err(no_attribute(a, t)) };
+            if trigtuple[k] == Value::Null {
+                return given();
+            }
+            // (an UPDATE's key compared as text, as SPI_getvalue writes each)
+            if let Some(new) = newtuple
+                && (new[k] == Value::Null || new[k].to_text() != trigtuple[k].to_text())
+            {
+                same = false;
+            }
+            vals.push(trigtuple[k].clone());
+            types.push(Some(t.cols[k].ty));
+            places.push(k);
+        }
+        // a statement for each referencing table, prepared (as SPI_prepare does: parsed, and its table and columns
+        // looked up) before it is known whether there is anything to do
+        let v = self.view()?;
+        let mut stmts = vec![];
+        for r in rest[nkeys..].chunks(nkeys + 1) {
+            let (relname, cols) = (&r[0], &r[1..]);
+            let mut sql = match (action, newtuple) {
+                ('r', _) => format!("select 1 from {relname} where "),
+                ('c', Some(new)) => {
+                    let sets: Vec<String> = (cols.iter().zip(&places))
+                        .map(|(c, &k)| match &new[k] {
+                            Value::Null => format!(" {c} = NULL "),
+                            v => format!(" {c} = {} ", quote_literal_cstr(&v.to_text())),
+                        })
+                        .collect();
+                    format!("update {relname} set {} where ", sets.join(", "))
+                }
+                ('c', None) => format!("delete from {relname} where "),
+                _ => {
+                    let sets: Vec<String> = cols.iter().map(|c| format!("{c} = null")).collect();
+                    format!("update {relname} set {} where ", sets.join(", "))
+                }
+            };
+            for (i, c) in cols.iter().enumerate() {
+                sql.push_str(&format!("{c} = ${} ", i + 1));
+                if i + 1 < nkeys {
+                    sql.push_str("and ");
+                }
+            }
+            let st = spi_prepare(&sql)?;
+            spi_analyze(&v, &st, cols).map_err(|e| spi_error(e, &sql))?;
+            stmts.push((relname, sql, st));
+        }
+        drop(v);
+        if newtuple.is_some() && same {
+            return given();
+        }
+        for (relname, sql, st) in stmts {
+            let (_, n) = self.spi_execp(&st, &sql, &vals, &types)?;
+            if action == 'r' {
+                if n > 0 {
+                    return Err(triggered_action(
+                        format!("\"{}\": tuple is referenced in \"{relname}\"", x.name),
+                        None,
+                    ));
+                }
+            } else {
+                // (refint.so is built with REFINT_VERBOSE for the regression tests)
+                let done = if action == 'c' { "deleted" } else { "set to null" };
+                notice("NOTICE", format!("{}: {n} tuple(s) of {relname} are {done}", x.name));
+            }
+        }
+        given()
+    }
+}
+
+/// autoinc.c's autoinc(column, sequence, ...), a BEFORE INSERT OR UPDATE row trigger: each int4 `column` that is
+/// NULL or 0 is set to nextval of its `sequence` (the next one again where that gives 0).
+fn autoinc(tr: &plpgsql::Trig) -> Result<Option<Vec<Value>>> {
+    let (t, x) = (tr.table, tr.trigger);
+    if !x.row {
+        return Err(elog("must be fired for row"));
+    }
+    if !x.before {
+        return Err(elog("must be fired before event"));
+    }
+    if tr.event == Event::Delete {
+        return Err(elog("cannot process DELETE events"));
+    }
+    let mut row = tr.new.unwrap_or_default().to_vec();
+    let relname = rel_part(&t.name);
+    if x.args.is_empty() || x.args.len() % 2 != 0 {
+        return Err(elog(format!("autoinc ({relname}): even number gt 0 of arguments was expected")));
+    }
+    for pair in x.args.chunks(2) {
+        let (col, seq) = (&pair[0], &pair[1]);
+        let Some(k) = spi_fnumber(t, col) else {
+            return Err(triggered_action(format!("\"{relname}\" has no attribute \"{col}\""), None));
+        };
+        if t.cols[k].ty != Type::Int {
+            return Err(triggered_action(format!("attribute \"{col}\" of \"{relname}\" must be type INT4"), None));
+        }
+        if !matches!(row[k], Value::Null | Value::Int(0)) {
+            continue;
+        }
+        let mut n = nextval_int4(seq)?;
+        if n == 0 {
+            n = nextval_int4(seq)?;
+        }
+        row[k] = Value::Int(n);
+    }
+    Ok(Some(row))
 }

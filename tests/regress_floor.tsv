@@ -1,219 +1,219 @@
-advisory_lock	FAIL	68
-aggregates	FAIL	80
-alter_generic	FAIL	74
-alter_operator	FAIL	67
-alter_table	FAIL	88
-amutils	FAIL	40
-arrays	FAIL	94
-async	PASS	100
-bit	FAIL	99
-bitmapops	PASS	100
-boolean	PASS	100
-box	FAIL	91
-brin	FAIL	85
-brin_bloom	FAIL	83
-brin_multi	FAIL	80
-btree_index	FAIL	87
-case	FAIL	88
-char	PASS	100
-circle	PASS	100
-cluster	FAIL	67
-collate	FAIL	86
-collate.icu.utf8	FAIL	83
-collate.linux.utf8	FAIL	89
-collate.windows.win1252	FAIL	52
-combocid	FAIL	82
-comments	PASS	100
-compression	FAIL	78
-compression_pglz	FAIL	22
-constraints	FAIL	86
-conversion	FAIL	54
-copy	FAIL	99
-copy2	FAIL	71
-copydml	PASS	100
-copyselect	PASS	100
-create_aggregate	FAIL	95
-create_am	FAIL	70
-create_cast	FAIL	66
-create_function_c	FAIL	77
-create_function_sql	FAIL	79
-create_index	FAIL	82
-create_index_spgist	FAIL	75
-create_misc	FAIL	99
-create_operator	FAIL	81
-create_procedure	FAIL	74
-create_role	FAIL	96
-create_schema	FAIL	74
-create_table	FAIL	78
-create_table_like	FAIL	82
-create_type	FAIL	72
-create_view	FAIL	66
-database	FAIL	57
-date	PASS	100
-dbsize	PASS	100
-delete	PASS	100
-dependency	FAIL	93
-domain	FAIL	86
-drop_if_exists	FAIL	80
-drop_operator	FAIL	80
-encoding	FAIL	72
-enum	FAIL	94
-equivclass	FAIL	67
-errors	PASS	100
-euc_kr	FAIL	81
-event_trigger	FAIL	71
-explain	FAIL	31
-expressions	FAIL	77
-fast_default	FAIL	87
-float4	FAIL	69
-float8	FAIL	83
-foreign_data	FAIL	95
-foreign_key	FAIL	92
-functional_deps	FAIL	92
-generated	FAIL	86
-geometry	FAIL	87
-gin	FAIL	80
-gist	FAIL	85
-groupingsets	FAIL	83
-guc	FAIL	91
-hash_func	FAIL	78
-hash_index	PASS	100
-hash_part	FAIL	33
-horology	FAIL	99
-identity	FAIL	87
-incremental_sort	FAIL	75
-index_including	FAIL	64
-index_including_gist	FAIL	79
-indexing	FAIL	92
-indirect_toast	FAIL	57
-inet	FAIL	96
-infinite_recurse	PASS	100
-inherit	FAIL	81
-init_privs	FAIL	75
-insert	FAIL	94
-insert_conflict	FAIL	76
-int2	PASS	100
-int4	PASS	100
-int8	FAIL	99
-interval	FAIL	99
-join	FAIL	58
-join_hash	FAIL	70
-json	FAIL	91
-json_encoding	PASS	100
-jsonb	FAIL	96
-jsonb_jsonpath	PASS	100
-jsonpath	PASS	100
-jsonpath_encoding	PASS	100
-largeobject	FAIL	80
-limit	FAIL	92
-line	PASS	100
-lock	FAIL	73
-lseg	PASS	100
-macaddr	PASS	100
-macaddr8	PASS	100
-maintain_every	FAIL	81
-matview	FAIL	86
-md5	PASS	100
-memoize	FAIL	55
-merge	FAIL	91
-misc	FAIL	66
-misc_functions	FAIL	57
-misc_sanity	FAIL	81
-money	PASS	100
-multirangetypes	FAIL	94
-mvcc	PASS	100
-name	PASS	100
-namespace	FAIL	93
-numeric	FAIL	98
-numerology	FAIL	84
-object_address	FAIL	90
-oid	PASS	100
-oidjoins	FAIL	18
-opr_sanity	FAIL	92
-partition_aggregate	FAIL	47
-partition_info	PASS	100
-partition_join	FAIL	44
-partition_prune	FAIL	72
-password	PASS	100
-path	PASS	100
-pg_lsn	FAIL	68
-plancache	FAIL	88
-plpgsql	FAIL	93
-point	PASS	100
-polygon	FAIL	76
-polymorphism	FAIL	96
-portals	FAIL	84
-portals_p2	PASS	100
-prepare	FAIL	99
-prepared_xacts	FAIL	32
-privileges	FAIL	91
-psql	FAIL	95
-psql_crosstab	PASS	100
-publication	FAIL	92
-random	FAIL	73
-rangefuncs	FAIL	87
-rangetypes	FAIL	97
-regex	FAIL	91
-regproc	FAIL	74
-reloptions	FAIL	72
-replica_identity	FAIL	94
-returning	FAIL	76
-roleattributes	PASS	100
-rowsecurity	FAIL	82
-rowtypes	FAIL	82
-rules	FAIL	93
-sanity_check	FAIL	92
-security_label	PASS	100
-select	FAIL	92
-select_distinct	FAIL	86
-select_distinct_on	FAIL	84
-select_having	PASS	100
-select_implicit	PASS	100
-select_into	FAIL	73
-select_parallel	FAIL	50
-select_views	FAIL	38
-sequence	FAIL	97
-spgist	FAIL	93
-sqljson	FAIL	83
-stats	FAIL	92
-stats_ext	FAIL	85
-strings	FAIL	96
-subscription	FAIL	63
-subselect	FAIL	75
-sysviews	FAIL	96
-tablesample	FAIL	77
-tablespace	FAIL	64
-temp	FAIL	94
-text	FAIL	99
-tid	FAIL	70
-tidrangescan	FAIL	0
-tidscan	FAIL	75
-time	PASS	100
-timestamp	FAIL	98
-timestamptz	FAIL	98
-timetz	PASS	100
-transactions	FAIL	92
-triggers	FAIL	94
-truncate	FAIL	97
-tsdicts	FAIL	78
-tsearch	FAIL	93
-tsrf	FAIL	58
-tstypes	FAIL	95
-tuplesort	FAIL	85
-txid	FAIL	72
-type_sanity	FAIL	99
-typed_table	FAIL	60
-unicode	PASS	100
-union	FAIL	75
-updatable_views	FAIL	89
-update	FAIL	91
-uuid	PASS	100
-vacuum	FAIL	80
-vacuum_parallel	PASS	100
-varchar	PASS	100
-window	FAIL	90
-with	FAIL	79
-write_parallel	FAIL	55
-xid	FAIL	80
-xml	FAIL	94
-xmlmap	PASS	100
+advisory_lock	PASS	100	276	0
+aggregates	FAIL	80	3228	629
+alter_generic	FAIL	76	755	178
+alter_operator	FAIL	66	139	47
+alter_table	FAIL	92	4710	350
+amutils	FAIL	35	254	165
+arrays	FAIL	94	2680	142
+async	PASS	100	42	0
+bit	FAIL	99	826	3
+bitmapops	PASS	100	38	0
+boolean	PASS	100	578	0
+box	FAIL	89	666	73
+brin	FAIL	85	574	78
+brin_bloom	FAIL	82	428	67
+brin_multi	FAIL	79	589	114
+btree_index	FAIL	85	389	58
+case	FAIL	88	427	44
+char	PASS	100	199	0
+circle	PASS	100	125	0
+cluster	FAIL	67	667	89
+collate	FAIL	86	776	102
+collate.icu.utf8	FAIL	80	2571	502
+collate.linux.utf8	FAIL	87	1192	154
+collate.windows.win1252	PASS	100	13	0
+combocid	FAIL	82	169	29
+comments	PASS	100	65	0
+compression	FAIL	70	362	105
+compression_pglz	FAIL	22	77	26
+constraints	FAIL	86	836	83
+conversion	FAIL	45	746	403
+copy	FAIL	99	292	2
+copy2	FAIL	82	780	136
+copydml	PASS	100	116	0
+copyselect	PASS	100	161	0
+create_aggregate	FAIL	93	324	21
+create_am	FAIL	71	390	101
+create_cast	FAIL	73	103	27
+create_function_c	FAIL	77	36	5
+create_function_sql	FAIL	87	743	94
+create_index	FAIL	87	2862	372
+create_index_spgist	FAIL	70	1371	406
+create_misc	PASS	100	487	0
+create_operator	FAIL	81	285	53
+create_procedure	FAIL	74	446	112
+create_role	PASS	100	288	0
+create_schema	PASS	100	98	0
+create_table	FAIL	84	1132	172
+create_table_like	FAIL	89	566	60
+create_type	FAIL	71	407	118
+create_view	FAIL	84	2379	367
+database	FAIL	57	21	0
+date	PASS	100	1534	0
+dbsize	PASS	100	203	0
+delete	PASS	100	33	0
+dependency	FAIL	96	154	6
+domain	FAIL	87	1209	156
+drop_if_exists	PASS	100	342	0
+drop_operator	FAIL	73	61	16
+encoding	FAIL	70	464	138
+enum	FAIL	95	719	21
+equivclass	FAIL	62	453	171
+errors	PASS	100	447	0
+euc_kr	FAIL	68	16	5
+event_trigger	FAIL	72	691	192
+explain	FAIL	27	561	409
+expressions	FAIL	91	558	48
+fast_default	FAIL	84	926	147
+float4	FAIL	99	986	2
+float8	FAIL	99	1444	2
+foreign_data	FAIL	97	2130	56
+foreign_key	FAIL	94	3130	169
+functional_deps	FAIL	91	232	19
+generated	FAIL	88	1293	144
+geometry	FAIL	87	5322	677
+gin	FAIL	76	299	70
+gist	FAIL	82	439	77
+groupingsets	FAIL	81	2153	392
+guc	FAIL	95	890	41
+hash_func	FAIL	78	374	69
+hash_index	PASS	100	313	0
+hash_part	FAIL	33	121	52
+horology	FAIL	99	3703	12
+identity	FAIL	92	704	55
+incremental_sort	FAIL	73	1662	448
+index_including	FAIL	76	425	98
+index_including_gist	FAIL	77	166	37
+indexing	FAIL	93	1695	116
+indirect_toast	FAIL	46	166	88
+inet	FAIL	95	1095	46
+infinite_recurse	PASS	100	24	0
+inherit	FAIL	79	2837	583
+init_privs	PASS	100	12	0
+insert	FAIL	94	1096	64
+insert_conflict	FAIL	82	879	155
+int2	PASS	100	486	0
+int4	PASS	100	594	0
+int8	FAIL	99	1092	4
+interval	FAIL	99	1802	4
+join	FAIL	56	8123	3557
+join_hash	FAIL	64	1166	410
+json	FAIL	91	2670	199
+json_encoding	PASS	100	269	0
+jsonb	FAIL	97	5584	153
+jsonb_jsonpath	PASS	100	2593	0
+jsonpath	PASS	100	1218	0
+jsonpath_encoding	PASS	100	180	0
+largeobject	PASS	100	563	0
+limit	FAIL	91	708	60
+line	PASS	100	148	0
+lock	FAIL	93	252	7
+lseg	PASS	100	57	0
+macaddr	PASS	100	185	0
+macaddr8	PASS	100	379	0
+maintain_every	FAIL	93	33	2
+matview	FAIL	90	694	65
+md5	PASS	100	91	0
+memoize	FAIL	52	379	180
+merge	FAIL	90	2396	220
+misc	FAIL	58	398	164
+misc_functions	FAIL	73	644	173
+misc_sanity	FAIL	79	91	19
+money	PASS	100	557	0
+multirangetypes	FAIL	98	3382	46
+mvcc	PASS	100	42	0
+name	PASS	100	197	0
+namespace	FAIL	93	116	7
+numeric	FAIL	98	3702	60
+numerology	PASS	100	479	0
+object_address	FAIL	90	642	59
+oid	PASS	100	184	0
+oidjoins	FAIL	18	268	219
+opr_sanity	FAIL	98	2301	41
+partition_aggregate	FAIL	45	1520	834
+partition_info	PASS	100	351	0
+partition_join	FAIL	42	5134	2959
+partition_prune	FAIL	70	4467	1340
+password	PASS	100	149	0
+path	PASS	100	107	0
+pg_lsn	FAIL	95	270	13
+plancache	FAIL	84	400	63
+plpgsql	FAIL	94	5825	306
+point	PASS	100	478	0
+polygon	FAIL	72	333	91
+polymorphism	FAIL	95	2098	97
+portals	FAIL	91	1563	129
+portals_p2	PASS	100	122	0
+prepare	PASS	100	194	0
+prepared_xacts	PASS	100	3	0
+privileges	FAIL	89	3073	318
+psql	FAIL	97	6709	162
+psql_crosstab	PASS	100	216	0
+publication	FAIL	97	1809	39
+random	PASS	100	178	0
+rangefuncs	FAIL	86	2503	338
+rangetypes	FAIL	98	1851	33
+regex	FAIL	91	645	54
+regproc	FAIL	91	546	47
+reloptions	FAIL	91	226	19
+replica_identity	FAIL	94	270	15
+returning	FAIL	69	414	128
+roleattributes	PASS	100	249	0
+rowsecurity	FAIL	81	4718	884
+rowtypes	FAIL	79	1396	291
+rules	FAIL	93	3752	244
+sanity_check	FAIL	92	56	4
+security_label	PASS	100	44	0
+select	FAIL	92	970	74
+select_distinct	FAIL	84	446	70
+select_distinct_on	FAIL	82	125	22
+select_having	PASS	100	93	0
+select_implicit	PASS	100	338	0
+select_into	FAIL	68	222	71
+select_parallel	FAIL	57	1278	537
+select_views	FAIL	95	1552	71
+sequence	FAIL	96	841	28
+spgist	FAIL	92	96	7
+sqljson	FAIL	86	1137	153
+stats	FAIL	93	1649	99
+stats_ext	FAIL	87	3487	436
+strings	FAIL	96	2681	94
+subscription	FAIL	57	480	203
+subselect	FAIL	73	2083	553
+sysviews	FAIL	96	169	6
+tablesample	FAIL	75	331	80
+tablespace	FAIL	99	973	7
+temp	FAIL	96	412	12
+text	PASS	100	438	0
+tid	FAIL	70	121	22
+tidrangescan	FAIL	0	300	75
+tidscan	FAIL	72	296	80
+time	PASS	100	231	0
+timestamp	FAIL	98	2141	36
+timestamptz	FAIL	98	3183	46
+timetz	PASS	100	324	0
+transactions	FAIL	94	1198	37
+triggers	FAIL	96	3796	125
+truncate	FAIL	97	594	13
+tsdicts	FAIL	77	723	164
+tsearch	FAIL	97	3024	74
+tsrf	FAIL	83	712	120
+tstypes	FAIL	99	1444	8
+tuplesort	FAIL	84	692	109
+txid	FAIL	97	327	8
+type_sanity	FAIL	98	742	8
+typed_table	FAIL	96	133	4
+unicode	PASS	100	167	0
+union	FAIL	73	1434	385
+updatable_views	FAIL	88	3369	374
+update	FAIL	92	1028	79
+uuid	PASS	100	172	0
+vacuum	FAIL	93	557	38
+vacuum_parallel	PASS	100	49	0
+varchar	PASS	100	132	0
+window	FAIL	88	5189	578
+with	FAIL	82	3678	636
+write_parallel	FAIL	45	80	44
+xid	PASS	100	530	0
+xml	FAIL	93	1815	113
+xmlmap	PASS	100	1305	0

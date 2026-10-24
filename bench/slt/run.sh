@@ -12,7 +12,7 @@ mkdir -p "$O"; touch "$O/counts" "$O/failures"
 [ "$E" = postgres ] && { psql -X -q -h /tmp -d postgres -tAc "select 1 from pg_database where datname = 'slt$N'" | grep -q 1 || createdb -h /tmp "slt$N"; }
 for f in "$@"; do
   if [ "$E" = chronos ]; then
-    db=$(mktemp -d); "$D/chronos" serve "$db/db" --listen 127.0.0.1:$((17391 + N)) --pg 127.0.0.1:$((15391 + N)) > "$O/serve.log" 2>&1 & pid=$!
+    db=$(mktemp -d); CHRONOS_PROTECT_MAIN=off "$D/chronos" serve "$db/db" --listen 127.0.0.1:$((17391 + N)) --pg 127.0.0.1:$((15391 + N)) > "$O/serve.log" 2>&1 & pid=$!
     for _ in $(seq 100); do (exec 3<>/dev/tcp/127.0.0.1/$((15391 + N))) 2>/dev/null && break; sleep 0.1; done
     conn="host=127.0.0.1 port=$((15391 + N)) dbname=main user=slt"
   else

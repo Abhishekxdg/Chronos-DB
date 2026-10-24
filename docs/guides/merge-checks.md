@@ -30,7 +30,7 @@ MERGE WORLD w
 ## Setup
 
 ```bash
-chronos serve crmdb
+CHRONOS_PROTECT_MAIN=off chronos serve crmdb   # the setup below writes main directly
 psql postgres://127.0.0.1:5433/main
 ```
 

@@ -537,8 +537,10 @@ impl Import<'_> {
                 // (aggregates are made below, from pg_aggregate)
                 ("a", _) => {}
                 ("w", _) => self.report.skipped.push(format!("window function {label}: not imported")),
-                // (CREATE, not Postgres's CREATE OR REPLACE: one of that name already here is said, never replaced)
-                (_, "sql" | "plpgsql") => match &r[5] {
+                // (CREATE, not Postgres's CREATE OR REPLACE: one of that name already here is said, never replaced;
+                // a C one too: Chronos makes those of the regression tests' libraries it has, and says why it can't
+                // make any other)
+                (_, "sql" | "plpgsql" | "c") => match &r[5] {
                     Some(def) => items.push((format!("function {label}"), not_replacing(def))),
                     None => self.report.skipped.push(format!("function {label}: its definition can't be read")),
                 },
@@ -1604,7 +1606,8 @@ pub fn attach_help() -> &'static str {
      runs to make it. A table needs a primary key, and no generated column or row-level security. Inserts into\n\
      tables keyed by a sequence or identity column are refused for now (updates and deletes go). Triggers stay in\n\
      Postgres and run as merges are written. Above 1,000,000 rows (Postgres's estimate) it asks for --yes.\n\
-     Tables or columns changed in Postgres later: attach again into a new folder."
+     Columns added in Postgres later come over at the next chronos refresh (or serve --refresh-every); other\n\
+     changes to a table's shape there: attach again into a new folder."
 }
 
 /// What attach reads of a table before copying it: its name, kind, what Chronos's attach refuses in it, and its
@@ -1776,8 +1779,8 @@ pub fn attach(dir: &str, opts: &chronos::Open, tables: &[String], schemas: &[Str
             return Err(e);
         }
     };
-    println!("\nattached {} tables of {} to {dir}", att.tables.len(), att.source());
-    for t in &att.tables {
+    println!("\nattached {} tables of {} to {dir}", att.tables().len(), att.source());
+    for t in att.tables().iter() {
         for sq in &t.seqs {
             let col = attach::q(&t.cols[sq.col].name);
             match (&sq.pg, &sq.counter) {
@@ -1796,7 +1799,7 @@ pub fn attach(dir: &str, opts: &chronos::Open, tables: &[String], schemas: &[Str
     }
     println!(
         "\nnext: chronos serve {dir} (with CHRONOS_SOURCE_URL set), fork a world, change rows there, and MERGE WORLD:\n\
-         the change goes to Postgres first. main's own rows can't be written directly, and tables can't change shape."
+         the change goes to Postgres first. main's own rows can't be written directly; tables change shape only as Postgres's do (a refresh takes added columns)."
     );
     Ok(())
 }

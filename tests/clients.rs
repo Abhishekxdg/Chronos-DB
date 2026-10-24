@@ -21,7 +21,7 @@ fn start(name: &str, token: Option<&str>) -> (Server, String) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_chronos"));
     cmd.args(["serve", dir.to_str().unwrap()]);
     if let Some(t) = token {
-        cmd.args(["--token", t]);
+        cmd.args(["--token", t, "--unsafe"]); // the token guards the port and, as before 0.4, is the database's own user
     }
     let s = common::serve(&mut cmd, false);
     (Server(s.child, dir), format!("http://127.0.0.1:{}", s.http))
@@ -127,6 +127,13 @@ fn guessable_tokens_and_remote_listens_without_tls_are_refused() {
     assert!(refused(local, "off", &[], Some("change-me")).contains("placeholder `change-me`"));
     let long = "0123456789abcdef01234567";
     assert!(refused(local, "off", &["--admin-token", "ADMIN"], Some(long)).contains("admin token"));
+    // the same secret for both tokens would make the guest's token the database's own user's
+    let e = refused(local, "off", &["--admin-token", long], Some(long));
+    assert!(e.contains("the server token and the admin token are the same"), "{e}");
+    // ...or the same once SASLprep has run (the Postgres login's SCRAM verifiers are made of the prepared tokens)
+    let (composed, decomposed) = ("é".repeat(24), "e\u{301}".repeat(24));
+    let e = refused(local, "off", &["--admin-token", &decomposed], Some(&composed));
+    assert!(e.contains("the server token and the admin token are the same"), "{e}");
     let e = refused("0.0.0.0:0", "off", &[], Some(long));
     assert!(e.contains("without TLS") && e.contains("--insecure-no-tls"), "{e}");
     let e = refused(local, "0.0.0.0:0", &[], Some(long));
@@ -145,8 +152,10 @@ fn guessable_tokens_and_remote_listens_without_tls_are_refused() {
     assert!(log.contains("WITHOUT TLS"), "{log}");
 }
 
-/// A server other machines can reach, whose token can change main directly (no --safe, protect_main off), says so
-/// as it starts; --safe, or protect_main on, and it doesn't. A loopback server doesn't either.
+/// A server other machines can reach whose token can change main directly (--unsafe, protect_main off) says so as it
+/// starts; protect_main on, and it doesn't. Without --unsafe the server token is the guest's: no warning, and a note
+/// saying so when there is no admin token (so a client that was the database's own user before 0.4 learns why it
+/// isn't). A loopback server with no token says nothing.
 #[test]
 fn an_exposed_server_whose_token_can_change_main_warns() {
     use std::io::BufRead;
@@ -172,18 +181,38 @@ fn an_exposed_server_whose_token_can_change_main_warns() {
         log
     };
     let warned = |log: &str| log.contains("can change main directly");
+    let noted = |log: &str| log.contains("the server token is the guest's");
+    let log = started("0.0.0.0:0", &["--insecure-no-tls", "--unsafe"]);
+    assert!(warned(&log) && log.contains("--admin-token") && log.contains("protect_main = on"), "{log}");
+    assert!(!noted(&log), "{log}");
     let log = started("0.0.0.0:0", &["--insecure-no-tls"]);
-    assert!(warned(&log) && log.contains("--safe --admin-token") && log.contains("protect_main = on"), "{log}");
+    assert!(
+        !warned(&log) && noted(&log) && log.contains("--unsafe"),
+        "the default: the server token is the guest's\n{log}"
+    );
+    let log = started("0.0.0.0:0", &["--insecure-no-tls", "--admin-token", "abcdef0123456789abcdef01"]);
+    assert!(!warned(&log) && !noted(&log), "an admin token: the database's own user has a way in\n{log}");
     let log = started("0.0.0.0:0", &["--insecure-no-tls", "--safe", "--admin-token", "abcdef0123456789abcdef01"]);
-    assert!(!warned(&log), "--safe: the server token alone is the guest\n{log}");
-    assert!(!warned(&started("127.0.0.1:0", &[])), "loopback");
+    assert!(!warned(&log) && !noted(&log), "--safe: the server token alone is the guest\n{log}");
+    let log = started("127.0.0.1:0", &[]);
+    assert!(!warned(&log) && noted(&log), "loopback with a token: the note, not the warning\n{log}");
     {
         let db = chronos::Db::open(&dir).unwrap();
         chronos::sql::run(&db, chronos::MAIN, "alter system set protect_main = on", &[]).unwrap();
         db.close().unwrap();
     }
-    let log = started("0.0.0.0:0", &["--insecure-no-tls"]);
+    let log = started("0.0.0.0:0", &["--insecure-no-tls", "--unsafe"]);
     assert!(!warned(&log), "protect_main on\n{log}");
+    // --safe and --unsafe together: refused
+    let mut c = Command::new(env!("CARGO_BIN_EXE_chronos"));
+    c.args(["serve", dir.to_str().unwrap(), "--pg", "off", "--safe", "--unsafe"]).env("CHRONOS_TOKEN", long);
+    let out = c.output().unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--safe and --unsafe"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -7,6 +7,9 @@
 //!     ranges, and whole tables (a search, or past MOST_KEYS / MOST_RANGES for one table)
 //!   a SQL scan of a whole table with `column op constant` conditions ─> the rows they can
 //!     match (`sql::RowFilter`), not the table: rows it couldn't have seen may change
+//!   a plain SELECT (no function made with CREATE FUNCTION, no row security) ─> the columns it
+//!     reads of each table (`USING`), kept per table: a row changed since only in columns no read
+//!     used doesn't count (an insert or a delete always does: it changes what a read finds)
 //!   merge ─> each read, fork point vs the world merged into now ─> changed: held
 //!
 //! Opt-in: a world forked `WITH (check_reads = true)`, or any world an agent keeping to a merge
@@ -22,9 +25,20 @@
 
 use crate::{Core, Error, Result, State};
 use serde_json::{Map, Value as Json, json};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
+
+/// The columns of each table the statement running reads, by the table's name as rows are keyed
+/// (see `sql`'s `read_columns`): what's read meanwhile is kept as read for those columns alone. A
+/// table it doesn't name (one a view or a constraint reaches), or no statement: every column.
+pub(crate) type Using = Arc<HashMap<String, BTreeSet<String>>>;
+
+thread_local! {
+    pub(crate) static USING: RefCell<Option<Using>> = const { RefCell::new(None) };
+}
 
 /// Metadata key marking a world whose reads are checked at merge.
 pub(crate) const CHECK_READS: &str = "_sonos_check_reads";
@@ -52,6 +66,8 @@ pub(crate) struct ReadSet {
     /// the filters kept, as `RowFilter::to_json` writes them with their group: a scan run again with the same
     /// conditions (an agent's loop) adds nothing, and doesn't bring its table nearer `MOST_FILTERS`
     seen: HashSet<String>,
+    /// per table read (its group), the columns its reads used (None: any); a table not here, every column
+    columns: BTreeMap<String, Option<BTreeSet<String>>>,
 }
 
 /// The group a key's read falls in: a table's rows (`orders/`) or, for the rows SQL keeps behind
@@ -71,8 +87,23 @@ impl ReadSet {
         ReadSet { complete: true, ..Default::default() }
     }
 
+    /// Table group `g` read by the statement running: the columns it uses join those its reads used.
+    fn used(&mut self, g: &str) {
+        let Some(table) = g.strip_suffix('/').filter(|t| !t.contains('/')) else { return }; // a table's own rows
+        let cols = USING.with_borrow(|u| u.as_ref().and_then(|m| m.get(table).cloned()));
+        match (self.columns.get_mut(g), cols) {
+            (Some(None), _) => {}
+            (Some(Some(had)), Some(c)) => had.extend(c),
+            (Some(slot), None) => *slot = None,
+            (None, c) => {
+                self.columns.insert(g.to_string(), c);
+            }
+        }
+    }
+
     pub(crate) fn key(&mut self, k: &str) {
         let Some(g) = group(k) else { return };
+        self.used(&g);
         if self.groups.contains(&g) {
             return;
         }
@@ -84,6 +115,7 @@ impl ReadSet {
 
     pub(crate) fn range(&mut self, prefix: &str, after: Option<&str>, upto: Option<&str>) {
         let Some(g) = group(prefix).or_else(|| group(&format!("{prefix}/"))) else { return };
+        self.used(&g);
         if self.groups.contains(&g) {
             return;
         }
@@ -96,6 +128,7 @@ impl ReadSet {
     /// A search: it may have read any row of `table`.
     pub(crate) fn table(&mut self, table: &str) {
         if let Some(g) = group(&format!("{table}/")) {
+            self.columns.insert(g.clone(), None); // a search may rank by any column
             self.whole(g);
         }
     }
@@ -103,6 +136,7 @@ impl ReadSet {
     /// A scan of `table` whose rows `f` matches: any of them it may have read.
     pub(crate) fn filtered(&mut self, table: &str, f: crate::sql::RowFilter) {
         let Some(g) = group(&format!("{table}/")) else { return };
+        self.used(&g);
         if self.groups.contains(&g) {
             return;
         }
@@ -149,6 +183,28 @@ impl ReadSet {
         out
     }
 
+    /// The filtered scans of `table` (by its name as rows are keyed), when they and rows read one by one are all
+    /// that was read of it: no key range, not the whole table, nothing behind its indexes or constraints. For
+    /// checking reads against the Postgres an attached folder copies (see `attach`), which can then be asked for the
+    /// rows they match rather than the table. None otherwise, and when no scan of it was filtered.
+    pub(crate) fn only_filtered(&self, table: &str) -> Option<Vec<crate::sql::RowFilter>> {
+        let g = format!("{table}/");
+        let of_table = |x: &str| {
+            x == g
+                || x.strip_suffix(&g)
+                    .is_some_and(|first| first.ends_with('/') && !first[..first.len() - 1].contains('/'))
+        };
+        let wider = self.ranges.iter().filter_map(|(p, ..)| group(p).or_else(|| group(&format!("{p}/"))));
+        if self.groups.iter().cloned().chain(wider).any(|x| of_table(&x))
+            || self.keys.iter().filter_map(|k| group(k)).any(|x| x != g && of_table(&x))
+        {
+            return None;
+        }
+        let fs: Vec<crate::sql::RowFilter> =
+            self.filters.iter().filter(|(f, _)| *f == g).map(|(_, f)| f.clone()).collect();
+        (!fs.is_empty()).then_some(fs)
+    }
+
     fn whole(&mut self, g: String) {
         self.keys.retain(|k| !k.starts_with(&g));
         self.ranges.retain(|(p, ..)| !p.starts_with(&g));
@@ -177,6 +233,7 @@ impl ReadSet {
             "ranges": self.ranges.iter().map(|(p, a, u)| json!([p, a, u])).collect::<Vec<_>>(),
             "groups": groups,
             "filters": filters,
+            "columns": self.columns,
         })
     }
 
@@ -204,7 +261,20 @@ impl ReadSet {
             .collect::<Option<_>>()?;
         let filters: Vec<(String, crate::sql::RowFilter)> = filters;
         let seen = filters.iter().filter_map(|(g, f)| Some(format!("{g}\u{0}{}", f.to_json()?))).collect();
-        Some(ReadSet { complete: true, keys: strs(&j["keys"])?, ranges, groups: strs(&j["groups"])?, filters, seen })
+        // (kept by an older version: none, and every column counts)
+        let columns = match &j["columns"] {
+            Json::Null => BTreeMap::new(),
+            c => serde_json::from_value(c.clone()).ok()?,
+        };
+        Some(ReadSet {
+            complete: true,
+            keys: strs(&j["keys"])?,
+            ranges,
+            groups: strs(&j["groups"])?,
+            filters,
+            seen,
+            columns,
+        })
     }
 }
 
@@ -231,6 +301,14 @@ pub(crate) fn from_meta(meta: &mut Map<String, Json>) -> Result<()> {
     }
 }
 
+/// How the error `stale` gives ends: what tells it from the other refusals that share its SQLSTATE.
+const STALE_END: &str = ": redo the work in a new world forked from now";
+
+/// Whether `e` is the error `stale` gives.
+pub(crate) fn is_stale(e: &Error) -> bool {
+    matches!(e, Error::Constraint { code: "40001", message } if message.ends_with(STALE_END))
+}
+
 /// The error a merge (or a rebase: `doing`) gets when what it read changed (and its agent keeps
 /// to no merge policy).
 pub(crate) fn stale(b: &str, doing: &str, reasons: &[String]) -> Error {
@@ -240,10 +318,7 @@ pub(crate) fn stale(b: &str, doing: &str, reasons: &[String]) -> Error {
     };
     Error::Constraint {
         code: "40001", // Postgres's serialization_failure: the same kind of refusal
-        message: format!(
-            "{doing} {b} {}; {after}: redo the work in a new world forked from now",
-            reasons.join("; it ")
-        ),
+        message: format!("{doing} {b} {}; {after}{STALE_END}", reasons.join("; it ")),
     }
 }
 
@@ -357,7 +432,8 @@ impl Core {
             changed.extend(in_range(prefix, after.as_deref(), upto.as_deref())?);
         }
         for g in &set.groups {
-            if !in_range(g, None, None)?.is_empty() {
+            let found = in_range(g, None, None)?;
+            if !found.is_empty() && !self.unused(&set, base, now, found)?.is_empty() {
                 whole.push(g.clone());
             }
         }
@@ -388,6 +464,7 @@ impl Core {
         }
         changed.sort();
         changed.dedup();
+        let changed = self.unused(&set, base, now, changed)?;
         // rows first, then what's behind indexes and constraints, which a row read usually covers
         let (rows, behind): (Vec<String>, Vec<String>) =
             changed.into_iter().partition(|k| group(k).is_some_and(|g| !crate::reserved_table(&g[..g.len() - 1])));
@@ -400,6 +477,41 @@ impl Core {
         groups.extend(whole);
         for g in groups {
             out.push(format!("read {}, which changed since it forked", named(&g)));
+        }
+        Ok(out)
+    }
+
+    /// Of `keys`, changed between `base` and `now`, those that count against what was read: all
+    /// but the rows updated only in columns no read of their table used, or only in columns the
+    /// table didn't have at `base` (added since, as an attached folder's refresh adds Postgres's:
+    /// nothing read them). A column read that the table doesn't have (a whole-row reference, a
+    /// name a query made) counts as every column.
+    fn unused(&self, set: &ReadSet, base: &State, now: &State, keys: Vec<String>) -> Result<Vec<String>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            let cols = group(&k).and_then(|g| set.columns.get(&g).cloned().flatten());
+            let c = crate::Change { key: k.clone(), before: self.val(base, &k)?, after: self.val(now, &k)? };
+            let c = self.show_change(base, now, c)?;
+            let counts = match crate::sql::describe(std::slice::from_ref(&c)).pop() {
+                Some(d) if d.change == "update" => {
+                    let had = |name: &String| d.before.as_ref().is_some_and(|r| r.get(name).is_some());
+                    let seen: Vec<&String> = d.columns.iter().filter(|x| had(x)).collect();
+                    match &cols {
+                        _ if seen.is_empty() => false,
+                        None => true,
+                        Some(cols) => {
+                            let has = |name: &String| {
+                                [&d.before, &d.after].iter().all(|r| r.as_ref().is_some_and(|r| r.get(name).is_some()))
+                            };
+                            !cols.iter().all(has) || seen.iter().any(|x| cols.contains(*x))
+                        }
+                    }
+                }
+                _ => true,
+            };
+            if counts {
+                out.push(k);
+            }
         }
         Ok(out)
     }

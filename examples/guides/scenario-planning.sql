@@ -1,6 +1,6 @@
 -- Plan prices with a thousand simulated futures (docs/guides/scenario-planning.md).
 -- Against a fresh database, on disk (REPLAY needs history):
---   chronos serve plandb
+--   CHRONOS_PROTECT_MAIN=off chronos serve plandb   (this setup writes main directly)
 --   psql -v ON_ERROR_STOP=1 -f examples/guides/scenario-planning.sql postgres://127.0.0.1:5433/main
 -- Writes /tmp/chronos-scenario-sim.txt (the simulation's result) and reads kept worlds' names from it.
 \set ON_ERROR_STOP 1

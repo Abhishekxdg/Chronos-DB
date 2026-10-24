@@ -11,7 +11,7 @@ Everything below runs in `psql` in a few minutes. The whole script is [examples/
 Start a server on a new folder and connect to it. The database name is the world you start in.
 
 ```bash
-chronos serve shopdb                          # HTTP on 7070, Postgres protocol on 5433
+CHRONOS_PROTECT_MAIN=off chronos serve shopdb  # HTTP on 7070, Postgres on 5433; the setup writes main directly
 psql postgres://127.0.0.1:5433/main
 ```
 
@@ -103,7 +103,7 @@ diff world agent_a as sql;   -- one statement per row: run them on main to make 
 Look first. A dry run shows every row the merge would touch and what would happen to it, and changes nothing:
 
 ```sql
-merge world agent_a dry run;   -- table, id, outcome, detail, base, ours, theirs, result
+merge world agent_a dry run;   -- table, id, outcome, detail, base, ours, theirs, result, postgres, columns
 merge world agent_a;           -- MERGE 3
 ```
 
@@ -158,15 +158,15 @@ select * from products order by sku;
    5 | Descaler                  |  6.30 |   300
 ```
 
-## Safe mode: agents can't write main
+## The guest: clients with the server token can't write main
 
-On a shared server you don't want to trust every client. Start it with `--safe`:
+On a shared server you don't want to trust every client. Give it a server token, which lets clients in as the guest, and an admin token for the person who approves:
 
 ```bash
-chronos serve shopdb --safe --admin-token "$ADMIN_TOKEN"
+CHRONOS_TOKEN="$SERVER_TOKEN" CHRONOS_ADMIN_TOKEN="$ADMIN_TOKEN" chronos serve shopdb
 ```
 
-- **Clients that aren't agents act as the agent `guest`:** over Postgres, that's any password other than the admin token. The guest reads anything, forks, and changes only worlds it forked. It can't write `main`, merge, restore, drop others' worlds or change settings (SQLSTATE 42501).
+- **Clients with the server token act as the agent `guest`** (since 0.4; with `--safe`, every client that isn't an agent or the admin token, loopback without a token too). The guest reads anything, forks, and changes only worlds it forked. It can't write `main`, merge, restore, drop others' worlds, make agents or change settings (SQLSTATE 42501).
 - **The person approving** connects with the admin token as the password and runs the merges: `psql "postgres://admin:$ADMIN_TOKEN@127.0.0.1:5433/main"`.
 - **Agents with their own names and rights** (`CREATE AGENT`, then user = its name, password = its token) keep their own rights. See [concepts](../concepts.md#agents). One allowed to merge into `main` should keep to a [merge policy](merge-policies.md#start-here-no-delete-merges-on-its-own), starting with `max_deletes = 0`.
 

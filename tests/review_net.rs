@@ -36,13 +36,23 @@ fn scratch(name: &str) -> PathBuf {
     d
 }
 
+/// `scratch`, where a Unix socket's path fits: macOS's temp directory is already some 50 bytes, and a socket path is
+/// limited to 104 (the server's socket is `<tmp>/chronos-<uid>/chronos-<hash>.sock`).
+fn short_scratch(name: &str) -> PathBuf {
+    let base = if cfg!(target_os = "macos") { PathBuf::from("/tmp") } else { std::env::temp_dir() };
+    let d = base.join(format!("crn-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
 /// A server on free ports (HTTP and Postgres), with `tmp` as its temp directory.
 fn start(name: &str, token: Option<&str>, tmp: Option<&PathBuf>) -> Server {
     let dir = scratch(name);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_chronos"));
     cmd.args(["serve", dir.join("db").to_str().unwrap()]);
     if let Some(t) = token {
-        cmd.args(["--token", t]);
+        cmd.args(["--token", t, "--unsafe"]); // the token as the database's own user, as before 0.4
     }
     if let Some(t) = tmp {
         cmd.env("TMPDIR", t);
@@ -248,7 +258,7 @@ fn a_public_name_needs_a_token() {
 /// could have made is refused.
 #[test]
 fn local_socket_is_private() {
-    let tmp = scratch("sock-tmp");
+    let tmp = short_scratch("sock-tmp");
     let uid = std::fs::metadata(&tmp).unwrap().uid();
     let s = start("sock", None, Some(&tmp));
     let d = tmp.join(format!("chronos-{uid}"));
@@ -258,7 +268,7 @@ fn local_socket_is_private() {
     assert!(std::fs::read_dir(&d).unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with(".sock")));
     drop(s);
 
-    let open = scratch("sock-open");
+    let open = short_scratch("sock-open");
     let d = open.join(format!("chronos-{uid}"));
     std::fs::create_dir(&d).unwrap();
     std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o777)).unwrap();

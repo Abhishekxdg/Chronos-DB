@@ -283,6 +283,7 @@ fn query_src(ctx: &Ctx, sql: &str, forest: bool) -> Result<Src> {
     let Some(db) = ctx.core.db() else { return err(UNSUPPORTED, "an XML mapping needs a running database") };
     // (the session's zone and settings are put back after the query: the values are written in them)
     let kept = time::zone_state();
+    read_only_text(sql, false)?; // (Postgres's SPI_execute(query, true, 0))
     let ran = run(&db, &ctx.world, sql, &[]);
     time::restore_zone(kept);
     let out =

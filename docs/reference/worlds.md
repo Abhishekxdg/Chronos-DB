@@ -14,7 +14,7 @@ merge world agent_7;        -- into main; the session moves back to main
 
 ## Names and moments
 
-- **World names:** a bare name (`agent_7`), a double-quoted name (`"agent-7"`), or a string (`'agent-7'`). A name with a dash must be quoted: `task-1` unquoted fails with 42601 `world names with a dash need quotes`.
+- **World names:** a bare name (`agent_7`, and with dashes, `add-todos` or `task-1`), a double-quoted name (`"agent-7"`), or a string (`'agent-7'`). A dash with no name part after it (`task-`) fails with 42601 `world names with a dash need quotes`.
 - **Reserved:** a name can't be empty or contain `@` (42602), start with `_tx_` (42939: transactions use those), or be one of MERGE's own words, in any case: `using`, `ours`, `theirs`, `confirm`, `by`, `resolve`, `dry`, `into`, `only` (42939). `MERGE WORLD ours` reads `ours` as MERGE's word, so a world named so couldn't be merged unquoted. A world given such a name before this rule still loads; merge it quoted: `MERGE WORLD "ours"`. A MERGE that names no world while on `main` fails with 0A000 and says this.
 - **A world ID** works wherever a world is read or switched to: `switch world '<id>'`, `fork world '<id>' as b`.
 - **A world as it was:** `'name@when'`, read only. Works in `DIFF ... TO` (either side), `FORK WORLD` / `CREATE WORLD ... FROM`, `SIMULATE ... FROM`, and as a Postgres database name (the whole session reads the past; writes fail with 25006).
@@ -105,11 +105,12 @@ USE BRANCH name
 USE name
 ```
 
-The session's statements run on that world from now on. `name` is a world's name or ID (3D000 otherwise).
+The session's statements run on that world from now on. `name` is a world's name or ID (3D000 otherwise), or `'name@when'`: the world as it was, read only (writes fail with 25006; 22023 outside the history window).
 
 ```sql
 switch world agent_7;
 use world '<its id>';   -- by ID, from SHOW WORLDS
+use world 'agent_7@-10 minutes';  -- as it was, read only
 ```
 
 Over the Postgres port the database name does the same: `psql postgres://127.0.0.1:5433/agent_7`. To read a past moment for a whole session, connect to the database `main@-1 hour` (read only; writes fail with 25006).
@@ -357,6 +358,7 @@ alter world payout set (check_reads = false);    -- a person's way past it
 ```
 
 - **What counts as read:** every row read through the world (a key looked up, in SQL or with the row API's `get` over HTTP, MCP or the shell, and a scan's range, up to where it stopped when it stopped early), the entries of indexes and constraints it looked in (so a row the parent added that a lookup would have found counts too), and whole tables for full-text and vector searches. A SQL scan of a whole table with conditions like `column op constant` (`=`, `<`, `>=`, `IN`, `IS NULL`, `LIKE 'prefix%'`, joined by `AND`) counts as reading the rows those conditions can match, not the table: a changed row holds the merge only if it matched them before the change or after it, so `select ... from leads where owner = 'ana'` isn't held by changes to other owners' leads. A scan with no such condition (`where lower(name) = 'x'`, an `OR` of columns) reads the whole table. Past 10,000 keys, 1,000 ranges or 1,000 distinct filtered scans of one table, reads of it count as the whole table, and then any change to that table holds the merge: an agent that looks up many rows one at a time does better to read them with one filtered scan (`where owner = 'ana'`). The same scan run again (the same conditions on the same table) is kept once. Reads in a transaction count for its world. Rows the world wrote itself aren't checked here: they conflict or settle as always.
+- **Only the columns read:** a `SELECT` keeps, per table, the columns it used (its select list, `WHERE`, `JOIN`, `GROUP BY`, `HAVING`, `ORDER BY`, aggregates' arguments). A row updated since only in other columns doesn't hold the merge: `select sum(amount) from orders where status = 'open'` isn't held when an open order's `notes` changes, but is when its `amount` or `status` does. A row added or deleted always counts. The columns of every read of a table count together. Every column counts for `*` or a whole-row reference, for a statement calling a function made with `CREATE FUNCTION` or a set-returning function in `FROM`, under row security, for anything but a `SELECT` (an `UPDATE`'s `WHERE`), and for reads outside SQL (the row API, searches). An aggregate whose value came out the same, or changes that cancel out, still hold it.
 - **Refused or queued:** SQLSTATE `40001` (HTTP 409); for an agent keeping to a merge policy, a reason like any broken rule, and the world waits in `SHOW REVIEWS`. `MERGE ... DRY RUN` shows it in its `blocked` row.
 - **For every world of an agent:** a merge policy with `check_reads = true` turns it on for every world its agents fork, and they can't turn it off (42501); a person can.
 - **Restarts:** what a world read is kept in memory, and in the folder (`readsets`) as the database closes cleanly: after a clean restart it's checked as before. After a crash, a world that checks its reads can't show its earlier reads were current, so its merge is held (`relies on reads made before the database restarted`): redo the work in a new world, or turn the check off. Reads of a value kept only in memory, or a text range in a collation, come back as reads of the whole table.
@@ -655,6 +657,7 @@ SHOW AUDIT [FOR [AGENT] name] [LIMIT n]          -- at, agent, world, action, ro
 | `max_concurrent` | statements at once | 0 (no limit) |
 | `max_memory_mb` | working memory per statement | 0 (no limit) |
 | `max_idle_ms` | ms, or an interval string: how long a Postgres connection of its may sit idle inside a transaction | 0 (no limit) |
+| `max_threads` | threads one statement's parallel parts run on, its own included (`1`: one core) | 0 (as many as the server lends) |
 | `disabled` | `true` / `false` | `false` |
 | `policy` | a merge policy's name (see below); `null` for none | none |
 
@@ -691,7 +694,7 @@ ALTER AGENT name SET (policy = 'name')              -- or policy = null
 |---|---|---|
 | `max_rows` | it changes more rows than this | `null` (no limit) |
 | `max_deletes` | it deletes more rows than this (`0`: any delete, the recommended start for any agent) | `null` (no limit) |
-| `rows_per_hour` | it's a merge into `main`, and with the agent's other merges into `main` in the last hour it changes more rows than this | `null` (no limit) |
+| `rows_per_hour` | it's a merge into `main`, and with the agent's other merges into `main` in the last hour (for an agent made `WITH (tenant = ...)`, every agent's for that tenant) it changes more rows than this | `null` (no limit) |
 | `deletes_per_hour` | likewise for deleted rows (`50`: at most 50 deletes an hour, however the job is split) | `null` (no limit) |
 | `confirm_deletes_over` | it deletes more rows than this. And the person approving it must give the count: `MERGE WORLD x CONFIRM DELETES 4812`, counted from the merge's own plan; a missing or wrong count is refused (55000) with the real one, before anything is written (to Postgres too, in an [attached folder](../guides/attach-postgres.md)). It applies to a person merging a world queued under this policy, or owned by an agent keeping to it; an agent's own count doesn't count | `null` (no count asked) |
 | `max_age` | the world was forked longer ago than this (`'1h'`, `'30 minutes'`, or ms): its merge rests on what it read then | `null` (no limit) |

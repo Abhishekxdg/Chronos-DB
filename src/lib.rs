@@ -35,6 +35,7 @@ mod stale;
 mod sync;
 mod tally;
 mod traced;
+mod wal_ship;
 
 use disk::Op;
 use imbl::{OrdMap, ordmap::DiffItem};
@@ -58,6 +59,7 @@ pub use checks::MergeCheck;
 pub use disk::{ActingAs, SyncCommit, acting_as};
 pub use outbox::Effect;
 pub use reads::Read;
+pub use wal_ship::Shipping;
 
 thread_local! {
     /// The branches this thread holds the long lock of (see `batch_long`), each with its database's address: a write
@@ -525,6 +527,8 @@ struct Worker {
     stop: Arc<AtomicBool>,
     kick: SyncSender<()>,
     thread: sync::thread::JoinHandle<()>,
+    /// Ships the log to the remote (see `wal_ship`); stopped after the closing checkpoint.
+    shipper: Option<std::thread::JoinHandle<()>>,
 }
 
 impl std::ops::Deref for Db {
@@ -738,7 +742,8 @@ pub struct MergeOptions {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Planned {
     pub key: String,
-    /// apply, conflict, by columns, picked ours, picked theirs, picked row, kept ours, kept theirs
+    /// apply, conflict, by columns, by columns ours, by columns theirs, picked ours, picked theirs, picked row,
+    /// kept ours, kept theirs
     pub outcome: &'static str,
     pub detail: String,
     pub base: Option<Val>,
@@ -746,6 +751,82 @@ pub struct Planned {
     pub theirs: Option<Val>,
     /// the row after the merge (for a conflict: none, as nothing would be merged)
     pub result: Option<Val>,
+    /// for a row both sides changed (a conflict, or settled), the columns each changed since the fork; none for a
+    /// row only one side changed, or one a side added or deleted
+    pub columns: Option<ColumnChanges>,
+}
+
+/// The columns each side of a merge changed in one row since the fork (see `Planned::columns`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ColumnChanges {
+    /// changed in the world merged
+    pub here: Vec<String>,
+    /// changed in the world merged into
+    pub there: Vec<String>,
+}
+
+impl ColumnChanges {
+    /// The columns both sides changed: where a side has to be chosen.
+    pub fn both(&self) -> Vec<String> {
+        self.here.iter().filter(|c| self.there.contains(c)).cloned().collect()
+    }
+
+    /// For a row where both changed a column and one side changed more, from its three versions as JSON objects: the
+    /// changes a whole side discards, against BY COLUMNS with that side, which picks it only for the columns both
+    /// changed. A column both set to the same value is discarded by neither. Empty otherwise.
+    fn choices(base: Option<&str>, ours: Option<&str>, theirs: Option<&str>) -> String {
+        let (Some(o), Some(t)) = (ours.and_then(json_object), theirs.and_then(json_object)) else {
+            return String::new();
+        };
+        let Some(c) = ColumnChanges::of(base, ours, theirs) else { return String::new() };
+        let both = c.both();
+        if both.is_empty() {
+            return String::new();
+        }
+        // the changes a side discards: its columns, but those the other side set to the same value
+        let lost = |side: &[String]| side.iter().filter(|k| o.get(*k) != t.get(*k)).cloned().collect::<Vec<_>>();
+        let clash = lost(&both);
+        let by_columns = |side: &str| match clash.is_empty() {
+            true => format!("BY COLUMNS USING {side} nothing"),
+            false => format!("BY COLUMNS USING {side} only {}", clash.join(", ")),
+        };
+        let mut said = vec![];
+        let (parents, worlds) = (lost(&c.there), lost(&c.here));
+        if parents.len() > clash.len() {
+            said.push(format!("USING OURS overwrites the parent's {}, {}", parents.join(", "), by_columns("OURS")));
+        }
+        if worlds.len() > clash.len() {
+            said.push(format!("USING THEIRS drops this world's {}, {}", worlds.join(", "), by_columns("THEIRS")));
+        }
+        match said.is_empty() {
+            true => String::new(),
+            false => format!(". {}", said.join("; ")),
+        }
+    }
+
+    /// Of a row's three versions as JSON objects; none for an add or a delete.
+    fn of(base: Option<&str>, ours: Option<&str>, theirs: Option<&str>) -> Option<ColumnChanges> {
+        let (b, o, t) = (json_object(base?)?, json_object(ours?)?, json_object(theirs?)?);
+        Some(ColumnChanges { here: changed_columns(&b, &o), there: changed_columns(&b, &t) })
+    }
+}
+
+fn json_object(v: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    match serde_json::from_str(v) {
+        Ok(serde_json::Value::Object(o)) => Some(o),
+        _ => None,
+    }
+}
+
+/// The columns `to` changed from `from` (set, changed or gone), sorted.
+fn changed_columns(
+    from: &serde_json::Map<String, serde_json::Value>,
+    to: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    let mut c: Vec<String> = to.iter().filter(|(k, v)| from.get(*k) != Some(v)).map(|(k, _)| k.clone()).collect();
+    c.extend(from.keys().filter(|k| !to.contains_key(*k)).cloned());
+    c.sort();
+    c
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -820,18 +901,7 @@ enum Settle {
 const COMBINES: &str = "(different columns: merge by columns combines them)";
 
 fn explain(base: Option<&str>, ours: Option<&str>, theirs: Option<&str>) -> String {
-    let obj = |v: Option<&str>| match v.map(serde_json::from_str::<serde_json::Value>) {
-        Some(Ok(serde_json::Value::Object(o))) => Some(o),
-        _ => None,
-    };
-    let changed = |from: &Option<serde_json::Map<String, serde_json::Value>>,
-                   to: &Option<serde_json::Map<String, serde_json::Value>>| {
-        let (f, t) = (from.clone().unwrap_or_default(), to.clone().unwrap_or_default());
-        let mut c: Vec<String> = t.iter().filter(|(k, v)| f.get(*k) != Some(v)).map(|(k, _)| k.clone()).collect();
-        c.extend(f.keys().filter(|k| !t.contains_key(*k)).cloned());
-        c.sort();
-        c
-    };
+    let obj = |v: Option<&str>| v.and_then(json_object).unwrap_or_default();
     match (base, ours, theirs) {
         (None, Some(_), Some(_)) => "both sides added this row".into(),
         (_, None, None) => "both sides deleted this row".into(),
@@ -841,14 +911,21 @@ fn explain(base: Option<&str>, ours: Option<&str>, theirs: Option<&str>) -> Stri
             "both sides made the same change (still a conflict: first merge wins)".into()
         }
         _ => {
-            let (b, o, t) = (obj(base), obj(ours), obj(theirs));
-            let (co, ct) = (changed(&b, &o), changed(&b, &t));
-            let both: Vec<&String> = co.iter().filter(|c| ct.contains(c)).collect();
+            let b = obj(base);
+            let c = ColumnChanges { here: changed_columns(&b, &obj(ours)), there: changed_columns(&b, &obj(theirs)) };
+            let both = c.both();
             if both.is_empty() {
-                format!("here: {}; the parent: {} {COMBINES}", co.join(", "), ct.join(", "))
-            } else {
-                format!("both changed {}", both.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))
+                return format!("here: {}; the parent: {} {COMBINES}", c.here.join(", "), c.there.join(", "));
             }
+            // and the columns only one side changed, which BY COLUMNS USING OURS|THEIRS keeps from that side
+            let only = |side: &[String]| side.iter().filter(|x| !both.contains(x)).cloned().collect::<Vec<_>>();
+            let mut said = format!("both changed {}", both.join(", "));
+            for (label, cols) in [("only here", only(&c.here)), ("only the parent", only(&c.there))] {
+                if !cols.is_empty() {
+                    said.push_str(&format!("; {label}: {}", cols.join(", ")));
+                }
+            }
+            said
         }
     }
 }
@@ -1068,7 +1145,8 @@ impl Db {
                 }
             })
         };
-        Db::of(core, Some(Worker { stop, kick, thread }))
+        let shipper = wal_ship::start(core.clone());
+        Db::of(core, Some(Worker { stop, kick, thread, shipper }))
     }
 }
 
@@ -1087,9 +1165,19 @@ impl Drop for Db {
         if let Err(e) = self.save_tallies() {
             eprintln!("chronos: could not save agents' hourly merge counts: {e}");
         }
+        let mut shipper = w.shipper;
+        // the shipper stops after the closing checkpoint (which ships the log up to it) and before
+        // the lease goes: the next writer starts where this one's log ended
+        let mut stop_shipping = || {
+            if let (Some(ship), Some(t)) = (self.log.as_ref().and_then(|l| l.ship.as_ref()), shipper.take()) {
+                ship.stop();
+                let _ = t.join();
+            }
+        };
         if let (Some(r), Some(owner)) = (self.pages.as_ref().and_then(|p| p.remote()), &self.owner) {
             match self.checkpoint_closing() {
                 Ok(()) => {
+                    stop_shipping();
                     if let Err(e) = remote::release(r, owner) {
                         eprintln!("chronos: could not release the lease on {}: {e}", r.url());
                     }
@@ -1097,6 +1185,7 @@ impl Drop for Db {
                 Err(e) => eprintln!("chronos: final checkpoint to {} failed: {e}", r.url()),
             }
         }
+        stop_shipping();
     }
 }
 
@@ -1104,6 +1193,7 @@ impl Drop for Core {
     /// Logs the writes waiting in batches before the log closes (its fields drop after this).
     fn drop(&mut self) {
         sql::forget_stats(self.uid); // (its cumulative statistics are the process's: see `sql::pgstat`)
+        sql::forget_world_types(self.uid, None); // (and the composite types its worlds were read with)
         // what worlds read, kept for the next open: last, as nothing reads any more (see `stale`)
         if let Err(e) = self.save_read_sets() {
             eprintln!("chronos: could not keep what worlds read; their merges will be held after the restart: {e}");
@@ -1234,14 +1324,20 @@ impl Core {
         }
         let remote = url.as_deref().map(remote::Remote::new).transpose()?;
         let mut set_aside = false;
+        let mut shipped = None; // where the remote's log ends, and the manifest's first segment
         let owner = match &remote {
             Some(r) => {
                 let owner = remote::owner(dir)?;
-                if !remote::acquire(r, &owner, takeover)? {
+                let lease = remote::acquire(r, &owner, takeover)?;
+                if lease != remote::Lease::Held {
                     *taken = Some((r.url().to_string(), owner.clone()));
                 }
                 // a fresh folder starts from the remote's manifest; a stale one doesn't hold the lease
                 set_aside = remote::adopt(r, dir, takeover)?;
+                // and from its log, shipped since that manifest (after a takeover, fenced first)
+                let rec = wal_ship::reconcile(r, dir, crypt.as_deref(), &owner, lease, takeover)?;
+                set_aside |= rec.set_aside;
+                shipped = Some((rec.at, rec.first));
                 Some(owner)
             }
             None => None,
@@ -1274,12 +1370,18 @@ impl Core {
             // Only then: a takeover that adopted nothing is checked like any open
             disk::check_anchor(&mut log, anchor, fresh, o.anchor_reset || set_aside)?;
         }
+        if let (Some(url), Some(owner), Some((at, first))) = (&url, &db.owner, shipped)
+            && wal_ship::setting(dir)?.0 != Shipping::Off
+        {
+            log.ship = Some(Arc::new(wal_ship::Ship::new(url, owner, dir, at, first)?));
+        }
         db.log = Some(log);
         db.replay_clock.store(0, Ordering::Relaxed);
         // after replay: the log holds what was accepted then, whatever the limits are now
         *db.reads.get_mut().unwrap() = reads::load(dir, crypt.as_deref());
         stale::load(&mut db, dir, crypt.as_deref(), clean)?; // what worlds read, if it closed cleanly
         *db.tallies.get_mut().unwrap() = tally::load(dir, crypt.as_deref());
+        db.migrate_tallies(); // (counts saved under a tenant agent's name, before they were its tenant's)
         *db.ledger.get_mut().unwrap() = outbox::load_ledger(dir, crypt.as_deref());
         db.attached = attach::Attached::load(dir)?.map(Arc::new);
         let saved = disk::settings(dir)?;
@@ -1613,6 +1715,33 @@ impl Core {
         Ok(())
     }
 
+    /// How the log goes to the remote (see `Shipping`), and how long an `async` byte may wait,
+    /// in ms. As the folder says if this database doesn't ship now (no remote, or `off` at open).
+    pub fn wal_shipping(&self) -> (Shipping, u64) {
+        match self.log.as_ref().map(|l| (l, l.ship.as_ref())) {
+            Some((_, Some(s))) => (s.mode(), s.delay_ms()),
+            Some((l, None)) => wal_ship::setting(&l.dir).unwrap_or((Shipping::Off, 1000)),
+            None => (Shipping::Off, 0),
+        }
+    }
+
+    /// Sets how the log goes to the remote; kept in the folder. Between `async` and `sync` it
+    /// takes effect at once; turning shipping on or off entirely, at the next open (`off` while
+    /// open still ships what checkpoints need).
+    pub fn set_wal_shipping(&self, m: Shipping, delay_ms: u64) -> Result<()> {
+        let Some(log) = &self.log else { return Err(no_history("an in-memory database has no log to ship".into())) };
+        match &log.ship {
+            Some(s) => s.set(&log.dir, m, delay_ms)?,
+            None => wal_ship::save_setting(&log.dir, m, delay_ms)?,
+        }
+        Ok(())
+    }
+
+    /// Log written but not yet in the remote, in bytes (0 when the log isn't shipped).
+    pub fn wal_shipping_lag(&self) -> u64 {
+        self.log.as_ref().and_then(|l| Some(l.ship.as_ref()?.lag(l))).unwrap_or(0)
+    }
+
     /// Folds every branch's recent changes into its tree, publishes the roots and drops the log
     /// before them. Runs on its own when the log passes 64 MB; call it to make reopening fast.
     pub fn checkpoint(&self) -> io::Result<()> {
@@ -1789,6 +1918,11 @@ impl Core {
                     .unwrap_or_default(),
             })
             .collect();
+        if let Some(ship) = &log.ship {
+            // the log up to the cut is in the remote before a manifest says to replay from after it
+            // (the local one too: its cleanup may delete the segment)
+            ship.wait_sealed(first_seg - 1)?;
+        }
         disk::write_manifest(&log.dir, log.crypt.as_deref(), first_seg, &man, &counters, closing, cut_ms)?;
         log.move_anchor(first_seg, 0)?; // after the manifest: a crash between leaves the folder ahead, which opens
         self.past.lock().unwrap().clear(); // history may have been dropped: rebuild on demand
@@ -1796,6 +1930,14 @@ impl Core {
             let bytes = std::fs::read(log.dir.join("manifest"))?;
             pages.publish("manifest", bytes.clone())?; // after its pages; fenced
             remote::saw(&log.dir, &bytes)?;
+            pages.publish("folder-settings", remote::settings_object(&log.dir))?;
+            if let (Some(ship), Some(r)) = (&log.ship, pages.remote())
+                && let Err(e) = ship.collect(r, first_seg)
+            {
+                eprintln!(
+                    "chronos: could not delete shipped log the remote no longer needs ({e}); the next checkpoint tries again"
+                );
+            }
         }
         log.published(behind);
         *self.published.lock().unwrap() = man.iter().flat_map(|b| [b.base, b.data]).collect();
@@ -2073,6 +2215,7 @@ impl Core {
     /// database's own rows but index entries (tables' definitions, agents, sequences), always go
     /// through, so a full database can still DELETE, DROP and TRUNCATE its way back under its cap.
     pub(crate) fn guard_rows<'r>(&self, rows: impl Iterator<Item = (&'r str, Option<usize>)>) -> Result<()> {
+        self.guard_shipping()?;
         if self.folder.limit == 0 {
             return Ok(());
         }
@@ -2083,6 +2226,18 @@ impl Core {
         match adding {
             0 => Ok(()),
             n => self.guard_disk(n),
+        }
+    }
+
+    /// Refuses a change whose commit couldn't reach the remote: `wal_shipping = sync` with the remote
+    /// unreachable for a while, or taken over by another writer. 58030 is Postgres's `io_error`.
+    pub(crate) fn guard_shipping(&self) -> Result<()> {
+        if RECOVERING.get() {
+            return Ok(());
+        }
+        match self.log.as_ref().and_then(|l| l.ship.as_ref()?.refusing()) {
+            Some(why) => Err(Error::Constraint { code: "58030", message: why }),
+            None => Ok(()),
         }
     }
 
@@ -2774,6 +2929,9 @@ impl Core {
         // commits share a WAL flush)
         drop(_long);
         self.after(pos.1, b == MAIN);
+        if rows.iter().any(|(k, _)| sql::type_row(k)) {
+            sql::world_types_moved(self, b); // (a type's row written through the API, or put back by a restore)
+        }
         Ok(pos.0)
     }
 
@@ -2806,7 +2964,7 @@ impl Core {
         let quota = self.quota(b)?;
         let br = self.branch(b)?; // as in `write`, one lookup for both locks
         let _long = gated.then(|| lock(&br.long)); // inside a write: it holds the gate
-        let (out, pos) = {
+        let (out, pos, typed) = {
             let _g = if gated { self.gate() } else { None };
             let gone = lock(&br.writer);
             if *gone {
@@ -2817,10 +2975,13 @@ impl Core {
                 return Ok((br.version.load(Ordering::Relaxed), out));
             }
             let (version, pos) = self.put_rows(b, &br, &quota, &rows)?;
-            ((version, out), pos)
+            ((version, out), pos, rows.iter().any(|(k, _)| sql::type_row(k)))
         };
         drop(_long); // (the next writer goes on while this one waits for the disk: see `write`)
         self.after(pos, b == MAIN);
+        if typed {
+            sql::world_types_moved(self, b); // (a type's row: CREATE, ALTER or DROP TYPE, a restore, an undone merge)
+        }
         Ok(out)
     }
 
@@ -2833,6 +2994,16 @@ impl Core {
         quota: &Option<agents::Quota>,
         rows: &[(String, Option<String>)],
     ) -> Result<(u64, u64)> {
+        // (what the running SQL statement does to the order objects were made in joins the write that makes, renames
+        // or drops them, so the statement stays one write: see `sql::riding`)
+        let joined;
+        let rows = match sql::riding(self, b, br.born, &|| br.snapshot(), rows)? {
+            extra if extra.is_empty() => rows,
+            extra => {
+                joined = [rows, &extra[..]].concat();
+                &joined[..]
+            }
+        };
         if let Some(q) = quota {
             q.check(b, br.changed.load(Ordering::Relaxed), rows.len() as u64)?;
         }
@@ -2930,6 +3101,9 @@ impl Core {
         let (version, pos) = write(&rows)?;
         drop(_long); // (the next writer goes on while this one waits for the disk: see `write`)
         self.after(pos, b == MAIN);
+        if rows.iter().any(|(k, _)| sql::type_row(k)) {
+            sql::world_types_moved(self, b); // (as in `batch_in`)
+        }
         Ok((version, out))
     }
 
@@ -3503,7 +3677,7 @@ impl Core {
     /// the merge are left alone with `skip_changed`; otherwise their names come back as an error
     /// and nothing changes.
     pub fn undo_merge(&self, child: &str, skip_changed: bool) -> Result<Undone> {
-        let _back = Recovering::enter(); // a way back: main's protection lets it through
+        let back = Recovering::enter(); // a way back: main's protection lets it through
         not_tx(child)?; // a transaction's commit: undone by a statement, not by its hidden name
         let Some(log) = &self.log else {
             return Err(no_history("an in-memory database keeps no history".into()));
@@ -3543,10 +3717,16 @@ impl Core {
         let Some((place, when, Some(parent))) = found else {
             return Err(no_history(format!("no merge of {child} within the history window")));
         };
-        if parent == MAIN {
-            attach::refuse_main(self, "UNDO MERGE")?;
-        }
         self.may_undo_into(&parent)?;
+        // in a folder attached to Postgres, main changes only by a merge written there first: the rows go back in a
+        // world of main, which is then merged into it as any world is (each row locked and compared in Postgres, a
+        // row changed there since the merge a conflict, and nothing written)
+        let via = (parent == MAIN && self.attached.is_some())
+            .then(|| format!("undo-{}-{}", child.replace('/', "-"), disk::now_ms()));
+        if let Some(w) = &via {
+            self.fork(MAIN, w)?;
+        }
+        let target = via.clone().unwrap_or_else(|| parent.clone());
         // the world it merged into, just before and just after that record
         let (base_seg, _, base) = hist.iter().rev().find(|h| h.0 <= place.0).expect("the first history is older");
         let (_, _, man) = disk::read_manifest_at(base, log.crypt.as_deref())?
@@ -3569,7 +3749,7 @@ impl Core {
         })?;
         let (before, after) = states.ok_or_else(|| no_history(format!("the merge of {child} can't be rebuilt")))?;
         let changes = self.state_diff(&before, &after)?;
-        let (_, (rows, skipped)) = self.batch_with(&parent, |v| {
+        let written = self.batch_with(&target, |v| {
             let (mut rows, mut changed) = (vec![], vec![]);
             for c in changes.iter().filter(|c| !c.key.starts_with("_sonos_seq/")) {
                 if self.val(&v.s, &c.key)? == c.after {
@@ -3591,7 +3771,22 @@ impl Core {
             }
             let n = rows.iter().filter(|(k, _)| !sql::internal(k) && !sql::btree_entry(k) && !k.starts_with("_sonos_")).count();
             Ok((rows, (n, changed.len())))
-        })?;
+        });
+        let (_, (rows, skipped)) = match (written, &via) {
+            (Ok(w), _) => w,
+            (Err(e), Some(w)) => {
+                let _ = self.discard(w);
+                return Err(e);
+            }
+            (Err(e), None) => return Err(e),
+        };
+        if let Some(w) = via {
+            drop(back); // (the merge writes back to Postgres: not as a way back that skips it)
+            if let Err(e) = self.merge_with(&w, &MergeOptions::default()) {
+                let _ = self.discard(&w);
+                return Err(e);
+            }
+        }
         Ok(Undone { parent, at: when, rows, skipped })
     }
 
@@ -3845,6 +4040,9 @@ impl Core {
             out.push(("pages_bytes", size(&log.dir.join("pages"))));
             out.push(("log_bytes", size(&log.dir)));
             out.push(("history_bytes", size(&log.dir.join("history"))));
+            if let Some(ship) = &log.ship {
+                out.extend(ship.counters(log));
+            }
         }
         out
     }
@@ -4446,6 +4644,7 @@ impl Core {
     /// with no other writer's change in it.
     pub fn merge_kept(&self, b: &str, o: &MergeOptions) -> Result<(usize, Option<u64>)> {
         let _t = self.metrics.time(if b.starts_with("_tx_") { metrics::Op::Commit } else { metrics::Op::Merge });
+        self.guard_shipping()?;
         // the rows a merge brings count toward the parent's changes, and its agent's quota there
         let parent = {
             let m = self.branches.read().unwrap();
@@ -4510,7 +4709,11 @@ impl Core {
         // like `write`, only a merge into main waits for the disk: worlds and transactions
         // inside one become durable when they reach main
         let durable = into.map_or(parent.as_ref().is_some_and(|(p, _)| p == MAIN), |y| y == MAIN);
-        self.touch(into.or(parent.as_ref().map(|(p, _)| p.as_str())).unwrap_or(MAIN)); // where the rows went
+        let went = into.or(parent.as_ref().map(|(p, _)| p.as_str())).unwrap_or(MAIN);
+        self.touch(went); // where the rows went
+        if !whole {
+            sql::world_types_moved(self, went); // (a whole merge's are read in as the world goes: see `retire`)
+        }
         if let Some((_, pbr)) = parent {
             pbr.changed.fetch_add(brought, Ordering::Relaxed);
         }
@@ -4586,37 +4789,64 @@ impl Core {
         drop(longs);
         let Merged::Done(n, pos, ..) = done else { unreachable!("a rebase is done or refused") };
         self.touch(b);
+        sql::world_types_moved(self, b); // (its parent's composite types may be others by now)
         self.after(pos, false);
         Ok(n)
     }
 
     /// A row both sides changed, merged by columns: the parent's row with the columns this branch
-    /// changed, if the two changed different columns. Stored as the parent stores it.
-    fn by_columns(&self, key: &str, states: [&State; 3], vals: [&Option<Val>; 3]) -> Option<Val> {
-        let [Some(b), Some(o), Some(t)] = vals else { return None }; // an add or delete: not by columns
-        let obj = |s: &State, v: &Val| match self
-            .show(s, key, v.clone(), &mut HashMap::new())
-            .ok()
-            .map(|j| serde_json::from_str(&j))
-        {
-            Some(Ok(serde_json::Value::Object(o))) => Some(o),
-            _ => None,
+    /// changed, if the two changed different columns ("by columns"). Where both changed a column,
+    /// `how` picks the side for those columns only ("by columns ours" or "by columns theirs"): each
+    /// column only one side changed keeps that side's value. Stored as `into` (the world merged into,
+    /// with the table definitions the merge brings) stores it, without the columns the merged table
+    /// doesn't have (one the world dropped), with whether it overwrites a value the parent changed.
+    /// None where it can't combine; a combined row the merged table refuses is an error, not a
+    /// whole side taken in its place.
+    fn by_columns(
+        &self,
+        key: &str,
+        states: [&State; 3],
+        vals: [&Option<Val>; 3],
+        how: Resolve,
+        into: &View,
+    ) -> Result<Option<(&'static str, Val, bool)>> {
+        let [Some(b), Some(o), Some(t)] = vals else { return Ok(None) }; // an add or delete: not by columns
+        let obj = |s: &State, v: &Val| json_object(&self.show(s, key, v.clone(), &mut HashMap::new()).ok()?);
+        let (Some(bo), Some(oo), Some(mut to)) = (obj(states[0], b), obj(states[1], o), obj(states[2], t)) else {
+            return Ok(None);
         };
-        let (bo, oo, mut to) = (obj(states[0], b)?, obj(states[1], o)?, obj(states[2], t)?);
         let differs = |x: &serde_json::Map<String, serde_json::Value>, k: &String| x.get(k) != bo.get(k);
         let keys: std::collections::BTreeSet<String> = bo.keys().chain(oo.keys()).chain(to.keys()).cloned().collect();
         let mine: Vec<&String> = keys.iter().filter(|k| differs(&oo, k)).collect();
-        if mine.iter().any(|k| differs(&to, k)) {
-            return None; // both changed a column
-        }
-        for k in mine {
+        let both: Vec<&String> = mine.iter().copied().filter(|k| differs(&to, k)).collect();
+        let what = match (both.is_empty(), how) {
+            (true, _) => "by columns",
+            (false, Resolve::Fail) => return Ok(None), // both changed a column, and nothing says whose
+            (false, Resolve::Ours) => "by columns ours",
+            (false, Resolve::Theirs) => "by columns theirs",
+        };
+        // the parent's values it replaces: only ours, on a column both changed to different values
+        let overwrites = how == Resolve::Ours && both.iter().any(|k| oo.get(*k) != to.get(*k));
+        for k in mine.into_iter().filter(|k| how != Resolve::Theirs || !both.contains(k)) {
             match oo.get(k) {
                 Some(v) => to.insert(k.clone(), v.clone()),
                 None => to.remove(k),
             };
         }
-        let parent = View { core: self, born: PAST, s: states[2].clone(), branch: String::new(), reads: None };
-        sql::stored(&parent, key, &serde_json::Value::Object(to).to_string()).ok()
+        if let Some(cols) = sql::stored_columns(into, key.split_once('/').map_or(key, |(t, _)| t))? {
+            to.retain(|k, _| cols.contains(k));
+        }
+        let v = sql::stored(into, key, &serde_json::Value::Object(to).to_string()).map_err(|e| match e {
+            Error::Constraint { code, message } => Error::Constraint {
+                code,
+                message: format!(
+                    "{} can't be combined by columns: {message}; settle it with RESOLVE; nothing was merged",
+                    sql::show_key(key)
+                ),
+            },
+            e => e,
+        })?;
+        Ok(Some((what, v, overwrites)))
     }
 
     /// The merge itself (see `merge_with`), or with `dry` its plan. `o.picks` is ignored: rows
@@ -4732,6 +4962,17 @@ impl Core {
         let theirs_state = next.clone();
         let parent_view =
             View { core: self, born: parent.born, s: theirs_state.clone(), branch: String::new(), reads: None };
+        // the world merged into with the definitions this merge brings it (a column the world added): a row settled
+        // here as JSON (picked, or combined by columns) is stored as the merged table reads it
+        let packing_view = {
+            let mut s = theirs_state.clone();
+            for ch in diff.iter().filter(|c| c.key.starts_with("_sonos_")) {
+                if self.val(&theirs_state, &ch.key)? == ch.before {
+                    s.set(&ch.key, ch.after.clone());
+                }
+            }
+            View { s, ..parent_view.clone() }
+        };
 
         let (mut apply, mut conflicts) = (vec![], vec![]);
         let mut schema_clash = vec![];
@@ -4775,6 +5016,17 @@ impl Core {
             {
                 continue; // both sides made the same schema (or extension): it merges as one
             }
+            if sql::made_row(&ch.key) {
+                continue; // when an object was made follows the object: both sides made it, and the parent's stands
+            }
+            // both sides made a relation's storage anew (REINDEX, SET TABLESPACE: see `sql::FILENODES`), which is
+            // maintenance and no definition: the parent's stands, unless this side dropped the table it is of
+            if ch.key.starts_with(sql::FILENODES) {
+                if ch.after.is_none() {
+                    apply.push(ch);
+                }
+                continue;
+            }
             if ch.key.starts_with("_sonos_tables/") {
                 // both changed a table: its rows follow each side's own column layout, so picking
                 // either schema would misread the other side's rows
@@ -4791,12 +5043,13 @@ impl Core {
                 !reserved_table(t)
                     && *by_table.entry(t.to_string()).or_insert_with(|| sql::merges_by_columns(&parent_view, t))
             };
+            let mut by_cols_overwrites = None; // a row settled by columns: whether it overwrites the parent's change
             let settled = if sql::internal(&ch.key) {
                 None // rows behind constraints follow the rows they index
             } else {
                 match picks.get(&ch.key) {
                     Some(Settle::Json(j)) => {
-                        let v = j.as_deref().map(|j| sql::stored(&parent_view, &ch.key, j)).transpose()?;
+                        let v = j.as_deref().map(|j| sql::stored(&packing_view, &ch.key, j)).transpose()?;
                         Some(("picked row", Settle::Stored(v)))
                     }
                     Some(Settle::Ours) => Some(("picked ours", Settle::Ours)),
@@ -4807,8 +5060,13 @@ impl Core {
                             &ch.key,
                             [&base_state, &ours_state, &theirs_state],
                             [&ch.before, &ch.after, &theirs],
-                        )
-                        .map(|v| ("by columns", Settle::Stored(Some(v)))),
+                            how,
+                            &packing_view,
+                        )?
+                        .map(|(what, v, over)| {
+                            by_cols_overwrites = Some(over);
+                            (what, Settle::Stored(Some(v)))
+                        }),
                     None => None,
                 }
             };
@@ -4836,7 +5094,8 @@ impl Core {
                         Settle::Json(_) => unreachable!(),
                     };
                     outcomes.insert(ch.key.clone(), (what, result.clone()));
-                    overwrote += (result != theirs && what != "by columns" && shown(&ch.key)) as usize;
+                    let overwrites = by_cols_overwrites.unwrap_or(result != theirs);
+                    overwrote += (overwrites && shown(&ch.key)) as usize;
                     if result != theirs {
                         apply.push(Change { key: ch.key, before: ch.before, after: result });
                     }
@@ -4848,18 +5107,24 @@ impl Core {
         // row it applies, from the parent's value now to what it gets (a row combined by columns
         // changes only the world's columns; a picked row, or OURS over the parent's change,
         // changes what it changes), and each conflicting row as the world changed it
+        let applied = || -> Result<Vec<Change>> {
+            let mut rows = vec![];
+            for c in apply.iter().filter(|c| shown(&c.key)) {
+                let now = self.val(&theirs_state, &c.key)?;
+                // a row picked as JSON, or combined by columns, is stored as the merged table reads it
+                // (see `packing_view`); the rest are the world's own
+                let made = outcomes.get(&c.key).is_some_and(|o| {
+                    matches!(o.0, "picked row" | "by columns" | "by columns ours" | "by columns theirs")
+                });
+                let after_state = if made { &packing_view.s } else { &ours_state };
+                let c = Change { key: c.key.clone(), before: now, after: c.after.clone() };
+                rows.extend(self.show_change(&theirs_state, after_state, c).ok());
+            }
+            Ok(rows)
+        };
         let merge_rows = match declared.is_some() || columns_reviewed {
             true => {
-                let mut rows = vec![];
-                for c in apply.iter().filter(|c| shown(&c.key)) {
-                    let now = self.val(&theirs_state, &c.key)?;
-                    // a row picked as JSON, or combined by columns, is stored in the parent's
-                    // layout; the rest are the world's own
-                    let made = outcomes.get(&c.key).is_some_and(|o| matches!(o.0, "picked row" | "by columns"));
-                    let after_state = if made { &theirs_state } else { &ours_state };
-                    let c = Change { key: c.key.clone(), before: now, after: c.after.clone() };
-                    rows.extend(self.show_change(&theirs_state, after_state, c).ok());
-                }
+                let mut rows = applied()?;
                 for c in conflicts.iter().filter(|c| shown(&c.key)) {
                     let c = Change { key: c.key.clone(), before: c.base.clone(), after: c.ours.clone() };
                     rows.extend(self.show_change(&base_state, &ours_state, c).ok());
@@ -4899,14 +5164,10 @@ impl Core {
                 broken.extend(p.hourly_broken(self, &disk::actor(), &apply));
             }
             // columns a reader marked critical reads (see `sql::impact`): a person looks first.
-            // Readers are traced over rows as JSON, as diffs show them, and only once some reader
-            // is marked
+            // Readers are traced over rows as JSON, as diffs show them (what each row the merge
+            // applies changes in the parent), and only once some reader is marked
             if !p.critical && parent_view.prefix("_sonos_critical/")?.next().is_some() {
-                let rows: Vec<Change> = apply
-                    .iter()
-                    .filter(|c| shown(&c.key))
-                    .filter_map(|c| self.show_change(&base_state, &ours_state, c.clone()).ok())
-                    .collect();
+                let rows = applied()?;
                 let why = sql::critical_reasons(self, &parent_view, &rows)
                     .map_err(|e| Error::Constraint { code: e.code, message: e.message })?;
                 broken.extend(why);
@@ -5051,7 +5312,11 @@ impl Core {
             self.landing(b, &info.id, review, policy.as_ref().map(|p| p.name.as_str()), &apply);
         }
         // an agent's merge into main counts toward its policy's hourly limits once it's done
-        let counted = (name == MAIN && policy.is_some()).then(|| agents::counts(&apply));
+        // (whose count it goes into is read now, before main's locks: see `tally_of`)
+        let counted = (name == MAIN && policy.is_some()).then(|| {
+            let (rows, deletes, effects) = agents::counts(&apply);
+            (self.tally_of(&disk::actor()).0, rows, deletes, effects)
+        });
         for ch in apply {
             next.set(&ch.key, ch.after);
         }
@@ -5258,8 +5523,8 @@ impl Core {
             let kept = child.version.load(Ordering::Relaxed); // under its writer lock: no write since
             parent.changed.fetch_add(n as u64, Ordering::Relaxed);
             let pos = self.append(rec);
-            if let Some((rows, deletes, effects)) = counted {
-                self.count_merge(&disk::actor(), rows, deletes, effects);
+            if let Some((key, rows, deletes, effects)) = &counted {
+                self.count_merge(key, *rows, *deletes, *effects);
             }
             return Ok(Merged::Done(n, pos, notes, Some(kept)));
         }
@@ -5282,8 +5547,8 @@ impl Core {
         if !locked.is_empty() {
             self.keep_locks(&name, &parent, locked, at);
         }
-        if let Some((rows, deletes, effects)) = counted {
-            self.count_merge(&disk::actor(), rows, deletes, effects);
+        if let Some((key, rows, deletes, effects)) = &counted {
+            self.count_merge(key, *rows, *deletes, *effects);
         }
         Ok(Merged::Done(n, pos, notes, None))
     }
@@ -5404,30 +5669,36 @@ impl Core {
                 sql::check_merge(&View { s: next.clone(), ..before.clone() }, &before, &keys).err().map(|e| e.message)
             }
         };
+        // a row both sides changed, settled: what each side did, and the columns each changed
+        let settled = |base: &Option<Val>, ours: &Option<Val>, theirs: &Option<Val>| {
+            let (b, o, t) = (base.as_deref(), ours.as_deref(), theirs.as_deref());
+            (explain(b, o, t), ColumnChanges::of(b, o, t))
+        };
         for ch in apply.iter().filter(|c| !sql::internal(&c.key) && !sql::btree_entry(&c.key)) {
             let outcome = outcomes.get(&ch.key).map_or("apply", |o| o.0);
             let theirs = self.val(states[2], &ch.key)?;
-            rows.push(Planned {
-                key: ch.key.clone(),
-                outcome,
-                detail: if outcome == "apply" { String::new() } else { "both sides changed this row".into() },
-                base: show(0, states[0], &ch.key, ch.before.clone())?,
-                ours: show(1, states[1], &ch.key, self.val(states[1], &ch.key)?)?,
-                theirs: show(2, states[2], &ch.key, theirs)?,
-                result: show(3, &next, &ch.key, ch.after.clone())?,
-            });
+            let (base, ours, theirs) = (
+                show(0, states[0], &ch.key, ch.before.clone())?,
+                show(1, states[1], &ch.key, self.val(states[1], &ch.key)?)?,
+                show(2, states[2], &ch.key, theirs)?,
+            );
+            let (detail, columns) = match outcome {
+                "apply" => (String::new(), None),
+                _ => settled(&base, &ours, &theirs),
+            };
+            let result = show(3, &next, &ch.key, ch.after.clone())?;
+            rows.push(Planned { key: ch.key.clone(), outcome, detail, base, ours, theirs, result, columns });
         }
         // settled rows that end as the parent already has them (kept theirs, picked theirs)
         for (k, (outcome, v)) in outcomes.iter().filter(|(k, _)| !apply.iter().any(|c| &c.key == *k)) {
-            rows.push(Planned {
-                key: k.clone(),
-                outcome,
-                detail: "both sides changed this row".into(),
-                base: show(0, states[0], k, self.val(states[0], k)?)?,
-                ours: show(1, states[1], k, self.val(states[1], k)?)?,
-                theirs: show(2, states[2], k, v.clone())?,
-                result: show(3, &next, k, v.clone())?,
-            });
+            let (base, ours, theirs) = (
+                show(0, states[0], k, self.val(states[0], k)?)?,
+                show(1, states[1], k, self.val(states[1], k)?)?,
+                show(2, states[2], k, v.clone())?,
+            );
+            let (detail, columns) = settled(&base, &ours, &theirs);
+            let result = show(3, &next, k, v.clone())?;
+            rows.push(Planned { key: k.clone(), outcome, detail, base, ours, theirs, result, columns });
         }
         for c in conflicts {
             let (base, ours, theirs) = (
@@ -5435,12 +5706,15 @@ impl Core {
                 show(1, states[1], &c.key, c.ours.clone())?,
                 show(2, states[2], &c.key, c.theirs.clone())?,
             );
-            let detail = if schema_clash.contains(&c.key) {
-                "both sides changed this table itself: merge one side, then redo the other's change".into()
+            let (detail, columns) = if schema_clash.contains(&c.key) {
+                ("both sides changed this table itself: merge one side, then redo the other's change".into(), None)
             } else {
-                explain(base.as_deref(), ours.as_deref(), theirs.as_deref())
+                let columns = ColumnChanges::of(base.as_deref(), ours.as_deref(), theirs.as_deref());
+                let said = explain(base.as_deref(), ours.as_deref(), theirs.as_deref());
+                (said + &ColumnChanges::choices(base.as_deref(), ours.as_deref(), theirs.as_deref()), columns)
             };
-            rows.push(Planned { key: c.key.clone(), outcome: "conflict", detail, base, ours, theirs, result: None });
+            let (key, outcome, result) = (c.key.clone(), "conflict", None);
+            rows.push(Planned { key, outcome, detail, base, ours, theirs, result, columns });
         }
         rows.sort_by(|a, b| a.key.cmp(&b.key));
         Ok((
@@ -5484,7 +5758,7 @@ impl Core {
         }
         todo.sort_by_key(|(_, br)| std::cmp::Reverse(br.born)); // the lock order: the later fork first
         let mut recs: Vec<_> = todo.iter().map(|(i, _)| self.record(|| Op::Discard(names[*i].as_ref()))).collect();
-        let (mut borns, mut worlds) = (vec![], vec![]);
+        let (mut borns, mut worlds, mut discarded) = (vec![], vec![], vec![]); // (`discarded`: transactions' too)
         let mut effects = vec![]; // what each world held to send, recorded once it's gone (see `discarding`)
         let pos = {
             let _g = self.gate();
@@ -5516,6 +5790,7 @@ impl Core {
                     pos = l.append(g, &rec); // still under the map lock: orders us against forks
                 }
                 borns.push(br.born);
+                discarded.push(b);
                 if !b.starts_with("_tx_") {
                     if self.me.get().is_some() && !RECOVERING.get() {
                         let held = self.effects_of(br).unwrap_or_default();
@@ -5536,6 +5811,7 @@ impl Core {
         }
         self.forget(&borns);
         sql::forget_world_stats(self.uid, &worlds); // a world made again by that name starts with none
+        sql::forget_world_types(self.uid, Some(&discarded));
         if self.reclaim_due()
             && let Some(k) = &self.kick
         {
@@ -5983,7 +6259,7 @@ impl Core {
             (chain, parent)
         };
         let rec = self.record(|| Op::RebaseTx(top));
-        let pos = {
+        let (pos, typed) = {
             let _g = self.gate();
             // the later forks' writer locks first, as merges take them
             let mut order: Vec<&Arc<Branch>> = chain.iter().map(|(_, b)| b).collect();
@@ -6027,6 +6303,8 @@ impl Core {
                     }
                 }
             }
+            // (whether a type's row may have come in: the world's composite types may then be others than its own were)
+            let typed = many || changes.iter().any(|c| sql::type_row(&c.key));
             if many {
                 drop(changes);
                 if let Some(conflict) = self.rebase_own(&chain, &seen, &now)? {
@@ -6036,7 +6314,8 @@ impl Core {
                 // a row it changed that the world changed too can't be both (see `Rebased::Conflict`); a table both
                 // altered is such a row (its definition's), as at COMMIT. A sequence's row is the exception: one the
                 // transaction altered stays as it altered it, whoever altered it meanwhile (its fork point takes the
-                // world's, so the commit brings it over theirs, as it always has)
+                // world's, so the commit brings it over theirs, as it always has); so is when an object was made
+                // (`sql::made_row`), which follows the object
                 // (each level's own value of those, by key)
                 let mut mine: Vec<HashMap<&str, Option<Val>>> = vec![HashMap::new(); chain.len()];
                 for (i, (_, br)) in chain.iter().enumerate() {
@@ -6046,7 +6325,7 @@ impl Core {
                         if is == was {
                             continue;
                         }
-                        if c.key.starts_with("_sonos_seq/") {
+                        if c.key.starts_with("_sonos_seq/") || sql::made_row(&c.key) {
                             mine[i].insert(c.key.as_str(), is);
                             continue;
                         }
@@ -6093,9 +6372,15 @@ impl Core {
             let mut batch = lock(&parent.batch);
             let mut g = self.log.as_ref().map(|l| l.lock());
             self.flush_batch_in(&mut g, &mut batch);
-            self.append_in(&mut g, rec)
+            (self.append_in(&mut g, rec), typed)
         };
         self.after(pos, false);
+        if typed {
+            // (its levels' composite types, as read in, may be the world's from before: read in again when next looked
+            // up; a transaction's are its session's alone, and this is before its statement runs)
+            let levels: Vec<&str> = chain.iter().map(|(n, _)| n.as_str()).collect();
+            sql::forget_world_types(self.uid, Some(&levels));
+        }
         Ok(Rebased::Moved)
     }
 
@@ -6108,7 +6393,7 @@ impl Core {
         let mut owns: Vec<Vec<Change>> = Vec::with_capacity(chain.len());
         for (_, br) in chain {
             let own = self.state_diff(&br.base(), &br.snapshot())?;
-            for c in own.iter().filter(|c| !c.key.starts_with("_sonos_seq/")) {
+            for c in own.iter().filter(|c| !c.key.starts_with("_sonos_seq/") && !sql::made_row(&c.key)) {
                 let before = self.val(seen, &c.key)?;
                 if before != self.val(now, &c.key)? {
                     return Ok(Some(Rebased::Conflict(c.key.clone(), c.before.is_none() && before.is_none())));
@@ -6179,7 +6464,7 @@ impl Core {
         next: State,
         published: impl FnOnce(),
     ) -> Result<u64> {
-        let (pos, born) = {
+        let (pos, born, up) = {
             let mut snap = parent.snap.write().unwrap();
             let mut g = self.log.as_ref().map(|l| l.lock());
             let mut m = self.branches.write().unwrap();
@@ -6189,14 +6474,17 @@ impl Core {
             *snap = next;
             parent.stamp.store(stamp(), Ordering::Relaxed);
             published(); // moved on with the state published: a fork reads both at once (see `fork_info`)
-            let born = m.take(b).map(|e| e.br.born);
+            let (born, up) = m.take(b).map(|e| (e.br.born, e.parent)).unzip();
             self.row_locks.lock().unwrap().remove(b); // what was locked in it goes with it
-            (self.append_in(&mut g, rec), born) // still under the map lock: orders us against forks and other retires
+            // (still under the map lock: orders us against forks and other retires)
+            (self.append_in(&mut g, rec), born, up.flatten())
         };
         self.forget(&Vec::from_iter(born));
         if !b.starts_with("_tx_") {
             sql::forget_world_stats(self.uid, &[b]); // a world made again by that name starts with none
         }
+        // (its composite types go with it; the parent's are read in again where the merge changed them)
+        sql::merged_world_types(self, b, up.as_deref());
         Ok(pos)
     }
 }
@@ -6268,7 +6556,9 @@ fn settles(o: &MergeOptions) -> HashMap<String, Settle> {
 
 /// The table a key belongs to: a row's, or the one a schema, constraint or index row is for.
 fn table_of(key: &str) -> &str {
-    let k = ["_sonos_tables/", "_sonos_uniq/", "_sonos_ref/", "_sonos_idx/"].iter().find_map(|p| key.strip_prefix(p));
+    let k = ["_sonos_tables/", "_sonos_uniq/", "_sonos_ref/", "_sonos_idx/", sql::FILENODES]
+        .iter()
+        .find_map(|p| key.strip_prefix(p));
     let k = k.unwrap_or(key);
     k.split('/').next().unwrap_or(k)
 }

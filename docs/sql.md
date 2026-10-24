@@ -614,7 +614,8 @@ diff world agent_7b readers;  -- what reads each changed column (views, checks, 
 register reader nightly_export on orders (status, total);   -- a reader outside SQL, named by hand
 show readers;                 -- registered readers, and the clients seen reading which columns
 diff world a to b;            -- between any two worlds, or moments (a@-1 hour)
-merge world agent_7b dry run;  -- what the merge would do, row by row, and why rows conflict (attached: checked against live Postgres too)
+merge world agent_7b dry run;  -- what the merge would do, row by row, and why rows conflict, with the columns each side changed (attached: checked against live Postgres too)
+merge world agent_7b by columns using ours;  -- rows both changed: ours only for the columns both changed, each side's own columns kept
 merge world agent_7b by columns resolve ('orders/7' = theirs, 'orders/9' = '{"id": 9, "status": "paid"}');
 merge world agent_7b only tables (orders);           -- just these; agent_7b stays open with the rest
 merge world agent_7b only keys ('orders/7', 'orders/9');
@@ -734,7 +735,8 @@ See docs/operations.md for restoring (`chronos restore`).
 create agent bot with (can = 'read,fork,write_own', max_worlds = 10, world_ttl = '1 day');  -- returns its token, once
 alter agent bot set (writes_per_minute = 600, disabled = false);
 alter agent bot set (max_query_ms = 30000, max_concurrent = 4, max_memory_mb = 512);
-show agents;                              -- name, id, can, quotas, world_ttl, created, disabled, limits
+show agents;                              -- name, id, can, quotas, world_ttl, created, disabled, limits, tenant, expires
+create agent run_42 with (tenant = 'org_id = 42', valid_for = '1 hour');  -- one tenant's rows only; token expires
 show agent bot privileges;                -- what bot may read, write and merge, table by table
 show agent bot privileges in world w;     -- the same, for world w's tables
 show audit for agent bot limit 20;        -- at, agent, world, action, rows
@@ -887,8 +889,8 @@ alter agent support_bot set (can = 'read,fork,write_own,unmask');   -- this one 
   stored`), whether it was there first or added later, is masked too: with NULL if one it reads is masked with NULL,
   else with HASH.
 - **Still a table:** `SELECT ... FOR UPDATE` locks the rows of a masked table as of any (by its key), and `ctid` reads.
-- **Who reads masks:** a session with an agent's token (Postgres login, HTTP, MCP over HTTP), `serve --safe`'s
-  guest, `chronos mcp <folder> --agent NAME`, and a plain `chronos mcp <folder>`: it acts as the folder's owner but
+- **Who reads masks:** a session with an agent's token (Postgres login, HTTP, MCP over HTTP), the server's
+  guest (a client with the server token), `chronos mcp <folder> --agent NAME`, and a plain `chronos mcp <folder>`: it acts as the folder's owner but
   serves a model, so its SQL reads masks and its row tools (`get`, `find`, `diff`, ...) are refused on tables with
   masked columns. `chronos mcp <folder> --unmask` gives that model the values.
 - **The mask is the column's:** it forks, merges, renames and drops with the column, `DIFF` shows it as a change to the
@@ -906,7 +908,7 @@ alter agent support_bot set (can = 'read,fork,write_own,unmask');   -- this one 
 alter system set statement_timeout = '30s';   -- every session starts with it (0: none, the default)
 alter system set max_worlds = 10000;          -- live worlds besides main (0: no limit, the default)
 alter system set world_idle_ttl = '7 days';   -- unused worlds are discarded (0: never, the default)
-alter system set protect_main = on;           -- main's rows change only by merging a world (off by default)
+alter system set protect_main = on;           -- main's rows change only by merging a world (on in a folder serve makes)
 alter system set outbox_keep_payloads = on;   -- discarded effects keep their payloads, not only a hash (off by default)
 show max_worlds;
 show world_idle_ttl;
@@ -1103,6 +1105,7 @@ Execution Time: 0.061 ms
 - **Each table's read** shows how Chronos reached its rows: `Index Scan using <index>` with its `Index Cond`, the primary key, the search index, or `Seq Scan`. A table looked up once per row of a join shows `loops=`.
 - **`ANALYZE` runs the statement**, as in Postgres (so `EXPLAIN ANALYZE DELETE` deletes), and adds actual row counts and the time taken. Without it, a write only finds its rows.
 - **Not shown:** costs, and how joins pair rows beyond the order tables are read in.
+- **PostgreSQL's plan, when asked for:** with `SET chronos.explain = postgres`, `EXPLAIN (COSTS OFF)` without `ANALYZE`, `VERBOSE`, `SETTINGS`, `SUMMARY` or `GENERIC_PLAN`, of a simple statement, shows the plan PostgreSQL 16 would choose for it, in its words, with a NOTICE saying so (sent as `client_min_messages` allows). A simple statement is one table read (partitions pruned by the `WHERE`) with no index on the columns it filters or sorts by and no parameters, under an aggregate without `GROUP BY`, a sort or a limit, or an `UPDATE` or `DELETE` of one table. Chronos may run it differently: it may use its search index where that plan has a `Filter`, or read every partition. Anything else shows Chronos's steps as above, with no NOTICE. The default, `chronos`, always shows Chronos's steps; any other value is 22023. `SHOW chronos.explain`, `SHOW ALL` and `pg_settings` say which is set.
 
 ## Text order
 

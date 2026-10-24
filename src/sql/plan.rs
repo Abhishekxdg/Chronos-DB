@@ -1,5 +1,6 @@
-//! EXPLAIN (COSTS OFF) as Postgres's planner makes the plan, for the statements whose plan doesn't turn on what things
-//! cost: a read of one table (a partitioned or inherited one an Append of the partitions or children it reads, pruned
+//! EXPLAIN (COSTS OFF) as Postgres's planner makes the plan, when the session asks for it (chronos.explain = postgres,
+//! exact mode's default: Chronos may run the statement another way), for the statements whose plan doesn't turn on
+//! what things cost: a read of one table (a partitioned or inherited one an Append of the partitions or children it reads, pruned
 //! as partprune.c prunes them by the WHERE), under a plain Aggregate, a Sort and a Limit; an UPDATE or DELETE of one.
 //! Conditions are written as ruleutils.c writes them, in the order the planner keeps them (createplan.c's
 //! order_qual_clauses: cheapest first, the equalities that make equivalence classes after the rest). Anything else

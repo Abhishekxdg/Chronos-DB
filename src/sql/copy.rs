@@ -483,9 +483,11 @@ fn server_files() -> SqlError {
 
 /// Whether the server reads and writes its files for anyone at all (COPY to or from a file, file_fdw's
 /// `filename`, lo_import and lo_export): only with CHRONOS_ALLOW_SERVER_COPY=1, and then only for the
-/// roles Postgres lets.
+/// roles Postgres lets. Never in a server that hands SQL to people (`serve --studio-api`, see `NO_SERVER_PATHS`),
+/// whatever the variable says.
 pub(super) fn server_files_allowed() -> bool {
     std::env::var("CHRONOS_ALLOW_SERVER_COPY").is_ok_and(|v| v == "1")
+        && !super::NO_SERVER_PATHS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Postgres's 42501 for a COPY FROM (`from`) or TO a file by a role without the privileges of
@@ -771,6 +773,7 @@ impl Session {
             gone: self.gone.clone(),
             ctx: None,
             mem: None,
+            threads: agent.as_ref().map_or(0, |a| a.max_threads as usize),
         };
         let filter = c.filter.clone().map(|f| {
             let cols = t.cols.iter().filter(|x| names.contains(&x.name)).cloned().collect::<Vec<_>>();

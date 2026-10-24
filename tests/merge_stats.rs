@@ -398,14 +398,15 @@ fn a_kill_during_merges_loses_no_merge() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `POST /v1/merge_outcomes`: the server's token gets the counts as JSON; an agent's is refused, as for /metrics.
+/// `POST /v1/merge_outcomes`: the database's own user (the admin token) gets the counts as JSON; an agent's token is
+/// refused, as for /metrics.
 #[test]
-fn the_api_op_is_for_the_server_s_token() {
+fn the_api_op_is_for_the_admin_token() {
     use std::io::{Read, Write};
     const SERVER: &str = "SERVER-SERVER-SERVER-SERVER-0";
     let dir = tmp("api");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_chronos"));
-    cmd.args(["serve", dir.to_str().unwrap(), "--token", SERVER]);
+    cmd.args(["serve", dir.to_str().unwrap(), "--admin-token", SERVER]);
     /// Stops the server however the test ends.
     struct Server(std::process::Child, PathBuf);
     impl Drop for Server {

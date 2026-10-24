@@ -39,6 +39,12 @@ fn base_text(dom: &Json) -> String {
     dom["base"].as_str().unwrap_or("text").to_string()
 }
 
+/// The type domain `name` (its stored name) is over, as written (`varchar(5)`, another domain's name); None if it
+/// isn't a domain.
+pub(super) fn base_of(v: &View, name: &str) -> Result<Option<String>> {
+    Ok(definition(v, name)?.map(|d| base_text(&d)))
+}
+
 /// The domain a type the parser knows by name only (`Type::Enum`, see `resolve_type`) names, if it names one: its
 /// stored name.
 pub(super) fn of_type(v: &View, t: Type) -> Result<Option<String>> {
@@ -136,13 +142,19 @@ thread_local! {
 fn compiled(v: &View, name: &str) -> Result<Option<std::rc::Rc<Compiled>>> {
     let Some(raw) = v.get(&type_key(name))? else { return Ok(None) };
     let key = format!("{name}\u{0}{raw}");
-    if let Some(c) = COMPILED.with_borrow(|m| m.get(&key).cloned()) {
+    // (one over a composite type an ALTER TYPE has changed since, or another world has otherwise, is made again)
+    if let Some(c) = COMPILED.with_borrow(|m| m.get(&key).cloned())
+        && !userdefs::stale_in(v, c.cols[0].ty)
+    {
         return Ok(Some(c));
     }
     let j: Json = serde_json::from_str(&raw).unwrap_or_default();
     let Some(dom) = j.get("domain") else { return Ok(None) };
-    let made = Parser::new(lex(&format!("x {}", base_text(dom)))?).column()?;
-    let cols = vec![Col::new("", "value", resolve_type(v, made.ty)?)];
+    let base = userdefs::in_world(v, || -> Result<Type> {
+        let made = Parser::new(lex(&format!("x {}", base_text(dom)))?).column()?;
+        resolve_type(v, made.ty)
+    })?;
+    let cols = vec![Col::new("", "value", base)];
     let (not_null, texts) = own_constraints(dom, name);
     let mut checks = vec![];
     for (n, text) in texts {
@@ -422,6 +434,163 @@ pub(super) fn made_over(v: &View, name: &str) -> Result<Vec<String>> {
         }
     }
     Ok(out)
+}
+
+/// Domain check `text` (over VALUE) as parsed, VALUE the one column `value`.
+fn parsed_check(text: &str) -> Result<Expr> {
+    let read: Vec<Tok> = lex(text)?
+        .into_iter()
+        .map(|t| match t {
+            Tok::Word(w) if w == "value" => Tok::Ident("value".into()),
+            t => t,
+        })
+        .collect();
+    check_expr(&tokens_sql(&read))
+}
+
+/// Domains, each by its stored name with its own checks (name, condition over VALUE).
+type DomainChecks = Vec<(String, Vec<(String, String)>)>;
+
+/// The domains directly over composite type `name` (their stored names), with their own constraints.
+fn over_composite(v: &View, name: &str) -> Result<DomainChecks> {
+    let mut out = vec![];
+    for d in made_over(v, name)? {
+        let Some(dom) = definition(v, &d)? else { continue };
+        if bare_type(&base_text(&dom)) == name && !base_text(&dom).trim_end().ends_with(']') {
+            let (_, checks) = own_constraints(&dom, &d);
+            out.push((d, checks));
+        }
+    }
+    Ok(out)
+}
+
+/// The checks of the domains over composite type `name` that read its attribute `attr` (`(VALUE).attr`): each
+/// domain's stored name and the check's.
+pub(super) fn checks_reading(v: &View, name: &str, attr: &str) -> Result<Vec<(String, String)>> {
+    let mut out = vec![];
+    for (d, checks) in over_composite(v, name)? {
+        for (n, text) in checks {
+            if parsed_check(&text).is_ok_and(|e| reads_field(&e, "value", attr)) {
+                out.push((d.clone(), n));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// ALTER TYPE ... RENAME ATTRIBUTE `from` TO `to` of composite type `name`: the checks of the domains over it that read
+/// it (`(VALUE).from`) written to read it by its new name, as Postgres's keep reading it (by its number). Each
+/// domain's row, where one changed.
+pub(super) fn renamed_attribute(v: &View, name: &str, from: &str, to: &str) -> Result<Vec<(String, Option<String>)>> {
+    let value = ["value".to_string()];
+    let mut out = vec![];
+    for d in made_over(v, name)? {
+        let Some(raw) = v.get(&type_key(&d))? else { continue };
+        let mut j: Json = serde_json::from_str(&raw).unwrap_or_default();
+        let Some(dom) = j.get_mut("domain") else { continue };
+        let base = base_text(dom);
+        if bare_type(&base) != name || base.trim_end().ends_with(']') {
+            continue;
+        }
+        let mut changed = false;
+        let mut each = |c: &mut Json| -> Result<()> {
+            if let Some(t) = c.as_str().map(|t| renamed_field(t, &value, from, to)).transpose()?.flatten() {
+                *c = Json::from(t);
+                changed = true;
+            }
+            Ok(())
+        };
+        for c in dom.get_mut("checks").and_then(Json::as_array_mut).into_iter().flatten() {
+            each(c)?;
+        }
+        for n in dom.get_mut("named").and_then(Json::as_array_mut).into_iter().flatten() {
+            if let Some(c) = n.get_mut(1) {
+                each(c)?;
+            }
+        }
+        if changed {
+            out.push((type_key(&d), Some(j.to_string())));
+        }
+    }
+    Ok(out)
+}
+
+/// ALTER TYPE ... ALTER ATTRIBUTE `attr` TYPE of composite type `name`, its attributes now `fields` (name, type as
+/// written) and the attribute's type before `old` (as written): each check of a domain over the type bound again,
+/// as Postgres's ALTER TABLE rebuilds the constraints that read the attribute. Postgres keeps a check bound, a
+/// constant beside the attribute cast to the attribute's type of then (`(VALUE).r > 0` is `(VALUE).r >
+/// 0::double precision`): rebuilt, that is an operator between the new type and the old, of which there is none
+/// between a string type and a number.
+pub(super) fn rebind_over(v: &View, name: &str, attr: &str, old: &str, fields: &[(String, String)]) -> Result<()> {
+    let domains = over_composite(v, name)?;
+    if domains.is_empty() {
+        return Ok(());
+    }
+    let read = |t: &str| -> Result<ColDef> { Parser::new(lex(&format!("x {t}"))?).column() };
+    let was = read(old)?;
+    let now = read(fields.iter().find(|(f, _)| f == attr).map_or("text", |(_, t)| t.as_str()))?;
+    // (the name format_type_be gives it: a varchar's without its length)
+    let shown = |c: &ColDef| match c.chars {
+        Some((_, false)) => "character varying".to_string(),
+        Some((_, true)) => "character".to_string(),
+        None => c.ty.pg_name().into_owned(),
+    };
+    let number =
+        |t: Type| matches!(t, Type::SmallInt | Type::Int | Type::BigInt | Type::Numeric | Type::Float | Type::Float4);
+    let mut shape = vec![];
+    for (f, t) in fields {
+        shape.push((f.clone(), resolve_type(v, read(t)?.ty)?));
+    }
+    let cols = vec![Col::new("", "value", Type::record(shape))];
+    let is_attr = |x: &Expr| is_field(x, "value", attr);
+    for (_, checks) in domains {
+        for (_, text) in checks {
+            let e = parsed_check(&text)?;
+            let mut clash = None;
+            walk(&e, &mut |x| {
+                let Expr::Bin(l, op, r) = x else { return };
+                let Some(sym) = op_symbol(*op) else { return };
+                for (this, other, left) in [(&**l, &**r, true), (&**r, &**l, false)] {
+                    if clash.is_some() || !is_attr(this) {
+                        continue;
+                    }
+                    let (t, other_name) = match other {
+                        // (a constant: cast to the attribute's type of then, where that is a number)
+                        Expr::Lit(Value::Int(_) | Value::Numeric(_) | Value::Float(_)) if number(was.ty) => {
+                            (was.ty, shown(&was))
+                        }
+                        Expr::Lit(Value::Int(_)) => (Type::Int, "integer".to_string()),
+                        Expr::Lit(Value::Numeric(_)) => (Type::Numeric, "numeric".to_string()),
+                        Expr::Lit(_) => continue,
+                        x => match Binder::plain(&cols, Some(v)).bind(x).and_then(|b| ty_of(&b, &cols, &[])) {
+                            Ok(t) => (t, t.pg_name().into_owned()),
+                            Err(_) => continue,
+                        },
+                    };
+                    if (now.ty == Type::Text && number(t)) || (number(now.ty) && t == Type::Text) {
+                        clash = Some(match left {
+                            true => format!("operator does not exist: {} {sym} {other_name}", shown(&now)),
+                            false => format!("operator does not exist: {other_name} {sym} {}", shown(&now)),
+                        });
+                    }
+                }
+            });
+            if let Some(m) = clash {
+                return no_op(m);
+            }
+            Binder::plain(&cols, Some(v)).bind(&e)?;
+        }
+    }
+    Ok(())
+}
+
+/// Type `text` as written (a domain's base, an attribute's type), where it names type `from` (or an array of it):
+/// written for `to` instead (ALTER TYPE ... RENAME TO or SET SCHEMA moved it). None where it names another type.
+pub(super) fn renamed_text(text: &str, from: &str, to: &str) -> Option<String> {
+    if bare_type(text) != from || text.contains('(') {
+        return None;
+    }
+    Some(format!("{}{}", ident_rel(to), "[]".repeat(text.matches('[').count())))
 }
 
 /// The table column checks that are domain check `text` (over VALUE) on column `col`, compared as tokens: what

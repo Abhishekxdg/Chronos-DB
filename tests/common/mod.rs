@@ -22,6 +22,10 @@ pub struct Serve {
 pub fn serve(cmd: &mut Command, pg: bool) -> Serve {
     cmd.args(["--listen", "127.0.0.1:0", "--pg", if pg { "127.0.0.1:0" } else { "off" }]).stderr(Stdio::piped());
     // tests try many wrong passwords from 127.0.0.1: no waits between them, unless a test asks for them
+    // tests write main directly: a folder the server makes leaves it unprotected, unless a test asks
+    if !cmd.get_envs().any(|(k, _)| k == "CHRONOS_PROTECT_MAIN") {
+        cmd.env("CHRONOS_PROTECT_MAIN", "off");
+    }
     if !cmd.get_envs().any(|(k, _)| k == "CHRONOS_LOGIN_FREE_TRIES") {
         cmd.env("CHRONOS_LOGIN_FREE_TRIES", "1000000");
     }

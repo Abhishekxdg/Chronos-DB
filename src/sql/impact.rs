@@ -458,7 +458,8 @@ pub(crate) fn readers(
     Ok(out)
 }
 
-/// The columns a query reads: (table, column), with (table, "*") for all of a table's.
+/// The columns a query reads: (table, column), with (table, "*") for all of a table's, and
+/// (table, "") for each table it reads at all (its rows, even with none of their columns).
 pub(super) type Reads = BTreeSet<(String, String)>;
 
 /// Each table's columns, to tell which of a query's tables a bare name is from; None when the
@@ -482,6 +483,24 @@ fn traced(v: &View, names: &HashMap<String, Vec<String>>, q: &Select) -> Reads {
     };
     let mut out = Reads::new();
     trace(Some(names), &q, &mut vec![], &mut out);
+    out.retain(|(_, c)| !c.is_empty()); // readers are of columns, not of a table's rows alone
+    out
+}
+
+/// The columns query `q` (views already inlined) reads in world `v`, each name found in the tables that have it: a
+/// bare name a subquery's own tables don't have is an outer query's (a correlated column), as SQL reads it. With
+/// (table, "") for each table it reads at all. For the stale-read check (see `stale`), which mustn't miss a column.
+pub(super) fn named_reads(v: &View, q: &Select) -> Reads {
+    let tables: BTreeSet<String> =
+        plain_reads(&Stmt::Select(Box::new(q.clone()))).into_iter().map(|(t, _)| t).collect();
+    let mut names: HashMap<String, Vec<String>> = HashMap::new();
+    for t in tables {
+        if let Ok(Some(table)) = load(v, &t) {
+            names.insert(t, table.cols.iter().filter(|c| !c.hidden).map(|c| c.name.clone()).collect());
+        }
+    }
+    let mut out = Reads::new();
+    trace(Some(&names), q, &mut vec![], &mut out);
     out
 }
 
@@ -563,6 +582,7 @@ fn trace(names: Names, q: &Select, outer: &mut Vec<Level>, out: &mut Reads) {
         }
     }
     let tables = level.tables.clone();
+    out.extend(tables.iter().map(|(_, t)| (t.clone(), String::new())));
     outer.push(level);
     for s in &sources {
         if let Some(sub) = &s.sub {
@@ -590,6 +610,7 @@ fn trace(names: Names, q: &Select, outer: &mut Vec<Level>, out: &mut Reads) {
         }
     }
     let rest = q.joins.iter().filter_map(|j| j.on.as_ref()).chain(&q.filter).chain(&q.group).chain(&q.having);
+    let rest = rest.chain(&q.distinct_on);
     for e in rest.chain(q.order.iter().map(|(e, _)| e)).chain(&q.limit).chain(&q.offset) {
         exprs(names, e, outer, out);
     }
@@ -608,13 +629,24 @@ fn exprs(names: Names, e: &Expr, outer: &mut Vec<Level>, out: &mut Reads) {
     });
 }
 
+/// The source of `level` that the name `q` refers to: the one whose alias is `q`, else one with no alias of its own
+/// (its alias is its table's name) whose table is `q`: `FROM orders AS hidden` hides `orders`, which may then name
+/// another source (`audit AS orders`).
+fn shown<'a>(level: &'a Level, q: &str) -> Option<&'a (String, String)> {
+    level
+        .tables
+        .iter()
+        .find(|(a, _)| a == q)
+        .or_else(|| level.tables.iter().find(|(a, t)| (a == t || a == rel_part(t)) && (t == q || rel_part(t) == q)))
+}
+
 /// Where column `n` (of `q`, if qualified) comes from: the nearest level naming it. Unqualified
 /// and in several of that level's tables, it counts for each.
 fn column(names: Names, q: Option<&str>, n: &str, outer: &[Level], out: &mut Reads) {
     for level in outer.iter().rev() {
         match q {
             Some(q) => {
-                if let Some((_, t)) = level.tables.iter().find(|(a, t)| a == q || t == q || rel_part(t) == q) {
+                if let Some((_, t)) = shown(level, q) {
                     out.insert((t.clone(), n.to_string()));
                     return;
                 }
@@ -626,6 +658,11 @@ fn column(names: Names, q: Option<&str>, n: &str, outer: &[Level], out: &mut Rea
                 let from: Vec<&String> = level.tables.iter().map(|(_, t)| t).filter(|t| has(names, t, n)).collect();
                 if !from.is_empty() {
                     out.extend(from.into_iter().map(|t| (t.clone(), n.to_string())));
+                    return;
+                }
+                // no column of that name: a table's name as a value is its whole row (`select o from orders o`)
+                if let Some((_, t)) = shown(level, n) {
+                    out.insert((t.clone(), "*".to_string()));
                     return;
                 }
             }

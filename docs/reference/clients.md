@@ -46,7 +46,7 @@ Chronos(url="http://127.0.0.1:7070", token=None, branch="main")
 | Option | Default | |
 |---|---|---|
 | `url` | `http://127.0.0.1:7070` | the server; a trailing `/` is dropped |
-| `token` | none | sent as `Authorization: Bearer <token>`: the server's token, an agent's token or the admin token (see [auth](../http-api.md#auth-and-exposure)) |
+| `token` | none | sent as `Authorization: Bearer <token>`: the admin token (the database's own user), an agent's token, or the server's token (the guest; see [auth](../http-api.md#auth-and-exposure)) |
 | `branch` | `main` | the branch every call works on; also `name@when` (see [`at`](#reading-the-past)) |
 
 - **No timeouts or retries:** neither client sets one. Calls wait as long as `fetch` / `urllib.request.urlopen` do; wrap them (an `AbortSignal` isn't accepted) if you need a limit.

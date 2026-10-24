@@ -46,24 +46,74 @@ pub(super) fn bound_text(rels: &[TableInfo], name: &str, sql: &str, names: &[Str
     let ctes = recursive_ctes(&q);
     let mut d = Dp::new(rels, true, 0);
     d.ctes = &ctes;
+    d.stored = true;
+    d.storing = true;
+    written_aliases(&q, &d.synthetic, &mut d.taken);
     d.query(&q, Some(names), true, 0)?;
     Some((d.buf.trim().to_string(), d.made_up))
 }
 
-/// View `i`'s query (or a materialized view's) written again for rename `rn` of a relation it reads, pretty, as
-/// its new definition, with the aliases that made up where two relations came to be shown by one name (which are
-/// none: see `Dp::synthetic`); None for a form this doesn't write back.
+/// View `i`'s query (or a materialized view's) written again for change `rn` of a relation it reads (a rename, or
+/// ALTER TABLE ADD, DROP or RENAME COLUMN), pretty, as its new definition: each name in it finds the column it found
+/// before, as Postgres's views read their columns by number (a column added whose name another takes shown by
+/// another, `t t(x, y, z_1)`). With the aliases made up where two relations came to be shown by one name (see
+/// `Dp::synthetic`); None for a form this doesn't write back.
 pub(super) fn renamed_text(rels: &[TableInfo], i: usize, rn: &Renames) -> Option<(String, Vec<String>)> {
+    kept_as(rels, i, Some(rn))
+}
+
+/// View `i`'s query (or a materialized view's) written as `renamed_text` writes it, for no change: its text read
+/// against what it reads as `rels` has it now, by name; None where a name in it finds no column, or more than one
+/// (see `Dp::strict`). Where this is what `renamed_text` writes for a change, the text, read by name after the
+/// change, binds as it did: it needs no writing again.
+pub(super) fn kept_text(rels: &[TableInfo], i: usize) -> Option<String> {
+    kept_as(rels, i, None).map(|(text, _)| text)
+}
+
+/// `renamed_text` (`rn`: the change), and `kept_text` (no change, each name finding one column only).
+fn kept_as(rels: &[TableInfo], i: usize, rn: Option<&Renames>) -> Option<(String, Vec<String>)> {
     let r = rels.get(i)?;
     let q = view_query(&r.name, r.definition.as_deref()?).ok()?;
     let names: Vec<String> = r.columns.iter().map(|c| c.0.clone()).collect();
     let ctes = recursive_ctes(&q);
     let mut d = Dp::new(rels, true, 0);
     d.ctes = &ctes;
-    d.renames = Some(rn);
+    d.renames = rn;
+    d.strict = rn.is_none();
+    d.stored = true;
     d.synthetic.clone_from(&r.view_aliases);
+    d.storing = true;
+    written_aliases(&q, &d.synthetic, &mut d.taken);
     d.query(&q, Some(&names[..]), true, 0)?;
     Some((d.buf.trim().to_string(), d.made_up))
+}
+
+/// The aliases written in `q` and in the queries in it, other than those a rename made up (`synthetic`): what a
+/// relation shown by its own name doesn't take where the query is written to be kept (see `Dp::storing`).
+fn written_aliases(q: &Select, synthetic: &[String], out: &mut Vec<String>) {
+    for src in q.from.iter().chain(q.joins.iter().map(|j| &j.src)) {
+        let own = src.sub.is_none() && src.srf.is_none() && src.rec.is_none() && src.alias == rel_part(&src.table);
+        if !own && src.alias != GROUP && !synthetic.contains(&src.alias) && !out.contains(&src.alias) {
+            out.push(src.alias.clone());
+        }
+        if let Some(sub) = &src.sub {
+            written_aliases(sub, synthetic, out);
+        }
+        if let Some(r) = &src.rec {
+            written_aliases(&r.base, synthetic, out);
+            written_aliases(&r.step, synthetic, out);
+        }
+    }
+    for (_, _, p) in &q.set {
+        written_aliases(p, synthetic, out);
+    }
+    for e in select_exprs(q) {
+        walk(e, &mut |x| {
+            if let Expr::Sub(sq) | Expr::Exists(sq, _) | Expr::InSub(_, sq, _) = x {
+                written_aliases(&sq.q, synthetic, out);
+            }
+        });
+    }
 }
 
 /// A function's SQL-standard body as pg_get_functiondef writes it (print_function_sqlbody): `RETURN expr`, or
@@ -86,11 +136,10 @@ pub(super) fn function_body(rels: &[TableInfo], f: &functions::Function) -> Opti
         cols: f.args.iter().map(|a| a.0.clone()).collect::<Option<Vec<_>>>()?,
         types: f.args.iter().map(|a| Ty::of(a.1)).collect(),
         via: vec![Via::Own; f.args.len()],
-        rel: None,
-        shown: None,
+        ..Rte::default()
     });
     // (an entry of the level, which names find; never written, as no FROM of it is)
-    lv.from.push(Node::Rel { rte: 0, name: String::new(), only: false, aliased: false, cols_given: false });
+    lv.from.push(Node::Rel { rte: 0, name: String::new(), only: false, aliased: false });
     lv.prefix = false;
     d.levels.push(lv);
     // (RETURN's value: its SELECT's one item, alone)
@@ -156,8 +205,7 @@ pub(super) fn trigger_when(text: &str, cols: &[(String, Type, (i64, i64))], pret
             cols: cols.iter().map(|c| c.0.clone()).collect(),
             types: cols.iter().map(|c| Ty::with(c.1, c.2)).collect(),
             via: vec![Via::Own; cols.len()],
-            rel: None,
-            shown: None,
+            ..Rte::default()
         });
     }
     lv.prefix = true;
@@ -189,10 +237,9 @@ pub(super) fn column_expr(e: &Expr, cols: &[Col], pretty: bool) -> Option<String
         cols: typed.iter().map(|c| c.0.clone()).collect(),
         types: typed.iter().map(|c| Ty::with(c.1, c.2)).collect(),
         via: vec![Via::Own; typed.len()],
-        rel: None,
-        shown: None,
+        ..Rte::default()
     });
-    lv.from.push(Node::Rel { rte: 0, name: String::new(), only: false, aliased: false, cols_given: false });
+    lv.from.push(Node::Rel { rte: 0, name: String::new(), only: false, aliased: false });
     lv.prefix = false;
     d.levels.push(lv);
     let t = d.tn(e)?;
@@ -217,10 +264,9 @@ pub(super) fn plan_expr(e: &Expr, rels: &[PlanRel], prefix: bool, want: Type) ->
             cols: r.cols.iter().map(|c| c.0.clone()).collect(),
             types: r.cols.iter().map(|c| Ty::with(c.1, c.2)).collect(),
             via: vec![Via::Own; r.cols.len()],
-            rel: None,
-            shown: None,
+            ..Rte::default()
         });
-        lv.from.push(Node::Rel { rte: i, name: r.shown.clone(), only: false, aliased: false, cols_given: false });
+        lv.from.push(Node::Rel { rte: i, name: r.shown.clone(), only: false, aliased: false });
     }
     lv.prefix = prefix;
     d.levels.push(lv);
@@ -542,38 +588,97 @@ impl<'q> Tn<'q> {
 // ---------------------------------------------------------------- the range table
 
 /// A range-table entry: a relation, subquery, function or join a query reads, and the names it shows.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct Rte {
     /// what the query calls it (its alias, or the relation's name); empty for a join without an alias
     written: String,
     /// the name it is shown by, unique among those of its query and the queries around it (set_rtable_names);
     /// None for a join without an alias
     refname: Option<String>,
+    /// its columns as the query's text names them (a column alias list's names, else the relation's as they were
+    /// when the text was written): what a name in it finds
     cols: Vec<String>,
     types: Vec<Ty>,
     /// a join's columns: what each one is
     via: Vec<Via>,
     /// a relation's stored name (its row type's)
     rel: Option<String>,
-    /// the names its columns are shown by where they aren't `cols` (a column renamed since the query was written,
-    /// which the query's text still names as it was: see `Renames`)
-    shown: Option<Vec<String>>,
+    /// what it is, which says when its column alias list is written (see `Names::print`)
+    kind: Kind,
+    /// a relation's columns' names now, by their places in `cols` (one renamed since the text was written by its
+    /// new name, one dropped since None), then the columns added since; empty where they are `cols`
+    real: Vec<Option<String>>,
+    /// the column alias list written for it (`t(a, b)`, `(a JOIN b) j(x, y)`)
+    aliases: Vec<String>,
+    /// a join's sides
+    sides: Option<Box<Sides>>,
+    /// the names its columns are shown by
+    names: Names,
 }
 
 impl Rte {
     /// Column `i`'s name as it is shown.
     fn shown(&self, i: usize) -> Option<&String> {
-        self.shown.as_ref().and_then(|s| s.get(i)).or_else(|| self.cols.get(i))
+        self.names.cols.get(i).and_then(Option::as_ref).or_else(|| self.cols.get(i))
+    }
+
+    /// Its columns' names now, as its column alias list writes them.
+    fn now(&self) -> Vec<String> {
+        if self.names.now.is_empty() { self.cols.clone() } else { self.names.now.clone() }
     }
 }
 
-/// A rename a view's (or materialized view's) query is written again for, before it is made (Postgres's views
-/// read their relations by oid and their columns by number, so they follow a rename): relation `table` (its stored
-/// name) now `to_table`, its column `col.0` now `col.1`.
+/// What a range-table entry is, for when its column alias list is written: a table's or a view's only where a name
+/// differs from its column's, a function's always, a subquery's (a VALUES list's, a WITH query's) where one was
+/// written or a name differs, a join's (one with an alias) where a name differs from its side's.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Kind {
+    Rel,
+    Func,
+    #[default]
+    Other,
+    Join,
+}
+
+/// A join's two sides (their entries), and where each of its columns comes from on each (a USING column from both).
+#[derive(Clone, Debug)]
+struct Sides {
+    left: usize,
+    right: usize,
+    l: Vec<Option<usize>>,
+    r: Vec<Option<usize>>,
+}
+
+/// The names an entry's columns are shown by, as ruleutils.c's deparse_columns holds them: chosen so that the text
+/// written reads as the same columns again, a column whose name another takes (a USING column's above it, another
+/// of its own, or a column added since the query was written) renamed `c_1`, `c_2`, ... (set_using_names,
+/// set_relation_column_names, set_join_column_names).
+#[derive(Clone, Debug, Default)]
+struct Names {
+    /// each column's name, by its place (None: not chosen yet, or a column dropped since)
+    cols: Vec<Option<String>>,
+    /// the names of the columns it has now, in order, the dropped ones left out and the added ones in: its column
+    /// alias list
+    now: Vec<String>,
+    /// which of `now` were added since the query was written
+    added: Vec<bool>,
+    /// whether its column alias list is written (printaliases)
+    print: bool,
+    /// a join's USING columns' names
+    using: Vec<String>,
+    /// the names of the USING columns of the joins above it, which its columns don't take
+    parent_using: Vec<String>,
+}
+
+/// A change a view's (or materialized view's) query is written again for, before it is made (Postgres's views
+/// read their relations by oid and their columns by number, so they follow it): relation `table` (its stored
+/// name) now `to_table`, its column `col.0` now `col.1`; or (ALTER TABLE ADD, DROP or RENAME COLUMN) its columns
+/// now (`cols`), each with the name it had (None: added), a column it had that isn't among them dropped.
 pub(super) struct Renames {
     pub(super) table: String,
     pub(super) to_table: Option<String>,
     pub(super) col: Option<(String, String)>,
+    pub(super) cols: Option<Vec<(String, Option<String>)>>,
 }
 
 /// What a join's column is: a column of one of its sides, or (a FULL JOIN's merged column) its bare name.
@@ -592,13 +697,11 @@ enum Node<'q> {
         name: String,
         only: bool,
         aliased: bool,
-        cols_given: bool,
     },
     Sub {
         rte: usize,
         q: &'q Select,
         lateral: bool,
-        cols_given: bool,
     },
     Func {
         rte: usize,
@@ -613,7 +716,10 @@ enum Node<'q> {
         on: Option<&'q Expr>,
         using: Vec<String>,
         named: bool,
-        cols_given: bool,
+        /// USING (...) AS x: x
+        using_as: Option<String>,
+        /// NATURAL, of sides with no column in common (which has no condition: ON TRUE)
+        natural: bool,
     },
 }
 
@@ -650,6 +756,247 @@ struct Level<'q> {
 impl Level<'_> {
     fn empty(desc: Option<&[String]>, visible: bool) -> Self {
         Level { rtes: vec![], from: vec![], prefix: true, out: vec![], desc: desc.map(<[String]>::to_vec), visible }
+    }
+}
+
+// ---------------------------------------------------------------- the names of columns
+
+/// The names each entry of `lv` shows its columns by (set_deparse_for_query): the USING columns' first, from the top
+/// of each FROM item down, each pushed down to the columns of the sides it merges; then each entry's others, a join's
+/// after its sides'. Where a USING column of a join without an alias is an expression of its own (a FULL JOIN's),
+/// whose bare name is all that can show it, every USING column's name is unique in the query (has_dangerous_join_using).
+fn name_columns(lv: &mut Level<'_>) {
+    let from = std::mem::take(&mut lv.from);
+    let unique_using = from.iter().any(|n| dangerous(lv, n));
+    let mut global = vec![];
+    for n in &from {
+        using_names(lv, n, unique_using, &mut global);
+    }
+    lv.from = from;
+    for k in 0..lv.rtes.len() {
+        match lv.rtes[k].sides.is_some() {
+            true => join_names(lv, k, &global),
+            false => relation_names(lv, k, &global),
+        }
+    }
+}
+
+/// Whether `n` has a join without an alias whose USING column is an expression of its own (has_dangerous_join_using).
+fn dangerous(lv: &Level<'_>, n: &Node<'_>) -> bool {
+    let Node::Join { rte, left, right, using, named, .. } = n else { return false };
+    (!*named && lv.rtes[*rte].via.iter().take(using.len()).any(|v| *v == Via::Bare))
+        || dangerous(lv, left)
+        || dangerous(lv, right)
+}
+
+/// colname_is_unique: whether `name` is none of the names chosen for the entry's columns so far, nor a USING column's
+/// that has to be unique in the query (`global`), nor one of the joins' above it.
+fn name_free(name: &str, nm: &Names, global: &[String]) -> bool {
+    !nm.cols.iter().flatten().chain(&nm.now).chain(global).chain(&nm.parent_using).any(|c| c == name)
+}
+
+/// make_colname_unique: `name`, else `name_1`, `name_2`, ...
+fn unique_col(name: &str, nm: &Names, global: &[String]) -> String {
+    if name_free(name, nm, global) {
+        return name.to_string();
+    }
+    (1..).map(|i| format!("{name}_{i}")).find(|n| name_free(n, nm, global)).unwrap_or_else(|| name.to_string())
+}
+
+/// The name chosen for join column `i` (of a join of sides `sides`) pushed down to the columns of its sides it is,
+/// which take it.
+fn push_name(lv: &mut Level<'_>, sides: &Sides, i: usize, name: &str) {
+    let at = [(sides.left, sides.l.get(i).copied().flatten()), (sides.right, sides.r.get(i).copied().flatten())];
+    for (k, c) in at {
+        let Some(c) = c else { continue };
+        let cols = &mut lv.rtes[k].names.cols;
+        if cols.len() <= c {
+            cols.resize(c + 1, None);
+        }
+        cols[c] = Some(name.to_string());
+    }
+}
+
+/// set_using_names: the names of `n`'s USING columns, and of its columns pushed down to its sides where it has no
+/// alias (which could show them by another name); `unique_using`: each USING column's name unique in the query,
+/// kept in `global`.
+fn using_names(lv: &mut Level<'_>, n: &Node<'_>, unique_using: bool, global: &mut Vec<String>) {
+    let Node::Join { rte, left, right, using, .. } = n else { return };
+    let k = *rte;
+    let Some(sides) = lv.rtes[k].sides.clone() else { return };
+    if lv.rtes[k].refname.is_none() {
+        let chosen = lv.rtes[k].names.cols.clone();
+        for (i, c) in chosen.iter().enumerate() {
+            if let Some(c) = c {
+                push_name(lv, &sides, i, c);
+            }
+        }
+    }
+    let mut parent = lv.rtes[k].names.parent_using.clone();
+    if lv.rtes[k].names.cols.len() < using.len() {
+        lv.rtes[k].names.cols.resize(using.len(), None);
+    }
+    for (i, u) in using.iter().enumerate() {
+        let name = match lv.rtes[k].names.cols[i].clone() {
+            Some(c) => c,
+            None => {
+                // (an alias list's name for it first)
+                let e = &lv.rtes[k];
+                let c = unique_col(e.aliases.get(i).unwrap_or(u), &e.names, global);
+                if unique_using {
+                    global.push(c.clone());
+                }
+                lv.rtes[k].names.cols[i] = Some(c.clone());
+                c
+            }
+        };
+        lv.rtes[k].names.using.push(name.clone());
+        parent.push(name.clone());
+        push_name(lv, &sides, i, &name);
+    }
+    lv.rtes[sides.left].names.parent_using.clone_from(&parent);
+    lv.rtes[sides.right].names.parent_using = parent;
+    using_names(lv, left, unique_using, global);
+    using_names(lv, right, unique_using, global);
+}
+
+/// set_relation_column_names: entry `k`'s columns' names (an alias list's, else each column's own as it is now),
+/// each made unique; the columns added since the text was written after the others.
+fn relation_names(lv: &mut Level<'_>, k: usize, global: &[String]) {
+    let e = &lv.rtes[k];
+    let real: Vec<Option<String>> =
+        if e.real.is_empty() { e.cols.iter().cloned().map(Some).collect() } else { e.real.clone() };
+    let (old, aliases, kind) = (e.cols.len(), e.aliases.clone(), e.kind);
+    let mut nm = std::mem::take(&mut lv.rtes[k].names);
+    if nm.cols.len() < real.len() {
+        nm.cols.resize(real.len(), None);
+    }
+    let mut changed = false;
+    for (i, now) in real.iter().enumerate() {
+        // (a column dropped since has none)
+        let Some(now) = now else { continue };
+        let name = match nm.cols[i].clone() {
+            Some(c) => c,
+            None => {
+                let c = unique_col(aliases.get(i).unwrap_or(now), &nm, global);
+                nm.cols[i] = Some(c.clone());
+                c
+            }
+        };
+        changed |= name != *now;
+        nm.now.push(name);
+        nm.added.push(i >= old);
+    }
+    nm.print = match kind {
+        Kind::Rel | Kind::Join => changed,
+        Kind::Func => true,
+        Kind::Other => !aliases.is_empty() || changed,
+    };
+    lv.rtes[k].names = nm;
+}
+
+/// set_join_column_names: join `k`'s columns' names (where it has no alias, its sides' as they show them), then the
+/// names of the columns it has now, in the order a join of its sides as they are now has them (the USING columns,
+/// the left side's others, the right's), the columns added below it made unique.
+fn join_names(lv: &mut Level<'_>, k: usize, global: &[String]) {
+    let Some(sides) = lv.rtes[k].sides.clone() else { return };
+    let (left, right) = (lv.rtes[sides.left].names.clone(), lv.rtes[sides.right].names.clone());
+    let named = lv.rtes[k].refname.is_some();
+    let (old, aliases) = (lv.rtes[k].cols.len(), lv.rtes[k].aliases.clone());
+    let mut nm = std::mem::take(&mut lv.rtes[k].names);
+    if nm.cols.len() < old {
+        nm.cols.resize(old, None);
+    }
+    let mut changed = false;
+    for i in nm.using.len()..old {
+        let child = match (sides.l[i], sides.r[i]) {
+            (Some(li), _) => left.cols.get(li).cloned().flatten(),
+            (None, Some(ri)) => right.cols.get(ri).cloned().flatten(),
+            _ => None,
+        };
+        // (a column dropped below has none)
+        let Some(child) = child else {
+            nm.cols[i] = None;
+            continue;
+        };
+        if !named {
+            nm.cols[i] = Some(child);
+            continue;
+        }
+        let name = match nm.cols[i].clone() {
+            Some(c) => c,
+            None => {
+                let c = unique_col(aliases.get(i).unwrap_or(&child), &nm, global);
+                nm.cols[i] = Some(c.clone());
+                c
+            }
+        };
+        changed |= name != child;
+    }
+    // the USING columns first, then each side's others: those it had by the names chosen for them, those added below
+    // by their sides' names, made unique
+    let mut i = 0;
+    let (mut lmerged, mut rmerged) = (vec![], vec![]);
+    while i < old {
+        let (Some(li), Some(ri)) = (sides.l[i], sides.r[i]) else { break };
+        nm.now.push(nm.cols[i].clone().unwrap_or_default());
+        nm.added.push(false);
+        lmerged.push(li);
+        rmerged.push(ri);
+        i += 1;
+    }
+    for (child, merged) in [(&left, &lmerged), (&right, &rmerged)] {
+        let mut ic = 0;
+        for (jc, child_name) in child.now.iter().enumerate() {
+            let added = child.added.get(jc).copied().unwrap_or(false);
+            if added {
+                let name = match named {
+                    true => unique_col(child_name, &nm, global),
+                    false => child_name.clone(),
+                };
+                changed |= name != *child_name;
+                nm.now.push(name);
+            } else {
+                // (the side's next column it had, past those dropped)
+                while ic < child.cols.len() && child.cols[ic].is_none() {
+                    ic += 1;
+                }
+                let at = ic;
+                ic += 1;
+                if merged.contains(&at) {
+                    continue;
+                }
+                while i < nm.cols.len() && nm.cols[i].is_none() {
+                    i += 1;
+                }
+                nm.now.push(nm.cols.get(i).cloned().flatten().unwrap_or_else(|| child_name.clone()));
+                i += 1;
+            }
+            nm.added.push(added);
+        }
+    }
+    nm.print = named && changed;
+    lv.rtes[k].names = nm;
+}
+
+/// The type of a USING column of columns of types `a` and `b` (select_common_type): `common`'s, a date or timestamp
+/// with a timestamp or timestamptz taking the later's.
+fn merged_ty(a: Ty, b: Ty) -> Ty {
+    let rank = |t: Ty| match t.t {
+        Type::Date => 1,
+        Type::Timestamp => 2,
+        Type::TimestampTz => 3,
+        _ => 0,
+    };
+    match (rank(a), rank(b)) {
+        (x, y) if x > 0 && y > 0 && x != y => {
+            if y > x {
+                b
+            } else {
+                a
+            }
+        }
+        _ => common([Some(a), Some(b)].into_iter()).unwrap_or(a),
     }
 }
 
@@ -837,12 +1184,25 @@ struct Dp<'q> {
     synthetic: Vec<String>,
     /// the aliases this writing makes up so (a relation not aliased shown by another name than its own)
     made_up: Vec<String>,
+    /// the query is written to be kept as the view's definition, to be read again (see `bound_text`): a relation
+    /// shown by its own name takes no name an alias in it has (`taken`), where Postgres's query, which reads it by
+    /// oid, would show the alias by another (`tt1 a2_1`); so the alias stays as it was written, and is shown as
+    /// Postgres shows it when the definition is (see `unique_own`)
+    storing: bool,
+    taken: Vec<String>,
+    /// a column's name finds it only where nothing else of that name is there to find (see `kept_text`): a name
+    /// that two FROM items' columns have, or two of one item's, finds none, as it is ambiguous when read again
+    strict: bool,
     /// how many levels outside the query are its context's, not queries of its own (a function's parameters, see
     /// `function_body`): a query among them qualifies its columns only where it reads more than one relation
     base: usize,
     /// the view's WITH RECURSIVE queries: name, its column list as written (if one is), and its query as Postgres
     /// keeps it (its two parts put back together: `base UNION [ALL] step`)
     ctes: &'q [(String, Vec<String>, Select)],
+    /// writing the query to be kept as a view's definition (see `bound_text`, `renamed_text`), not to be shown: a
+    /// call of a function's rows of a table keeps the column aliases it was written with, none made of the table's
+    /// columns now, which a column dropped later would leave too many of
+    stored: bool,
 }
 
 impl<'q> Dp<'q> {
@@ -859,8 +1219,12 @@ impl<'q> Dp<'q> {
             renames: None,
             synthetic: vec![],
             made_up: vec![],
+            storing: false,
+            taken: vec![],
+            strict: false,
             base: 0,
             ctes: &[],
+            stored: false,
         }
     }
 
@@ -1280,13 +1644,13 @@ impl<'q> Dp<'q> {
         if let Some(first) = &q.from {
             let mut cur = self.node(&mut lv, first)?;
             for j in &q.joins {
-                if j.kind == JoinKind::Cross {
-                    // (a comma: another FROM item)
+                if j.comma {
+                    // (a comma: another FROM item; CROSS JOIN is a join)
                     lv.from.push(cur);
                     cur = self.node(&mut lv, &j.src)?;
                 } else {
                     let right = self.node(&mut lv, &j.src)?;
-                    cur = self.join(&mut lv, cur, right, j.kind, j.on.as_ref(), &j.using, j.natural)?;
+                    cur = self.join(&mut lv, cur, right, j)?;
                 }
             }
             lv.from.push(cur);
@@ -1295,17 +1659,30 @@ impl<'q> Dp<'q> {
             0 => !self.levels.is_empty() || lv.rtes.len() != 1,
             b => self.levels.len() > b || lv.rtes.len() > 1,
         };
+        name_columns(&mut lv);
         Some(lv)
     }
 
     /// A name for an entry unique among those of the queries being written and of this one so far: `base`, else
     /// `base_1`, `base_2`, ...
     fn unique(&self, lv: &Level<'q>, base: &str) -> String {
+        self.unique_among(lv, base, &[])
+    }
+
+    /// `unique`, for a relation shown by its own name: where the query is written to be kept, unique among the
+    /// aliases written in it too (see `storing`), so that none of them hides it when the text is read again.
+    fn unique_own(&self, lv: &Level<'q>, base: &str) -> String {
+        self.unique_among(lv, base, if self.storing { &self.taken } else { &[] })
+    }
+
+    fn unique_among(&self, lv: &Level<'q>, base: &str, also: &[String]) -> String {
         let taken = |n: &str| {
-            lv.rtes
-                .iter()
-                .chain(self.levels.iter().flat_map(|l| l.rtes.iter()))
-                .any(|r| r.refname.as_deref() == Some(n))
+            also.iter().any(|a| a == n)
+                || lv
+                    .rtes
+                    .iter()
+                    .chain(self.levels.iter().flat_map(|l| l.rtes.iter()))
+                    .any(|r| r.refname.as_deref() == Some(n))
         };
         if !taken(base) {
             return base.into();
@@ -1323,7 +1700,15 @@ impl<'q> Dp<'q> {
     ) -> usize {
         let refname = Some(self.unique(lv, written));
         let n = cols.len();
-        lv.rtes.push(Rte { written: written.into(), refname, cols, types, via: vec![Via::Own; n], rel, shown: None });
+        lv.rtes.push(Rte {
+            written: written.into(),
+            refname,
+            cols,
+            types,
+            via: vec![Via::Own; n],
+            rel,
+            ..Rte::default()
+        });
         lv.rtes.len() - 1
     }
 
@@ -1346,13 +1731,7 @@ impl<'q> Dp<'q> {
             }
             let types = cols.iter().map(|c| c.1).collect();
             let rte = self.add_rte(lv, &src.alias, names, types, None);
-            return Some(Node::Rel {
-                rte,
-                name: name.to_string(),
-                only: false,
-                aliased: src.alias != name,
-                cols_given: false,
-            });
+            return Some(Node::Rel { rte, name: name.to_string(), only: false, aliased: src.alias != name });
         }
         if src.cte != 0
             || src.rec.is_some()
@@ -1368,10 +1747,10 @@ impl<'q> Dp<'q> {
             let mut cur = self.node(lv, g.from.as_ref()?)?;
             for j in &g.joins {
                 let right = self.node(lv, &j.src)?;
-                cur = self.join(lv, cur, right, j.kind, j.on.as_ref(), &j.using, j.natural)?;
+                cur = self.join(lv, cur, right, j)?;
             }
             if src.alias != GROUP {
-                let Node::Join { rte, named, cols_given, .. } = &mut cur else { return None };
+                let Node::Join { rte, named, .. } = &mut cur else { return None };
                 let refname = self.unique(lv, &src.alias);
                 let r = &mut lv.rtes[*rte];
                 r.written = src.alias.clone();
@@ -1379,8 +1758,8 @@ impl<'q> Dp<'q> {
                 for (c, n) in r.cols.iter_mut().zip(&src.names) {
                     *c = n.clone();
                 }
+                r.aliases = src.names.clone();
                 *named = true;
-                *cols_given = !src.names.is_empty();
             }
             return Some(cur);
         }
@@ -1404,6 +1783,7 @@ impl<'q> Dp<'q> {
                 let names = if src.names.is_empty() { vec![alias.clone()] } else { src.names.clone() };
                 let types = vec![ty; names.len()];
                 let rte = self.add_rte(lv, &src.alias, names, types, None);
+                lv.rtes[rte].kind = Kind::Func;
                 return Some(Node::Func { rte, name: c.name.clone(), args: &c.args });
             }
             let cols = self.out_cols(sub)?;
@@ -1415,12 +1795,32 @@ impl<'q> Dp<'q> {
             // a subquery without an alias is shown as Postgres names it: unnamed_subquery, then _1, _2, ...
             let base = if src.alias == "subquery" { "unnamed_subquery" } else { src.alias.as_str() };
             let rte = self.add_rte(lv, base, names, types, None);
-            return Some(Node::Sub { rte, q: sub, lateral: src.lateral, cols_given: !src.names.is_empty() });
+            lv.rtes[rte].aliases = src.names.clone();
+            return Some(Node::Sub { rte, q: sub, lateral: src.lateral });
         }
         if let Some(f) = src.srf.as_deref() {
             let (name, args) = (&f.0, &f.1[..]);
             if name.contains(COLDEFS) {
                 return None;
+            }
+            // a function's rows of a table (RETURNS SETOF t), shown: the table's columns now, as Postgres names those
+            // of a function's composite result (`tt14f() t(f1, f3, f4)`); kept (`stored`), as it was written
+            if !self.stored
+                && let Some(table) = with_path_view(|v| functions::rows_of_call(v, name, args.len())).flatten()
+                && let Some(r) = self.rels.iter().find(|r| r.name == table)
+            {
+                let mut names: Vec<String> = r.columns.iter().map(|c| c.0.clone()).collect();
+                for (c, n) in names.iter_mut().zip(&src.names) {
+                    *c = n.clone();
+                }
+                let types = r
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| Ty::with(c.1, r.typmods.get(i).copied().unwrap_or((0, -1))))
+                    .collect();
+                let rte = self.add_rte(lv, &src.alias, names, types, None);
+                return Some(Node::Func { rte, name: name.clone(), args });
             }
             let bare = rel_part(written(name));
             let mut names: Vec<String> = match bare {
@@ -1450,23 +1850,18 @@ impl<'q> Dp<'q> {
             };
             let types = vec![first; names.len()];
             let rte = self.add_rte(lv, &src.alias, names, types, None);
+            lv.rtes[rte].kind = Kind::Func;
+            lv.rtes[rte].aliases = src.names.clone();
             return Some(Node::Func { rte, name: name.clone(), args });
         }
         let r = self.rels.iter().find(|r| r.name == src.table)?;
         if !matches!(r.kind, 'r' | 'p' | 'v' | 'm' | 'f') {
             return None;
         }
+        // (its columns as the text names them: an alias list's names, then the relation's)
         let mut names: Vec<String> = r.columns.iter().map(|c| c.0.clone()).collect();
         for (c, n) in names.iter_mut().zip(&src.names) {
             *c = n.clone();
-        }
-        // (a column past the aliases with a name one of them took is made unique, as set_relation_column_names
-        // makes it: `c_1`)
-        for i in src.names.len()..names.len() {
-            if names[..i].contains(&names[i]) {
-                let base = names[i].clone();
-                names[i] = (1..).map(|k| format!("{base}_{k}")).find(|n| !names.contains(n)).unwrap_or(base);
-            }
         }
         let types = r
             .columns
@@ -1478,105 +1873,110 @@ impl<'q> Dp<'q> {
         // (an alias a rename made up is none: the relation is shown by its own name, made unique)
         let synthetic = self.synthetic.contains(&src.alias);
         let aliased = src.alias != rel_part(&src.table) && !synthetic;
-        if synthetic {
-            // (the name it was given a moment ago, by its alias, isn't one taken)
-            lv.rtes[rte].refname = None;
-            let refname = self.unique(lv, rel_part(&r.name));
-            lv.rtes[rte].refname = Some(refname);
-        }
-        // (the relation renamed: shown by its new name, and by the new name of a column renamed that no alias
-        // names)
+        // (the relation changed: shown by its new name, its columns by theirs, those dropped gone and those added
+        // after the others)
         let mut name = r.name.clone();
+        let mut real: Vec<Option<String>> = r.columns.iter().map(|c| Some(c.0.clone())).collect();
         if let Some(rn) = self.renames.filter(|rn| rn.table == r.name) {
             if let Some((a, b)) = &rn.col {
-                let mut shown = lv.rtes[rte].cols.clone();
-                for (i, c) in shown.iter_mut().enumerate().skip(src.names.len()) {
-                    if r.columns.get(i).is_some_and(|x| x.0 == *a) {
-                        *c = b.clone();
-                    }
+                for c in real.iter_mut().flatten().filter(|c| *c == a) {
+                    c.clone_from(b);
                 }
-                lv.rtes[rte].shown = Some(shown);
+            }
+            if let Some(now) = &rn.cols {
+                let was = |o: &String| now.iter().find(|(_, w)| w.as_ref() == Some(o)).map(|(n, _)| n.clone());
+                real = r.columns.iter().map(|c| was(&c.0)).collect();
+                real.extend(now.iter().filter(|(_, w)| w.is_none()).map(|(n, _)| Some(n.clone())));
             }
             if let Some(to) = &rn.to_table {
                 name = to.clone();
-                if !aliased {
-                    lv.rtes[rte].refname = None;
-                    let refname = self.unique(lv, rel_part(to));
-                    lv.rtes[rte].refname = Some(refname);
-                }
             }
         }
-        Some(Node::Rel { rte, name, only: src.only, aliased, cols_given: !src.names.is_empty() })
+        if !aliased {
+            // (the name it was given a moment ago, by what the text calls it, isn't one taken)
+            lv.rtes[rte].refname = None;
+            let refname = self.unique_own(lv, rel_part(&name));
+            lv.rtes[rte].refname = Some(refname);
+        }
+        let e = &mut lv.rtes[rte];
+        e.kind = Kind::Rel;
+        e.real = real;
+        e.aliases = src.names.clone();
+        Some(Node::Rel { rte, name, only: src.only, aliased })
     }
 
-    /// A join of `left` and `right`, and its entry: USING's columns first (the left side's, the right's for a RIGHT
-    /// JOIN, a FULL JOIN's merged), then each side's others.
-    #[allow(clippy::too_many_arguments)]
-    fn join(
-        &mut self,
-        lv: &mut Level<'q>,
-        left: Node<'q>,
-        right: Node<'q>,
-        kind: JoinKind,
-        on: Option<&'q Expr>,
-        using: &[String],
-        natural: bool,
-    ) -> Option<Node<'q>> {
-        let (mut left, mut right) = (left, right);
+    /// Join `j` of `left` and `right`, and its entry: USING's columns first (the left side's, the right's for a
+    /// RIGHT JOIN, a FULL JOIN's merged), then each side's others.
+    fn join(&mut self, lv: &mut Level<'q>, left: Node<'q>, right: Node<'q>, j: &'q Join) -> Option<Node<'q>> {
         let (lr, rr) = (left.rte(), right.rte());
         let (lcols, rcols) = (lv.rtes[lr].cols.clone(), lv.rtes[rr].cols.clone());
-        let using: Vec<String> = match natural {
+        let using: Vec<String> = match j.natural {
             true => lcols.iter().filter(|c| rcols.contains(c)).cloned().collect(),
-            false => using.to_vec(),
+            false => j.using.clone(),
         };
         let (mut cols, mut types, mut via) = (vec![], vec![], vec![]);
+        let (mut l, mut r) = (vec![], vec![]);
         for u in &using {
             let li = lcols.iter().position(|c| c == u)?;
             let ri = rcols.iter().position(|c| c == u)?;
-            // (a column renamed that USING names keeps the name USING gives it: its relation is shown with the
-            // names its columns had as an alias list, `tt3 tt3(ax, b, c)`, as Postgres's set_relation_column_names
-            // gives a renamed column its old name back)
-            for (side, node, at) in [(lr, &mut left, li), (rr, &mut right, ri)] {
-                if lv.rtes[side].shown(at) != Some(u) {
-                    let Node::Rel { cols_given, .. } = node else { return None };
-                    lv.rtes[side].shown = None;
-                    *cols_given = true;
-                }
+            // (strict: a USING column a side has two of is ambiguous)
+            let once = |cs: &[String]| cs.iter().filter(|c| *c == u).count() == 1;
+            if self.strict && !(once(&lcols) && once(&rcols)) {
+                return None;
             }
             cols.push(u.clone());
             let (lt, rt) = (lv.rtes[lr].types[li], lv.rtes[rr].types[ri]);
-            let both = common([Some(lt), Some(rt)].into_iter()).unwrap_or(lt);
+            let both = merged_ty(lt, rt);
             types.push(both);
-            // (an inner join's merged column is the side that needs no cast to their common type, the left where
-            // neither does: buildMergedJoinVar)
-            via.push(match kind {
+            // (the merged column is a side's own column where that side needs no cast to their common type, the
+            // left where neither does for an inner join: buildMergedJoinVar; else, as a FULL JOIN's, an
+            // expression of its own, shown by its bare name)
+            via.push(match j.kind {
                 JoinKind::Full => Via::Bare,
-                JoinKind::Right => Via::Col(rr, ri),
-                JoinKind::Inner if lt != both && rt == both => Via::Col(rr, ri),
-                _ => Via::Col(lr, li),
+                JoinKind::Right if rt == both => Via::Col(rr, ri),
+                JoinKind::Left if lt == both => Via::Col(lr, li),
+                JoinKind::Inner | JoinKind::Cross if lt == both => Via::Col(lr, li),
+                JoinKind::Inner | JoinKind::Cross if rt == both => Via::Col(rr, ri),
+                _ => Via::Bare,
             });
+            l.push(Some(li));
+            r.push(Some(ri));
         }
-        for (side, names) in [(lr, &lcols), (rr, &rcols)] {
+        for (side, names, is_left) in [(lr, &lcols, true), (rr, &rcols, false)] {
             for (i, c) in names.iter().enumerate() {
                 if !using.contains(c) {
                     cols.push(c.clone());
                     types.push(lv.rtes[side].types[i]);
                     via.push(Via::Col(side, i));
+                    l.push(is_left.then_some(i));
+                    r.push((!is_left).then_some(i));
                 }
             }
         }
-        lv.rtes.push(Rte { written: String::new(), refname: None, cols, types, via, rel: None, shown: None });
+        lv.rtes.push(Rte {
+            cols,
+            types,
+            via,
+            kind: Kind::Join,
+            sides: Some(Box::new(Sides { left: lr, right: rr, l, r })),
+            ..Rte::default()
+        });
         let rte = lv.rtes.len() - 1;
-        let kind = if kind == JoinKind::Inner && on.is_none() && using.is_empty() { JoinKind::Cross } else { kind };
+        let natural = j.natural && using.is_empty();
+        let kind = match j.kind {
+            JoinKind::Inner if j.on.is_none() && using.is_empty() => JoinKind::Cross,
+            k => k,
+        };
         Some(Node::Join {
             rte,
             kind,
             left: Box::new(left),
             right: Box::new(right),
-            on,
+            on: j.on.as_ref(),
             using,
             named: false,
-            cols_given: false,
+            using_as: j.using_as.clone(),
+            natural,
         })
     }
 
@@ -1634,15 +2034,30 @@ impl<'q> Dp<'q> {
                         (r.refname.is_some() && r.written == t).then_some((ri, ci))
                     });
                     if let Some((ri, ci)) = at {
+                        // (strict: `j.c` of a join with two columns c is ambiguous)
+                        if self.strict && lv.rtes[ri].cols.iter().filter(|c| *c == name).count() > 1 {
+                            return None;
+                        }
                         return Some((up, ri, ci));
                     }
                 }
                 None => {
+                    let mut found = None;
                     for node in &lv.from {
                         let ri = node.rte();
-                        if let Some(ci) = lv.rtes[ri].cols.iter().position(|c| c == name) {
-                            return Some((up, ri, ci));
+                        for (ci, _) in lv.rtes[ri].cols.iter().enumerate().filter(|(_, c)| *c == name) {
+                            if !self.strict {
+                                return Some((up, ri, ci));
+                            }
+                            // (strict: a name two columns have is ambiguous)
+                            if found.is_some() {
+                                return None;
+                            }
+                            found = Some((up, ri, ci));
                         }
+                    }
+                    if found.is_some() {
+                        return found;
                     }
                 }
             }
@@ -1805,9 +2220,9 @@ impl<'q> Dp<'q> {
         Some(())
     }
 
-    /// An entry's column alias list, `(a, b, c)`.
+    /// An entry's column alias list, `(a, b, c)`: the names of the columns it has now (get_column_alias_list).
     fn col_list(&mut self, rte: usize) -> Option<()> {
-        let cols = self.levels.last()?.rtes.get(rte)?.cols.clone();
+        let cols = self.levels.last()?.rtes.get(rte)?.now();
         self.buf.push('(');
         self.buf.push_str(&cols.iter().map(|c| quoted(c)).collect::<Vec<_>>().join(", "));
         self.buf.push(')');
@@ -1818,28 +2233,42 @@ impl<'q> Dp<'q> {
         self.levels.last()?.rtes.get(rte)?.refname.clone()
     }
 
+    /// Whether entries `l` and `r` have columns of one name, as they are now.
+    fn in_common(&self, l: usize, r: usize) -> bool {
+        let Some(lv) = self.levels.last() else { return false };
+        let (Some(a), Some(b)) = (lv.rtes.get(l), lv.rtes.get(r)) else { return false };
+        let right = b.now();
+        a.now().iter().any(|c| right.contains(c))
+    }
+
+    /// Whether an entry's column alias list is written (see `Names::print`).
+    fn aliases_shown(&self, rte: usize) -> bool {
+        self.levels.last().and_then(|l| l.rtes.get(rte)).is_some_and(|r| r.names.print)
+    }
+
     /// get_from_clause_item.
     #[allow(clippy::wrong_self_convention)]
     fn from_item(&mut self, node: &Node<'q>) -> Option<()> {
         match node {
-            Node::Rel { rte, name, only, aliased, cols_given } => {
+            Node::Rel { rte, name, only, aliased } => {
                 if *only {
                     self.buf.push_str("ONLY ");
                 }
                 self.buf.push_str(&rel_text(name));
                 let refname = self.refname(*rte)?;
-                if !*aliased && !*cols_given && refname != rel_part(name) {
+                let listed = self.aliases_shown(*rte);
+                if !*aliased && refname != rel_part(name) {
                     self.made_up.push(refname.clone());
                 }
-                if *aliased || *cols_given || refname != rel_part(name) {
+                if *aliased || listed || refname != rel_part(name) {
                     self.buf.push(' ');
                     self.buf.push_str(&quoted(&refname));
                 }
-                if *cols_given {
+                if listed {
                     self.col_list(*rte)?;
                 }
             }
-            Node::Sub { rte, q, lateral, cols_given } => {
+            Node::Sub { rte, q, lateral } => {
                 if *lateral {
                     self.buf.push_str("LATERAL ");
                 }
@@ -1850,7 +2279,7 @@ impl<'q> Dp<'q> {
                 let refname = self.refname(*rte)?;
                 self.buf.push(' ');
                 self.buf.push_str(&quoted(&refname));
-                if *cols_given {
+                if self.aliases_shown(*rte) {
                     self.col_list(*rte)?;
                 }
             }
@@ -1873,7 +2302,7 @@ impl<'q> Dp<'q> {
                 self.buf.push_str(&quoted(&refname));
                 self.col_list(*rte)?;
             }
-            Node::Join { rte, kind, left, right, on, using, named, cols_given } => {
+            Node::Join { rte, kind, left, right, on, using, named, using_as, natural } => {
                 let paren = self.paren;
                 let right_simple = matches!(**right, Node::Rel { .. } | Node::Sub { .. } | Node::Func { .. })
                     || matches!(**right, Node::Join { named: true, .. });
@@ -1882,9 +2311,17 @@ impl<'q> Dp<'q> {
                     self.buf.push('(');
                 }
                 self.from_item(left)?;
+                // (an outer join that has no condition, a NATURAL one of sides with no column in common, is ON TRUE;
+                // kept, it stays NATURAL, which ON TRUE read again isn't (that is `ON true`), unless the sides now
+                // have a column in common)
+                let outer = !matches!(kind, JoinKind::Inner | JoinKind::Cross);
+                let kept_natural = self.storing && *natural && outer && !self.in_common(left.rte(), right.rte());
                 let word = match kind {
                     JoinKind::Inner => " JOIN ",
                     JoinKind::Cross => " CROSS JOIN ",
+                    JoinKind::Left if kept_natural => " NATURAL LEFT JOIN ",
+                    JoinKind::Right if kept_natural => " NATURAL RIGHT JOIN ",
+                    JoinKind::Full if kept_natural => " NATURAL FULL JOIN ",
                     JoinKind::Left => " LEFT JOIN ",
                     JoinKind::Right => " RIGHT JOIN ",
                     JoinKind::Full => " FULL JOIN ",
@@ -1898,9 +2335,16 @@ impl<'q> Dp<'q> {
                     self.buf.push(')');
                 }
                 if !using.is_empty() {
+                    // (by the names chosen for them)
+                    let shown = self.levels.last()?.rtes.get(*rte)?.names.using.clone();
+                    let names = if shown.len() == using.len() { &shown } else { using };
                     self.buf.push_str(" USING (");
-                    self.buf.push_str(&using.iter().map(|c| quoted(c)).collect::<Vec<_>>().join(", "));
+                    self.buf.push_str(&names.iter().map(|c| quoted(c)).collect::<Vec<_>>().join(", "));
                     self.buf.push(')');
+                    if let Some(x) = using_as {
+                        self.buf.push_str(" AS ");
+                        self.buf.push_str(&quoted(x));
+                    }
                 } else if let Some(e) = on {
                     self.buf.push_str(" ON ");
                     if !paren {
@@ -1910,7 +2354,7 @@ impl<'q> Dp<'q> {
                     if !paren {
                         self.buf.push(')');
                     }
-                } else if !matches!(kind, JoinKind::Inner | JoinKind::Cross) {
+                } else if outer && !kept_natural {
                     self.buf.push_str(" ON TRUE");
                 }
                 if !paren || *named {
@@ -1920,7 +2364,7 @@ impl<'q> Dp<'q> {
                     let refname = self.refname(*rte)?;
                     self.buf.push(' ');
                     self.buf.push_str(&quoted(&refname));
-                    if *cols_given {
+                    if self.aliases_shown(*rte) {
                         self.col_list(*rte)?;
                     }
                 }

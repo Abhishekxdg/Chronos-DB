@@ -32,7 +32,7 @@ result = tools.run_tool(db, call.name, call.input)   # send `result` back as the
 [`parallel.ts`](parallel.ts) runs 20 agents that each fork, upvote two shared tasks and merge. Agents that collide get a conflict and redo their work on a fresh fork, so no vote is lost:
 
 ```
-chronos serve demo-db &
+CHRONOS_PROTECT_MAIN=off chronos serve demo-db &   # the example seeds main directly
 CHRONOS_URL=http://127.0.0.1:7070 node parallel.ts
 # 20 agents, 42 retries after conflicts, 90 ms
 # votes recorded: 40 (expected 40: no update lost)

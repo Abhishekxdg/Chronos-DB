@@ -35,8 +35,15 @@ addressed by table and id. Workflow: call describe to learn the tables and field
 branch from main before changing anything (instant, no copying); make changes on your branch; \
 check them with diff; then merge to publish or discard to throw them away. Your work isn't live \
 until it's merged, so when the diff is right, call merge yourself instead of handing the branch to \
-a person. Reads and writes take a branch argument (default main). If merge reports conflicts, decide \
-which side wins and call merge again with resolve set to ours or theirs. A merge policy may hold \
+a person. Reads and writes take a branch argument (default main). If merge reports conflicts (rows \
+both your branch and its parent changed), nothing merged, and calling merge the same way again fails \
+the same way. Settle them, safest first: merge_preview shows each row's fork-point, parent and branch \
+versions and the columns each side changed; by_columns=true combines rows where the two sides changed \
+different columns; by_columns=true with resolve=\"ours\" or \"theirs\" picks that side only for the \
+columns both changed, keeping the other side's other columns; rows settles single rows (\"ours\", \
+\"theirs\", \"delete\" or the row to keep). resolve without by_columns takes whole rows, overwriting the \
+parent's changes to columns you never touched: use it only when that is what you mean. A long task can \
+rebase to settle conflicts as they come. A merge policy may hold \
 your merge for a person: if merge says it needs a person's review, it is queued, not lost: stop, \
 and tell the person the branch and the reasons. Merge policies are the rules under which agents' \
 merges go through without a person (merge_policies lists them, check_merge_policy tries rules on a \
@@ -140,7 +147,8 @@ impl Guard {
             // run as SQL in a session acting as the agent: checked statement by statement
             "sql" | "undo_merge" | "checkpoint" | "rollback" => Ok(()),
             "simulate" | "replay" => Ok(()), // checked as they run; the worlds are its own
-            "merge_preview" => me.may_read(branch),
+            "merge_preview" | "diff" | "history" | "check_reads" | "review" => me.may_see_changes(branch),
+            "reviews" | "audit" => me.may_list_all(name),
             _ => me.may_read(branch),
         };
         r.map_err(|e| e.to_string())?;
@@ -213,7 +221,7 @@ impl Guard {
 
 /// MCP's Streamable HTTP transport, as `chronos serve` answers `POST /mcp`: one JSON-RPC message per request, its
 /// reply as the response's JSON body (no event stream). The caller is `agent`, the agent whose token came with the
-/// request (the guest under `--safe`), as with `chronos mcp --agent`; so a client needs only that token, never the
+/// request (the guest for a client the server's token let in), as with `chronos mcp --agent`; so a client needs only that token, never the
 /// folder. Nothing carries over between requests, as nothing does between stdio's calls (each `sql` call is a
 /// session of its own). Returns the status and the reply: none (202) for a notification or a client's response.
 pub fn http(db: &std::sync::Arc<chronos::Db>, agent: &str, body: &[u8]) -> (u16, Option<Value>) {
@@ -343,7 +351,10 @@ fn call(sh: &mut Shell, g: &mut Guard, name: &str, a: &Value) -> Result<String, 
             let limited = |t: &str| {
                 chronos::sql::row_security_possible(&db)
                     && match me {
-                        Some(ag) => !matches!(chronos::sql::row_security_refuses(&db, ag, &sh.branch, &[t]), Ok(None)),
+                        Some(ag) => {
+                            !matches!(chronos::sql::row_security_refuses(&db, ag, &sh.branch, &[t]), Ok(None))
+                                || !matches!(chronos::sql::tenant_refuses(&db, ag, &sh.branch, &[t]), Ok(None))
+                        }
                         None => masked && !matches!(chronos::sql::masks_refuse(&db, &sh.branch, &[t]), Ok(None)),
                     }
             };
@@ -439,13 +450,16 @@ fn call(sh: &mut Shell, g: &mut Guard, name: &str, a: &Value) -> Result<String, 
                     .map_err(|e| e.to_string())?;
                 let mut lines: Vec<String> = d
                     .iter()
-                    .map(|c| {
+                    .filter_map(|c| {
+                        if let Some(line) = crate::catalog_line(c) {
+                            return line;
+                        }
                         let k = chronos::sql::show_key(&c.key);
-                        match (&c.before, &c.after) {
+                        Some(match (&c.before, &c.after) {
                             (None, Some(a)) => format!("+ {k}  {a}"),
                             (Some(x), Some(y)) => format!("~ {k}  {}", crate::field_diff(x, y)),
                             _ => format!("- {k}"),
-                        }
+                        })
                     })
                     .collect();
                 lines.push(match next {
@@ -550,6 +564,7 @@ fn call(sh: &mut Shell, g: &mut Guard, name: &str, a: &Value) -> Result<String, 
         {
             sh.sql_as(&format!("merge world {}", merge_clauses(word("branch")?, a)?), &[], g.agent.as_deref())
                 .map(no_cursor)
+                .map_err(settle_hint)
         }
         "undo_merge" => {
             let skip = if a.get("skip_changed").and_then(Value::as_bool) == Some(true) { " skip changed" } else { "" };
@@ -574,16 +589,7 @@ fn call(sh: &mut Shell, g: &mut Guard, name: &str, a: &Value) -> Result<String, 
             // goes in as the shell's own (sh.branch), not a word, which a branch named ours,
             // theirs or confirm would turn into the keyword
             word("branch")?;
-            sh.exec(&format!("merge {resolve} {confirm}")).map(no_cursor).map_err(|e| {
-                if !e.contains("nothing was merged") {
-                    return e;
-                }
-                format!(
-                    "{e}\nor, as tool calls: merge with resolve=\"ours\"|\"theirs\"; by_columns=true (only a column both \
-                     changed conflicts); rows={{\"table/id\": \"ours\"|\"theirs\"|\"delete\"|{{row}}}} per row. \
-                     merge_preview shows what a choice would do first"
-                )
-            })
+            sh.exec(&format!("merge {resolve} {confirm}")).map(no_cursor).map_err(settle_hint)
         }
         "discard" => {
             let b = word("branch")?;
@@ -809,6 +815,22 @@ fn sim_text(r: &chronos::Simulated) -> String {
 /// A SQL string literal.
 fn lit(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// A merge's conflict (rows both sides changed, here or in Postgres) with how to settle it as tool calls, safest
+/// first: the SQL error names the shell's commands, and retrying the same call fails the same way.
+fn settle_hint(e: String) -> String {
+    let conflict = e.contains("nothing was merged") && (e.contains("conflict") || e.contains("changed on both sides"));
+    if !conflict && !e.contains("changed in Postgres since") {
+        return e;
+    }
+    format!(
+        "{e}\nAs tool calls, safest first (the same call again fails the same way): merge_preview shows each row's \
+         versions and the columns each side changed; merge with by_columns=true combines rows where the sides changed \
+         different columns, and with resolve=\"ours\"|\"theirs\" too picks that side only for the columns both \
+         changed; rows={{\"table/id\": \"ours\"|\"theirs\"|\"delete\"|{{row}}}} settles single rows. resolve \
+         without by_columns takes whole rows, overwriting the other side's changes to other columns"
+    )
 }
 
 /// `'branch' [into 'w'] [only tables (...)] [only keys (...)] [by columns] [using ours|theirs]
@@ -1069,9 +1091,9 @@ fn tools(hidden: &[&str]) -> Value {
                 "into": { "type": "string", "description": "Merge into this branch instead of the parent; the branch stays" },
                 "only_tables": { "type": "array", "items": { "type": "string" }, "description": "Merge only these tables; the branch stays with the rest" },
                 "only_keys": { "type": "array", "items": { "type": "string" }, "description": "Merge only these rows (\"table/id\"); the branch stays with the rest" },
-                "by_columns": { "type": "boolean", "description": "Rows both sides changed merge column by column; only a column both changed conflicts" },
+                "by_columns": { "type": "boolean", "description": "Rows both sides changed merge column by column; only a column both changed conflicts, unless resolve picks a side for it" },
                 "rows": { "type": "object", "description": "Per-row decisions: {\"table/id\": \"ours\" | \"theirs\" | \"delete\" | {the row to keep}}" },
-                "resolve": { "type": "string", "enum": ["fail", "ours", "theirs"], "description": "On conflict: fail (default), ours (keep this branch's values), theirs (keep the parent's)" },
+                "resolve": { "type": "string", "enum": ["fail", "ours", "theirs"], "description": "On conflict: fail (default), ours (this branch's values), theirs (the parent's). With by_columns, the side wins only the columns both changed; without, it takes whole rows, overwriting the other side's changes to other columns" },
                 "confirm": { "type": "boolean", "description": "After a crash, merge the branch as it is now; check its diff first, since some of its writes may be lost" },
                 "version": { "type": "integer", "description": "Merge only if the branch is still at this version (the one merge_preview or the review showed): what was reviewed is what merges" },
                 "target": { "type": "integer", "description": "With rows settled (resolve, by_columns, rows): the target merge_preview named, so they settle against the parent as the preview saw it (refused if it changed)" },
@@ -1087,9 +1109,9 @@ fn tools(hidden: &[&str]) -> Value {
              when a row the branch read (with check_reads) changed since: redo that work in a new branch.",
             json!({
                 "branch": branch,
-                "by_columns": { "type": "boolean", "description": "Rows both sides changed combine column by column; only a column both changed conflicts" },
+                "by_columns": { "type": "boolean", "description": "Rows both sides changed combine column by column; only a column both changed conflicts, unless resolve picks a side for it" },
                 "rows": { "type": "object", "description": "Per-row decisions: {\"table/id\": \"ours\" | \"theirs\" | \"delete\" | {the row to keep}}" },
-                "resolve": { "type": "string", "enum": ["fail", "ours", "theirs"], "description": "On conflict: fail (default), ours (keep this branch's values), theirs (take the parent's)" },
+                "resolve": { "type": "string", "enum": ["fail", "ours", "theirs"], "description": "On conflict: fail (default), ours (this branch's values), theirs (the parent's). With by_columns, the side wins only the columns both changed; without, it takes whole rows" },
                 "version": { "type": "integer", "description": "Rebase only if the branch is still at this version" },
             }),
             &["branch"],
@@ -1119,8 +1141,8 @@ fn tools(hidden: &[&str]) -> Value {
                 "into": { "type": "string", "description": "Merge into this branch instead of the parent" },
                 "only_tables": { "type": "array", "items": { "type": "string" }, "description": "Merge only these tables" },
                 "only_keys": { "type": "array", "items": { "type": "string" }, "description": "Merge only these rows (\"table/id\")" },
-                "by_columns": { "type": "boolean", "description": "Rows both sides changed merge column by column; only a column both changed conflicts" },
-                "resolve": { "type": "string", "enum": ["fail", "ours", "theirs"], "description": "What conflicts become" },
+                "by_columns": { "type": "boolean", "description": "Rows both sides changed merge column by column; only a column both changed conflicts, unless resolve picks a side for it" },
+                "resolve": { "type": "string", "enum": ["fail", "ours", "theirs"], "description": "What conflicts become: with by_columns, that side for the columns both changed only; without, whole rows" },
                 "rows": { "type": "object", "description": "Per-row decisions: {\"table/id\": \"ours\" | \"theirs\" | \"delete\" | {the row to keep}}" },
                 "limit": { "type": "integer", "description": "Rows to show (default 20)" },
                 "offset": { "type": "integer", "description": "Skip this many rows (for the next page)" },

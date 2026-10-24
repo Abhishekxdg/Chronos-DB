@@ -1,6 +1,6 @@
 //! The same SQL workload over the Postgres protocol against Chronos and Postgres.
 //!
-//!   chronos serve /tmp/sqlbench &               (Postgres protocol on 127.0.0.1:5433)
+//!   CHRONOS_PROTECT_MAIN=off chronos serve /tmp/sqlbench &   # it loads main directly               (Postgres protocol on 127.0.0.1:5433)
 //!   N=10000 cargo run --release --example sql
 //!
 //! Everything goes over TCP. CHRONOS and PG override the connection strings; PG_FULL adds a Postgres

@@ -70,9 +70,15 @@ read is checked against main, Chronos's copy, which a row changed straight in Po
 write-back also reads, for each attached table the world read:
 
 - **rows read by key:** compared with Postgres's as the write-back compares the rows it writes;
-- **ranges, filtered scans (`where email = 'x'`), whole-table reads, lookups through an index, and keys that found
-  no row:** the table is read whole from Postgres (at most 100,000 rows; past that the merge is held for a
-  person), so a row added there that the read would have found counts, an empty result included.
+- **filtered scans (`where org_id = 42 and status = 'open'`), with or without an index:** Postgres is asked only
+  for the rows the conditions can match, now and at the fork, however big the table. Conditions go to Postgres as
+  they compare here: whole numbers on integer and numeric columns, text on text and varchar compared byte by byte,
+  booleans, `IS NULL`. Other conditions are left out of what's asked, so more rows are compared, never fewer;
+- **ranges, whole-table reads, lookups through an expression index, keys that found no row, and filtered scans
+  with no condition Postgres can be asked by:** the table is read whole from Postgres (at most 100,000 rows; past
+  that the merge is held for a person),
+
+so a row added there that the read would have found counts, an empty result included.
 
 Postgres's rows are put in the world's fork point, with the index entries they make, and checked as a read against
 main is. A row the read couldn't have found (another email) doesn't hold the merge. A read that changed holds it as
@@ -113,7 +119,8 @@ create merge check one_lead_per_email on tables (leads) as
   aren't there to check.
 
 Main's rows change only this way: writes to main, `RESTORE` and `UNDO` on main are refused, and no statement may
-change a table's shape (do that in Postgres, then attach again into a new folder).
+change a table's shape here. Change it in Postgres: a refresh takes added columns (below); any other change needs a
+new attach into a new folder.
 
 An agent's merge into main needs a person unless the agent has a [merge policy](merge-policies.md) of its own; a
 person approves by merging the queued world.
@@ -125,16 +132,70 @@ person approves by merging the queued world.
 - Serial and identity columns take their new values from Postgres's own sequence, reserved 1,000 at a time, so an
   id a world gives a row is never given to another by Postgres, and is the id written at merge. The cost is gaps in
   the sequence. An id typed by hand into such a column is refused at merge. The role needs USAGE on the sequence.
-- At most 10,000 changed rows per merge (`MERGE WORLD w ONLY TABLES (...)` merges part of one).
-- Main is as old as the attach for rows no merge touched: a merge only compares the rows it writes. To pick up
-  Postgres's other changes, attach again into a new folder (no refresh yet).
-- A world that reads a table more broadly than 100,000 rows (a range, a filtered scan or a whole-table read of a
-  bigger table) with `check_reads` on can't have that read checked against Postgres: its merge is held for a
-  person, saying so.
-- Triggers stay in Postgres and run as the merge is written. Rows they change in other tables show up as conflicts
-  later, not in main right away.
+- At most 50,000 changed rows per merge by default (`CHRONOS_ATTACH_MAX_ROWS` raises it, to 1,000,000), sent 5,000
+  at a time in the one transaction; each stays locked until it commits. `MERGE WORLD w ONLY TABLES (...)` merges
+  part of one.
+- Rows no merge touched are as old as the last refresh (below). A refresh reads every attached table whole: on big
+  tables, run it from a read replica's URL and not too often.
+- A world that reads a table more broadly than 100,000 rows (a range or a whole-table read of a bigger table, or
+  a filtered scan more than 100,000 of its rows can match) with `check_reads` on can't have that read checked
+  against Postgres: its merge is held for a person, saying so.
+- Triggers stay in Postgres and run as the merge is written. Rows they (or a rule, or a foreign key's `ON DELETE` /
+  `ON UPDATE` action) write or delete in other attached tables come into main with the merge: the write-back counts
+  what its transaction wrote per table (`pg_stat_xact_user_tables`), and the tables written besides the merge's own
+  rows are refreshed alone right after it (read whole, as a refresh reads them). Deferred constraint triggers run
+  before the counts are read (`SET CONSTRAINTS ALL IMMEDIATE`), so a deferred check that fails refuses the merge
+  there rather than at COMMIT. Until that refresh is done the pending record stays, so after a crash recovery does
+  it. With `track_counts` off, they wait for the next refresh.
 - Tested on Neon, both straight to the database and through its pooler (PgBouncer, transaction mode): a merge of
   1,000 rows took about 1.2 s from a machine 60 ms away, mostly round trips ([BENCHMARKS.md §14](https://github.com/Abhishekxdg/chronosdb/blob/main/BENCHMARKS.md#14-attach-writing-merges-back-to-a-managed-postgres-neon)).
+
+## Keeping main up to date (refresh)
+
+```bash
+chronos refresh ./crm                      # once, on a folder no server has open
+chronos serve ./crm --refresh-every 5m     # on a timer, while it serves
+curl -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' localhost:7070/v1/refresh -d '{}'
+```
+
+A refresh reads every attached table in one `REPEATABLE READ, READ ONLY` transaction, under the write-back lock (no
+merge into main runs meanwhile). Each of main's rows is compared with Postgres's as the write-back compares them, and
+rows Postgres has that main hasn't are read whole; main takes the differences in one change. Open worlds see main
+move: a row a world changed that Postgres changed too is a conflict at its merge, settled as any.
+
+- **Columns added in Postgres** (`ALTER TABLE ... ADD COLUMN`, as a migration does) are added to main's table first,
+  with Postgres's type and default; main's rows then take their values in the same refresh, and the column is made
+  `NOT NULL` if Postgres has it. A default worked out per row (`gen_random_uuid()`, `random()`), which Chronos won't
+  fill rows it has with, is set once they have Postgres's values. The refresh lists the columns (`added`). One
+  stopped halfway is redone at the next. Until a refresh has taken them, a merge writing to the table is refused and
+  says to refresh. A column added with a sequence or identity default, or a generated one, isn't taken.
+- Worlds forked before a column was added keep the table as they had it. When one merges, a row it changed keeps the
+  values Postgres holds in the columns it never had, settled `USING OURS` too: it can't have meant to change them.
+  A row it inserts leaves those columns out, so Postgres fills them as it fills its own rows (`now()` is the
+  insert's time), and main takes the row back as Postgres has it.
+- A table whose columns were dropped, renamed or retyped, or whose key or row security changed, is left as it was
+  and named (`skipped`); attach again into a new folder to take the new shape.
+- `POST /v1/attached` says what the folder is attached to, its tables, and `as_of`: how old main's untouched rows
+  may be (the last refresh, else the attach).
+
+## Undoing a merge that reached Postgres
+
+`UNDO MERGE OF WORLD w` (or HTTP `undo_merge`) on a merge into main puts the rows back through Postgres: they go
+back in a world of main, which is merged as any world is, every row locked and compared there. A row changed in
+Postgres since the merge is a conflict, and nothing is written.
+
+## Agents held to one tenant
+
+For an agent working for one of your customers, `create agent run_42 with (tenant = 'org_id = 42', valid_for =
+'1 hour', ...)` (HTTP `create_agent` with `tenant` and `valid_for` in ms):
+
+- in every world it reads and changes only rows of tables with an `org_id` column that hold 42, whatever its role,
+  the table's own row security, or `row_security`; a row it writes must hold 42 before and after;
+- every world it forks is declared that tenant's (`tenant` in its scope), so its merge is held to it too;
+- it sees changes as rows (`DIFF`, a dry run, `CHECK READS`, `history`) only of the worlds it forked, and not `SHOW
+  REVIEWS`, `SHOW AUDIT` or the whole `SHOW HISTORY`; the row API is refused on tables the tenant limits (SQL
+  applies it);
+- its token stops working once `valid_for` has passed.
 
 ## After a crash
 

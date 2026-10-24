@@ -6,8 +6,8 @@
 
 use super::*;
 
-/// What a set of parameters is for: a table (`heap`), its TOAST table (`toast.` ones), or an index of an access
-/// method.
+/// What a set of parameters is for: a table (`heap`), its TOAST table (`toast.` ones), an index of an access
+/// method, or a tablespace (see `tablespace`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Kind {
     Heap,
@@ -18,6 +18,7 @@ pub(super) enum Kind {
     Gin,
     Brin,
     Spgist,
+    Tablespace,
 }
 
 impl Kind {
@@ -49,6 +50,7 @@ const ON_OFF_AUTO: &str = "Valid values are \"on\", \"off\", and \"auto\".";
 const HT: &[Kind] = &[Kind::Heap, Kind::Toast];
 const H: &[Kind] = &[Kind::Heap];
 const MAX: i64 = i32::MAX as i64;
+const TS: &[Kind] = &[Kind::Tablespace];
 
 /// Postgres 16's parameters (reloptions.c), with the kinds each is for.
 const PARAMS: &[(&str, Ty, &[Kind])] = &[
@@ -80,11 +82,36 @@ const PARAMS: &[(&str, Ty, &[Kind])] = &[
     ("autovacuum_analyze_scale_factor", Ty::Real(0.0, 100.0), H),
     ("vacuum_index_cleanup", Ty::Enum(&["auto", "on", "off", "true", "false", "yes", "no", "1", "0"], ON_OFF_AUTO), HT),
     ("buffering", Ty::Enum(&["auto", "on", "off"], ON_OFF_AUTO), &[Kind::Gist]),
+    // (a tablespace's: what the planner would cost reading from it, and how much it may read ahead)
+    ("random_page_cost", Ty::Real(0.0, f64::MAX), TS),
+    ("seq_page_cost", Ty::Real(0.0, f64::MAX), TS),
+    ("effective_io_concurrency", Ty::Int(0, 1000), TS),
+    ("maintenance_io_concurrency", Ty::Int(0, 1000), TS),
 ];
 
 /// One parameter as a statement writes it: its namespace (`toast` of `toast.fillfactor`), its name, and its value
 /// as written (None: none given, which is `true`).
 pub(super) type Given = (Option<String>, String, Option<String>);
+
+/// The lock ALTER TABLE, VIEW or INDEX takes to SET or RESET `given`, as Postgres's AlterTableGetRelOptionsLockLevel
+/// works it out (whatever their namespace): ACCESS EXCLUSIVE for a parameter that changes what a query sees (a
+/// view's, user_catalog_table) or how an index is read (fastupdate, buffering, autosummarize), else SHARE UPDATE
+/// EXCLUSIVE, which lets reads and writes go on.
+pub(super) fn lock_mode(given: &[Given]) -> &'static str {
+    const STRONG: &[&str] = &[
+        "autosummarize",
+        "user_catalog_table",
+        "fastupdate",
+        "security_barrier",
+        "security_invoker",
+        "buffering",
+        "check_option",
+    ];
+    match given.iter().any(|(_, n, _)| STRONG.iter().any(|s| s.eq_ignore_ascii_case(n))) {
+        true => "AccessExclusiveLock",
+        false => "ShareUpdateExclusiveLock",
+    }
+}
 
 fn bad(message: String) -> SqlError {
     SqlError { code: "22023", message, info: None }

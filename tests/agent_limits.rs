@@ -116,3 +116,143 @@ fn a_world_older_than_max_age_waits_for_a_person() {
     assert!(run(&db, MAIN, "alter merge policy hourly set (max_age = 'soon')", &[]).is_err());
     assert!(run(&db, MAIN, "alter merge policy hourly set (max_age = 0)", &[]).is_err());
 }
+
+#[test]
+fn agents_made_for_one_tenant_share_its_count() {
+    // an agent per run, as the agent gateway makes them: the hour doesn't start again with each run
+    let db = Db::new();
+    run(
+        &db,
+        MAIN,
+        "create table leads (id int primary key, org_id int not null);
+         insert into leads select g, case when g <= 200 then 42 else 7 end from generate_series(1, 300) g;
+         create merge policy runs with (deletes_per_hour = 100)",
+        &[],
+    )
+    .unwrap();
+    let run_for = |n: u32, tenant: u32| {
+        let can = "read,fork,write_own,write_main,merge_own";
+        let sql = format!("create agent run_{n} with (can = '{can}', policy = 'runs', tenant = 'org_id = {tenant}')");
+        run(&db, MAIN, &sql, &[]).unwrap();
+        let mut s = Session::new(MAIN);
+        s.agent = Some(format!("run_{n}"));
+        s
+    };
+    // two runs for tenant 42 delete 50 rows each: 100 in the hour
+    for n in 1..=2 {
+        let mut s = run_for(n, 42);
+        let sql = format!("delete from leads where id between {} and {}", (n - 1) * 50 + 1, n * 50);
+        assert_eq!(attempt(&db, &mut s, &format!("w{n}"), &sql), None, "run {n}");
+    }
+    // a third, a new agent: held, counted with the tenant's other runs
+    let mut s = run_for(3, 42);
+    let e = attempt(&db, &mut s, "w3", "delete from leads where id between 101 and 150").unwrap();
+    assert!(e.contains(r#"deletes 50 rows, and merges for tenant "org_id" = 42 deleted 100 in the last hour"#), "{e}");
+    // the same tenant written as text ('42'): the same count, as the tenant's scope treats it as the same tenant
+    let can = "read,fork,write_own,write_main,merge_own";
+    run(
+        &db,
+        MAIN,
+        &format!("create agent run_t with (can = '{can}', policy = 'runs', tenant = 'org_id = ''42''')"),
+        &[],
+    )
+    .unwrap();
+    let mut s = Session::new(MAIN);
+    s.agent = Some("run_t".into());
+    assert!(attempt(&db, &mut s, "wt", "delete from leads where id = 151").is_some(), "counted with tenant 42");
+    // text ids spelled otherwise are other tenants: '042' isn't '42', and has an hour of its own
+    run(
+        &db,
+        MAIN,
+        &format!("create agent run_z with (can = '{can}', policy = 'runs', tenant = 'org_id = ''042''')"),
+        &[],
+    )
+    .unwrap();
+    let mut s = Session::new(MAIN);
+    s.agent = Some("run_z".into());
+    assert_eq!(attempt(&db, &mut s, "wz", "delete from leads where id = 152"), None, "'042' counted apart from 42");
+    // another tenant's runs have a count of their own
+    let mut s = run_for(4, 7);
+    assert_eq!(attempt(&db, &mut s, "w4", "delete from leads where id between 201 and 250"), None);
+    // an agent with no tenant is still counted alone
+    run(&db, MAIN, "create agent solo with (can = 'read,fork,write_own,write_main,merge_own', policy = 'runs')", &[])
+        .unwrap();
+    let mut s = Session::new(MAIN);
+    s.agent = Some("solo".into());
+    assert_eq!(attempt(&db, &mut s, "w5", "delete from leads where id between 251 and 300"), None);
+}
+
+#[test]
+fn a_partial_merge_by_an_agent_under_a_policy_is_counted() {
+    // ONLY TABLES leaves the world open, and counts the merge while main's snapshot is held: whose count it goes
+    // into is read before that, so this finishes (it once waited on itself)
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let db = Db::new();
+        run(
+            &db,
+            MAIN,
+            "create table leads (id int primary key, org_id int not null);
+             create table notes (id int primary key, org_id int not null);
+             insert into leads select g, 42 from generate_series(1, 10) g;
+             create merge policy runs with (deletes_per_hour = 3);
+             create agent t42 with (can = 'read,fork,write_own,write_main,merge_own', policy = 'runs',
+                                    tenant = 'org_id = 42');
+             create agent solo with (can = 'read,fork,write_own,write_main,merge_own', policy = 'runs')",
+            &[],
+        )
+        .unwrap();
+        let mut said = vec![];
+        for (who, w, ids) in [("t42", "a", "1, 2"), ("solo", "b", "3, 4"), ("t42", "c", "5, 6")] {
+            let mut s = Session::new(MAIN);
+            s.agent = Some(who.into());
+            let sql = format!(
+                "create world {w}; use world {w}; delete from leads where id in ({ids}); \
+                 insert into notes values ({}, 42); use world main",
+                ids.len()
+            );
+            s.run(&db, &sql, &[]).unwrap();
+            said.push(s.run(&db, &format!("merge world {w} only tables (leads)"), &[]).err().map(|e| e.message));
+        }
+        tx.send(said).unwrap();
+    });
+    let said = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("a partial merge into main finishes");
+    assert_eq!(said[0], None);
+    assert_eq!(said[1], None, "an agent with no tenant counts alone");
+    let held = said[2].clone().unwrap_or_default();
+    assert!(held.contains(r#"merges for tenant "org_id" = 42 deleted 2 in the last hour"#), "{held}");
+}
+
+#[test]
+fn counts_saved_before_an_upgrade_go_to_the_tenant() {
+    // a folder from before tenant agents shared their tenant's count: run_1's merges saved under its own name
+    let dir = std::env::temp_dir().join(format!("chronos-agent-limits-upgrade-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let can = "read,fork,write_own,write_main,merge_own";
+    {
+        let db = Db::open(&dir).unwrap();
+        run(
+            &db,
+            MAIN,
+            &format!(
+                "create table leads (id int primary key, org_id int not null);
+                 insert into leads select g, 42 from generate_series(1, 20) g;
+                 create merge policy runs with (deletes_per_hour = 3);
+                 create agent run_1 with (can = '{can}', policy = 'runs', tenant = 'org_id = 42');
+                 create agent run_2 with (can = '{can}', policy = 'runs', tenant = 'org_id = 42')"
+            ),
+            &[],
+        )
+        .unwrap();
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    std::fs::write(dir.join("tallies"), format!(r#"{{"run_1": [[{now}, 3, 3, 0]]}}"#)).unwrap();
+    // opened by this version: run_1's 3 deletes are the tenant's, so run_2, a new run, has none left
+    let db = Db::open(&dir).unwrap();
+    let mut s = Session::new(MAIN);
+    s.agent = Some("run_2".into());
+    let e = attempt(&db, &mut s, "w", "delete from leads where id = 1").unwrap();
+    assert!(e.contains(r#"merges for tenant "org_id" = 42 deleted 3 in the last hour"#), "{e}");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}

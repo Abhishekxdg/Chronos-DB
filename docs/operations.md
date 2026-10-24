@@ -52,10 +52,11 @@ chronos --remote s3://bucket/prefix mydb        # or: chronos serve … with the
 - **Uploads:** checkpoints upload finished page files, their indexes, then the manifest, so pages always land before the manifest that names them. Closing the database checkpoints.
 - **Another machine:** an empty folder attached to the same remote opens the database as of its last checkpoint and downloads pages as they're read. The first read of a page downloads its whole page file (up to 64 MB), which then stays on local disk until `Db::evict_local()`, so the local disk needs room for the files a workload touches.
 - **Scale to zero:** `Db::evict_local()` deletes local copies of uploaded pages, leaving the bucket as the database.
-- **Local only until the next checkpoint:** changes since the last checkpoint live only in the local log until the next checkpoint or close.
+- **The log ships too:** as it is written, the log goes to the bucket in chunks (`wal-<segment>-<offset>` objects), so another machine opening the bucket has every commit that was shipped, not just the last checkpoint. `wal_shipping` (see [settings](reference/cli.md)) says when: `async` (the default) within `wal_shipping_delay` (1 s) of being written; `sync` before a commit to `main` or a merge returns, which adds a round trip to the bucket to each; `off` only at checkpoints, as before. Checkpoints delete the shipped log the bucket no longer needs, and publish the folder's own settings (`folder-settings`), which a new folder takes. In `sync` mode, while the bucket can't be reached for 10 s, new writes and merges are refused with SQLSTATE 58030 (reads work) until it can. `/metrics` shows `wal_shipping_lag_bytes`, `wal_shipping_lag_ms`, `wal_shipping_uploads`, `wal_shipping_upload_failures` and `wal_shipping_fenced`. A `gs://` remote reads its token from `CHRONOS_GCS_TOKEN_FILE` when that is set. Put costs follow the number of chunks: about $0.0013 per GB written at bulk rates on GCS, and at a slow trickle one put per delay while writes continue (see [the design](designs/wal-shipping.md#cost-on-gcs-decision-input)).
 - **One writer per remote,** enforced by a `lease` object:
   - A second folder gets an error naming the holder.
-  - If that process is gone, open with `--takeover` (or `Db::open_remote_takeover`). The old writer is fenced off: it re-checks the lease before every upload.
+  - If that process is gone, open with `--takeover` (or `Db::open_remote_takeover`). The old writer is fenced off: it re-checks the lease before every upload of pages, and the takeover puts a fence at the end of the shipped log, which its next log upload runs into. A fenced writer in `sync` mode stops (it can't say a commit is safe); in `async` mode it stops shipping and its checkpoints fail.
+  - A folder that fell behind (another folder wrote since) is refused; with `--takeover` its own database is set aside in `stale-<ms>`, or, if only its log differs, the log in `stale-log-<ms>`.
 - **Local testing:** a local MinIO container works well for this (see `tests/remote.rs`).
 
 ## High availability
@@ -63,10 +64,10 @@ chronos --remote s3://bucket/prefix mydb        # or: chronos serve … with the
 Chronos is one process that writes one database. There is no replica that follows it and nothing fails over on its own; what keeps a database available is how fast another process can open it.
 
 - **One machine:** the database is its folder. `main` writes and merges are on disk before they return, so a crash or a `kill -9` loses none that were acknowledged; the process opens the folder again in the time it takes to read the log since the last checkpoint. Run it under a supervisor that restarts it.
-- **Losing the machine:** with [cloud storage](#cloud-storage---features-s3) the bucket holds the database as of its last checkpoint. Another machine opens it from an empty folder with `--takeover`, and the lease fences the old writer off. What that loses is the writes since the last checkpoint, which live only in the old machine's log: checkpoint as often as the writes you can afford to lose.
+- **Losing the machine:** with [cloud storage](#cloud-storage---features-s3) the bucket holds the database as of its last checkpoint plus the log shipped since. Another machine opens it from an empty folder with `--takeover`, which fences the old writer off. With `wal_shipping = sync` that loses no acknowledged write; with `async` (the default), at most about `wal_shipping_delay` of writes (1 s); with `off`, everything since the last checkpoint.
 - **Without cloud storage:** a [backup](#backups) is the copy on another machine, and it is as old as it is.
 - **One writer, always:** two processes never write the same database, on a folder (the second gets an error) or a bucket (the lease).
-- **Not here:** synchronous replication, a hot standby that follows the log, automatic failover, several writers.
+- **Not here:** a hot standby that follows the log, automatic failover, several writers.
 
 ## TLS
 
@@ -118,7 +119,7 @@ Settings for a server shared by agents, all off by default:
 - **`ALTER SYSTEM SET max_worlds = n`:** forks past n live worlds are refused.
 - **`ALTER SYSTEM SET world_idle_ttl = '7 days'`:** the background worker discards worlds unused that long (see [concepts](concepts.md#worlds)), logged and audited as `system`, then gives the space back (see Cleanup).
 - **`ALTER SYSTEM SET protect_main = on`:** `main`'s rows change only by merging a world, for every user (see [SQL](sql.md#limits-for-the-whole-database)).
-- **`chronos serve --safe --admin-token A`:** clients without an agent's token get MCP's safe mode (see [concepts](concepts.md#agents)); `A` (or `CHRONOS_ADMIN_TOKEN`) is the database's own user. `--token` still guards the port: with both, the server's token alone gets a guest.
+- **`chronos serve --token T --admin-token A`:** `T` (or `CHRONOS_TOKEN`) guards the port and lets a client in as the guest, MCP's safe mode (see [concepts](concepts.md#agents)); `A` (or `CHRONOS_ADMIN_TOKEN`) is the database's own user. `--unsafe` makes `T` the database's own user, as before 0.4; `--safe` makes every client but an agent or `A` the guest, loopback without a token too.
 
 ## Limits the operator sets
 
@@ -177,7 +178,7 @@ Pages stay on disk (or in the bucket) and are read as queries need them, so a da
 What the database has done since it opened: each kind of operation's count and latency (p50, p95, p99, max), and counters.
 
 - **In SQL:** `SHOW METRICS;` (also in the shell).
-- **For Prometheus:** `GET /metrics` on `chronos serve`, with the server's token if it has one (agents' tokens get 403). Latencies are a summary, `chronos_op_seconds{op="...",quantile="..."}`.
+- **For Prometheus:** `GET /metrics` on `chronos serve`, with the server's token (the guest may read them) or the admin token (agents' tokens get 403). Latencies are a summary, `chronos_op_seconds{op="...",quantile="..."}`.
 - **Operations timed:** `select`, `insert`, `update`, `delete`, `schema` (CREATE, ALTER, DROP), `other_sql`, `commit` (a transaction going into its world), `log_sync` (waiting for the log to reach disk), `fork`, `diff`, `merge`, `search`, `checkpoint`, `gc`, `simulate` (SIMULATE and REPLAY WORLD).
 - **Counters:** `rows_written`, `errors`, `conflicts`, `spilled_bytes`, `cache_hits`, `cache_misses` (since opening); `worlds`, `pages_bytes`, `log_bytes`, `history_bytes`, `cache_bytes`, `uptime_seconds` (now); `disk_bytes` and `disk_limit_bytes` (the folder as its cap counts it, and the cap; see [limits the operator sets](#limits-the-operator-sets)); `last_statement_unix_ms`, when a client's last statement or operation started or ended (ms since 1970, 0 for none since opening; background checkpoints and cleanups don't count).
 - **Idle:** `GET /metrics` also gives `chronos_connections_open`, the HTTP and Postgres connections open now, not counting the one asking. With `chronos_last_statement_unix_ms`, a host tells an idle database from these two without reading its logs.

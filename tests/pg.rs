@@ -25,7 +25,7 @@ fn start(name: &str, token: Option<&str>) -> (Server, u16) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_chronos"));
     cmd.args(["serve", dir.to_str().unwrap()]);
     if let Some(t) = token {
-        cmd.args(["--token", t]);
+        cmd.args(["--token", t, "--unsafe"]); // the token as the database's own user, as before 0.4
     }
     let s = common::serve(&mut cmd, true);
     (Server(s.child, dir), s.pg)
@@ -1562,4 +1562,38 @@ fn varchar_and_char_types_over_the_wire() {
     assert_eq!(ids, [2]);
     let stmt = c.prepare("update vw set b = $1 where id = $2").unwrap();
     assert_eq!(stmt.params().iter().map(|t| t.oid()).collect::<Vec<_>>(), [1043, 23]);
+}
+
+/// A folder `chronos serve` makes protects main from its first moment (issue #41): the server's token writes main's
+/// rows only by merging a world, definitions still go straight in, and a client of the server can't turn the
+/// protection off; the database's own shell can.
+#[test]
+fn a_new_served_database_protects_main() {
+    let dir = std::env::temp_dir().join(format!("chronos-pg-{}-protected", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_chronos"));
+    cmd.args(["serve", dir.to_str().unwrap()]).env("CHRONOS_PROTECT_MAIN", "on");
+    let s = common::serve(&mut cmd, true);
+    let mut server = s.child; // (the folder is read again below: not a `Server`, which removes it)
+    assert!(s.log.contains("main is protected"), "{}", s.log);
+    let mut c = connect(s.pg, "").unwrap();
+    c.batch_execute("create table t (id int primary key, v text)").unwrap(); // definitions: as before
+    let e = c.batch_execute("insert into t values (1, 'a')").unwrap_err();
+    assert_eq!(e.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE), "{e}");
+    c.batch_execute("create world w; use world w; insert into t values (1, 'a'); use world main; merge world w")
+        .unwrap();
+    assert_eq!(c.query_one("select count(*) from t", &[]).unwrap().get::<_, i64>(0), 1);
+    let e = c.batch_execute("alter system set protect_main = off").unwrap_err();
+    assert_eq!(e.code(), Some(&SqlState::INSUFFICIENT_PRIVILEGE), "{e}");
+    let why = e.as_db_error().map(|d| d.message().to_string()).unwrap_or_default();
+    assert!(why.contains("database's own machine"), "{why}");
+    drop(c);
+    let _ = server.kill();
+    let _ = server.wait();
+    // a served folder that's there already keeps its setting; the folder's own shell turns it off
+    let db = chronos::Db::open(&dir).unwrap();
+    assert_eq!(chronos::sql::run(&db, "main", "show protect_main", &[]).unwrap()[0].rows[0][0].to_text(), "on");
+    chronos::sql::run(&db, "main", "alter system set protect_main = off", &[]).unwrap();
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -257,12 +257,14 @@ export class Chronos {
   }
 
   /** Applies this branch to its parent and deletes it. Throws ChronosError (409) with `conflicts`
-   *  if both changed the same rows (retry with resolve "ours" or "theirs"), or if the branch lost
-   *  writes in a server crash (redo them; `confirm: true` merges it as it is after a crash). */
-  /** Applies this branch to its parent and deletes it. Conflicts (409) come with `explain` per row;
-   *  settle them with `resolve`, `columns` (combine rows where the sides changed different columns)
-   *  or `picks` ({"table/id": "ours" | "theirs" | row | null}). `onlyTables` / `onlyKeys` merge just
-   *  those rows, and `into` merges into another branch instead; either way this branch stays. */
+   *  (each with `explain`) if both changed the same rows: merging the same way again fails the same
+   *  way. Settle them, safest first: `columns: true` combines rows where the sides changed different
+   *  columns, and with `resolve` "ours" or "theirs" too picks that side only for the columns both
+   *  changed; `picks` ({"table/id": "ours" | "theirs" | row | null}) settles single rows; `resolve`
+   *  without `columns` takes whole rows, overwriting the other side's changes to other columns.
+   *  Also throws if the branch lost writes in a server crash (redo them; `confirm: true` merges it as
+   *  it is after a crash). `onlyTables` / `onlyKeys` merge just those rows, and `into` merges into
+   *  another branch instead; either way this branch stays. */
   async merge(
     resolve: "fail" | "ours" | "theirs" = "fail",
     opts: MergeOptions & { confirm?: boolean; version?: number; target?: number } = {},
@@ -282,7 +284,14 @@ export class Chronos {
     resolve: "fail" | "ours" | "theirs" = "fail",
     opts: MergeOptions = {},
   ): Promise<{
-    rows: { key: string; outcome: string; detail: string; result: unknown }[];
+    rows: {
+      key: string;
+      outcome: string;
+      detail: string;
+      result: unknown;
+      // for a row both sides changed: the columns each changed since the fork, and those both did
+      columns: { here: string[]; there: string[]; both: string[] } | null;
+    }[];
     conflicts: number;
     blocked: string | null;
     version: number;

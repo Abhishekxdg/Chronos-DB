@@ -1,8 +1,9 @@
 //! What a statement can change, so a caller can refuse some before running them (the MCP
 //! server's safe mode: agents change only their own worlds, and a person merges).
 
-use super::{CtxFn, Expr, Func, SRFS, Statement, Stmt, expand_stmt, functions};
-use crate::Db;
+use super::{Agg, CtxFn, Expr, Func, ListAgg, SRFS, Statement, Stmt, WinFn, expand_stmt, functions, userdefs};
+use crate::{Db, View};
+use std::cell::Cell;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reach {
@@ -97,13 +98,149 @@ fn finds(s: &Stmt, f: impl Fn(&Expr) -> bool) -> bool {
 }
 
 /// Whether a query calls a built-in function that changes something: a sequence (nextval,
-/// setval), other sessions (pg_notify), or a large object (lo_create, lo_put, lo_unlink, ...).
+/// setval), other sessions (pg_notify), or a large object (lo_create, lo_put, lo_unlink, ...); or one that runs a
+/// query given as text (ts_stat, ts_rewrite, crosstab, query_to_xml), which may call what does.
 pub(super) fn side_effects(s: &Stmt) -> bool {
-    finds(s, |e| match e {
-        Expr::Func(Func::Ctx(CtxFn::NextVal | CtxFn::SetVal | CtxFn::Notify), _) => true,
-        Expr::Func(Func::Ctx(CtxFn::LargeObject(n)), _) => super::largeobj::writes(n),
+    let found = Cell::new(false);
+    let _ = functions::visit(
+        &mut s.clone(),
+        &mut |e| {
+            let changes = match e {
+                Expr::Func(Func::Ctx(CtxFn::NextVal | CtxFn::SetVal | CtxFn::Notify | CtxFn::TsRewrite), _) => true,
+                Expr::Func(Func::Ctx(CtxFn::LargeObject(n)), _) => {
+                    super::largeobj::writes(n) || n.starts_with("query_to_xml")
+                }
+                _ => false,
+            };
+            found.set(found.get() || changes);
+            Ok(())
+        },
+        &mut |q| {
+            let mut srfs = q.from.iter().chain(q.joins.iter().map(|j| &j.src)).filter_map(|s| s.srf.as_deref());
+            found.set(found.get() || srfs.any(|(name, _)| srf_names(name).any(runs_text)));
+        },
+    );
+    found.get()
+}
+
+/// Whether built-in set-returning function `name` runs a query given as text (ts_stat's; crosstab's).
+fn runs_text(name: &str) -> bool {
+    matches!(name, "ts_stat" | "crosstab")
+}
+
+/// The functions a FROM function's stored name names: `ROWS FROM`'s each (see `ROWS_FROM`), without the column
+/// definition list that rides on a name (see `COLDEFS`).
+fn srf_names(name: &str) -> impl Iterator<Item = &str> {
+    let parts = match super::rows_from_parts(name) {
+        Some(p) => p.into_iter().map(|(n, _)| n).collect(),
+        None => vec![name],
+    };
+    parts.into_iter().map(|n| n.split_once(super::COLDEFS).map_or(n, |(bare, _)| bare))
+}
+
+/// Whether running statement `s` could change anything at all, which EXPLAIN without ANALYZE must not (Postgres's
+/// runs nothing: see `Exec::explain_run`), as far as the statement shows. Any statement but a SELECT could; a SELECT
+/// could by a built-in that changes something (see `CtxFn::changes`: a sequence, a notification, a large object, an
+/// advisory lock, a setting, ...), setseed, pg_stat_statements_reset, ts_stat, crosstab or ts_rewrite's two-argument
+/// form (which run a query given as text), FOR UPDATE (or SHARE) in a subquery or a WITH query, which locks the rows
+/// it reads, or a function made with CREATE FUNCTION, an operator's or an aggregate's (CREATE OPERATOR's, CREATE
+/// AGGREGATE's) that could. With `v`, the world it would run in, a function counts only if its statements could: one
+/// in SQL (LANGUAGE internal's is SQL: see `userdefs::internal_sql`); without, every one does. What isn't seen here
+/// (a PL/pgSQL function's body, a domain's CHECK, a function of CREATE CAST) `sql::dry_run` stops as it runs.
+pub(super) fn effects(s: &Stmt, v: Option<&View>) -> bool {
+    effects_in(s, v, &Seen::default())
+}
+
+/// What `effects` has looked at already, or is looking at (a function that calls itself, an operator whose function
+/// compares with the operator again): a call's name, with whether it may mean the built-in, and a function's
+/// signature. Looked at again it adds nothing, as what it could change is counted where it was first.
+type Seen = std::cell::RefCell<std::collections::HashSet<String>>;
+
+/// `effects`, with what was looked at already (see `Seen`).
+fn effects_in(s: &Stmt, v: Option<&View>, seen: &Seen) -> bool {
+    if !matches!(s, Stmt::Select(_)) {
+        return true;
+    }
+    let user = |name: &str, builtin: bool| v.is_none_or(|v| call_changes(v, name, builtin, seen));
+    let agg = |a: &Agg| match a {
+        Agg::List(ListAgg::User(i), _) => userdefs::aggregate_at(*i)
+            .is_none_or(|d| std::iter::once(&d.sfunc).chain(&d.finalfunc).any(|f| user(&super::func_named(f), false))),
         _ => false,
-    })
+    };
+    let found = Cell::new(false);
+    let _ = functions::visit(
+        &mut s.clone(),
+        &mut |e| {
+            let changes = match e {
+                Expr::Func(Func::Ctx(CtxFn::TsRewrite), a) => a.len() == 2,
+                Expr::Func(f, _) => func_changes(f),
+                Expr::Call(c) => match &c.def {
+                    Some(f) => v.is_none_or(|v| function_changes(v, f, seen)),
+                    None => user(&c.name, c.builtin),
+                },
+                Expr::Agg(a, ..) => agg(a),
+                Expr::Window(w) => matches!(&w.func, WinFn::Agg(a) if agg(a)),
+                _ => false,
+            };
+            found.set(found.get() || changes);
+            Ok(())
+        },
+        &mut |q| {
+            let mut srfs = q.from.iter().chain(q.joins.iter().map(|j| &j.src)).filter_map(|s| s.srf.as_deref());
+            let changes = !q.locking.is_empty()
+                || srfs.any(|(name, _)| {
+                    srf_names(name).any(|n| if SRFS.contains(&n) { runs_text(n) } else { user(n, false) })
+                });
+            found.set(found.get() || changes);
+        },
+    );
+    found.get()
+}
+
+/// Whether a call of built-in `f` changes something besides giving its value (see `CtxFn::changes`; setseed and
+/// pg_stat_statements_reset too).
+fn func_changes(f: &Func) -> bool {
+    use super::funcs::Scalar::{SetSeed, StatReset};
+    match f {
+        Func::Ctx(c) => c.changes(),
+        Func::Scalar(SetSeed | StatReset) => true,
+        _ => false,
+    }
+}
+
+/// Whether a call of function `name` could change something in world `v` (see `effects`): the functions of the name
+/// made with CREATE FUNCTION, and else (or with `builtin`, where the call's arguments may choose it over them: see
+/// `Call::builtin`) the built-in it names, by its name or by its C symbol (an operator's procedure, `int4lt`); for a
+/// call that several operators of one symbol share, any of their functions. A name of no function there is changes
+/// nothing: the call fails (and an operator's that isn't there, a rolled-back CREATE OPERATOR's, which the registry
+/// keeps, is never made).
+fn call_changes(v: &View, name: &str, builtin: bool, seen: &Seen) -> bool {
+    let first = seen.borrow_mut().insert(format!("{builtin} {name}"));
+    if !first {
+        return false;
+    }
+    if let Some(funcs) = userdefs::op_funcs(name) {
+        return funcs.iter().any(|f| call_changes(v, &super::func_named(f), false, seen));
+    }
+    let Ok(made) = functions::named(v, name) else { return true };
+    let bare = super::rel_part(super::written(name));
+    let built_in = || match super::builtin_of(bare) {
+        Some((f, _)) => func_changes(&f),
+        // (what it does, as SQL)
+        None => userdefs::internal_sql(bare).is_some_and(|sql| {
+            super::check_expr(&sql)
+                .map_or(true, |e| effects_in(&Stmt::Select(Box::new(super::select_of(e))), Some(v), seen))
+        }),
+    };
+    made.iter().any(|f| function_changes(v, f, seen)) || ((made.is_empty() || builtin) && built_in())
+}
+
+/// Whether running function `f`, made with CREATE FUNCTION, could change something by its statements (see
+/// `effects`): a SQL function's. A PL/pgSQL function's body isn't looked at: what it would change, `sql::dry_run`
+/// stops as it runs.
+fn function_changes(v: &View, f: &functions::Function, seen: &Seen) -> bool {
+    let first = seen.borrow_mut().insert(f.described());
+    first && f.statements().iter().any(|st| effects_in(st, Some(v), seen))
 }
 
 /// What statement `s` itself can change, apart from the functions it calls (see `Statement::access`).
@@ -114,7 +251,16 @@ pub(super) fn reach(s: &Stmt) -> Reach {
 fn access(s: &Stmt) -> Reach {
     match s {
         Stmt::Select(_) if side_effects(s) => Reach::Write,
+        // EXPLAIN without ANALYZE runs nothing that changes anything (see `effects`), but EXPLAIN EXECUTE works out its
+        // arguments, as Postgres's does
+        Stmt::Explain { analyze: false, stmt, .. } if matches!(**stmt, Stmt::Execute { .. }) && side_effects(s) => {
+            Reach::Write
+        }
         Stmt::Locking(..) => Reach::Write, // it locks rows it may then change
+        // REINDEX writes what it rebuilds and moves (see `maintain::rebuild`): the world it runs on, a row of its own
+        // per table (`tablespace::FILENODES`) that pg_class.relfilenode and pg_relation_filenode show, which a merge
+        // carries. (A READ ONLY transaction still runs it, as Postgres's does: see `sql::read_only_refusal`.)
+        Stmt::Maintain(m) if m.verb == super::maintain::Verb::Reindex => Reach::Write,
         Stmt::Select(_)
         | Stmt::Set
         | Stmt::SetReadOnly { .. }
@@ -253,6 +399,9 @@ mod tests {
             "diff world 'a' to 'main@-1 hour'",
             "diff world a readers",
             "explain select * from t",
+            "explain select nextval('s'), pg_notify('c', 'x'), lo_create(1)", // (not run: see `effects`)
+            "explain delete from t",
+            "explain execute p(1)",
             "merge world a dry run",
             "show agents",
             "show merge checks",
@@ -264,7 +413,6 @@ mod tests {
             "set statement_timeout = '1h'",
             "vacuum",
             "analyze t",
-            "reindex table t",
             "cluster t using t_pkey",
             "discard all",
             "lock table t in share mode",
@@ -279,6 +427,7 @@ mod tests {
         for sql in [
             "insert into t values (1)",
             "comment on table t is 'x'",               // a row of the world
+            "reindex table t",                         // so is its new relfilenode (Postgres's changes pg_class too)
             "create extension if not exists pgcrypto", // so is pgcrypto's record, for pg_extension
             "drop extension if exists pgcrypto",
             "update t set a = 1",
@@ -288,6 +437,8 @@ mod tests {
             "create table t (id int primary key)",
             "begin",
             "explain analyze delete from t",
+            "explain execute p(nextval('s'))", // (its arguments are worked out)
+            "explain execute p(my_function(1))",
             "select my_function(1)",
             "select * from my_rows(2)",
             "create function f() returns int language sql as 'select 1'",
@@ -297,6 +448,10 @@ mod tests {
             "select setval('orders_id_seq', 1)",
             "select nextval('s')",
             "select 1 where exists (select pg_notify('c', 'x'))",
+            "select distinct on (lo_unlink(1)) * from t",
+            "select * from ts_stat('delete from t returning to_tsvector(a)')", // (what a query given as text calls)
+            "select * from crosstab('select 1, 2, my_function(3)') as ct(a int, b int)",
+            "select query_to_xml('select 1', true, false, '')",
             "notify c",
             "do $$ begin null; end $$",
             "call p()",
@@ -336,6 +491,51 @@ mod tests {
             "replay world t_0",
         ] {
             assert_eq!(one(sql), World, "{sql}");
+        }
+    }
+
+    #[test]
+    fn finds_what_running_a_query_could_change() {
+        // (with no world to look in, any function made with CREATE FUNCTION counts; random() is run, its seeded
+        // numbers kept as they were: see `sql::dry_run`)
+        let changes = |sql: &str| super::effects(&parse(sql).unwrap()[0].0, None);
+        for sql in [
+            "select 1",
+            "select * from t where a > 1 order by b",
+            "select currval('s'), now(), random()",
+            "select distinct on (a) * from t",
+            "select * from t, generate_series(1, 2) g, jsonb_to_recordset('[]') as j (id text)",
+            "select lo_get(1)", // (a large object's function that only reads)
+            "select ts_rewrite('a'::tsquery, 'a'::tsquery, 'b'::tsquery)", // (no query of its own)
+        ] {
+            assert!(!changes(sql), "{sql}");
+        }
+        for sql in [
+            "select nextval('s')",
+            "select * from t where setval('s', 1) > 0",
+            "select (select pg_notify('c', 'x'))",
+            "select lo_unlink(1)",
+            "select lo_open(1, 262144)", // (a descriptor of the session's)
+            "select pg_stat_statements_reset()",
+            "select ts_rewrite('a'::tsquery, 'select ''a''::tsquery, ''b''::tsquery')", // (its query, given as text)
+            "select pg_advisory_lock(1)",
+            "select set_config('work_mem', '1MB', false)",
+            "select setseed(0.5)",
+            "select pg_terminate_backend(1)",
+            "select my_function(1)",
+            "select * from my_rows(2)",
+            "select * from t for update",
+            "select * from (select * from t for share) x",
+            "select distinct on (nextval('s')) * from t",
+            "select * from t where a in (select distinct on (lo_unlink(1)) a from t)",
+            "select * from ts_stat('select to_tsvector(a) from t')", // (its query, given as text)
+            "select * from crosstab('select 1, 2, 3') as ct(a int, b int)",
+            "select * from t, rows from (generate_series(1, 2), my_rows(2)) g",
+            "with d as (delete from t returning *) select * from d",
+            "update t set a = 1",
+            "insert into t values (1)",
+        ] {
+            assert!(changes(sql), "{sql}");
         }
     }
 }

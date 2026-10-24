@@ -20,7 +20,9 @@
 //!   chronos serve mydb [--listen 127.0.0.1:7070] [--pg 127.0.0.1:5433|off] [--token T]
 //!                [--tls-cert cert.pem --tls-key key.pem]   HTTPS, and TLS on the Postgres port (needed
 //!                                to listen on any address but loopback, unless --insecure-no-tls)
-//!                [--safe [--admin-token A]]   clients that aren't agents get MCP's safe mode
+//!                [--admin-token A] [--safe | --unsafe] [--studio-api] [--refresh-every 5m]   a server token is the guest's: clients
+//!                                with it get MCP's safe mode; the admin token is the database's own user
+//!                                (--unsafe: the server token is, as before 0.4)
 //!                                HTTP JSON API, and the Postgres protocol for psql and drivers
 //!   chronos studio mydb [--port N] [--no-open]   a web UI for the database on 127.0.0.1 (see
 //!                                src/studio.rs, docs/studio.md), beside a running `serve` too
@@ -90,11 +92,41 @@ other     migrate <folder>             apply the folder's new .sql files in name
           help, quit";
 
 /// Who a server's clients are (see `api` and `pg`): the server's token, the admin token, and
-/// whether safe mode is on (then a client without an agent's or the admin token is the guest).
+/// which clients are the guest (see `Mode`).
 pub(crate) struct Auth {
     token: Option<String>,
     admin: Option<String>,
-    safe: bool,
+    mode: Mode,
+    /// `--studio-api`: also serve `POST /studio/api/<op>` (the admin token only; see `api::studio`).
+    studio_api: bool,
+}
+
+/// Who a client that proved neither an agent's token nor the admin token is: the database's own
+/// user, or the guest (`chronos::GUEST`: reads, forks and changes only the guest's own worlds).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Mode {
+    /// the default since 0.4: with a server token or an admin token configured, such a client is
+    /// the guest (the server token lets it in, no further); with no token at all (loopback only)
+    /// it is the database's own user, as nothing could have leaked
+    Default,
+    /// `--safe`: the guest, always, loopback without a token included
+    Safe,
+    /// `--unsafe`: the database's own user, the server token included (how every server ran
+    /// before 0.4)
+    Unsafe,
+}
+
+impl Auth {
+    /// Whether a client that is no agent, didn't send the admin token (`admin`), and (on the
+    /// Postgres port) didn't log in as a role with its password, is the guest.
+    pub(crate) fn guest(&self, admin: bool) -> bool {
+        !admin
+            && match self.mode {
+                Mode::Default => self.token.is_some() || self.admin.is_some(),
+                Mode::Safe => true,
+                Mode::Unsafe => false,
+            }
+    }
 }
 
 pub(crate) struct Shell {
@@ -151,6 +183,7 @@ fn main() {
     let schema = flag(&["--schema"]);
     let attach_tables = flag(&["--tables"]);
     let source_file = flag(&["--source-file"]);
+    let refresh_every = flag(&["--refresh-every"]);
     let port = flag(&["--port"]);
     let mut hosts = vec![]; // chronos studio --login's names, --host repeated
     while let Some(h) = flag(&["--host"]) {
@@ -165,6 +198,8 @@ fn main() {
         flag(&["--admin-token"]).or_else(|| std::env::var("CHRONOS_ADMIN_TOKEN").ok()).filter(|t| !t.is_empty());
     let anchor = flag(&["--anchor"]).or_else(|| std::env::var("CHRONOS_ANCHOR").ok()).filter(|a| !a.is_empty());
     let safe = args.iter().position(|a| a == "--safe").map(|i| args.remove(i)).is_some();
+    let unsafe_ = args.iter().position(|a| a == "--unsafe").map(|i| args.remove(i)).is_some();
+    let studio_api = args.iter().position(|a| a == "--studio-api").map(|i| args.remove(i)).is_some();
     let insecure_no_tls = args.iter().position(|a| a == "--insecure-no-tls").map(|i| args.remove(i)).is_some();
     let plain_password = args.iter().position(|a| a == "--allow-plaintext-password").map(|i| args.remove(i)).is_some();
     let takeover = args.iter().position(|a| a == "--takeover").map(|i| args.remove(i)).is_some();
@@ -233,6 +268,52 @@ fn main() {
             std::process::exit(1);
         }
         return;
+    }
+    // chronos refresh <attached folder>: main takes Postgres's rows as they are now (see chronos::attach::refresh)
+    if args[0] == "refresh" {
+        if args.len() != 2 {
+            eprintln!("usage: chronos refresh <attached folder>   (CHRONOS_SOURCE_URL, or --source-file)");
+            std::process::exit(2);
+        }
+        let opts = chronos::Open {
+            remote: remote.clone(),
+            takeover,
+            key,
+            anchor: anchor.clone().map(Into::into),
+            anchor_reset,
+            ..Default::default()
+        };
+        let db = match Db::open_with(&args[1], &opts) {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!(
+                    "chronos refresh: {}: {e} (a folder chronos serve has open refreshes with POST /v1/refresh and the \
+                     admin token, or serve --refresh-every)",
+                    args[1]
+                );
+                std::process::exit(1);
+            }
+        };
+        let code = match chronos::attach::refresh(&db) {
+            Ok(r) => {
+                for c in &r.added {
+                    println!("column added in Postgres, taken: {c}");
+                }
+                for (t, i, u, d) in &r.tables {
+                    println!("{t}: {i} inserted, {u} updated, {d} deleted");
+                }
+                for s in &r.skipped {
+                    println!("left as it was: {s}");
+                }
+                0
+            }
+            Err(e) => {
+                eprintln!("chronos refresh: {e}");
+                1
+            }
+        };
+        let _ = db.close();
+        std::process::exit(code);
     }
     if attach_tables.is_some() || yes {
         eprintln!("chronos: --tables and --yes are for chronos attach");
@@ -309,6 +390,10 @@ fn main() {
         return;
     }
     let serve = args[0] == "serve";
+    if refresh_every.is_some() && !serve {
+        eprintln!("chronos: --refresh-every is for chronos serve on an attached folder");
+        std::process::exit(2);
+    }
     let mcp = args[0] == "mcp";
     let import = args[0] == "import";
     let studio = args[0] == "studio";
@@ -362,6 +447,12 @@ fn main() {
         }
     }
     let dir = args.remove(0);
+    // a folder `chronos serve` makes protects main from its first moment: rows change only by merging a world, even
+    // with the server's token (CHRONOS_PROTECT_MAIN=off makes one without; see docs/security.md)
+    let fresh = serve
+        && remote.is_none()
+        && !std::path::Path::new(&dir).exists()
+        && std::env::var("CHRONOS_PROTECT_MAIN").map_or(true, |v| v != "off");
     if remote.is_none() && std::path::Path::new(&dir).is_file() {
         eprintln!("chronos: {dir} is a file; give a database folder (a new name makes a new database)");
         std::process::exit(2);
@@ -425,6 +516,17 @@ fn main() {
         }
     };
     chronos::sql::cleanup(&db); // transactions of a process that died
+    if fresh {
+        match db.set_setting(chronos::Setting::ProtectMain, 1) {
+            Ok(()) => eprintln!(
+                "chronos: a new database: main is protected (protect_main): its rows change only by merging a world, \
+                 even with the server's token. Work in a world (CREATE WORLD w; USE WORLD w), then MERGE WORLD w"
+            ),
+            Err(e) => {
+                eprintln!("chronos: warning: main couldn't be protected ({e}); ALTER SYSTEM SET protect_main = on")
+            }
+        }
+    }
     let db = Arc::new(db);
     let sql = chronos::sql::Session::new(&branch);
     let mut sh = Shell { db, branch, sql };
@@ -488,8 +590,42 @@ fn main() {
     if serve {
         let pg_on = pg_listen != "off";
         let tls_on = tls_cert.is_some() || tls_key.is_some();
+        let mode = match (safe, unsafe_) {
+            (true, false) => Mode::Safe,
+            (false, true) => Mode::Unsafe,
+            _ => Mode::Default,
+        };
         let checked = check_token("server token (--token or CHRONOS_TOKEN)", token.as_deref())
             .and_then(|_| check_token("admin token (--admin-token or CHRONOS_ADMIN_TOKEN)", admin.as_deref()))
+            .and_then(|_| {
+                if safe && unsafe_ {
+                    Err(std::io::Error::other("refusing to start: --safe and --unsafe can't both be given"))
+                } else if let (Some(t), Some(a)) = (&token, &admin)
+                    && chronos::sql::scram::saslprep(t) == chronos::sql::scram::saslprep(a)
+                {
+                    // the same secret for both would make the guest's token the database's own user's: `api::admit`
+                    // and the Postgres login check the admin token first. Compared after SASLprep, as the Postgres
+                    // login's SCRAM verifiers are made of the prepared tokens: two spellings of one string are one
+                    // verifier there
+                    Err(std::io::Error::other(
+                        "refusing to start: the server token and the admin token are the same; the server token lets \
+                         a client in as the guest, the admin token is the database's own user, so make them \
+                         different (openssl rand -hex 24 for each)",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .and_then(|_| {
+                // the Studio API answers only to the admin token: without one every call would be refused
+                if studio_api && admin.is_none() {
+                    Err(std::io::Error::other(
+                        "refusing to start: --studio-api needs an admin token (--admin-token or CHRONOS_ADMIN_TOKEN): its calls take no other",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
             .and_then(|_| check_listen(&listen, token.as_deref(), tls_on, insecure_no_tls))
             .and_then(
                 |_| if pg_on { check_listen(&pg_listen, token.as_deref(), tls_on, insecure_no_tls) } else { Ok(()) },
@@ -507,18 +643,67 @@ fn main() {
                 Err(e) => eprintln!("chronos: warning: {e}; worlds work, merges into main are refused until it does"),
             }
         }
-        // reachable from other machines, where a server token in someone's .env changes main with no world and no
-        // review: said at start, unless --safe (the token alone is then the guest) or protect_main covers it
+        // --refresh-every: main takes Postgres's rows on a timer (see chronos::attach::refresh)
+        if let Some(every) = &refresh_every {
+            let Some(every) = every_of(every) else {
+                eprintln!("chronos: --refresh-every takes a time such as 60s, 5m or 1h, not {every}");
+                std::process::exit(2);
+            };
+            if db.attached().is_none() {
+                eprintln!("chronos: --refresh-every is for a folder attached to Postgres (chronos attach)");
+                std::process::exit(2);
+            }
+            let db = sh.db.clone();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(every);
+                    match chronos::attach::refresh(&db) {
+                        Ok(r) if r.changed() > 0 || !r.skipped.is_empty() || !r.added.is_empty() => {
+                            for c in &r.added {
+                                eprintln!("chronos: column added in Postgres, taken: {c}");
+                            }
+                            let tables: Vec<String> = r
+                                .tables
+                                .iter()
+                                .filter(|t| t.1 + t.2 + t.3 > 0)
+                                .map(|(t, i, u, d)| format!("{t} +{i} ~{u} -{d}"))
+                                .collect();
+                            eprintln!("chronos: refreshed from Postgres: {}", tables.join(", "));
+                            for s in &r.skipped {
+                                eprintln!("chronos: refresh left as it was: {s}");
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("chronos: refresh from Postgres failed (tried again in {every:?}): {e}"),
+                    }
+                }
+            });
+        }
+        // --unsafe, reachable from other machines, where a server token in someone's .env changes main with no world
+        // and no review: said at start, unless protect_main covers it
         let exposed = !loopback(&listen) || (pg_on && !loopback(&pg_listen));
-        if checked.is_ok() && exposed && !safe && db.setting(chronos::Setting::ProtectMain) == 0 {
+        if checked.is_ok() && exposed && mode == Mode::Unsafe && db.setting(chronos::Setting::ProtectMain) == 0 {
             eprintln!(
-                "chronos: warning: the server token can change main directly, with no world and no review. If agents or \
-                 their tools can reach this server, give each agent its own token (CREATE AGENT), keep the server token \
-                 out of their environment, and serve with --safe --admin-token, or ALTER SYSTEM SET protect_main = on \
-                 (see the hardened deployment checklist in docs/security.md)"
+                "chronos: warning: --unsafe: the server token can change main directly, with no world and no review. If \
+                 agents or their tools can reach this server, give each agent its own token (CREATE AGENT), keep the \
+                 server token out of their environment, and drop --unsafe (pass --admin-token for the database's own \
+                 user), or ALTER SYSTEM SET protect_main = on (see the hardened deployment checklist in docs/security.md)"
             );
         }
-        let auth = &Auth { token, admin, safe };
+        // a server token and no admin token: nobody over the network is the database's own user; said at start, as
+        // a server that ran before 0.4 behaves differently now
+        if checked.is_ok() && mode == Mode::Default && token.is_some() && admin.is_none() {
+            eprintln!(
+                "chronos: the server token is the guest's: a client with it reads, forks and changes only the guest's \
+                 worlds, and can't write main, merge, or manage agents. For the database's own user over the network \
+                 pass --admin-token (CHRONOS_ADMIN_TOKEN); --unsafe makes the server token the database's own user, \
+                 as before 0.4"
+            );
+        }
+        if studio_api {
+            chronos::sql::NO_SERVER_PATHS.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let auth = &Auth { token, admin, mode, studio_api };
         let r = checked.and(tls).and_then(|tls| {
             std::thread::scope(|s| {
                 s.spawn(move || {
@@ -735,9 +920,11 @@ fn db_key() -> std::io::Result<Option<[u8; 32]>> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: chronos [-b branch] [--remote s3://bucket/prefix [--takeover]] [--anchor FILE [--anchor-reset]] <folder> [command]\n       chronos mcp <folder> [--allow-merge | --agent NAME] [--unmask]   (MCP server for AI agents, over stdio; without --allow-merge, agents can't merge; --agent acts as that agent; masked columns read masked unless --unmask)\n       chronos import <folder> <table> <data.csv> --schema <schema.csv>   (a copy of one Postgres table)\n       chronos attach <new folder> --tables a,b | --schema s [--yes]   (work beside a Postgres: merges into main are written there; CHRONOS_SOURCE_URL)\n       chronos restore <backup> <new folder>   (start a database from a backup, and verify it)\n       chronos init [--no-open]   (in a project folder: its Chronos Cloud database, wired up for agents; chronos cloud help)\n       chronos keygen   (a new encryption key: CHRONOS_KEY=<key> chronos <new folder> makes an encrypted database)\n       chronos studio <folder> [--port N] [--no-open]   (a web UI for the database, on 127.0.0.1; works beside a running serve)\n       chronos studio <folder> --login [--port N | --listen ADDR:PORT] [--host NAME[:PORT]]... [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--no-open]\n                                  (the web UI, signed in with a database role and its password, acting with its privileges;\n                                   make one with: create role admin login superuser password '...'; any address but loopback needs TLS)\n       chronos serve <folder> [--listen 127.0.0.1:7070] [--pg 127.0.0.1:5433|off] [--token T] [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--safe [--admin-token A]]
-                                  (HTTP JSON API, and Postgres protocol: psql postgres://127.0.0.1:5433/main; with --safe,
-                                   clients that aren't agents only fork and change their own worlds, unless they give the admin token;
+        "usage: chronos [-b branch] [--remote s3://bucket/prefix [--takeover]] [--anchor FILE [--anchor-reset]] <folder> [command]\n       chronos mcp <folder> [--allow-merge | --agent NAME] [--unmask]   (MCP server for AI agents, over stdio; without --allow-merge, agents can't merge; --agent acts as that agent; masked columns read masked unless --unmask)\n       chronos import <folder> <table> <data.csv> --schema <schema.csv>   (a copy of one Postgres table)\n       chronos attach <new folder> --tables a,b | --schema s [--yes]   (work beside a Postgres: merges into main are written there; CHRONOS_SOURCE_URL)\n       chronos refresh <attached folder>   (main takes Postgres's rows as they are now; chronos serve --refresh-every 5m does it on a timer)\n       chronos restore <backup> <new folder>   (start a database from a backup, and verify it)\n       chronos init [--no-open]   (in a project folder: its Chronos Cloud database, wired up for agents; chronos cloud help)\n       chronos keygen   (a new encryption key: CHRONOS_KEY=<key> chronos <new folder> makes an encrypted database)\n       chronos studio <folder> [--port N] [--no-open]   (a web UI for the database, on 127.0.0.1; works beside a running serve)\n       chronos studio <folder> --login [--port N | --listen ADDR:PORT] [--host NAME[:PORT]]... [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--no-open]\n                                  (the web UI, signed in with a database role and its password, acting with its privileges;\n                                   make one with: create role admin login superuser password '...'; any address but loopback needs TLS)\n       chronos serve <folder> [--listen 127.0.0.1:7070] [--pg 127.0.0.1:5433|off] [--token T] [--admin-token A] [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--safe | --unsafe] [--studio-api]
+                                  (HTTP JSON API, and Postgres protocol: psql postgres://127.0.0.1:5433/main; the server token T
+                                   lets a client in as the guest, which only forks and changes its own worlds; the admin token A
+                                   is the database's own user; --unsafe makes T the database's own user, as before 0.4, and --safe
+                                   makes every client but an agent the guest, loopback without a token included;
                                    a token is 24 characters or more (openssl rand -hex 24; pass it as CHRONOS_TOKEN, not on the
                                    command line, where other users can see it); any address but loopback needs a token and TLS)\n\n{HELP}"
     );
@@ -814,6 +1001,20 @@ fn is_sql(line: &str) -> bool {
             || (matches!(first.as_str(), "fork" | "use" | "switch" | "diff" | "merge" | "replay")
                 && second.as_deref() == Some("world"))
     }
+}
+
+/// A time such as `90`, `90s`, `5m` or `1h` (seconds without a unit), at least one second.
+fn every_of(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    let (n, unit) = s.find(|c: char| !c.is_ascii_digit()).map_or((s, ""), |i| s.split_at(i));
+    let n: u64 = n.parse().ok()?;
+    let secs = match unit.trim() {
+        "" | "s" => n,
+        "m" => n.checked_mul(60)?,
+        "h" => n.checked_mul(3600)?,
+        _ => return None,
+    };
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
 }
 
 /// The shortest server or admin token a server starts with.
@@ -1017,11 +1218,14 @@ impl Shell {
                 }
                 let lines: Vec<String> = d
                     .iter()
-                    .map(|c| match (&c.before, &c.after) {
-                        (None, Some(a)) => format!("+ {}  {a}", show_key(&c.key)),
-                        (Some(x), None) => format!("- DELETE {}  {x}", show_key(&c.key)),
-                        (Some(x), Some(y)) => format!("~ {}  {}", show_key(&c.key), field_diff(x, y)),
-                        (None, None) => unreachable!(),
+                    .filter_map(|c| match catalog_line(c) {
+                        Some(line) => line,
+                        None => Some(match (&c.before, &c.after) {
+                            (None, Some(a)) => format!("+ {}  {a}", show_key(&c.key)),
+                            (Some(x), None) => format!("- DELETE {}  {x}", show_key(&c.key)),
+                            (Some(x), Some(y)) => format!("~ {}  {}", show_key(&c.key), field_diff(x, y)),
+                            (None, None) => unreachable!(),
+                        }),
                     })
                     .collect();
                 // per table, deletes first, on the first line: what a person reads before approving
@@ -1432,6 +1636,139 @@ fn listing(rows: &[(String, chronos::Val)], n: usize, head: &str, more: &str) ->
         out.push(format!("  ... {} more ({more})", rows.len() - n));
     }
     out.join("\n")
+}
+
+/// A change to the database's own catalog (`_sonos_tables/<t>`, a view, a function...) as `DIFF` puts it in words:
+/// `+ create table todos (id integer not null, title text)`, `~ alter table t: +email text`, or the definition for
+/// what has no columns (`~ replace function f  {...}`). `None`: not a catalog key, shown as a row; `Some(None)`:
+/// one people don't read (the rows behind constraints, indexes and sequences), left out.
+fn catalog_line(c: &chronos::Change) -> Option<Option<String>> {
+    if !c.key.starts_with("_sonos_") {
+        return None;
+    }
+    let Some(d) = chronos::sql::describe(std::slice::from_ref(c)).into_iter().next() else {
+        // the rows behind constraints, indexes and sequences: left out, as DIFF leaves them; any other catalog entry
+        // DIFF has no words for (a type, a domain) shows as what it is, with its definition, rather than not at all
+        if chronos::sql::internal(&c.key) {
+            return Some(None);
+        }
+        let (kind, name) = c.key.trim_start_matches("_sonos_").split_once('/').unwrap_or(("catalog", &c.key));
+        let kind = kind.strip_suffix('s').unwrap_or(kind);
+        let (sign, def) = match (&c.before, &c.after) {
+            (None, Some(a)) => ('+', a.to_string()),
+            (Some(b), None) => ('-', b.to_string()),
+            (_, a) => ('~', a.as_deref().unwrap_or_default().to_string()),
+        };
+        return Some(Some(format!("{sign} {kind} {name}  {def}")));
+    };
+    if d.id.is_some() {
+        return None; // described as a row: show it as one
+    }
+    let sign = match d.change.split(' ').next() {
+        Some("create" | "register" | "mark") => '+',
+        Some("drop" | "unregister" | "unmark") => '-',
+        _ => '~',
+    };
+    let what = if d.change == "create table" {
+        d.after.as_ref().map_or(String::new(), |a| format!(" ({})", table_definition(a).join(", ")))
+    } else if d.change == "alter table" {
+        // each changed column as it was and as it is, then the table's own parts (constraints, indexes) that changed
+        let (b, a) = (d.before.clone().unwrap_or_default(), d.after.clone().unwrap_or_default());
+        let mut parts = column_changes(&b, &a);
+        parts.extend(part_changes(&b, &a));
+        if parts.is_empty() { String::new() } else { format!(": {}", parts.join(", ")) }
+    } else {
+        // a view's query, a function's body, a policy's roles and expressions: the definition itself, so two that
+        // differ never read the same (what it is now; what it was, for a drop), after what changed if it's said
+        let names = if d.columns.is_empty() { String::new() } else { format!(": {}", d.columns.join(", ")) };
+        let def = d.after.as_ref().or(d.before.as_ref()).map_or(String::new(), |j| format!("  {j}"));
+        format!("{names}{def}")
+    };
+    Some(Some(format!("{sign} {} {}{what}", d.change, d.table)))
+}
+
+/// A table's definition as its catalog row keeps it: each column with its type and whatever else it has (not null, a
+/// default, identity, generated, a length), then the table's own parts (primary key, unique, checks, foreign keys,
+/// indexes). All of it, so two tables that differ never read the same.
+fn table_definition(t: &Value) -> Vec<String> {
+    let mut out: Vec<String> =
+        t["columns"].as_array().map(|cs| cs.iter().map(column_definition).collect()).unwrap_or_default();
+    out.extend(table_parts(t).into_iter().map(|(k, v)| part(k, v)));
+    out
+}
+
+/// A column's whole definition: its name and type, then everything else its catalog entry has.
+fn column_definition(c: &Value) -> String {
+    let mut s = format!("{} {}", c["name"].as_str().unwrap_or("?"), c["type"].as_str().unwrap_or("?"));
+    if c["not_null"] == true {
+        s.push_str(" not null");
+    }
+    for (k, v) in c.as_object().into_iter().flatten() {
+        if !matches!(k.as_str(), "id" | "name" | "type" | "not_null") && !v.is_null() {
+            s.push_str(&format!(" {k} {v}"));
+        }
+    }
+    s
+}
+
+/// The columns an altered table changed, matched by their id: `+x int not null default 1`, `-age`, and a changed
+/// one whole on both sides (`a int -> a bigint not null`), whatever of it changed.
+fn column_changes(before: &Value, after: &Value) -> Vec<String> {
+    let cols = |t: &Value| t["columns"].as_array().cloned().unwrap_or_default();
+    let (b, a) = (cols(before), cols(after));
+    let find = |cs: &[Value], id: &Value| cs.iter().find(|c| c["id"] == *id).cloned();
+    let mut out = vec![];
+    for c in &b {
+        match find(&a, &c["id"]) {
+            None => out.push(format!("-{}", c["name"].as_str().unwrap_or("?"))),
+            Some(n) if n != *c => out.push(format!("{} -> {}", column_definition(c), column_definition(&n))),
+            Some(_) => {}
+        }
+    }
+    out.extend(a.iter().filter(|c| find(&b, &c["id"]).is_none()).map(|c| format!("+{}", column_definition(c))));
+    out
+}
+
+/// The table-level parts of a catalog row that say something (not empty, not false): constraints, indexes and the
+/// like. Its columns, and what only lays rows out, aren't among them.
+fn table_parts(t: &Value) -> Vec<(&str, &Value)> {
+    t.as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, _)| !matches!(k.as_str(), "columns" | "layouts" | "next_id" | "int_keys"))
+        .filter(|(_, v)| !(v.is_null() || *v == &Value::Bool(false) || v.as_array().is_some_and(Vec::is_empty)))
+        .map(|(k, v)| (k.as_str(), v))
+        .collect()
+}
+
+/// The table-level parts an altered table changed, on both sides: one it gained (`check [...]`), one it lost
+/// (`-check [...]`, the last check dropped too), one it changed (`index [...] -> [...]`).
+fn part_changes(before: &Value, after: &Value) -> Vec<String> {
+    let (b, a) = (table_parts(before), table_parts(after));
+    let get = |ps: &[(&str, &Value)], k: &str| ps.iter().find(|(x, _)| *x == k).map(|(_, v)| (*v).clone());
+    let mut keys: Vec<&str> = b.iter().chain(&a).map(|(k, _)| *k).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys.into_iter()
+        .filter_map(|k| match (get(&b, k), get(&a, k)) {
+            (Some(x), Some(y)) if x != y => Some(format!("{} -> {y}", part(k, &x))),
+            (None, Some(y)) => Some(part(k, &y)),
+            (Some(x), None) => Some(format!("-{}", part(k, &x))),
+            _ => None,
+        })
+        .collect()
+}
+
+fn part(k: &str, v: &Value) -> String {
+    let label = match k {
+        "primary_key" => "primary key",
+        "unique" => "unique",
+        "checks" => "check",
+        "foreign" => "foreign key",
+        "indexes" => "index",
+        other => other,
+    };
+    format!("{label} {v}")
 }
 
 /// `name: "Ada" -> "Ada L."` for changed fields of two JSON objects, else the whole values.
