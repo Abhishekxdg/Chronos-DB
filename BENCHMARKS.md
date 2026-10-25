@@ -1001,7 +1001,7 @@ BranchBench drives each database through one git-like API (branch, commit, diff,
 
 (seconds of the workflow, then invariants passed; setup and seeding not counted. A run's invariant count follows the path it took, so it varies a little between backends.)
 
-- **Chronos was fastest in five of six, and the one whose answers held in all six.** Doltgres finished S6 sooner, but half its invariants failed: its `dolt_reset('--hard', ...)` returned success and left the rows loaded after the commit (`S6.2 batch 5 reset to step 1 restores its rows: expected 200, got 400`). That may be this Doltgres version or our setup; the BranchBench authors' own runs are the reference for it.
+- **Chronos was fastest in four of six (S1, S2, S3, S5), and the one whose answers held in all six.** Doltgres was faster in S4, and finished S6 sooner, but half its S6 invariants failed: its `dolt_reset('--hard', ...)` returned success and left the rows loaded after the commit (`S6.2 batch 5 reset to step 1 restores its rows: expected 200, got 400`). That may be this Doltgres version or our setup; the BranchBench authors' own runs are the reference for it.
 - **Recovery after the bad deploy (S5)** took 18.8 s on Chronos (`RESTORE WORLD ... TO` the commit's moment), 195 s on file_copy (drop and re-clone) and 208 s on Doltgres.
 - **S4 is Doltgres's.** 563 s to 663 s. Chronos's S4 also needed #257 first (below).
 - **The background TPC-C load ran slower on Chronos** while the agents worked: 28 transactions/s in S4 (Doltgres 30, file_copy 73) and 21/s in S5 (Doltgres 30, file_copy 24).
