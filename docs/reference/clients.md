@@ -250,4 +250,35 @@ print(agent.preview()["conflicts"])
 agent.merge()
 ```
 
+## LangGraph and pytest (Python)
+
+Two more files beside `chronos.py`, each needing only its framework.
+
+[`chronos_langgraph.py`](https://github.com/Abhishekxdg/chronosdb/blob/main/clients/python/chronos_langgraph.py) (`pip install langgraph`): `ChronosSaver`, a checkpointer, and `ChronosStore`, a long-term memory store, on a branch. Give them a world: main is protected by default, and a world keeps the agent's state beside the rows it changed.
+
+```python
+from chronos import Chronos
+from chronos_langgraph import ChronosSaver, ChronosStore
+
+db = Chronos("http://127.0.0.1:7070", token=os.environ.get("CHRONOS_TOKEN"))
+world = db.fork(f"run-{job_id}")
+graph = builder.compile(checkpointer=ChronosSaver(world), store=ChronosStore(world))
+graph.invoke(inputs, {"configurable": {"thread_id": job_id}})
+print(world.diff())   # the rows it changed, and its checkpoints
+world.merge()         # both land; world.discard() drops both
+```
+
+- Rows go in `langgraph_checkpoints`, `langgraph_writes` and `langgraph_store`, made on the first write. A checkpoint is one row (its channel values with it, as LangGraph's serde writes them); a task's pending writes are one `batch`, all or none.
+- Forking the world forks the thread: each fork goes on from the same checkpoint. `world.at("-5 minutes")` reads the rows and the thread as they were.
+- `ChronosSaver` passes LangGraph's checkpointer conformance suite (`langgraph-checkpoint-conformance`), except `prune` and `delete_for_runs`, which it doesn't offer. The async methods (`aget_tuple`, `aput`, ...) run the same calls on a worker thread.
+- `ChronosStore.search(query=...)` is [find](#find)'s full-text search over the item's strings (or the fields a put's `index` names; `index=False` leaves it out), typos allowed. There is no vector search: a store given an embedding `index` is refused. Filters take values and `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`.
+
+[`chronos_pytest.py`](https://github.com/Abhishekxdg/chronosdb/blob/main/clients/python/chronos_pytest.py) (`pip install pytest`): the fixture `chronos_world`, a fork of main for each test, discarded after it (a test that merges it is fine). Turn it on with `pytest -p chronos_pytest` or `pytest_plugins = ["chronos_pytest"]`; it reads `CHRONOS_URL` and `CHRONOS_TOKEN`, and skips the test without `CHRONOS_URL`.
+
+```python
+def test_agent_fixes_names(chronos_world):
+    my_agent(chronos_world).run("fix the misspelt names")
+    assert {c["key"] for c in chronos_world.diff()} == {"users/1", "users/7"}
+```
+
 More: [examples/agents](https://github.com/Abhishekxdg/chronosdb/blob/main/examples/agents) (tool definitions for LLM APIs, 20 agents merging at once), run in CI by `tests/clients.rs`.

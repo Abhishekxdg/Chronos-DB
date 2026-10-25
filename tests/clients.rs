@@ -60,6 +60,15 @@ fn python_client() {
     run_client("python3", "test_chronos.py", "python", &url, "");
 }
 
+/// LangGraph's checkpointer and store on a world, and the pytest fixture (each skipped without its package).
+#[test]
+fn python_adapters() {
+    let (_server, url) = start("py-langgraph", None);
+    run_client("python3", "test_chronos_langgraph.py", "python", &url, "");
+    let (_server, url) = start("py-pytest", None);
+    run_client("python3", "test_chronos_pytest.py", "python", &url, "");
+}
+
 #[test]
 fn agent_examples_run() {
     let (_server, url) = start("agents", None);
