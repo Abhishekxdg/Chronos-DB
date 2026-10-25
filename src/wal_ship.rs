@@ -612,7 +612,7 @@ pub(crate) fn run(log: &Log, ship: &Ship) {
                 ship.st.lock().unwrap().failing = None;
             }
             Err(Failed::Fenced(why)) => {
-                eprintln!("chronos: {why}; shipping the log stops");
+                crate::obs::log_line("ERROR", "wal_ship_stopped", &[("detail", why.to_string())]);
                 ship.st.lock().unwrap().fenced = Some(why);
                 ship.cv.notify_all();
             }
@@ -620,7 +620,15 @@ pub(crate) fn run(log: &Log, ship: &Ship) {
                 ship.failures.fetch_add(1, Ordering::Relaxed);
                 let mut st = ship.st.lock().unwrap();
                 if st.failing.is_none() {
-                    eprintln!("chronos: shipping the log to {} failed ({e}); retrying", ship.remote.url());
+                    crate::obs::log_line(
+                        "WARN",
+                        "wal_ship_failed",
+                        &[
+                            ("remote", ship.remote.url().to_string()),
+                            ("error", format!("{e}")),
+                            ("detail", "retrying".into()),
+                        ],
+                    );
                 }
                 let since = st.failing.take().map_or_else(Instant::now, |(t, _)| t);
                 st.failing = Some((since, e.to_string()));

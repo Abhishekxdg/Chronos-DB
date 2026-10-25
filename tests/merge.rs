@@ -1,6 +1,7 @@
 //! The merge engine: a dry run shows what a merge would do and why rows conflict, changing
 //! nothing; rows are settled one by one or combined by columns; a restart replays a settled
-//! merge exactly; and two sides changing one table's schema can't be settled by picking a side.
+//! merge exactly; and two sides changing one table's columns the same way can't be settled by
+//! picking a side.
 
 use chronos::sql::{Output, Session, Value};
 use chronos::{Db, MAIN};
@@ -261,9 +262,10 @@ fn both_changing_a_table_cannot_be_settled_by_picking_a_side() {
     q(&db, MAIN, "create table t (id int primary key, a text)");
     q(&db, MAIN, "insert into t values (1, 'one')");
     db.fork(MAIN, "x").unwrap();
+    // one column both sides added, each its own way (different columns merge: see merge_columns.rs)
     q(&db, "x", "alter table t add column b int default 1");
     q(&db, "x", "insert into t values (2, 'two', 2)");
-    q(&db, MAIN, "alter table t add column c text default 'c'");
+    q(&db, MAIN, "alter table t add column b text default 'c'");
     q(&db, MAIN, "insert into t values (3, 'three', 'three')");
     for how in ["", " using ours", " using theirs", " by columns"] {
         let e = chronos::sql::run(&db, MAIN, &format!("merge world x{how}"), &[]).unwrap_err();

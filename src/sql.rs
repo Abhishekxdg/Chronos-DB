@@ -27858,6 +27858,134 @@ fn packed_parts(raw: &str) -> Option<(usize, &str)> {
     None
 }
 
+/// Two worlds' changes to one table's definition (its stored JSON), from the one they share: the
+/// definition holding both, when they changed different columns. See `merge_table_def`.
+pub(crate) struct MergedTable {
+    pub def: String,
+    /// layouts `from..to` are the world's own (added since the fork); in the merged definition each
+    /// is `by` further on, after the parent's (see `shift_layout`)
+    pub from: usize,
+    pub to: usize,
+    pub by: usize,
+}
+
+/// A table's definition both sides of a merge changed (`base` is it at the fork, `ours` the
+/// world's, `theirs` the parent's), merged column by column: a column only one side added, dropped
+/// or changed takes that side's change, the world's new columns going after the parent's with ids
+/// past the parent's own. Any other part of the definition (keys, indexes, checks, ...) only one
+/// side may change, and when both added columns the world mustn't change any (its parts name its
+/// columns by id, which move). None where the two can't be combined: one column changed by both,
+/// two columns of one name, or layouts that aren't the fork's with more after them.
+pub(crate) fn merge_table_def(base: &str, ours: &str, theirs: &str) -> Option<MergedTable> {
+    let parse = |s: &str| serde_json::from_str::<Json>(s).ok().filter(Json::is_object);
+    let (b, o, t) = (parse(base)?, parse(ours)?, parse(theirs)?);
+    let layouts = |j: &Json| -> Option<Vec<Vec<u64>>> {
+        j["layouts"].as_array()?.iter().map(|l| l.as_array()?.iter().map(Json::as_u64).collect()).collect()
+    };
+    let (lb, lo, lt) = (layouts(&b)?, layouts(&o)?, layouts(&t)?);
+    if lb.is_empty() || !lo.starts_with(&lb) || !lt.starts_with(&lb) {
+        return None;
+    }
+    let (nb, no, nt) = (b["next_id"].as_u64()?, o["next_id"].as_u64()?, t["next_id"].as_u64()?);
+    if no < nb || nt < nb {
+        return None;
+    }
+    let renumbered = no > nb && nt > nb;
+    let id = |old: u64| if old >= nb { old - nb + nt } else { old };
+    let (bo, oo) = (b.as_object()?, o.as_object()?);
+    let mut m = t.as_object()?.clone();
+    // everything but the columns: the world's change, where the parent made none or the same
+    let parts: std::collections::BTreeSet<&String> = bo.keys().chain(oo.keys()).chain(m.keys()).collect();
+    let mut taken = vec![];
+    for k in parts {
+        if matches!(k.as_str(), "columns" | "layouts" | "next_id" | "dropped") || oo.get(k) == bo.get(k) {
+            continue;
+        }
+        if renumbered || (t.get(k) != bo.get(k) && t.get(k) != oo.get(k)) {
+            return None;
+        }
+        taken.push((k.clone(), oo.get(k).cloned()));
+    }
+    for (k, v) in taken {
+        match v {
+            Some(v) => m.insert(k, v),
+            None => m.remove(&k),
+        };
+    }
+    let cols = |j: &Json| j["columns"].as_array().cloned().unwrap_or_default();
+    let (cb, co, ct) = (cols(&b), cols(&o), cols(&t));
+    let col_id = |c: &Json| c["id"].as_u64();
+    let find = |cs: &[Json], i: u64| cs.iter().find(|c| col_id(c) == Some(i)).cloned();
+    let mut out = vec![];
+    // the parent's columns, with the world's changes to those it had at the fork
+    for c in &ct {
+        let i = col_id(c)?;
+        if i >= nb {
+            out.push(c.clone()); // the parent's own new column
+            continue;
+        }
+        let bc = find(&cb, i)?;
+        match find(&co, i) {
+            Some(oc) if oc == bc => out.push(c.clone()),
+            Some(oc) if *c == bc || *c == oc => out.push(oc),
+            None if *c == bc => {} // the world dropped it, the parent left it
+            _ => return None,      // both changed it, or one dropped what the other changed
+        }
+    }
+    // a column the parent dropped, which the world changed
+    for bc in &cb {
+        let i = col_id(bc)?;
+        if find(&ct, i).is_none() && find(&co, i).is_some_and(|oc| oc != *bc) {
+            return None;
+        }
+    }
+    // the world's own new columns, after the parent's
+    for c in co.iter().filter(|c| col_id(c).is_some_and(|i| i >= nb)) {
+        let mut c = c.clone();
+        c["id"] = Json::from(id(col_id(&c)?));
+        out.push(c);
+    }
+    let mut names = std::collections::HashSet::new();
+    if !out.iter().all(|c| names.insert(c["name"].as_str().unwrap_or_default().to_string())) {
+        return None; // two columns of one name
+    }
+    // the parent's layouts, the world's own after them, and the merged columns as rows are packed now
+    let mut all = lt.clone();
+    all.extend(lo[lb.len()..].iter().map(|l| l.iter().map(|&i| id(i)).collect::<Vec<_>>()));
+    let now = out.iter().map(col_id).collect::<Option<Vec<u64>>>()?;
+    if all.last() != Some(&now) {
+        all.push(now);
+    }
+    // dropped columns' attnums (see `Table::dropped`): the parent's, and the world's own drops; a
+    // column the world added and dropped numbers after the parent's columns, as its new ones do
+    let dropped = |j: &Json| -> Option<Vec<u64>> {
+        j.get("dropped").map_or(Some(vec![]), |a| a.as_array()?.iter().map(Json::as_u64).collect())
+    };
+    let (db, dw, mut dm) = (dropped(&b)?, dropped(&o)?, dropped(&t)?);
+    let (used_b, used_t) = ((cb.len() + db.len()) as u64, (ct.len() + dm.len()) as u64);
+    for &d in dw.iter().filter(|d| !db.contains(d)) {
+        dm.push(if d <= used_b { d } else { d - used_b + used_t });
+    }
+    dm.sort_unstable();
+    dm.dedup();
+    match dm.is_empty() {
+        true => m.remove("dropped"),
+        false => m.insert("dropped".into(), serde_json::json!(dm)),
+    };
+    m.insert("columns".into(), Json::Array(out));
+    m.insert("layouts".into(), serde_json::json!(all));
+    m.insert("next_id".into(), Json::from(nt + (no - nb)));
+    Some(MergedTable { def: Json::Object(m).to_string(), from: lb.len(), to: lo.len(), by: lt.len() - lb.len() })
+}
+
+/// A packed row of the world in a merge that combined its table's definition (see `MergedTable`):
+/// packed with one of the world's own layouts (`from..to`), it reads the same as the merged
+/// definition's copy of it, `by` further on. None for any other row, which reads as it is.
+pub(crate) fn shift_layout(raw: &str, from: usize, to: usize, by: usize) -> Option<String> {
+    let (layout, body) = packed_parts(raw)?;
+    (by > 0 && (from..to).contains(&layout)).then(|| format!("\u{1}2{};{body}", layout + by))
+}
+
 fn pack(vals: &[Value], layout: usize) -> String {
     use std::fmt::Write;
     let mut s = format!("\u{1}2{layout};");
@@ -29065,7 +29193,8 @@ enum Left<'a> {
 /// What a join on disk needs from its step (see `Exec::grace_join`).
 struct Grace<'a> {
     lkeys: &'a [&'a Expr], // the left side of each key column's equality
-    cols: &'a [usize],     // the key columns of the right side (see `HashIndex::on`)
+    cols: &'a [usize],     // the key columns of the right side's files (see `HashIndex::on`)
+    held: &'a [usize],     // the right side's columns its files hold (see `narrowed`)
     rest: &'a [&'a Expr],
     now: &'a [&'a Expr],
     left_join: bool,
@@ -29318,6 +29447,31 @@ fn implied_equalities(conds: &[&Expr], cols: &[Col], ranges: &[std::ops::Range<u
 }
 
 /// Batches end to end, in order.
+/// `b`'s rows with only the columns `cols` (in that order): a hash join's other side held without the columns
+/// nothing reads after its own conditions, which its rows carry as nulls (a joined row of order_line holds 4 of its
+/// 10 columns for CH Q3, so 1.5 million of them fit in memory where the whole width went to disk).
+fn narrowed(b: Batch, cols: &[usize]) -> Batch {
+    if cols.len() == b.width && cols.iter().enumerate().all(|(i, &c)| i == c) {
+        return b;
+    }
+    let mut out = Batch::new(cols.len());
+    out.vals.reserve(b.len * cols.len());
+    for r in b.rows() {
+        out.vals.extend(cols.iter().map(|&c| r[c].clone()));
+        out.len += 1;
+    }
+    out.note();
+    out
+}
+
+/// Puts a row of a table held narrowed (its columns `cols`, see `narrowed`) into a joined row, the table's columns
+/// starting at `at`; the columns not held stay as they are (nulls).
+fn place(row: &mut [Value], at: usize, cols: &[usize], r: &[Value]) {
+    for (x, &c) in r.iter().zip(cols) {
+        row[at + c].clone_from(x);
+    }
+}
+
 fn concat(width: usize, parts: Vec<Batch>) -> Batch {
     let mut out = Batch::new(width);
     out.vals.reserve(parts.iter().map(|b| b.vals.len()).sum());
@@ -50528,6 +50682,29 @@ impl<'a> Exec<'a> {
                 let agent = crate::disk::actor();
                 if !agent.is_empty() {
                     definer_refused(self.db, &agent, ddl)?;
+                    // A statement reached through a dynamic EXECUTE, a function or trigger body, or a
+                    // DO block never passed `agent_check` (the front-door capability gate). The read
+                    // or write it does is already bounded by the world this runs in — the agent was
+                    // checked for that world when the outer statement (the function call, the DO) was,
+                    // so a policy agent can't be here on `main`. What must still be stopped is a
+                    // world- or system-level statement — fork, merge, restore, drop, switch worlds, or
+                    // changing agents, policies, merge checks or the system — which is never a
+                    // legitimate thing to do from inside a body. (Classifying with `self.branch`, the
+                    // world this runs in, is right for that: `Reach::World` doesn't depend on it, and
+                    // it may be a transaction's own `_tx_` world, which `may_write` would reject.)
+                    if Statement(ddl.clone(), PlanCache::default(), false).access_in(self.db, self.branch)
+                        == Reach::World
+                    {
+                        return Err(SqlError {
+                            code: "42501",
+                            message: format!(
+                                "agent {agent} may not run world- or system-level statements from \
+                                 inside a function, trigger or DO block; it changes main only by \
+                                 merging a world of its own"
+                            ),
+                            info: None,
+                        });
+                    }
                 }
                 let out = Statement(ddl.clone(), PlanCache::default(), false).run(self, self.branch, self.params)?;
                 let fresh = self.db.view_tx(self.branch)?;
@@ -51534,9 +51711,10 @@ impl Exec<'_> {
         Ok(Access::Rows(rows))
     }
 
-    /// A joined table's rows where its own conditions hold (`own`), read a wave of parts at a time
-    /// while they fit in CHRONOS_WORK_MEM; past that, all of them go to files by the hash of their
-    /// column `c` (the join's), each row numbered in the table's order (see `grace_join`).
+    /// A joined table's rows where its own conditions hold (`own`), with only the columns `held` (see `narrowed`),
+    /// read a wave of parts at a time while they fit in CHRONOS_WORK_MEM; past that, all of them go to files by the
+    /// hash of their key columns `cols` (positions in `held`), each row numbered in the table's order (see
+    /// `grace_join`).
     #[allow(clippy::too_many_arguments)]
     fn read_bounded(
         &self,
@@ -51546,6 +51724,7 @@ impl Exec<'_> {
         need: &[bool],
         keep: &[bool],
         own: &[&Expr],
+        held: &[usize],
         cols: &[usize],
     ) -> Result<Right> {
         let w = t.cols.len();
@@ -51557,17 +51736,18 @@ impl Exec<'_> {
                 }
                 Ok(true)
             })?;
-            return Ok(Right::Held(right));
+            return Ok(Right::Held(narrowed(right, held)));
         }
         let parts = Parts::new(v, t, &access, need, keep, own, self.params, w, 0)?;
+        let w = held.len(); // what each row holds from here: `held` (see `narrowed`), whose keys are `cols`
         let budget = spill::work_mem();
-        let (mut held, mut bytes, mut done) = (vec![], 0, 0);
+        let (mut kept, mut bytes, mut done) = (vec![], 0, 0);
         let mut wave = 1; // the first part alone, to learn how big parts are
         while done < parts.k {
             let end = (done + wave).min(parts.k);
-            for b in par_run(end - done, |i, _| parts.read(done + i))? {
+            for b in par_run(end - done, |i, _| parts.read(done + i).map(|b| narrowed(b, held)))? {
                 bytes += spill::size_of(&b.vals);
-                held.push(b);
+                kept.push(b);
             }
             done = end;
             if bytes > budget && done < parts.k {
@@ -51584,12 +51764,12 @@ impl Exec<'_> {
                     }
                     Ok(())
                 };
-                for b in std::mem::take(&mut held) {
+                for b in std::mem::take(&mut kept) {
                     put(&b)?;
                 }
                 while done < parts.k {
                     let end = (done + WAVE).min(parts.k);
-                    for b in par_run(end - done, |i, _| parts.read(done + i))? {
+                    for b in par_run(end - done, |i, _| parts.read(done + i).map(|b| narrowed(b, held)))? {
                         put(&b)?;
                     }
                     done = end;
@@ -51598,7 +51778,7 @@ impl Exec<'_> {
             }
             wave = next_wave(budget, bytes, done, parts.k);
         }
-        Ok(Right::Held(concat(w, held)))
+        Ok(Right::Held(concat(w, kept)))
     }
 
     /// A hash join too big for memory (grace): the first table's rows, from its parts (`head`:
@@ -51678,7 +51858,7 @@ impl Exec<'_> {
                 let mut matched = false;
                 for j in index.get_key(vals_key(xs.iter().map(|x| &**x))) {
                     let mut row = l.clone();
-                    row[g.at..g.at + rb.width].clone_from_slice(rb.row(j));
+                    place(&mut row, g.at, g.held, rb.row(j));
                     if holds(g.rest, &p.cols, &row, self.params)? {
                         matched = true;
                         out.push((s, rseq[j], row));
@@ -53629,6 +53809,12 @@ impl Exec<'_> {
             };
             let key_cols: Vec<usize> = keys.iter().map(|(_, c)| *c).collect();
             let lkeys: Vec<&Expr> = keys.iter().map(|(e, _)| e).collect();
+            // a hash join's other side, read within CHRONOS_WORK_MEM (`read_bounded`), holds only the columns
+            // read after its own conditions, and its keys are found among those (see `narrowed`)
+            let all_cols: Vec<usize> = (0..t.cols.len()).collect();
+            let hold: Vec<usize> = all_cols.iter().copied().filter(|&c| keep[c] || key_cols.contains(&c)).collect();
+            let key_slots: Vec<usize> =
+                key_cols.iter().map(|c| hold.iter().position(|h| h == c).expect("keys are held")).collect();
             let all_checks: Vec<&Expr> = own.iter().chain(check.iter()).copied().collect();
             // this table's rows where its own conditions hold
             let read_right = |t: &mut Table, access: Access| -> Result<Batch> {
@@ -53647,29 +53833,33 @@ impl Exec<'_> {
             // rows `range` of `left` joined to their matches in `right`, found by `index` from the
             // value of `le`, where `rest` holds (no subqueries: this runs on any core); a LEFT
             // join keeps unmatched rows, padded with nulls
-            let probe =
-                |left: &Batch, range: std::ops::Range<usize>, lkeys: &[&Expr], right: &Batch, index: &HashIndex| {
-                    let mut out = Batch::new(width);
-                    for i in range {
-                        let l = left.row(i);
-                        let env = Env { cols: &p.cols, row: l, params: self.params, aggs: &[], sub: None };
-                        let xs = lkeys.iter().map(|le| ev(le, &env)).collect::<Result<Vec<_>>>()?;
-                        let mut matched = false;
-                        for j in index.get_key(vals_key(xs.iter().map(|x| &**x))) {
-                            let c = out.extend(l);
-                            c[at..at + right.width].clone_from_slice(right.row(j));
-                            if holds(&rest, &p.cols, c, self.params)? {
-                                matched = true;
-                            } else {
-                                out.pop();
-                            }
-                        }
-                        if !matched && left_join {
-                            out.extend(l);
+            let probe = |left: &Batch,
+                         range: std::ops::Range<usize>,
+                         lkeys: &[&Expr],
+                         right: &Batch,
+                         cols: &[usize],
+                         index: &HashIndex| {
+                let mut out = Batch::new(width);
+                for i in range {
+                    let l = left.row(i);
+                    let env = Env { cols: &p.cols, row: l, params: self.params, aggs: &[], sub: None };
+                    let xs = lkeys.iter().map(|le| ev(le, &env)).collect::<Result<Vec<_>>>()?;
+                    let mut matched = false;
+                    for j in index.get_key(vals_key(xs.iter().map(|x| &**x))) {
+                        let c = out.extend(l);
+                        place(c, at, cols, right.row(j));
+                        if holds(&rest, &p.cols, c, self.params)? {
+                            matched = true;
+                        } else {
+                            out.pop();
                         }
                     }
-                    Ok::<_, SqlError>(out)
-                };
+                    if !matched && left_join {
+                        out.extend(l);
+                    }
+                }
+                Ok::<_, SqlError>(out)
+            };
 
             if let Some(f) = first.take() {
                 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
@@ -53702,12 +53892,13 @@ impl Exec<'_> {
                                 && p.aggs.iter().all(|a| exact(a, &p.cols))
                         });
                         // this table's rows, unless they outgrow CHRONOS_WORK_MEM: then a join on disk
-                        let right = match self.read_bounded(v, t, access, &need, keep, &own_here, &key_cols)? {
+                        let right = match self.read_bounded(v, t, access, &need, keep, &own_here, &hold, &key_slots)? {
                             Right::Held(b) => b,
                             Right::Spilled(files) => {
                                 let g = Grace {
                                     lkeys: &lkeys,
-                                    cols: &key_cols,
+                                    cols: &key_slots,
+                                    held: &hold,
                                     rest: &rest,
                                     now: &now,
                                     left_join,
@@ -53720,7 +53911,7 @@ impl Exec<'_> {
                                 continue;
                             }
                         };
-                        let index = HashIndex::on(&right, &key_cols)?;
+                        let index = HashIndex::on(&right, &key_slots)?;
                         let head: Vec<std::sync::Mutex<Option<Batch>>> =
                             head.into_iter().map(std::sync::Mutex::new).collect();
                         let outs = par_run(parts.k, |i, _| {
@@ -53729,7 +53920,7 @@ impl Exec<'_> {
                                 Some(b) => b,
                                 None => parts.read(i)?,
                             };
-                            let mut out = probe(&left, 0..left.len, &lkeys, &right, &index)?;
+                            let mut out = probe(&left, 0..left.len, &lkeys, &right, &hold, &index)?;
                             let mut g = Groups::default();
                             if let Some(group) = fold {
                                 out.retain(|r| holds(&now, &p.cols, r, self.params))?;
@@ -53761,12 +53952,16 @@ impl Exec<'_> {
             }
             let mut out = Batch::new(width);
             out.vals.reserve(rows.len * width);
-            let mut add = |l: &[Value], check: &[&Expr], matches: &mut dyn Iterator<Item = &[Value]>| -> Result<()> {
+            let mut add = |l: &[Value],
+                           check: &[&Expr],
+                           matches: &mut dyn Iterator<Item = &[Value]>,
+                           cols: &[usize]|
+             -> Result<()> {
                 let mut matched = false;
                 for r in matches {
                     let c = out.push();
                     c.clone_from_slice(l);
-                    c[at..at + r.len()].clone_from_slice(r);
+                    place(c, at, cols, r);
                     if self.all(check, &p.cols, c)? {
                         matched = true;
                     } else {
@@ -53792,7 +53987,7 @@ impl Exec<'_> {
             let mut access = Some(access);
             let mut held: Option<Right> = match &eq {
                 Some((_, le, c)) if !lookups && no_subs(std::iter::once(le).chain(rest.iter().copied())) => {
-                    Some(self.read_bounded(v, t, access.take().unwrap(), &need, keep, &own_here, &key_cols)?)
+                    Some(self.read_bounded(v, t, access.take().unwrap(), &need, keep, &own_here, &hold, &key_slots)?)
                 }
                 _ => None,
             };
@@ -53809,7 +54004,7 @@ impl Exec<'_> {
                         {
                             found = Some(decode_raw(t, &id, &raw, Some(&need))?);
                         }
-                        add(l, &all_checks, &mut found.iter().map(|r| &r[..]))?;
+                        add(l, &all_checks, &mut found.iter().map(|r| &r[..]), &all_cols)?;
                     }
                 }
                 // few rows so far, joined on an indexed column: look each value up in the index
@@ -53841,7 +54036,7 @@ impl Exec<'_> {
                             }
                             seen.insert(h.clone(), found);
                         }
-                        add(l, &all_checks, &mut seen[&h].rows())?;
+                        add(l, &all_checks, &mut seen[&h].rows(), &all_cols)?;
                     }
                 }
                 // a hash join whose other side outgrows CHRONOS_WORK_MEM: on disk (see `grace_join`)
@@ -53849,7 +54044,8 @@ impl Exec<'_> {
                     let Some(Right::Spilled(files)) = held.take() else { unreachable!() };
                     let g = Grace {
                         lkeys: &lkeys,
-                        cols: &key_cols,
+                        cols: &key_slots,
+                        held: &hold,
                         rest: &rest,
                         now: &now,
                         left_join,
@@ -53860,28 +54056,30 @@ impl Exec<'_> {
                     out = self.grace_join(Left::Rows(&rows), files, &g, p)?.0;
                 }
                 eq => {
-                    let right = match held.take() {
-                        Some(Right::Held(b)) => b,
-                        _ => read_right(t, access.take().expect("read once"))?,
+                    // (held narrowed, or read here whole)
+                    let (right, cols, key_at) = match held.take() {
+                        Some(Right::Held(b)) => (b, &hold, &key_slots),
+                        _ => (read_right(t, access.take().expect("read once"))?, &all_cols, &key_cols),
                     };
                     match &eq {
                         // many rows: probe on every free core
                         Some((_, le, _))
                             if rows.len >= PAR_MIN && no_subs(std::iter::once(le).chain(rest.iter().copied())) =>
                         {
-                            let index = HashIndex::on(&right, &key_cols)?;
-                            let parts = par_chunks(rows.len, |range| probe(&rows, range, &lkeys, &right, &index))?;
+                            let index = HashIndex::on(&right, key_at)?;
+                            let parts =
+                                par_chunks(rows.len, |range| probe(&rows, range, &lkeys, &right, cols, &index))?;
                             out = concat(width, parts);
                         }
                         // ponytail: a hash join matches equal values of the same kind; text '5' won't meet 5
                         Some(_) => {
-                            let index = HashIndex::on(&right, &key_cols)?;
+                            let index = HashIndex::on(&right, key_at)?;
                             for l in rows.rows() {
                                 let env =
                                     Env { cols: &p.cols, row: l, params: self.params, aggs: &[], sub: Some(self) };
                                 let xs = keys.iter().map(|(le, _)| ev(le, &env)).collect::<Result<Vec<_>>>()?;
                                 let found = index.get_key(vals_key(xs.iter().map(|x| &**x)));
-                                add(l, &rest, &mut found.map(|i| right.row(i)))?;
+                                add(l, &rest, &mut found.map(|i| right.row(i)), cols)?;
                             }
                         }
                         None => match &calc {
@@ -53907,13 +54105,13 @@ impl Exec<'_> {
                                 match index {
                                     None => {
                                         for l in rows.rows() {
-                                            add(l, &check, &mut right.rows())?;
+                                            add(l, &check, &mut right.rows(), cols)?;
                                         }
                                     }
                                     Some(index) => {
                                         if rows.len >= PAR_MIN && no_subs(rest.iter().copied()) {
                                             let parts = par_chunks(rows.len, |range| {
-                                                probe(&rows, range, &[le], &right, &index)
+                                                probe(&rows, range, &[le], &right, cols, &index)
                                             })?;
                                             out = concat(width, parts);
                                         } else {
@@ -53921,7 +54119,7 @@ impl Exec<'_> {
                                                 let env =
                                                     Env { cols: &p.cols, row: l, params, aggs: &[], sub: Some(self) };
                                                 let x = ev(le, &env)?;
-                                                add(l, &rest, &mut index.get(&x).map(|i| right.row(i)))?;
+                                                add(l, &rest, &mut index.get(&x).map(|i| right.row(i)), cols)?;
                                             }
                                         }
                                     }
@@ -53929,7 +54127,7 @@ impl Exec<'_> {
                             }
                             None => {
                                 for l in rows.rows() {
-                                    add(l, &check, &mut right.rows())?;
+                                    add(l, &check, &mut right.rows(), cols)?;
                                 }
                             }
                         },

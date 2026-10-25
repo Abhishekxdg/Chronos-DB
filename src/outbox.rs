@@ -400,7 +400,15 @@ pub(crate) fn load_ledger(dir: &std::path::Path, crypt: Option<&crate::crypt::Cr
             return Ledger { key: load_key(dir, crypt), ..Ledger::default() };
         }
         Err(e) => {
-            eprintln!("chronos: could not read {}: {e}; the outbox ledger starts empty", path.display());
+            crate::obs::log_line(
+                "WARN",
+                "ledger_load_failed",
+                &[
+                    ("path", path.display().to_string()),
+                    ("error", format!("{e}")),
+                    ("detail", "the outbox ledger starts empty".into()),
+                ],
+            );
             return Ledger::default();
         }
     };
@@ -414,7 +422,15 @@ pub(crate) fn load_ledger(dir: &std::path::Path, crypt: Option<&crate::crypt::Cr
             told: Default::default(),
         },
         Err(e) => {
-            eprintln!("chronos: {} is damaged ({e}); the outbox ledger starts empty", path.display());
+            crate::obs::log_line(
+                "WARN",
+                "ledger_damaged",
+                &[
+                    ("path", path.display().to_string()),
+                    ("error", format!("{e}")),
+                    ("detail", "the outbox ledger starts empty".into()),
+                ],
+            );
             Ledger { key: load_key(dir, crypt), ..Ledger::default() }
         }
     }
@@ -434,13 +450,25 @@ fn load_key(dir: &std::path::Path, crypt: Option<&crate::crypt::Crypt>) -> Optio
     match crate::crypt::open_file(crypt, bytes, &path.display().to_string()) {
         Ok(k) if k.len() == 32 => Some(k.try_into().unwrap()),
         Ok(_) => {
-            eprintln!("chronos: {} is damaged; discarded payloads are hashed under a new key", path.display());
+            crate::obs::log_line(
+                "WARN",
+                "outbox_key_damaged",
+                &[
+                    ("path", path.display().to_string()),
+                    ("detail", "discarded payloads are hashed under a new key".into()),
+                ],
+            );
             None
         }
         Err(e) => {
-            eprintln!(
-                "chronos: could not read {} ({e}); discarded payloads are hashed under a new key",
-                path.display()
+            crate::obs::log_line(
+                "WARN",
+                "outbox_key_load_failed",
+                &[
+                    ("path", path.display().to_string()),
+                    ("error", format!("{e}")),
+                    ("detail", "discarded payloads are hashed under a new key".into()),
+                ],
             );
             None
         }
@@ -617,7 +645,11 @@ impl Core {
                 None => k.to_vec(),
             };
             if let Err(e) = disk::write_file(&path, &bytes) {
-                eprintln!("chronos: could not save {}: {e}", path.display());
+                crate::obs::log_line(
+                    "WARN",
+                    "ledger_save_failed",
+                    &[("path", path.display().to_string()), ("error", format!("{e}"))],
+                );
             }
             #[cfg(unix)]
             {
@@ -655,7 +687,7 @@ impl Core {
             None => bytes,
         };
         if let Err(e) = disk::write_file(&log.dir.join(LEDGER), &bytes) {
-            eprintln!("chronos: could not save the outbox ledger: {e}");
+            crate::obs::log_line("WARN", "ledger_save_failed", &[("error", format!("{e}"))]);
         }
     }
 
