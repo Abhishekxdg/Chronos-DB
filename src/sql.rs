@@ -7796,7 +7796,23 @@ struct SubQ {
     sig: u64,
     /// its column's collation, found when it's bound (see `collation::of`)
     coll: collation::Strength,
+    /// its aggregates of only the outer query's columns, which are the outer query's (see `Binder::lift`): bound
+    /// there, with their types and collations; the subquery reads the k-th as `LIFTED.k`, its value for the outer group
+    lifted: Vec<(Expr, Type, collation::Coll)>,
 }
+
+/// A lifted aggregate's value (see `SubQ::lifted`), typed and in its collation, as `outer_value` puts an outer
+/// column's in.
+fn lifted_value(v: Value, ty: Type, coll: collation::Coll) -> Expr {
+    let e = Expr::Cast(Box::new(Expr::Lit(v)), ty);
+    match collation::collatable(ty) && coll != collation::Coll::DEFAULT {
+        true => Expr::Func(Func::Implicit(coll), vec![e]),
+        false => e,
+    }
+}
+
+/// The qualifier of a subquery's reference to an aggregate the outer query does for it (see `SubQ::lifted`)
+const LIFTED: &str = "\u{1}lifted";
 
 #[derive(Clone, Debug)]
 struct Select {
@@ -11707,6 +11723,7 @@ impl Parser {
                             cmp: None,
                             sig: 0,
                             coll: collation::Strength::None,
+                            lifted: vec![],
                         })
                     };
                     for (_, e) in &mut sets {
@@ -11793,6 +11810,7 @@ impl Parser {
                             cmp: None,
                             sig: 0,
                             coll: collation::Strength::None,
+                            lifted: vec![],
                         }),
                         false,
                     ));
@@ -14522,6 +14540,7 @@ impl Parser {
                     cmp: None,
                     sig: 0,
                     coll: collation::Strength::None,
+                    lifted: vec![],
                 }),
                 false,
             )
@@ -16899,6 +16918,7 @@ impl Parser {
                             cmp: None,
                             sig: 0,
                             coll: collation::Strength::None,
+                            lifted: vec![],
                         }))
                     })
                     .collect());
@@ -16930,6 +16950,7 @@ impl Parser {
                         cmp: None,
                         sig: 0,
                         coll: collation::Strength::None,
+                        lifted: vec![],
                     }))
                 })
                 .collect());
@@ -19282,6 +19303,7 @@ impl Parser {
                     cmp,
                     sig: 0,
                     coll: collation::Strength::None,
+                    lifted: vec![],
                 }),
                 plain.unwrap_or(false),
             )
@@ -20452,6 +20474,7 @@ impl Parser {
                                 cmp,
                                 sig: 0,
                                 coll: collation::Strength::None,
+                                lifted: vec![],
                             }),
                             neg,
                         ));
@@ -20509,6 +20532,7 @@ impl Parser {
                         cmp: None,
                         sig: 0,
                         coll: collation::Strength::None,
+                        lifted: vec![],
                     }),
                     neg,
                 ));
@@ -20997,6 +21021,7 @@ impl Parser {
                     cmp: None,
                     sig: 0,
                     coll: collation::Strength::None,
+                    lifted: vec![],
                 }))
             }
             Some(Tok::Sym("(")) => {
@@ -21057,6 +21082,7 @@ impl Parser {
                         cmp: None,
                         sig: 0,
                         coll: collation::Strength::None,
+                        lifted: vec![],
                     }),
                     false,
                 )
@@ -21430,6 +21456,7 @@ impl Parser {
                     cmp: None,
                     sig: 0,
                     coll: collation::Strength::None,
+                    lifted: vec![],
                 }))
             }
             // ARRAY[a, b]: an array, as Postgres array text ({a,b})
@@ -52104,10 +52131,12 @@ impl Runner for Exec<'_> {
 
     fn rows(&self, sq: &SubQ, env: &Env) -> Result<SubRows> {
         let vals: Vec<Value> = sq.outer.iter().map(|(i, ..)| env.row[*i].clone()).collect();
+        // (the outer query's aggregates it reads: their values for the group)
+        let lifted: Vec<Value> = sq.lifted.iter().map(|(e, ..)| eval(e, env)).collect::<Result<_>>()?;
         let at = if sq.sig == 0 { &*sq.q as *const Select as usize } else { 0 };
-        let key = (sq.sig, at, vals.iter().map(hkey).collect());
+        let key = (sq.sig, at, vals.iter().chain(&lifted).map(hkey).collect());
         // (one that reads outer values and runs a function that changes something runs for each outer row)
-        let each = !sq.outer.is_empty() && self.runs_each_time(sq);
+        let each = (!sq.outer.is_empty() || !sq.lifted.is_empty()) && self.runs_each_time(sq);
         let hit = if each { None } else { self.subs.borrow_mut().get(&key) };
         if let Some(r) = hit {
             return Ok(r);
@@ -52115,6 +52144,11 @@ impl Runner for Exec<'_> {
         // ponytail: a subquery reads the branch as it is when it runs, not as the outer
         // query's view began; keep one view per statement if concurrent writers make that matter
         let q = subst_select(&sq.q, &|q, n| {
+            if q.as_deref() == Some(LIFTED) {
+                let k = n.parse::<usize>().ok()?;
+                let (_, ty, coll) = sq.lifted.get(k)?;
+                return Some(lifted_value(lifted.get(k)?.clone(), *ty, *coll));
+            }
             sq.outer.iter().position(|(_, oq, on)| oq == q && on == n).map(|p| {
                 // (`(c).f` of an outer record column: the field of its value, typed as the record it is)
                 if outer_field(&env.cols[sq.outer[p].0], &sq.outer[p].1, &sq.outer[p].2) {
@@ -52143,7 +52177,7 @@ impl Runner for Exec<'_> {
             })
         });
         // one that reads outer values runs with its own WITH queries' rows: they may depend on them
-        let outer = (!sq.outer.is_empty()).then(|| self.ctes.take());
+        let outer = (!sq.outer.is_empty() || !sq.lifted.is_empty()).then(|| self.ctes.take());
         let ran = self.select(&q);
         if let Some(before) = outer {
             *self.ctes.borrow_mut() = before;
@@ -53296,7 +53330,7 @@ impl Exec<'_> {
                         bounds.entry(i).or_default().points = Some(vals);
                     }
                 }
-                Expr::InSub(a, sq, false) if sq.outer.is_empty() && sq.cmp.is_none() => {
+                Expr::InSub(a, sq, false) if sq.outer.is_empty() && sq.lifted.is_empty() && sq.cmp.is_none() => {
                     // the same list for every row: run it once (the filter reuses the result)
                     let Some(i) = col(a) else { continue };
                     let env = Env { cols: &[], row: &[], params: self.params, aggs: &[], sub: Some(self) };
@@ -54443,6 +54477,7 @@ impl Exec<'_> {
                             cmp: None,
                             sig: 0,
                             coll: collation::Strength::None,
+                            lifted: vec![],
                         };
                         // (it reads the tables before it: its own columns, and those of tables after it, aren't its
                         // outer ones, so `a` of `v(a), lateral (select a, ...)` is v's, not the subquery's own `a`)
@@ -63489,7 +63524,7 @@ fn renumber(sq: &SubQ, f: &dyn Fn(&Expr) -> Option<Expr>) -> SubQ {
             _ => (*i, q.clone(), n.clone()),
         })
         .collect();
-    SubQ { q: sq.q.clone(), outer, ty: sq.ty, cmp: sq.cmp, sig: sq.sig, coll: sq.coll }
+    SubQ { q: sq.q.clone(), outer, ty: sq.ty, cmp: sq.cmp, sig: sq.sig, coll: sq.coll, lifted: sq.lifted.clone() }
 }
 
 /// A copy of `s` with column references `f` answers for replaced, in every part and every
@@ -63880,8 +63915,37 @@ impl<'a> Binder<'a> {
         let Some(v) = self.v else { return err(UNSUPPORTED, "subqueries aren't supported here") };
         let mut outer = vec![];
         outer_refs(v, &sq.q, self.cols, &mut outer)?;
-        // planned with the outer values as typed nulls, to learn its columns
-        let probe = subst_select(&sq.q, &|q, n| {
+        let probe = self.probe(&sq.q, &outer, &sq.lifted);
+        outer_aggregates(v, &sq.q, &probe, &outer)?;
+        let (cols, colls) = select_columns_with(v, &probe, &[], &[])?;
+        if one && cols.len() != 1 {
+            return err(SYNTAX, format!("a subquery used as a value must return one column, not {}", cols.len()));
+        }
+        // what it is, for its answers' cache (see `Runner::rows`): planning it just now cost more; none for one
+        // reading the outer query's aggregates, whose answers are the group's
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        format!("{:?}", sq.q).hash(&mut h);
+        let sig = if sq.lifted.is_empty() { h.finish() | 1 } else { 0 };
+        let coll = colls.first().copied().unwrap_or(collation::Strength::None);
+        let ty = cols.first().map_or(Type::Text, |c| c.1);
+        Ok(SubQ { q: sq.q.clone(), outer, ty, cmp: sq.cmp, sig, coll, lifted: sq.lifted.clone() })
+    }
+
+    /// Subquery `q` with the outer values it reads (`outer`, and the aggregates `lifted` it reads of the outer
+    /// query's) as typed nulls: what is planned to learn its columns.
+    fn probe(
+        &self,
+        q: &Select,
+        outer: &[(usize, Option<String>, String)],
+        lifted: &[(Expr, Type, collation::Coll)],
+    ) -> Select {
+        subst_select(q, &|q, n| {
+            if q.as_deref() == Some(LIFTED) {
+                let at = n.parse::<usize>().ok().and_then(|k| lifted.get(k));
+                let (ty, coll) = at.map_or((Type::Text, collation::Coll::DEFAULT), |l| (l.1, l.2));
+                return Some(lifted_value(Value::Null, ty, coll));
+            }
             outer.iter().find(|(_, oq, on)| oq == q && on == n).map(|(i, oq, on)| {
                 let null = Expr::Cast(Box::new(Expr::Lit(Value::Null)), self.cols[*i].ty);
                 match outer_field(&self.cols[*i], oq, on) {
@@ -63889,19 +63953,52 @@ impl<'a> Binder<'a> {
                     false => outer_value(null, &self.cols[*i]),
                 }
             })
+        })
+    }
+
+    /// Whether `e` has a subquery with an aggregate of only this query's columns (one `lift` makes this query's).
+    fn lifts(&self, e: &Expr) -> bool {
+        let Some(v) = self.v else { return false };
+        let mut subs = vec![];
+        walk(e, &mut |x| {
+            if let Expr::Sub(sq) | Expr::Exists(sq, _) | Expr::InSub(_, sq, _) = x
+                && has_own_agg(&sq.q)
+            {
+                subs.push(sq.clone());
+            }
         });
-        outer_aggregates(v, &sq.q, &probe, &outer)?;
-        let (cols, colls) = select_columns_with(v, &probe, &[], &[])?;
-        if one && cols.len() != 1 {
-            return err(SYNTAX, format!("a subquery used as a value must return one column, not {}", cols.len()));
+        subs.iter().any(|sq| {
+            outer_level_aggs(v, &sq.q, self.cols, &|q, o| self.probe(q, o, &sq.lifted)).is_ok_and(|f| !f.is_empty())
+        })
+    }
+
+    /// Subquery `sq` with its aggregates of only this query's columns made this query's, as Postgres has them (an
+    /// aggregate's level is its arguments'): `HAVING EXISTS (SELECT 1 FROM b WHERE sum(DISTINCT a.four) = b.four)`
+    /// sums a's group. Each is bound here, and the subquery reads its value as `LIFTED.k` (see `SubQ::lifted`). Only
+    /// where this query aggregates (its select list, HAVING and ORDER BY); elsewhere they are refused, as before.
+    fn lift(&mut self, sq: &SubQ, in_agg: bool) -> Result<SubQ> {
+        let Some(v) = self.v else { return Ok(sq.clone()) };
+        if self.group.is_none() || !has_own_agg(&sq.q) {
+            return Ok(sq.clone());
         }
-        // what it is, for its answers' cache (see `Runner::rows`): planning it just now cost more
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        format!("{:?}", sq.q).hash(&mut h);
-        let sig = h.finish() | 1;
-        let coll = colls.first().copied().unwrap_or(collation::Strength::None);
-        Ok(SubQ { q: sq.q.clone(), outer, ty: cols.first().map_or(Type::Text, |c| c.1), cmp: sq.cmp, sig, coll })
+        let found = outer_level_aggs(v, &sq.q, self.cols, &|q, o| self.probe(q, o, &sq.lifted))?;
+        if found.is_empty() {
+            return Ok(sq.clone());
+        }
+        let (mut q, mut lifted) = ((*sq.q).clone(), sq.lifted.clone());
+        for a in found {
+            // (inside an aggregate of this query's, it is nested in it: 42803, as Postgres has it)
+            let bound = self.go(&a, in_agg)?;
+            let ty = ty_in(&bound, self.cols, self.params, &self.aggs)?;
+            let coll = self.coll_of(&bound)?.coll();
+            let at = Expr::Col(Some(LIFTED.into()), lifted.len().to_string());
+            lifted.push((bound, ty, coll));
+            let shown = format!("{a:?}");
+            for e in own_exprs_mut(&mut q) {
+                *e = rewrite(e, &|x| (matches!(x, Expr::Agg(..)) && format!("{x:?}") == shown).then(|| at.clone()));
+            }
+        }
+        Ok(SubQ { q: Box::new(q), lifted, sig: 0, ..sq.clone() })
     }
 
     fn bind(&mut self, e: &Expr) -> Result<Expr> {
@@ -66294,6 +66391,8 @@ impl<'a> Binder<'a> {
             && !has_agg(e)
             && !has_window(e)
             && !matches!(e, Expr::Lit(_) | Expr::Param(_))
+            // (a subquery with an aggregate of this query's: bound below, see `lift`)
+            && !self.lifts(e)
         {
             let b = Binder::plain(self.cols, self.v).with_params(self.params).bind(e)?;
             let shown = format!("{b:?}");
@@ -66425,8 +66524,14 @@ impl<'a> Binder<'a> {
             Expr::Lit(_) | Expr::Param(_) | Expr::Idx(_) | Expr::AggRef(_) | Expr::Default => e.clone(),
             Expr::Window(_) => self.go_window(e, in_agg)?,
             Expr::WinRef(..) => e.clone(),
-            Expr::Sub(sq) => Expr::Sub(Box::new(self.sub(sq, true)?)),
-            Expr::Exists(sq, n) => Expr::Exists(Box::new(self.sub(sq, false)?), *n),
+            Expr::Sub(sq) => {
+                let sq = self.lift(sq, in_agg)?;
+                Expr::Sub(Box::new(self.sub(&sq, true)?))
+            }
+            Expr::Exists(sq, n) => {
+                let sq = self.lift(sq, in_agg)?;
+                Expr::Exists(Box::new(self.sub(&sq, false)?), *n)
+            }
             // (a, b) IN (SELECT x, y ...): a subquery with a column for each element
             Expr::InSub(x, sq, n) if is_row(x) => {
                 // (its fields as they are, compared with the subquery's columns: a regproc's by its oid)
@@ -67271,7 +67376,8 @@ impl<'a> Binder<'a> {
         let mut go = |x: &Expr| self.go(x, in_agg).map(Box::new);
         Ok({
             let mut x = go(x)?;
-            let mut sq = self.sub(sq, true)?;
+            let sq = self.lift(sq, in_agg)?;
+            let mut sq = self.sub(&sq, true)?;
             let t = sq.ty;
             if self.oid_sub(&mut x, &mut sq, 0, t)? {
                 sq = self.sub(&sq, true)?;
@@ -68314,7 +68420,8 @@ impl Plan {
         let grouped = !s.group.is_empty()
             || s.having.is_some()
             || items.iter().any(|(_, e)| has_agg(e))
-            || s.order.iter().any(|(e, _)| has_agg(e));
+            || s.order.iter().any(|(e, _)| has_agg(e))
+            || lifts_aggs(v, items.iter().map(|(_, e)| e).chain(s.order.iter().map(|(e, _)| e)), &cols)?;
         let mut plain = Binder::plain(&cols, Some(v)).with_params(declared);
         let filter = s.filter.as_ref().map(|f| plain.bind(f)).transpose()?;
         // a join's ON sees the tables joined so far, not later ones (`join i1 on b.thousand = f1
@@ -68705,22 +68812,44 @@ fn hint_subqueries(v: &View, e: &Expr, out: &mut [Option<Type>]) -> Result<()> {
     Ok(())
 }
 
-/// A subquery's aggregate whose aggregated arguments read only the outer query's columns (`outer`, as `outer_refs`
-/// found them) is, in Postgres, the outer query's aggregate (its level is its arguments'): not done here, so 0A000,
-/// rather than an answer over the subquery's rows. One with a column of the subquery in its direct arguments
-/// (percentile_disc(a) WITHIN GROUP (ORDER BY outer.x)) is Postgres's 42803. `probe` is `q` with the outer columns as
-/// typed nulls, to find its sources' columns; its subqueries in FROM are looked into too.
+/// A subquery's aggregate whose aggregated arguments read only the outer query's columns is, in Postgres, the outer
+/// query's aggregate (its level is its arguments'). Where the outer query aggregates, `Binder::lift` makes it the
+/// outer query's; elsewhere (a WHERE's subquery, a subquery in FROM) it isn't done here, so 0A000, rather than an
+/// answer over the subquery's rows. `probe` is `q` with the outer columns as typed nulls, to find its sources'
+/// columns; its subqueries in FROM are looked into too.
 fn outer_aggregates(v: &View, q: &Select, probe: &Select, outer: &[(usize, Option<String>, String)]) -> Result<()> {
-    let Ok(tables) = sources(v, probe, None) else { return Ok(()) };
+    if !outer_level(v, q, probe, outer)?.is_empty() {
+        return err(UNSUPPORTED, "an aggregate of only the outer query's columns in a subquery is not supported");
+    }
+    // (a subquery in FROM sees the outer query too)
+    let srcs = |s: &Select| -> Vec<Option<Select>> {
+        s.from.iter().chain(s.joins.iter().map(|j| &j.src)).map(|x| x.sub.as_deref().cloned()).collect()
+    };
+    for (sub, psub) in srcs(q).into_iter().zip(srcs(probe)) {
+        if let (Some(sub), Some(psub)) = (sub, psub) {
+            outer_aggregates(v, &sub, &psub, outer)?;
+        }
+    }
+    for ((_, _, part), (_, _, ppart)) in q.set.iter().zip(&probe.set) {
+        outer_aggregates(v, part, ppart, outer)?;
+    }
+    Ok(())
+}
+
+/// The aggregates of subquery `q`'s own level (not its subqueries', nor a UNION's other parts') that are the outer
+/// query's: whose aggregated arguments read the outer query's columns (`outer`, as `outer_refs` found them) and none
+/// of the subquery's, each once. One with a column of the subquery in its direct arguments
+/// (percentile_disc(a) WITHIN GROUP (ORDER BY outer.x)) is Postgres's 42803. `probe` as for `outer_aggregates`.
+fn outer_level(v: &View, q: &Select, probe: &Select, outer: &[(usize, Option<String>, String)]) -> Result<Vec<Expr>> {
+    let Ok(tables) = sources(v, probe, None) else { return Ok(vec![]) };
     let inner: Vec<Col> = tables.into_iter().flat_map(|t| t.cols).collect();
     let is_inner = |t: &Option<String>, n: &String| resolve(&inner, t.as_deref(), n).is_ok();
     let is_outer =
         |t: &Option<String>, n: &String| !is_inner(t, n) && outer.iter().any(|(_, oq, on)| oq == t && on == n);
-    let mut found: Option<(&'static str, &'static str)> = None;
+    let (mut found, mut lower): (Vec<Expr>, bool) = (vec![], false);
     // (ARRAY(SELECT x FROM ...) is read as the subquery's array_agg of x, its own whatever x reads)
     let array_of = matches!(q.items.first(), Some(Item::Expr(Expr::Func(Func::Coalesce, a), Some(n)))
         if n == "array" && matches!(a.first(), Some(Expr::Agg(Agg::List(ListAgg::Array, _), ..))));
-    // (a UNION's other parts have their own sources: each is looked at on its own, below)
     let alone = Select { set: vec![], ..q.clone() };
     let exprs = if array_of { vec![] } else { select_exprs(&alone) };
     for e in exprs {
@@ -68747,7 +68876,6 @@ fn outer_aggregates(v: &View, q: &Select, probe: &Select, outer: &[(usize, Optio
             if own || !theirs {
                 return;
             }
-            let mut lower = false;
             for d in direct {
                 walk(d, &mut |y| {
                     if let Expr::Col(t, n) = y {
@@ -68755,29 +68883,75 @@ fn outer_aggregates(v: &View, q: &Select, probe: &Select, outer: &[(usize, Optio
                     }
                 });
             }
-            found = found.or(Some(if lower {
-                ("42803", "outer-level aggregate cannot contain a lower-level variable in its direct arguments")
-            } else {
-                (UNSUPPORTED, "an aggregate of only the outer query's columns in a subquery is not supported")
-            }));
+            let shown = format!("{x:?}");
+            if !found.iter().any(|f| format!("{f:?}") == shown) {
+                found.push(x.clone());
+            }
         });
     }
-    if let Some((code, message)) = found {
-        return err(code, message);
+    if lower {
+        return err("42803", "outer-level aggregate cannot contain a lower-level variable in its direct arguments");
     }
-    // (a subquery in FROM sees the outer query too)
-    let srcs = |s: &Select| -> Vec<Option<Select>> {
-        s.from.iter().chain(s.joins.iter().map(|j| &j.src)).map(|x| x.sub.as_deref().cloned()).collect()
-    };
-    for (sub, psub) in srcs(q).into_iter().zip(srcs(probe)) {
-        if let (Some(sub), Some(psub)) = (sub, psub) {
-            outer_aggregates(v, &sub, &psub, outer)?;
+    Ok(found)
+}
+
+/// A subquery's outer column references, as `outer_refs` finds them: each one's place in the outer row, and how the
+/// subquery names it.
+type OuterRefs = [(usize, Option<String>, String)];
+
+/// `outer_level` for subquery `q` of a query of columns `cols`, `probe` making its probe (see `Binder::probe`).
+fn outer_level_aggs(
+    v: &View,
+    q: &Select,
+    cols: &[Col],
+    probe: &dyn Fn(&Select, &OuterRefs) -> Select,
+) -> Result<Vec<Expr>> {
+    let mut outer = vec![];
+    outer_refs(v, q, cols, &mut outer)?;
+    if outer.is_empty() {
+        return Ok(vec![]);
+    }
+    outer_level(v, q, &probe(q, &outer), &outer)
+}
+
+/// Whether select `q` has an aggregate at its own level (not in its subqueries).
+fn has_own_agg(q: &Select) -> bool {
+    let alone = Select { set: vec![], ..q.clone() };
+    select_exprs(&alone).into_iter().any(has_agg)
+}
+
+/// Whether a subquery in `exprs` (a select list, an ORDER BY) has an aggregate of only the outer query's columns,
+/// which makes the query of columns `cols` aggregate (`SELECT (SELECT count(*) FILTER (WHERE outer_c <> 0) FROM ...)
+/// FROM t1` is one row; see `Binder::lift`).
+fn lifts_aggs<'e>(v: &View, exprs: impl Iterator<Item = &'e Expr>, cols: &[Col]) -> Result<bool> {
+    let b = Binder::plain(cols, Some(v));
+    let mut subs = vec![];
+    for e in exprs {
+        walk(e, &mut |x| {
+            if let Expr::Sub(sq) | Expr::Exists(sq, _) | Expr::InSub(_, sq, _) = x
+                && has_own_agg(&sq.q)
+            {
+                subs.push(sq.q.clone());
+            }
+        });
+    }
+    for q in subs {
+        if !outer_level_aggs(v, &q, cols, &|q, o| b.probe(q, o, &[]))?.is_empty() {
+            return Ok(true);
         }
     }
-    for ((_, _, part), (_, _, ppart)) in q.set.iter().zip(&probe.set) {
-        outer_aggregates(v, part, ppart, outer)?;
-    }
-    Ok(())
+    Ok(false)
+}
+
+/// `select_exprs` of `q`'s own level, to change: its UNION's other parts and its sources' AS OF left out.
+fn own_exprs_mut(q: &mut Select) -> Vec<&mut Expr> {
+    let mut out: Vec<&mut Expr> =
+        q.items.iter_mut().filter_map(|i| if let Item::Expr(e, _) = i { Some(e) } else { None }).collect();
+    out.extend(q.joins.iter_mut().filter_map(|j| j.on.as_mut()));
+    out.extend(q.filter.iter_mut().chain(q.group.iter_mut()).chain(q.having.iter_mut()));
+    out.extend(q.distinct_on.iter_mut());
+    out.extend(q.order.iter_mut().map(|(e, _)| e).chain(q.limit.iter_mut()).chain(q.offset.iter_mut()));
+    out
 }
 
 /// The outer columns a subquery reads: names that aren't its own tables' columns but are
