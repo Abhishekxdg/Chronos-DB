@@ -222,6 +222,8 @@ pub(super) struct PlanRel {
     pub(super) shown: String,
     pub(super) written: String,
     pub(super) cols: Vec<(String, Type, (i64, i64))>,
+    /// its columns' collations, which a COLLATE the planner folds away is compared with
+    pub(super) colls: Vec<collation::Coll>,
 }
 
 /// An expression over a table's columns `cols` (a constraint's, a default's, a partition key's) as Postgres writes it
@@ -264,6 +266,7 @@ pub(super) fn plan_expr(e: &Expr, rels: &[PlanRel], prefix: bool, want: Type) ->
             cols: r.cols.iter().map(|c| c.0.clone()).collect(),
             types: r.cols.iter().map(|c| Ty::with(c.1, c.2)).collect(),
             via: vec![Via::Own; r.cols.len()],
+            colls: r.colls.clone(),
             ..Rte::default()
         });
         lv.from.push(Node::Rel { rte: i, name: r.shown.clone(), only: false, aliased: false });
@@ -614,6 +617,8 @@ struct Rte {
     sides: Option<Box<Sides>>,
     /// the names its columns are shown by
     names: Names,
+    /// its columns' collations, where a plan's expression is written (see `plan_expr`); empty where not known
+    colls: Vec<collation::Coll>,
 }
 
 impl Rte {
@@ -2016,6 +2021,13 @@ impl<'q> Dp<'q> {
     }
 
     /// Where column `name` (of `qual`) is: levels out, entry, column.
+    /// The collation of the column `qual.name` names, where it is known (see `Rte::colls`).
+    fn col_coll(&self, qual: Option<&str>, name: &str) -> Option<collation::Coll> {
+        let (up, r, c) = self.find_col(qual, name)?;
+        let lv = self.levels.get(self.levels.len().checked_sub(1 + up)?)?;
+        lv.rtes.get(r)?.colls.get(c).copied()
+    }
+
     fn find_col(&self, qual: Option<&str>, name: &str) -> Option<(usize, usize, usize)> {
         for (up, lv) in self.levels.iter().rev().enumerate() {
             match qual {
@@ -2610,6 +2622,8 @@ impl<'q> Dp<'q> {
     fn tn(&mut self, e: &'q Expr) -> Option<Tn<'q>> {
         Some(match e {
             Expr::Lit(v) => self.lit(v)?,
+            // (a plan's parameter, as a generic plan has it: `$1`, of the type its other side gives it)
+            Expr::Param(n) if self.fold => Tn { n: N::Var(format!("${n}")), ty: None, raw: None },
             Expr::Col(qual, n) if n == "*" => {
                 let qual = qual.as_deref()?;
                 let lv = self
@@ -2896,12 +2910,20 @@ impl<'q> Dp<'q> {
         let tx = self.tn(x)?;
         let (vars, consts): (Vec<&'q Expr>, Vec<&'q Expr>) = list.iter().partition(|e| has_col(e));
         let mut terms = vec![];
-        let rest: Vec<&'q Expr> = if consts.len() > 1 {
+        // (an IN list of arrays: no array of them to make (get_array_type gives none), so each its own `=`, OR-ed:
+        // transformAExprIn, parse_expr.c:1197)
+        let arrays = consts.len() > 1 && matches!(tx.ty, Some(t) if matches!(t.t, Type::Array(_)));
+        let rest: Vec<&'q Expr> = if consts.len() > 1 && !arrays {
             let mut elems = vec![];
             for &c in &consts {
                 elems.push(self.tn(c)?);
             }
-            let to = common(std::iter::once(tx.ty).chain(elems.iter().map(|t| t.ty))).map_or(TEXT, Ty::base);
+            // (select_common_type, parse_coerce.c:1235, the left side first: the character types cast to each other
+            // implicitly both ways, so the first of them stays)
+            let to = match tx.ty {
+                Some(x) if x.t == Type::Text => x.base(),
+                _ => common(std::iter::once(tx.ty).chain(elems.iter().map(|t| t.ty))).map_or(TEXT, Ty::base),
+            };
             let items: Vec<N<'q>> = elems.into_iter().map(|t| self.cast(t, to, true)).collect();
             let (left, arr) = if to.varchar() {
                 let arr = match self.const_array(&items, "text[]") {
@@ -3022,6 +3044,16 @@ impl<'q> Dp<'q> {
             }
             Func::Distinct(not) => {
                 let [a, b] = args else { return None };
+                // (a boolean constant written as IS [NOT] DISTINCT FROM's other side, which the parser marks with a
+                // cast to boolean: that DistinctExpr itself, the constant as written)
+                if let Expr::Cast(x, Type::Bool) = b
+                    && written_bool(x)
+                {
+                    let (ta, tb) = (self.tn(a)?, self.tn(x)?);
+                    let (an, bn, _) = self.pair(ta, tb);
+                    let d = N::Distinct(Box::new(an), Box::new(bn));
+                    return Some(Tn::typed(if *not { N::Bool(BoolOp::Not, vec![d]) } else { d }, BOOL));
+                }
                 if let Expr::Lit(Value::Bool(v)) = b {
                     let ta = self.tn(a)?;
                     let test = match (*not, *v) {
@@ -3030,6 +3062,14 @@ impl<'q> Dp<'q> {
                         (true, false) => " IS FALSE",
                         (false, false) => " IS NOT FALSE",
                     };
+                    return Some(Tn::typed(N::BoolTest(Box::new(self.settle(ta, BOOL)), test), BOOL));
+                }
+                // IS [NOT] UNKNOWN (see `Parser`'s IS)
+                if let Expr::Cast(n, Type::Bool) = b
+                    && matches!(**n, Expr::Lit(Value::Null))
+                {
+                    let ta = self.tn(a)?;
+                    let test = if *not { " IS UNKNOWN" } else { " IS NOT UNKNOWN" };
                     return Some(Tn::typed(N::BoolTest(Box::new(self.settle(ta, BOOL)), test), BOOL));
                 }
                 let (ta, tb) = (self.tn(a)?, self.tn(b)?);
@@ -3053,8 +3093,11 @@ impl<'q> Dp<'q> {
             Func::QuantArray(op, all) => {
                 let [x, arr] = args else { return None };
                 let (tx, ta) = (self.tn(x)?, self.tn(arr)?);
-                let elem = tx.ty.unwrap_or(TEXT);
-                let xn = self.settle(tx, TEXT);
+                // (a varchar meets text's operator, relabeled to text: `(a)::text = ANY (...)`)
+                let (elem, xn) = match tx.ty {
+                    Some(t) if t.varchar() => (TEXT, self.cast(tx, TEXT, true)),
+                    t => (t.unwrap_or(TEXT), self.settle(tx, TEXT)),
+                };
                 let an = self.settle(ta, Ty::of(Type::Array(elem.t.oid())));
                 Tn::typed(N::ArrayOp(Box::new(xn), op_sym(*op)?.into(), *all, Box::new(an)), BOOL)
             }
@@ -3068,6 +3111,29 @@ impl<'q> Dp<'q> {
                 let [x] = args else { return None };
                 let tx = self.tn(x)?;
                 let ty = tx.ty.unwrap_or(TEXT);
+                // as the planner leaves it (eval_const_expressions, clauses.c:3076): a constant takes the collation
+                // (`'a'::text COLLATE "C"`), a column already of it is itself, anything else is relabeled to it
+                if self.fold {
+                    if tx.raw.is_some() || matches!(tx.n, N::Const { .. }) {
+                        let n = self.settle(tx, ty);
+                        let N::Const { text, label, ty: tname } = n else { return None };
+                        let label = match *c == collation::Coll::DEFAULT {
+                            true => label,
+                            false => Some(format!(
+                                "{} COLLATE {}",
+                                label.unwrap_or_else(|| tname.clone()),
+                                quoted(&c.name().0)
+                            )),
+                        };
+                        return Some(Tn::typed(N::Const { text, label, ty: tname }, ty));
+                    }
+                    if let Expr::Col(q, n) = x
+                        && self.col_coll(q.as_deref(), n) == Some(*c)
+                    {
+                        return Some(tx);
+                    }
+                    return Some(Tn::typed(N::Cast(Box::new(tx.n), ty.name(), CastKind::Relabel, true), ty));
+                }
                 let (name, _) = c.name();
                 Tn::typed(N::Collate(Box::new(self.settle(tx, TEXT)), quoted(&name)), ty)
             }

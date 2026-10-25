@@ -1773,8 +1773,12 @@ impl Conn<'_> {
                             text(if t.unlogged { "u" } else { "p" }),
                             text(&ident.to_string()),
                         ]);
-                        // (a partitioned table and a foreign table have no access method)
-                        r.push(if matches!(t.kind, 'p' | 'f') { Value::Null } else { text("heap") });
+                        // (a partitioned table and a foreign table have no access method; a table's is heap, or the
+                        // one CREATE TABLE ... USING gave it)
+                        r.push(match t.kind {
+                            'p' | 'f' => Value::Null,
+                            _ => text(t.hier.am.as_deref().unwrap_or("heap")),
+                        });
                         r
                     })
                     .into_iter()
@@ -1901,19 +1905,14 @@ impl Conn<'_> {
                     for x in all {
                         let con = t.constraints.iter().find(|c| c.name == x.name && matches!(c.kind, 'p' | 'u'));
                         let mut def = format!(
-                            "CREATE {}INDEX {} ON {}.{} USING {} ({})",
+                            "CREATE {}INDEX {} ON {}.{} USING {} {}",
                             if x.unique { "UNIQUE " } else { "" },
                             x.name,
                             sql::schema_part(&t.name),
                             sql::rel_part(&t.name),
-                            x.method,
+                            sql::quote_ident(x.am_name()),
                             // (pg_get_indexdef(oid, 0, true): pretty)
-                            x.parts_pretty
-                                .iter()
-                                .zip(x.collate.iter().map(String::as_str).chain(std::iter::repeat("")))
-                                .map(|(p, c)| format!("{p}{c}"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                            x.columns_def(true)
                         );
                         if x.nnd {
                             def.push_str(" NULLS NOT DISTINCT");

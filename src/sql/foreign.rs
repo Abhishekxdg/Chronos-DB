@@ -497,6 +497,8 @@ pub(crate) enum ForeignStmt {
     Statistics(super::statistics::StatStmt),
     /// CREATE, ALTER and DROP TABLESPACE, and ALTER ... ALL IN TABLESPACE (see `tablespace`)
     Tablespace(super::tablespace::TsStmt),
+    /// CREATE and DROP ACCESS METHOD (see `accessmethod`)
+    AccessMethod(super::accessmethod::AmStmt),
 }
 
 impl ForeignStmt {
@@ -526,6 +528,7 @@ impl ForeignStmt {
             }
             .into(),
             ForeignStmt::Tablespace(t) => t.tag().into(),
+            ForeignStmt::AccessMethod(a) => a.tag().into(),
         }
     }
 }
@@ -955,6 +958,7 @@ pub(super) fn run(db: &Db, branch: &str, s: &ForeignStmt) -> Result<Output> {
         ForeignStmt::Publication(p) => return super::publication::run(db, branch, p),
         ForeignStmt::Statistics(x) => return super::statistics::run(db, branch, x),
         ForeignStmt::Tablespace(t) => return super::tablespace::run(db, branch, t),
+        ForeignStmt::AccessMethod(a) => return super::accessmethod::run(db, branch, a),
         _ => {}
     }
     let who = who(db)?;
@@ -1091,6 +1095,7 @@ pub(super) fn run(db: &Db, branch: &str, s: &ForeignStmt) -> Result<Output> {
         ForeignStmt::Publication(p) => super::publication::run(db, branch, p),
         ForeignStmt::Statistics(x) => super::statistics::run(db, branch, x),
         ForeignStmt::Tablespace(t) => super::tablespace::run(db, branch, t),
+        ForeignStmt::AccessMethod(a) => super::accessmethod::run(db, branch, a),
         ForeignStmt::Import { server, into } => {
             let v = db.view_tx(branch)?;
             let o = load(&v)?;

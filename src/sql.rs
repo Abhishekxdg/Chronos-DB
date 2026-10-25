@@ -11,6 +11,7 @@
 //! ponytail: WHERE on anything but the primary key scans the table; use the search indexes for
 //! equality filters when tables get big.
 
+mod accessmethod;
 mod acl;
 mod advisory;
 mod agentprivs;
@@ -30,6 +31,7 @@ mod bit;
 mod datefmt;
 pub mod decimal;
 mod domain;
+mod explain;
 mod filerows;
 mod foreign;
 mod funcs;
@@ -41,6 +43,7 @@ mod hashfn;
 mod hier;
 mod hstore;
 mod impact;
+mod indexam;
 mod intarray;
 mod ispell;
 mod jsonb;
@@ -54,6 +57,7 @@ mod mdarray;
 mod money;
 pub mod net;
 mod objaddr;
+mod opt;
 mod partition;
 mod pgcrypto;
 mod pgsort;
@@ -100,6 +104,8 @@ pub use copy::{CopyIn, CopyOut};
 pub(crate) use funcs::{mix, seeded};
 pub(crate) use impact::critical_reasons;
 pub use impact::{Impact, Reader, impact};
+pub(crate) use opt::stats::KEY as RELSTATS;
+pub(crate) use opt::stats::merged as relstats_merged;
 pub use safe::Reach;
 pub(crate) use tablespace::FILENODES;
 pub use time::Interval;
@@ -3564,6 +3570,13 @@ fn has_temp(name: &str) -> bool {
     db.view_tx(&branch).is_ok_and(|v| v.get(&schema_key(name)).ok().flatten().is_some())
 }
 
+/// `f` of the running session's temporary tables' database, as the statement reads it (None: it has none).
+fn session_temp_view<T>(f: impl FnOnce(&View) -> Result<T>) -> Result<Option<T>> {
+    let Some((db, branch)) = TEMP.with_borrow(Clone::clone) else { return Ok(None) };
+    let v = db.view_tx(&branch)?;
+    f(&v).map(Some)
+}
+
 /// Where CREATE puts an unqualified `name`: in the first schema of the search_path that exists.
 fn create_in(name: &str) -> Result<String> {
     let Some((core, world, schemas)) =
@@ -5685,6 +5698,8 @@ enum CtxFn {
     MakeAclItem,
     ConstraintDef,
     IndexDef,
+    /// pg_indexam_has_property (0), pg_index_has_property (1) and pg_index_column_has_property (2) (see `indexam`)
+    IndexProperty(u8),
     /// pg_get_partkeydef, pg_get_partition_constraintdef, pg_partition_root
     PartKeyDef,
     PartConstraintDef,
@@ -5816,6 +5831,9 @@ impl CtxFn {
         ("to_regprocedure", CtxFn::ToReg(Reg::Procedure), 1..=1),
         ("pg_get_constraintdef", CtxFn::ConstraintDef, 1..=2),
         ("pg_get_indexdef", CtxFn::IndexDef, 1..=3),
+        ("pg_indexam_has_property", CtxFn::IndexProperty(0), 2..=2),
+        ("pg_index_has_property", CtxFn::IndexProperty(1), 2..=2),
+        ("pg_index_column_has_property", CtxFn::IndexProperty(2), 3..=3),
         ("pg_get_partkeydef", CtxFn::PartKeyDef, 1..=1),
         ("pg_get_partition_constraintdef", CtxFn::PartConstraintDef, 1..=1),
         ("pg_partition_root", CtxFn::PartRoot, 1..=1),
@@ -5989,6 +6007,7 @@ impl CtxFn {
             | CtxFn::StatsVisible
             | CtxFn::ColumnIsUpdatable
             | CtxFn::RowSecurityActive
+            | CtxFn::IndexProperty(_)
             | CtxFn::BinaryCoercible => Type::Bool,
             CtxFn::HashText
             | CtxFn::SetTtdummy
@@ -6832,6 +6851,22 @@ enum IndexPart {
     Expr(String),
 }
 
+/// What CREATE INDEX says of an index beyond the values it holds (kept with it: see `btree::Index::am`): its access
+/// method as written (`rtree` too, which is gist), and each part's ASC or DESC (`Some(true)`: DESC), NULLS FIRST or
+/// LAST (`Some(true)`: FIRST) and operator class (without its schema).
+#[derive(Clone, Debug, Default)]
+struct IndexSaid {
+    method: String,
+    orders: Vec<(Option<bool>, Option<bool>)>,
+    classes: Vec<Option<String>>,
+    /// the classes named that are neither Postgres's own of the method nor one Chronos knows: each must be one
+    /// CREATE OPERATOR CLASS made (see `Exec::create_index`)
+    made: Vec<String>,
+    /// for an access method CREATE ACCESS METHOD made (`method`), the built-in one its handler is (see
+    /// `accessmethod`): what the index is made as, and what it can do
+    builtin: Option<String>,
+}
+
 /// An ORDER BY key's direction, and where its nulls go.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Dir {
@@ -7124,7 +7159,13 @@ fn ctas_columns(
 
 /// The CREATE TABLE that CREATE TABLE AS makes its table with: its query's columns (see `ctas_columns`), as its own,
 /// with no keys, defaults or constraints.
-fn ctas_create(table: &str, cols: Vec<ColDef>, if_not_exists: bool, temp: bool, space: Option<&str>) -> Stmt {
+fn ctas_create(
+    table: &str,
+    cols: Vec<ColDef>,
+    if_not_exists: bool,
+    temp: bool,
+    (space, am): (Option<&str>, Option<&str>),
+) -> Stmt {
     Stmt::Create {
         constraints: vec![],
         table: table.into(),
@@ -7134,8 +7175,8 @@ fn ctas_create(table: &str, cols: Vec<ColDef>, if_not_exists: bool, temp: bool, 
         temp,
         likes: vec![],
         on_commit: None,
-        // (TABLESPACE: where it is kept, as CREATE TABLE's)
-        hier: hier::CreateHier { space: space.map(String::from), ..Default::default() },
+        // (TABLESPACE: where it is kept, and USING: its access method, as CREATE TABLE's)
+        hier: hier::CreateHier { space: space.map(String::from), am: am.map(String::from), ..Default::default() },
         unlogged: false,
     }
 }
@@ -7534,6 +7575,9 @@ enum Alter {
     Noop(&'static str),
     /// SET TABLESPACE name: where the table (or index, or materialized view) is kept (see `tablespace`)
     SetTablespace(String),
+    /// SET ACCESS METHOD name: the table's (or materialized view's) table access method from now on, its rows
+    /// written again by Postgres, kept as they are here (see `accessmethod`)
+    SetAccessMethod(String),
     /// ALTER INDEX a RENAME TO b (or a unique constraint's index, and the constraint with it)
     RenameIndex(String, String),
     /// ATTACH PARTITION table FOR VALUES ... | DEFAULT
@@ -7932,6 +7976,8 @@ enum Stmt {
         data: bool,
         /// TABLESPACE name (see `tablespace`)
         space: Option<String>,
+        /// USING method: its table access method (see `accessmethod`)
+        am: Option<String>,
     },
     CreateAs {
         table: String,
@@ -7944,6 +7990,8 @@ enum Stmt {
         on_commit: Option<bool>,
         /// TABLESPACE name (see `tablespace`)
         space: Option<String>,
+        /// USING method: its table access method (see `accessmethod`)
+        am: Option<String>,
     },
     /// CREATE SCHEMA [IF NOT EXISTS] name [AUTHORIZATION role]
     CreateSchema {
@@ -8168,6 +8216,8 @@ enum Stmt {
         options: Vec<String>,
         /// TABLESPACE name (see `tablespace`)
         space: Option<String>,
+        /// its access method as written, and each part's ordering and operator class
+        said: IndexSaid,
     },
     DropIndex {
         name: String,
@@ -8260,8 +8310,8 @@ enum Stmt {
         to: String,
         if_exists: bool,
     },
-    /// ALTER INDEX name ALTER COLUMN c SET (...) and the other column changes only a table takes: refused,
-    /// as `action` (Postgres's name for it), once the index is found
+    /// ALTER INDEX name ALTER COLUMN c SET (...), the other column changes only a table takes, and SET ACCESS
+    /// METHOD: refused, as `action` (Postgres's name for it), once the index is found
     IndexColumnAlter {
         name: String,
         action: &'static str,
@@ -8302,8 +8352,10 @@ enum Stmt {
     /// accepted and nothing to do, with this tag: CREATE EXTENSION vector, and pgvector's and
     /// full-text indexes (vector and text search are built in)
     Noop(&'static str),
-    /// UPDATE pg_class SET reltuples / relpages / relallvisible: the relations it names, counted (see `update`)
-    PlannerStats(String),
+    /// UPDATE pg_class SET reltuples / relpages / relallvisible: with `true`, the query of the relations it names and
+    /// their new values (oid, reltuples, relpages, relallvisible), which are kept (see `opt::stats`); with `false`,
+    /// one that counts them, and nothing is kept (a MERGE into pg_class, a SET this doesn't read)
+    PlannerStats(String, bool),
     /// CREATE BRANCH, or CREATE / FORK WORLD with metadata; `noun` is BRANCH or WORLD, for the tag
     CreateBranch {
         name: String,
@@ -8526,17 +8578,17 @@ enum Stmt {
     RollbackTo(String),
     /// PREPARE TRANSACTION 'gid': refused, ending the transaction (there are no prepared transactions)
     PrepareTransaction,
-    /// EXPLAIN [ANALYZE] statement: the plan, and with ANALYZE the statement run for real
+    /// EXPLAIN [ANALYZE] statement: the plan, and with ANALYZE the statement run for real. `opts`: its options (see
+    /// `explain::ExplainOpts`); the plan is Postgres's planner's where `plan` can make it and the session asks for it
+    /// (chronos.explain = postgres, exact mode's default: see `explain_shows_postgres`), else Chronos's own steps
     Explain {
-        analyze: bool,
-        /// EXPLAIN (COSTS OFF) without VERBOSE, SETTINGS or SUMMARY: the plan as Postgres's planner would make it,
-        /// where its shape doesn't turn on costs (see `plan`), when the session asks for it (chronos.explain =
-        /// postgres, exact mode's default: see `explain_shows_postgres`)
-        pg_plan: bool,
+        opts: explain::ExplainOpts,
         stmt: Box<Stmt>,
         /// the statement as written, before views and table hierarchies were put in it (see `Statement::catalog`):
         /// what `plan` reads, as Postgres's planner reads the query
         original: Option<Box<Stmt>>,
+        /// the explained statement's text, which its query identifier is of (see `stmtstats::query_id`)
+        text: Option<String>,
     },
     /// COPY ... FROM STDIN / TO STDOUT, over the Postgres protocol (see `copy`)
     Copy(Box<copy::Copy>),
@@ -8580,6 +8632,9 @@ enum Stmt {
         exists: Option<String>,
         /// a row that must be there, and the error if it isn't
         needs: Option<(String, String)>,
+        /// DROP ... CASCADE: what depends on it goes with it (DROP OPERATOR CLASS's partition keys; see
+        /// `userdefs::opclass_users`)
+        cascade: bool,
     },
     /// CREATE, ALTER and DROP of a foreign-data wrapper, server or user mapping, and IMPORT FOREIGN SCHEMA (see
     /// `foreign`)
@@ -8977,9 +9032,12 @@ fn tid_key(text: &str) -> i64 {
     num(b) * 65536 + num(o)
 }
 
+/// The system columns every table has, in the order of their attribute numbers (-1 to -6, sysattr.h).
+const SYSTEM_COLUMNS: [&str; 6] = ["ctid", "xmin", "cmin", "xmax", "cmax", "tableoid"];
+
 /// Whether `name` is one of the system columns every table has (`ctid`, `xmin`, `tableoid`, ...).
 fn system_name(name: &str) -> bool {
-    system_column(name).is_some() || name == "ctid" || name == "tableoid"
+    SYSTEM_COLUMNS.contains(&name)
 }
 
 /// The bytes of a Postgres heap page its tuples and their line pointers may take: 8192 less the page header.
@@ -9345,18 +9403,18 @@ fn srf_columns(full: &str, tys: &[Type], alias: &str) -> Result<Vec<(String, Typ
             need(1..=1)?;
             vec![("relid".into(), Type::Reg(Reg::Class))]
         }
-        // pg_proc's columns, and tableoid
+        // pg_proc's columns, and its system columns (see `catalog_system`)
         BUILTIN_PROCS => {
             need(0..=2)?;
             let mut cols = catalog_schema::columns("pg_proc");
-            cols.push(("tableoid".into(), Type::Oid));
+            cols.extend(catalog_system_cols());
             cols
         }
-        // the table's columns, and tableoid
+        // the table's columns, and its system columns
         n if BUILTIN_ROWS.contains(&n) => {
             need(0..=0)?;
             let mut cols = catalog_schema::columns(n.trim_start_matches("?builtin:"));
-            cols.push(("tableoid".into(), Type::Oid));
+            cols.extend(catalog_system_cols());
             cols
         }
         // search(table, words [, k]): the built-in text index's best k (default 10) rows
@@ -9888,17 +9946,12 @@ fn srf_rows(full: &str, a: &[Value]) -> Result<Vec<Vec<Value>>> {
             [Text(k), Null] if k == "proname" => vec![],
             _ => catalog_schema::builtin_proc_rows().to_vec(),
         },
-        // Postgres's own rows of the table, each with its tableoid
+        // Postgres's own rows of the table, each with its ctid and tableoid
         n if BUILTIN_ROWS.contains(&n) => {
             let table = n.trim_start_matches("?builtin:");
-            let oid = catalog::table_oid(table).unwrap_or(0);
-            catalog_schema::builtin_rows(table)
-                .into_iter()
-                .map(|mut r| {
-                    r.push(Int(oid));
-                    r
-                })
-                .collect()
+            let mut rows = catalog_schema::builtin_rows(table);
+            catalog_system(table, &mut rows, 0);
+            rows
         }
         "aclexplode" => acl::explode(&a[0])?,
         // reloptions and the like: `{fillfactor=70,autovacuum_enabled=off}` as (name, value) rows
@@ -10566,6 +10619,9 @@ struct Parser {
     /// the call whose arguments are read next takes a VARIADIC array whole, as concat, concat_ws and format
     /// do with an array that isn't written out (see `funcs::SPREAD`)
     spread: bool,
+    /// UPDATE pg_class SET ...: each `column = value` read, with the value's text (see `Stmt::PlannerStats`); None
+    /// when not wanted
+    set_texts: Option<Vec<(String, String)>>,
 }
 
 /// How deep a statement may nest: a level per parenthesis, NOT, sign, cast and operator in a
@@ -10647,6 +10703,7 @@ impl Parser {
             pkey_space: None,
             agg_at: vec![],
             spread: false,
+            set_texts: None,
         }
     }
 
@@ -11606,7 +11663,11 @@ impl Parser {
                 self.shadowed = explicit.clone().map(|a| (rel_part(&table).to_string(), a));
                 let alias = explicit.or_else(|| own_alias(&table));
                 self.expect_kw("set")?;
+                // (pg_class's: what each value says as written, see `Stmt::PlannerStats`)
+                let stats_target = matches!(table.as_str(), "pg_class" | "pg_catalog.pg_class");
+                self.set_texts = stats_target.then(Vec::new);
                 let mut sets = self.sets()?;
+                let texts = self.set_texts.take().unwrap_or_default();
                 if sets.iter().any(|(_, e)| has_srf(e)) {
                     return err(UNSUPPORTED, "set-returning functions are not allowed in UPDATE");
                 }
@@ -11661,19 +11722,36 @@ impl Parser {
                     returning = returning.map(|r| unalias_items(r, a, &table));
                 }
                 // the planner's statistics in pg_class (reltuples, relpages, relallvisible), which tests and tuning
-                // scripts set to steer Postgres's plans: there is no such input to plans here, so the UPDATE changes
-                // nothing and says how many relations it names
+                // scripts set to steer Postgres's plans: written where VACUUM and ANALYZE keep them (see
+                // `opt::stats`), for each relation it names
                 if matches!(table.as_str(), "pg_class" | "pg_catalog.pg_class")
                     && returning.is_none()
                     && join.is_none()
                     && sets.iter().all(|(c, _)| matches!(c.as_str(), "reltuples" | "relpages" | "relallvisible"))
                 {
                     // (run as SQL when the statement runs, so that pg_class is the catalog's)
-                    // (with the target's alias, which the WHERE may name it by)
+                    // (with the target's alias, which the WHERE and the values may name it by)
                     let named = alias.as_ref().map_or(String::new(), |a| format!(" as {}", ident(a)));
-                    return Ok(Stmt::PlannerStats(format!(
-                        "select count(*) from pg_catalog.pg_class{named} {where_text}"
-                    )));
+                    // each value as written: `name = value, ...`
+                    if texts.len() != sets.len() {
+                        // (a form whose values this didn't keep, `SET (a, b) = (...)`: counted, and nothing kept)
+                        return Ok(Stmt::PlannerStats(
+                            format!("select count(*) from pg_catalog.pg_class{named} {where_text}"),
+                            false,
+                        ));
+                    }
+                    let value =
+                        |c: &str| texts.iter().find(|(n, _)| n == c).map_or(c.to_string(), |(_, t)| format!("({t})"));
+                    // (reltuples is a float4, as the value is assigned to it: 123456789 is kept as 123456792)
+                    return Ok(Stmt::PlannerStats(
+                        format!(
+                            "select oid, ({})::float4, ({})::int4, ({})::int4 from pg_catalog.pg_class{named} {where_text}",
+                            value("reltuples"),
+                            value("relpages"),
+                            value("relallvisible"),
+                        ),
+                        true,
+                    ));
                 }
                 Ok(Stmt::Update { table, only, sets, filter, returning, from: join, checks: None })
             }
@@ -11750,35 +11828,7 @@ impl Parser {
             "create" | "drop" | "alter" if self.foreign_object() => self.foreign_stmt(&w),
             "create" => self.create(),
             "explain" => {
-                // EXPLAIN ANALYZE, or Postgres's EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT ...)
-                let mut analyze = self.kw("analyze") || self.kw("analyse");
-                let mut verbose = self.kw("verbose");
-                let (mut costs, mut more) = (true, false);
-                if self.sym("(") {
-                    while !self.sym(")") {
-                        // an option may be followed by its value: ANALYZE false
-                        let on = !matches!(self.t.get(self.i + 1), Some(Tok::Word(x)) if x == "false" || x == "off")
-                            && !matches!(self.t.get(self.i + 1), Some(Tok::Num(n)) if n == "0");
-                        match self.peek() {
-                            None => return self.fail("expected )"),
-                            Some(Tok::Word(w)) if w == "analyze" || w == "analyse" => analyze = on,
-                            Some(Tok::Word(w)) if w == "costs" => costs = on,
-                            Some(Tok::Word(w)) if w == "verbose" => verbose = on,
-                            // (options that add lines of their own)
-                            Some(Tok::Word(w)) if matches!(w.as_str(), "settings" | "summary" | "generic_plan") => {
-                                more |= on
-                            }
-                            Some(Tok::Word(w)) if w == "format" => {
-                                self.i += 1;
-                                if !self.is_kw("text") {
-                                    return err(UNSUPPORTED, "EXPLAIN shows its plan as text only");
-                                }
-                            }
-                            _ => {}
-                        }
-                        self.i += 1;
-                    }
-                }
+                let opts = self.explain_options()?;
                 // DECLARE c [SCROLL ...] CURSOR [WITH HOLD] FOR query: its query's plan, as Postgres shows it
                 let declare = self.kw("declare");
                 if declare {
@@ -11788,7 +11838,9 @@ impl Parser {
                         }
                     }
                 }
+                let (start, toks) = (self.i, self.ahead(false));
                 let stmt = self.stmt()?;
+                let text = self.since(&toks, start).ok().map(tokens_shown);
                 if declare && !matches!(stmt, Stmt::Select(_) | Stmt::With(_) | Stmt::Locking(..)) {
                     return err(UNSUPPORTED, "EXPLAIN DECLARE works on a SELECT cursor");
                 }
@@ -11805,8 +11857,7 @@ impl Parser {
                 ) {
                     return err(UNSUPPORTED, "EXPLAIN works on SELECT, INSERT, UPDATE, DELETE, MERGE and EXECUTE");
                 }
-                let pg_plan = !costs && !verbose && !more;
-                Ok(Stmt::Explain { analyze, pg_plan, stmt: Box::new(stmt), original: None })
+                Ok(Stmt::Explain { opts, stmt: Box::new(stmt), original: None, text })
             }
             "with" => self.with(),
             // ALTER DEFAULT PRIVILEGES: what the objects roles make start with (see `acl`)
@@ -12632,10 +12683,6 @@ impl Parser {
             }
             "drop" if self.kw("rule") => self.drop_rule(),
             "drop" | "alter" if self.is_kw("conversion") => self.conversion_stmt(&w),
-            "drop" if self.is_kw("access") && matches!(self.t.get(self.i + 1), Some(Tok::Word(m)) if m == "method") => {
-                self.i += 2;
-                self.drop_access_method()
-            }
             "drop" if self.kw("event") => self.event_trigger_stmt(true),
             "alter" if self.kw("event") => self.event_trigger_stmt(false),
             "alter" if self.is_kw("large") => self.alter_large_object(),
@@ -13044,6 +13091,7 @@ impl Parser {
                 data: true,
                 on_commit: None,
                 space: None,
+                am: None,
             });
         }
         Ok(Stmt::Select(Box::new(query)))
@@ -13120,7 +13168,7 @@ impl Parser {
             }
             if self.is_kw("using") && matches!(self.t.get(self.i + 1), Some(Tok::Word(_) | Tok::Ident(_))) {
                 self.i += 1;
-                method = Some(self.name()?);
+                method = Some(self.am_name()?);
             } else if self.is_kw("with") && self.t.get(self.i + 1) == Some(&Tok::Sym("(")) {
                 // there are no pages to fill: the parameters are read past
                 self.i += 2;
@@ -13146,9 +13194,8 @@ impl Parser {
             self.i = save;
             return Ok(None);
         }
-        if let Some(m) = method.filter(|m| m != "heap") {
-            return err("42704", format!("access method \"{m}\" does not exist"));
-        }
+        // (USING method: looked up as the table is made, see `accessmethod::for_new`)
+        let am = method;
         // AS EXECUTE name [(arguments)]: the rows a prepared statement gives
         if self.kw("execute") {
             let name = self.name()?;
@@ -13173,6 +13220,7 @@ impl Parser {
                 temp,
                 data,
                 space,
+                am,
             }));
         }
         if !matches!(self.peek(), Some(Tok::Word(w)) if matches!(w.as_str(), "select" | "with" | "values" | "table")) {
@@ -13186,7 +13234,7 @@ impl Parser {
             data = !self.kw("no");
             self.expect_kw("data")?;
         }
-        Ok(Some(Stmt::CreateAs { table: table.into(), cols, query, if_not_exists, temp, data, on_commit, space }))
+        Ok(Some(Stmt::CreateAs { table: table.into(), cols, query, if_not_exists, temp, data, on_commit, space, am }))
     }
 
     /// A SELECT after its keyword: parts joined by UNION / INTERSECT / EXCEPT, then ORDER BY,
@@ -14584,7 +14632,7 @@ impl Parser {
                 _ => false,
             })
         {
-            return Ok(Stmt::PlannerStats("select count(*) from pg_catalog.pg_class where false".into()));
+            return Ok(Stmt::PlannerStats("select count(*) from pg_catalog.pg_class where false".into(), false));
         }
         let source_alias = if members.is_empty() { src.alias } else { MERGE_JOINED.to_string() };
         Ok(Stmt::Merge(Box::new(MergeStmt {
@@ -15747,6 +15795,15 @@ impl Parser {
             let changes = vec![Alter::IndexOptions(reloptions::parse(self)?, reset)];
             return Ok(Stmt::Alter { table: name, changes, if_exists, only: false });
         }
+        // SET ACCESS METHOD m: ALTER TABLE's, which Postgres's grammar takes for an index too and refuses for one,
+        // whatever m is (ATSimplePermissions comes before ATPrepSetAccessMethod looks it up)
+        if self.is_kw("set") && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "access") {
+            self.i += 2;
+            self.expect_kw("method")?;
+            self.am_name()?;
+            self.skip_rest();
+            return Ok(Stmt::IndexColumnAlter { name, action: "SET ACCESS METHOD", if_exists });
+        }
         // SET TABLESPACE t: where it is kept (see `tablespace`)
         if self.is_kw("set") && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "tablespace") {
             self.i += 2;
@@ -15889,6 +15946,24 @@ impl Parser {
         {
             self.i += 2;
             let changes = vec![Alter::SetTablespace(self.name()?)];
+            return Ok(Stmt::Alter { table: name, changes, if_exists, only: false });
+        }
+        // SET ACCESS METHOD m [, ...]: a materialized view's table access method, as a table's (see `accessmethod`);
+        // a view has none (refused as the change ALTER TABLE refuses it)
+        if self.is_kw("set")
+            && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "access")
+            && matches!(self.t.get(self.i + 2), Some(Tok::Word(w)) if w == "method")
+        {
+            let mut changes = vec![];
+            loop {
+                self.expect_kw("set")?;
+                self.expect_kw("access")?;
+                self.expect_kw("method")?;
+                changes.push(Alter::SetAccessMethod(self.am_name()?));
+                if !self.sym(",") {
+                    break;
+                }
+            }
             return Ok(Stmt::Alter { table: name, changes, if_exists, only: false });
         }
         if !self.kw("owner") {
@@ -16214,6 +16289,7 @@ impl Parser {
                         tag: "ALTER TABLE",
                         missing: Some(format!("rule \"{name}\" for table \"{}\" does not exist", rel_part(&table))),
                         exists: None,
+                        cascade: false,
                     });
                 }
                 if !self.kw("trigger") {
@@ -16376,6 +16452,12 @@ impl Parser {
                 }
                 if set && self.kw("tablespace") {
                     Alter::SetTablespace(self.name()?)
+                } else if set
+                    && self.is_kw("access")
+                    && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "method")
+                {
+                    self.i += 2;
+                    Alter::SetAccessMethod(self.am_name()?)
                 } else if set && self.kw("schema") {
                     Alter::SetSchema(self.name()?)
                 } else if set && self.kw("logged") {
@@ -16570,7 +16652,14 @@ impl Parser {
                 });
             }
             self.expect_sym("=")?;
-            let value = self.expr()?;
+            let value = match self.set_texts.is_some() && steps.is_empty() {
+                true => {
+                    let (value, text) = self.text_of(|p| p.expr())?;
+                    self.set_texts.get_or_insert_default().push((c.clone(), text));
+                    value
+                }
+                false => self.expr()?,
+            };
             let value = if steps.is_empty() {
                 value
             } else {
@@ -17026,9 +17115,24 @@ impl Parser {
         let mut trgm = None;
         // (the access method as written: what its storage parameters are checked against)
         let method = match (self.is_kw("using"), self.t.get(self.i + 1)) {
-            (true, Some(Tok::Word(w) | Tok::Ident(w))) => w.to_lowercase(),
+            (true, Some(Tok::Word(w))) => w.to_lowercase(),
+            // (a quoted name keeps its spelling, as CREATE ACCESS METHOD kept it)
+            (true, Some(Tok::Ident(w))) => w.clone(),
             _ => "btree".to_string(),
         };
+        // an access method CREATE ACCESS METHOD made: made as the built-in one its handler is, under its own name
+        // (read here as that one's word; `method` keeps its own)
+        const OWN: [&str; 9] = ["btree", "hash", "gist", "gin", "spgist", "brin", "rtree", "hnsw", "ivfflat"];
+        let mut builtin = None;
+        if self.is_kw("using") && !OWN.contains(&method.as_str()) {
+            match accessmethod::index_at_parse(&method)? {
+                Some(b) => {
+                    self.t[self.i + 1] = Tok::Word(b.to_string());
+                    builtin = Some(b.to_string());
+                }
+                None => return err("42704", format!("access method \"{method}\" does not exist")),
+            }
+        }
         if self.kw("using") && !self.kw("btree") {
             if ["hnsw", "ivfflat"].into_iter().any(|m| self.kw(m)) {
                 self.expect_sym("(")?;
@@ -17076,7 +17180,8 @@ impl Parser {
                 Using::Btree
             } else if self.kw("gin") {
                 Using::Gin
-            } else if self.kw("gist") {
+            // (rtree is gist, as Postgres substitutes it: see `Exec::create_index`)
+            } else if self.kw("gist") || self.kw("rtree") {
                 Using::Gist
             } else if self.kw("spgist") {
                 Using::Spgist
@@ -17087,8 +17192,12 @@ impl Parser {
                 );
             };
         }
+        // (the method its operator classes are of; one made here has those CREATE OPERATOR CLASS made for it alone)
+        let am = if method == "rtree" { "gist" } else { method.as_str() };
+        let made_am = builtin.is_some();
         self.expect_sym("(")?;
         let (mut cols, mut colls) = (vec![], vec![]);
+        let (mut orders, mut classes, mut made) = (vec![], vec![], vec![]);
         loop {
             // a column, or an expression: in parentheses, or a function call
             let call = matches!(self.peek(), Some(Tok::Word(_) | Tok::Ident(_)))
@@ -17105,15 +17214,24 @@ impl Parser {
             // an operator class: the ones that only say how to compare what every btree here compares
             // (text_pattern_ops makes LIKE 'x%' use the index, as any text index here does)
             // (with its schema, as pg_dump writes one that isn't its type's default: `public.gist_ltree_ops`)
+            // (any name but an ordering's word, quoted too: opt_class is any_name, gram.y; one CREATE OPERATOR CLASS
+            // made needn't end in _ops)
+            let class_word = |t: Option<&Tok>| match t {
+                Some(Tok::Word(w)) => {
+                    !["asc", "desc", "nulls", "collate", "with", "where", "include"].contains(&w.as_str())
+                }
+                Some(Tok::Ident(_)) => true,
+                _ => false,
+            };
             if matches!(self.peek(), Some(Tok::Word(_) | Tok::Ident(_)))
                 && self.t.get(self.i + 1) == Some(&Tok::Sym("."))
-                && matches!(self.t.get(self.i + 2), Some(Tok::Word(w)) if w.ends_with("_ops"))
+                && class_word(self.t.get(self.i + 2))
             {
                 self.i += 2;
             }
-            if let Some(Tok::Word(w)) = self.peek()
-                && w.ends_with("_ops")
-                && !self.is_kw("asc")
+            let mut class = None;
+            if let Some(Tok::Word(w) | Tok::Ident(w)) = self.peek()
+                && class_word(self.peek())
             {
                 let w = w.clone();
                 // (jsonb_ops and jsonb_path_ops say which of a jsonb's operators a GIN index answers: an
@@ -17153,9 +17271,12 @@ impl Parser {
                     ]
                     .iter()
                     .any(|t| w == format!("{t}_ops"));
-                if !plain {
-                    return err(UNSUPPORTED, format!("operator class {w} isn't supported"));
+                // (and any other the access method has: each finds what its index finds here, which is a btree's;
+                // another must be one CREATE OPERATOR CLASS made)
+                if (!plain || made_am) && !indexam::has_class(am, &w) {
+                    made.push(w.clone());
                 }
+                class = Some(w.clone());
                 self.i += 1;
                 // its parameters, `gist_ltree_ops(siglen = 100)`: how the index Postgres builds is tuned
                 // (only the signature classes take any: the others have no options-parsing support function)
@@ -17168,11 +17289,22 @@ impl Parser {
                     self.skip_parens()?;
                 }
             }
-            // the order an index is kept in doesn't change which rows it finds
-            let _ = self.kw("asc") || self.kw("desc");
-            if self.kw("nulls") && !(self.kw("first") || self.kw("last")) {
-                return self.fail("expected FIRST or LAST");
-            }
+            // the order an index is kept in doesn't change which rows it finds: it is kept for the catalog
+            let desc = if self.kw("asc") {
+                Some(false)
+            } else if self.kw("desc") {
+                Some(true)
+            } else {
+                None
+            };
+            let nulls_first = match self.kw("nulls") {
+                true if self.kw("first") => Some(true),
+                true if self.kw("last") => Some(false),
+                true => return self.fail("expected FIRST or LAST"),
+                false => None,
+            };
+            orders.push((desc, nulls_first));
+            classes.push(class);
             if !self.sym(",") {
                 break;
             }
@@ -17190,7 +17322,7 @@ impl Parser {
         // WITH (fillfactor = 70, ...): checked as the access method's, and kept (pg_class.reloptions)
         let options = if self.kw("with") {
             let given = reloptions::parse(self)?;
-            reloptions::for_index(&method, &given)?
+            reloptions::for_index(builtin.as_deref().unwrap_or(am), &given)?
         } else {
             vec![]
         };
@@ -17218,6 +17350,7 @@ impl Parser {
             concurrently,
             options,
             space,
+            said: IndexSaid { method, orders, classes, made, builtin },
         })
     }
 
@@ -17922,10 +18055,8 @@ impl Parser {
             } else if self.kw("tablespace") {
                 hier.space = Some(self.name()?);
             } else if self.kw("using") {
-                let method = self.name()?;
-                if method != "heap" {
-                    return err("42704", format!("access method \"{method}\" does not exist"));
-                }
+                // (looked up as the table is made: see `accessmethod::for_new`)
+                hier.am = Some(self.am_name()?);
             } else if self.hier_clause(&mut hier)? {
             } else {
                 break;
@@ -19014,9 +19145,9 @@ impl Parser {
 
     fn items(&mut self) -> Result<Vec<Item>> {
         let mut v = vec![];
-        // SELECT with nothing to select: no columns (`SELECT FROM t`, `SELECT;`)
+        // SELECT with nothing to select: no columns (`SELECT FROM t`, `SELECT;`, `SELECT INTO t FROM u`)
         if matches!(self.peek(), None | Some(Tok::Sym(";" | ")")))
-            || matches!(self.peek(), Some(Tok::Word(w)) if ["from", "where", "group", "having", "order", "limit", "offset", "union", "intersect", "except", "window", "for"].contains(&w.as_str()))
+            || matches!(self.peek(), Some(Tok::Word(w)) if ["from", "where", "group", "having", "order", "limit", "offset", "union", "intersect", "except", "window", "for", "into"].contains(&w.as_str()))
         {
             return Ok(v);
         }
@@ -19888,6 +20019,103 @@ impl Parser {
         }
     }
 
+    /// After EXPLAIN: `ANALYZE [VERBOSE]`, `VERBOSE`, or `(option [value], ...)`, as gram.y's ExplainStmt has them,
+    /// each option read as ExplainQuery reads it (explain.c:176-251): a boolean one takes true, false, on, off, 1 or 0
+    /// (none: true), FORMAT one of text, xml, json and yaml. TIMING and SUMMARY are what ANALYZE says where not given.
+    /// What the options say together (WAL and TIMING need ANALYZE, GENERIC_PLAN can't have it) is checked as the
+    /// statement runs (see `Exec::explain`), after the statement's own errors, as in Postgres.
+    fn explain_options(&mut self) -> Result<explain::ExplainOpts> {
+        let mut o = explain::ExplainOpts::default();
+        let (mut timing, mut summary) = (None, None);
+        if self.kw("analyze") || self.kw("analyse") {
+            o.analyze = true;
+            o.verbose = self.kw("verbose");
+        } else if self.kw("verbose") {
+            o.verbose = true;
+        } else if self.sym("(") {
+            loop {
+                let at = self.i;
+                let name = match self.peek() {
+                    Some(Tok::Word(w) | Tok::Ident(w)) => {
+                        let w = if w == "analyse" { "analyze".to_string() } else { w.clone() };
+                        self.i += 1;
+                        w
+                    }
+                    _ => return self.fail("expected an EXPLAIN option"),
+                };
+                // its value: a word or a string (as defGetString gives it), a number, or none
+                let value: Option<String> = match self.peek() {
+                    Some(Tok::Sym(",") | Tok::Sym(")")) | None => None,
+                    Some(Tok::Word(w) | Tok::Ident(w)) => {
+                        let w = w.clone();
+                        self.i += 1;
+                        Some(w)
+                    }
+                    Some(Tok::Str(x)) => {
+                        let x = x.clone();
+                        self.i += 1;
+                        Some(x)
+                    }
+                    Some(Tok::Num(n)) => {
+                        let n = n.clone();
+                        self.i += 1;
+                        Some(n)
+                    }
+                    Some(Tok::Sym(sign @ ("-" | "+"))) if matches!(self.t.get(self.i + 1), Some(Tok::Num(_))) => {
+                        let sign = if *sign == "-" { "-" } else { "" };
+                        self.i += 1;
+                        let Some(Tok::Num(n)) = self.next() else { unreachable!() };
+                        Some(format!("{sign}{n}"))
+                    }
+                    _ => return self.fail("expected , or )"),
+                };
+                // defGetBoolean (commands/define.c: its error has no position)
+                let boolean = |v: &Option<String>| -> Result<bool> {
+                    match v.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                        None | Some("true" | "on" | "1") => Ok(true),
+                        Some("false" | "off" | "0") => Ok(false),
+                        _ => err("42601", format!("{name} requires a Boolean value")),
+                    }
+                };
+                match name.as_str() {
+                    "analyze" => o.analyze = boolean(&value)?,
+                    "verbose" => o.verbose = boolean(&value)?,
+                    "costs" => o.costs = boolean(&value)?,
+                    "buffers" => o.buffers = boolean(&value)?,
+                    "wal" => o.wal = boolean(&value)?,
+                    "settings" => o.settings = boolean(&value)?,
+                    "generic_plan" => o.generic = boolean(&value)?,
+                    "timing" => timing = Some(boolean(&value)?),
+                    "summary" => summary = Some(boolean(&value)?),
+                    "format" => {
+                        o.format = match value.as_deref() {
+                            Some("text") => explain::Format::Text,
+                            Some("xml") => explain::Format::Xml,
+                            Some("json") => explain::Format::Json,
+                            Some("yaml") => explain::Format::Yaml,
+                            None => return err("42601", "format requires a parameter"),
+                            Some(v) => {
+                                return self.err_at(
+                                    at,
+                                    "22023",
+                                    &format!("unrecognized value for EXPLAIN option \"format\": \"{v}\""),
+                                );
+                            }
+                        }
+                    }
+                    _ => return self.err_at(at, "42601", &format!("unrecognized EXPLAIN option \"{name}\"")),
+                }
+                if self.sym(")") {
+                    break;
+                }
+                self.expect_sym(",")?;
+            }
+        }
+        o.timing = timing.unwrap_or(o.analyze);
+        o.summary = summary.unwrap_or(o.analyze);
+        Ok(o)
+    }
+
     /// Error `code` with `message`, pointing to token `at` (where psql shows it, under the statement's line).
     fn err_at<T>(&self, at: usize, code: &'static str, message: &str) -> Result<T> {
         Err(SqlError {
@@ -20081,7 +20309,17 @@ impl Parser {
         }
         if self.kw("distinct") {
             self.expect_kw("from")?;
-            return Ok(Expr::Func(Func::Distinct(neg), vec![l, self.concat()?]));
+            // (a boolean constant written here is no BooleanTest, whose form IS TRUE, IS FALSE and IS UNKNOWN below
+            // have: it is marked with a cast to boolean, which `viewdef` takes off, so that pruning and EXPLAIN keep
+            // it a DistinctExpr, `NOT (a IS DISTINCT FROM true)`, as Postgres's parser does)
+            let r = match self.concat()? {
+                r @ Expr::Lit(Value::Bool(_)) => Expr::Cast(Box::new(r), Type::Bool),
+                Expr::Cast(n, Type::Bool) if matches!(*n, Expr::Lit(Value::Null)) => {
+                    Expr::Cast(Box::new(Expr::Cast(n, Type::Bool)), Type::Bool)
+                }
+                r => r,
+            };
+            return Ok(Expr::Func(Func::Distinct(neg), vec![l, r]));
         }
         // null is neither true nor false: IS TRUE is "not distinct from true", IS NOT TRUE "distinct from" it
         for (word, truth) in [("true", true), ("false", false)] {
@@ -20089,9 +20327,13 @@ impl Parser {
                 return Ok(Expr::Func(Func::Distinct(!neg), vec![l, Expr::Lit(Value::Bool(truth))]));
             }
         }
-        if !self.kw("unknown") {
-            self.expect_kw("null")?;
+        // IS [NOT] UNKNOWN: a boolean's test (BooleanTest), "not distinct from" a boolean NULL, which ruleutils writes
+        // back as written and partition pruning doesn't take for IS NULL
+        if self.kw("unknown") {
+            let null = Expr::Cast(Box::new(Expr::Lit(Value::Null)), Type::Bool);
+            return Ok(Expr::Func(Func::Distinct(!neg), vec![l, null]));
         }
+        self.expect_kw("null")?;
         // a row is null when all its fields are, and not null when none of them is (so a row can
         // be neither): each field's own test, and-ed
         if let Expr::Func(Func::RowValue, fields) = l {
@@ -21824,9 +22066,11 @@ impl Parser {
                     self.t.splice(end..end, tail);
                     self.t.splice(as_at + 1..as_at + 1, head);
                 }
-                // USING method: a materialized view's table access method, of which there is one
+                // USING method: a materialized view's table access method (see `accessmethod`), carried with its
+                // options, which are none of a view's
+                let mut am = None;
                 if materialized && self.kw("using") {
-                    self.name()?;
+                    am = Some(self.am_name()?);
                 }
                 // WITH (security_barrier, check_option = local, security_invoker, ...): a view's options, of which
                 // check_option, security_invoker and security_barrier mean something here
@@ -21878,6 +22122,9 @@ impl Parser {
                 // are none of a view's
                 if materialized && self.kw("tablespace") {
                     reloptions.push(("tablespace".into(), self.name()?));
+                }
+                if let Some(m) = am {
+                    reloptions.push(("access_method".into(), m));
                 }
                 self.expect_kw("as")?;
                 // copied first: parsing takes the text out of the tokens it reads
@@ -24152,7 +24399,9 @@ fn trigger_sql(name: &str, t: &Table, x: &functions::Trigger) -> Vec<String> {
     out
 }
 
-/// CREATE INDEX for index `x` of table `t` (as SQL), its columns named by `col_name`.
+/// CREATE INDEX for index `x` of table `t` (as SQL), its columns named by `col_name`: with what CREATE INDEX said of
+/// it beyond its entries (its access method, each part's operator class and ordering, INCLUDE's columns), so that the
+/// index made again from it is the same, as pg_get_indexdef writes them (ruleutils.c:1338-1452).
 fn index_sql(x: &btree::Index, t: &str, col_name: &dyn Fn(u32) -> String, unique: bool) -> String {
     let mut exprs = x.exprs.iter();
     let parts: Vec<String> = x
@@ -24160,26 +24409,36 @@ fn index_sql(x: &btree::Index, t: &str, col_name: &dyn Fn(u32) -> String, unique
         .iter()
         .enumerate()
         .map(|(k, &c)| {
-            let part =
+            let mut part =
                 if c == btree::EXPR { format!("({})", exprs.next().map_or("", String::as_str)) } else { col_name(c) };
-            match x.coll(k) {
-                collation::Coll::DEFAULT => part,
-                coll => format!("{part} collate {}", coll.sql()),
+            if x.coll(k) != collation::Coll::DEFAULT {
+                part.push_str(&format!(" collate {}", x.coll(k).sql()));
             }
+            // (a trigram index kept before classes were has its one part's in `trgm`)
+            if let Some(class) = x.said_class(k) {
+                part.push_str(&format!(" {}", ident(class)));
+            }
+            let opt = x.opt(k);
+            part.push_str(match (opt & btree::INDOPTION_DESC != 0, opt & btree::INDOPTION_NULLS_FIRST != 0) {
+                (true, true) => " desc",
+                (true, false) => " desc nulls last",
+                (false, true) => " nulls first",
+                (false, false) => "",
+            });
+            part
         })
         .collect();
+    let include = match &x.include[..] {
+        [] => String::new(),
+        cols => format!(" include ({})", cols.iter().map(|&c| col_name(c)).collect::<Vec<_>>().join(", ")),
+    };
     let filter = x.filter.as_ref().map_or(String::new(), |f| format!(" where {f}"));
-    // (a trigram index: gist when it was made as one, its one part with its operator class)
-    let (t, parts) = match &x.trgm {
-        Some(class) if class.starts_with("gist") => {
-            (format!("{t} using gist"), vec![format!("{} {class}", parts.join(", "))])
-        }
-        Some(class) => (format!("{t} using gin"), vec![format!("{} {class}", parts.join(", "))]),
-        None if x.gin => (format!("{t} using gin"), parts),
-        None => (t.to_string(), parts),
+    let using = match x.method() {
+        "btree" => String::new(),
+        m => format!(" using {}", ident(m)),
     };
     let unique = if unique { "unique " } else { "" };
-    format!("create {unique}index {} on {t} ({}){filter};", ident(&x.name), parts.join(", "))
+    format!("create {unique}index {} on {t}{using} ({}){include}{filter};", ident(&x.name), parts.join(", "))
 }
 
 /// A time column's precision is kept in `Col::dim` as this plus its digits (a vector's dimensions are below it).
@@ -24802,6 +25061,15 @@ fn parse_schema(name: &str, s: &str) -> Result<Table> {
                 gin: x["gin"] == true,
                 trgm: x["trgm"].as_str().map(String::from),
                 colls: x["colls"].as_array().into_iter().flatten().map(collation::Coll::from_json).collect(),
+                am: x["am"].as_str().map(String::from),
+                opts: (x["opts"].as_array().into_iter().flatten())
+                    .map(|o| o.as_i64().and_then(|o| i16::try_from(o).ok()).unwrap_or(0))
+                    .collect(),
+                include: ids(&x["include"]).unwrap_or_default(),
+                classes: (x["classes"].as_array().into_iter().flatten())
+                    .map(|c| c.as_str().map(String::from))
+                    .collect(),
+                builtin: x["builtin"].as_str().map(String::from),
             })
             .collect();
         let checks = j["checks"]
@@ -27744,6 +28012,22 @@ fn schema_json(t: &Table) -> String {
             }
             if x.colls.iter().any(|c| *c != collation::Coll::DEFAULT) {
                 j["colls"] = x.colls.iter().map(|c| c.to_json().unwrap_or(Json::Null)).collect();
+            }
+            // (what CREATE INDEX said beyond its entries, only where it said it: see `btree::Index::am`)
+            if let Some(am) = &x.am {
+                j["am"] = Json::String(am.clone());
+            }
+            if x.opts.iter().any(|o| *o != 0) {
+                j["opts"] = serde_json::json!(x.opts);
+            }
+            if !x.include.is_empty() {
+                j["include"] = serde_json::json!(x.include);
+            }
+            if x.classes.iter().any(Option::is_some) {
+                j["classes"] = serde_json::json!(x.classes);
+            }
+            if let Some(b) = &x.builtin {
+                j["builtin"] = Json::String(b.clone());
             }
             j
         })
@@ -31229,6 +31513,19 @@ fn resolve(cols: &[Col], table: Option<&str>, name: &str) -> Result<usize> {
     match (first, found.next()) {
         (Some((i, _)), None) => Ok(i),
         (Some(_), Some(_)) => {
+            // (within one relation a column of its own, or one its alias list named, wins over a system column of the
+            // name, which Postgres tries only where no other column matches: `pg_am x(ctid)`'s `ctid` is the alias's,
+            // scanRTEForColumn at parse_relation.c:840-866; a name two relations have stays ambiguous, colNameToVar)
+            let all: Vec<usize> = (cols.iter().enumerate())
+                .filter(|(_, c)| c.name == name && table.is_none_or(|t| c.table == t))
+                .map(|(k, _)| k)
+                .collect();
+            let mut shown = all.iter().copied().filter(|&k| !cols[k].hidden);
+            if all.iter().all(|&k| cols[k].table == cols[all[0]].table)
+                && let (Some(k), None) = (shown.next(), shown.next())
+            {
+                return Ok(k);
+            }
             err("42702", format!("column reference \"{name}\" is ambiguous; say which table, e.g. t.{name}"))
         }
         (None, _) => match table {
@@ -31245,8 +31542,10 @@ fn resolve(cols: &[Col], table: Option<&str>, name: &str) -> Result<usize> {
 /// away, one for short names), or nothing when none is close.
 fn did_you_mean(name: &str, cols: &[Col], table: Option<&str>) -> String {
     let limit = if name.chars().count() <= 4 { 1 } else { 2 };
+    // (not a system column, `ctid` or `tableoid`: Postgres matches those by their exact names only, its fuzzy match
+    // going over the user columns, scanRTEForColumn at parse_relation.c:823)
     cols.iter()
-        .filter(|c| table.is_none_or(|t| c.table == t) && !c.name.is_empty())
+        .filter(|c| table.is_none_or(|t| c.table == t) && !c.name.is_empty() && !c.hidden)
         .map(|c| (edits(&name.to_lowercase(), &c.name.to_lowercase()), &c.name))
         .filter(|&(d, _)| d <= limit)
         .min_by_key(|&(d, _)| d)
@@ -34983,6 +35282,11 @@ pub fn table_statistics(db: &crate::Core, branch: &str, name: &str) -> Result<Ve
     Ok(statistics::shown_for_table(&catalog::Catalog::of(db, branch)?, name))
 }
 
+/// Column `c`'s type id as pg_attribute.atttypid has it: a varchar's, a char(n)'s, a smallint's their own.
+fn col_oid(c: &Col) -> i64 {
+    Some(col_typmod(c).0).filter(|o| *o != 0).unwrap_or(i64::from(c.ty.oid()))
+}
+
 /// Column `c`'s type id where it isn't its type's own, and its type modifier, as `TableInfo::typmods` keeps them.
 fn col_typmod(c: &Col) -> (i64, i64) {
     match (c.chars, c.numeric) {
@@ -35026,6 +35330,8 @@ pub fn tables(db: &crate::Core, branch: &str) -> Result<Vec<TableInfo>> {
     let reg = if policies.is_empty() { None } else { Some(roles::registry(db)?) };
     // how many times each relation's storage was made anew (pg_class.relfilenode), kept apart from the schemas
     let gens = tablespace::Gens::all(&v)?;
+    // and the planner's statistics VACUUM and ANALYZE recorded (pg_class.relpages, reltuples, relallvisible)
+    let relstats = opt::stats::all(&v)?;
     for name in names.clone() {
         let info = |kind| TableInfo {
             name: name.clone(),
@@ -35275,6 +35581,7 @@ pub fn tables(db: &crate::Core, branch: &str) -> Result<Vec<TableInfo>> {
         });
         let (constraints, mut indexes) = catalog::describe(&v, &t);
         let mut hier = hier::info(&v, &t)?;
+        hier.stats = relstats.get(&name).map(|s| (s.relpages, s.reltuples, s.relallvisible));
         if let Some(g) = gens.get(&name) {
             hier.filenode = g.table;
             for x in &mut indexes {
@@ -35877,6 +36184,10 @@ fn setting(st: &SessState, live: &[(&str, String)], name: &str) -> Option<(Strin
     if name == "chronos.explain" {
         return Some((name.to_string(), if pg_exact() { "postgres" } else { "chronos" }.to_string()));
     }
+    // chronos.follow_pg_plan's: on in exact mode (see `opt::following`)
+    if name == "chronos.follow_pg_plan" {
+        return Some((name.to_string(), if pg_exact() { "on" } else { "off" }.to_string()));
+    }
     // a custom setting the session made once
     if name.contains('.') && st.placeholders.contains(name) {
         return Some((name.to_string(), String::new()));
@@ -35936,6 +36247,13 @@ fn checked_setting(name: &str, value: Option<&str>) -> Result<Option<String>> {
                 }),
             }
         }
+        // chronos.follow_pg_plan: a boolean, shown as on or off (see `opt::following`)
+        (None, Some(v)) if name.eq_ignore_ascii_case("chronos.follow_pg_plan") => {
+            match settings::parse_bool(v.trim()) {
+                Some(on) => Ok(Some(if on { "on" } else { "off" }.to_string())),
+                None => err("22023", "parameter \"chronos.follow_pg_plan\" requires a Boolean value"),
+            }
+        }
         (None, v) if name.contains('.') => Ok(v.map(String::from)),
         (None, _) => Err(unknown_setting(name)),
     }
@@ -35977,6 +36295,18 @@ fn setting_name_shown(name: &str) -> String {
 /// chronos.explain's description, as SHOW ALL and pg_settings give it.
 pub(super) const EXPLAIN_SETTING_ABOUT: &str = "Which plan EXPLAIN (COSTS OFF) shows: chronos (how Chronos runs it) or postgres (the plan PostgreSQL 16 would choose).";
 
+/// The settings only Chronos has, which SET takes by any case of their names.
+const CHRONOS_SETTINGS: [&str; 2] = ["chronos.explain", "chronos.follow_pg_plan"];
+
+/// A Chronos setting's description, as SHOW ALL and pg_settings give it.
+pub(super) fn chronos_setting_about(name: &str) -> &'static str {
+    match name {
+        "chronos.explain" => EXPLAIN_SETTING_ABOUT,
+        "chronos.follow_pg_plan" => opt::FOLLOW_SETTING_ABOUT,
+        _ => "",
+    }
+}
+
 fn all_settings() -> Vec<(String, String, &'static str, bool)> {
     let ctx = STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.clone()));
     let none = SessState::default();
@@ -36003,17 +36333,23 @@ fn all_settings() -> Vec<(String, String, &'static str, bool)> {
             out.push((shown, value, if set { "session" } else { "default" }, read_only));
         }
     }
-    // chronos.explain, set or not, as a setting an extension defines is listed (not in exact mode, whose pg_settings
-    // are Postgres's alone)
-    if !pg_exact()
-        && let Some((shown, value)) = setting(st, live, "chronos.explain")
-    {
-        let set = st.local.contains_key("chronos.explain") || st.settings.contains_key("chronos.explain");
-        out.push((shown, value, if set { "session" } else { "default" }, false));
+    // chronos.explain and chronos.follow_pg_plan, set or not, as settings an extension defines are listed (not in
+    // exact mode, whose pg_settings are Postgres's alone)
+    for name in CHRONOS_SETTINGS {
+        if !pg_exact()
+            && let Some((shown, value)) = setting(st, live, name)
+        {
+            let set = st.local.contains_key(name) || st.settings.contains_key(name);
+            out.push((shown, value, if set { "session" } else { "default" }, false));
+        }
     }
     // custom settings (SET app.org_id = ...) the session made
-    let mut custom: Vec<_> =
-        st.settings.iter().chain(st.local.iter()).filter(|(n, _)| n.contains('.') && *n != "chronos.explain").collect();
+    let mut custom: Vec<_> = st
+        .settings
+        .iter()
+        .chain(st.local.iter())
+        .filter(|(n, _)| n.contains('.') && !CHRONOS_SETTINGS.contains(&n.as_str()))
+        .collect();
     custom.sort();
     out.extend(custom.into_iter().map(|(n, v)| (n.clone(), v.clone(), "session", false)));
     out.sort_by_key(|a| a.0.to_lowercase());
@@ -37511,7 +37847,7 @@ impl Session {
         if_not_exists: bool,
         temp: bool,
         data: bool,
-        space: Option<&str>,
+        (space, am): (Option<&str>, Option<&str>),
     ) -> Result<Output> {
         let select = Statement(Stmt::Select(Box::new(query.clone())), PlanCache::default(), s.2);
         let found = self.columns(db, &select, types)?.unwrap_or_default();
@@ -37538,7 +37874,7 @@ impl Session {
             self.may_run(db, &s.0)?;
         }
         let (names, made) = ctas_columns(db.view_tx(self.target()).ok().as_ref(), query, &found, cols)?;
-        let create = Statement(ctas_create(table, made, if_not_exists, temp, space), PlanCache::default(), false);
+        let create = Statement(ctas_create(table, made, if_not_exists, temp, (space, am)), PlanCache::default(), false);
         let first = data && temp;
         let own = self.tx.is_none();
         let plain = |st: Stmt| Statement(st, PlanCache::default(), false);
@@ -38720,7 +39056,7 @@ impl Session {
             Stmt::SetVar { name, value, local } => {
                 // (chronos.explain by any case, `SET "Chronos.Explain"`, is the one setting, as Postgres's names are)
                 let lowered;
-                let name = if name.eq_ignore_ascii_case("chronos.explain") {
+                let name = if CHRONOS_SETTINGS.iter().any(|c| name.eq_ignore_ascii_case(c)) {
                     lowered = name.to_ascii_lowercase();
                     &lowered
                 } else {
@@ -38798,7 +39134,7 @@ impl Session {
                     .into_iter()
                     .map(|(n, v, ..)| {
                         let about = match n.as_str() {
-                            "chronos.explain" => EXPLAIN_SETTING_ABOUT,
+                            n if CHRONOS_SETTINGS.contains(&n) => chronos_setting_about(n),
                             _ => settings::find(&n).map_or("", |d| d.short),
                         };
                         vec![Value::Text(n), Value::Text(v), Value::Text(about.into())]
@@ -39577,7 +39913,7 @@ impl Session {
                 *name = Some(self.branch.clone());
                 self.step(db, &Statement(named, PlanCache::default(), false), params, types)
             }
-            Stmt::CreateAs { table, cols, query, if_not_exists, temp, data, on_commit, space } => {
+            Stmt::CreateAs { table, cols, query, if_not_exists, temp, data, on_commit, space, am } => {
                 let made = self.create_table_as(
                     db,
                     s,
@@ -39589,7 +39925,7 @@ impl Session {
                     *if_not_exists,
                     *temp,
                     *data,
-                    space.as_deref(),
+                    (space.as_deref(), am.as_deref()),
                 )?;
                 // (what a temporary table does at COMMIT, as CREATE TEMP TABLE ... ON COMMIT registers it)
                 if *temp && let Some(drop) = on_commit {
@@ -39599,7 +39935,7 @@ impl Session {
                 Ok(made)
             }
             // EXPLAIN EXECUTE name (arguments): the prepared statement's plan, with those arguments
-            Stmt::Explain { analyze, pg_plan, stmt, .. } if matches!(**stmt, Stmt::Execute { .. }) => {
+            Stmt::Explain { opts, stmt, .. } if matches!(**stmt, Stmt::Execute { .. }) => {
                 let Stmt::Execute { name, args } = &**stmt else { unreachable!() };
                 let Some(p) = self.prepared.get(name).cloned() else {
                     return err("26000", format!("prepared statement \"{name}\" does not exist"));
@@ -39624,15 +39960,10 @@ impl Session {
                     })
                 })?;
                 let Some(st) = &p.stmt else { return err(UNSUPPORTED, "an empty statement has no plan") };
-                let explain = Stmt::Explain {
-                    analyze: *analyze,
-                    pg_plan: *pg_plan,
-                    stmt: Box::new(st.0.clone()),
-                    original: None,
-                };
+                let explain = Stmt::Explain { opts: *opts, stmt: Box::new(st.0.clone()), original: None, text: None };
                 self.execute(db, &Statement(explain, PlanCache::default(), st.2), &vals, &p.types)
             }
-            Stmt::CreateAsExecute { table, cols, name, args, if_not_exists, temp, data, space } => {
+            Stmt::CreateAsExecute { table, cols, name, args, if_not_exists, temp, data, space, am } => {
                 let Some(p) = self.prepared.get(name).cloned() else {
                     return err("26000", format!("prepared statement \"{name}\" does not exist"));
                 };
@@ -39669,7 +40000,7 @@ impl Session {
                     *if_not_exists,
                     *temp,
                     *data,
-                    space.as_deref(),
+                    (space.as_deref(), am.as_deref()),
                 )
             }
             Stmt::Create { temp: true, likes, .. } if !likes.is_empty() => {
@@ -39797,6 +40128,16 @@ fn temp_route(d: &Db, v: &View, s: &Stmt) -> Result<bool> {
         // ponytail: a list mixing temporary and other tables drops in the world, which lacks the temporary ones
         Stmt::Drop { tables, .. } | Stmt::Truncate { tables, .. } => {
             return tables.iter().try_fold(true, |all, t| Ok(all && load(v, t)?.is_some()));
+        }
+        // VACUUM and ANALYZE of temporary tables alone: their statistics are kept with them (see `opt::stats`)
+        Stmt::Maintain(m) if matches!(m.verb, maintain::Verb::Vacuum | maintain::Verb::Analyze) => {
+            let names: Vec<&String> = (m.targets.iter())
+                .filter_map(|t| if let maintain::Target::Rel(n, _) = t { Some(n) } else { None })
+                .collect();
+            if names.is_empty() || names.len() != m.targets.len() {
+                return Ok(false);
+            }
+            return names.iter().try_fold(true, |all, n| Ok(all && load(v, &text_rel(n))?.is_some()));
         }
         // DROP INDEX of a temporary table's index (of theirs only, when several are named)
         Stmt::DropIndex { name, more, .. } => {
@@ -40086,7 +40427,7 @@ fn locking_tag(strongest: u8) -> String {
 /// non-volatile function may not run); None for what reads, and the statements that don't touch the database.
 fn changing_tag(s: &Stmt) -> Option<String> {
     let tag: String = match s {
-        Stmt::Explain { analyze: true, stmt, .. } => return changing_tag(stmt),
+        Stmt::Explain { opts, stmt, .. } if opts.analyze => return changing_tag(stmt),
         Stmt::Copy(c) if c.from => "COPY FROM".into(),
         // (COPY (INSERT ... RETURNING) TO: its statement's)
         Stmt::Copy(c) if c.dml.is_some() => return c.dml.as_deref().and_then(changing_tag),
@@ -40136,7 +40477,7 @@ fn changing_tag(s: &Stmt) -> Option<String> {
         // refuses itself as it is called, naming itself, as Postgres's PreventCommandIfReadOnly does
         Stmt::Select(_) if !safe::calls(s) => return None,
         Stmt::Insert { .. } => "INSERT".into(),
-        Stmt::Update { .. } | Stmt::PlannerStats(_) => "UPDATE".into(),
+        Stmt::Update { .. } | Stmt::PlannerStats(..) => "UPDATE".into(),
         Stmt::Delete { .. } => "DELETE".into(),
         Stmt::Merge(_) => "MERGE".into(),
         Stmt::Truncate { .. } => "TRUNCATE TABLE".into(),
@@ -40285,9 +40626,7 @@ fn catalog_stmt(db: &Db, branch: &str, st: &Stmt, params: Option<&[Value]>) -> R
         changed = true;
     }
     // (EXPLAIN keeps the query as written for Postgres's plan of it: see `plan`)
-    if changed
-        && let (Stmt::Explain { stmt: written, .. }, Stmt::Explain { pg_plan: true, original, .. }) = (st0, &mut st)
-    {
+    if changed && let (Stmt::Explain { stmt: written, .. }, Stmt::Explain { original, .. }) = (st0, &mut st) {
         *original = Some(written.clone());
     }
     Ok(changed.then_some(st))
@@ -40687,7 +41026,7 @@ impl Statement {
             return Statement(w.main.clone(), self.1.declaring(), self.2).columns_typed(db, branch, types);
         }
         let items = match &self.0 {
-            Stmt::Explain { .. } => return fixed(&[("QUERY PLAN", Type::Text)]),
+            Stmt::Explain { opts, .. } => return fixed(&[("QUERY PLAN", opts.column_type())]),
             Stmt::ShowBranches => {
                 return fixed(&[("name", Type::Text), ("parent", Type::Text), ("changes", Type::BigInt)]);
             }
@@ -41081,7 +41420,9 @@ impl Statement {
             return acl::vetted(|| s.execute(db, branch, params, types));
         }
         let n = self.param_count();
-        if params.len() < n {
+        // (EXPLAIN (GENERIC_PLAN) plans a statement whose parameters have no values)
+        let generic = matches!(&self.0, Stmt::Explain { opts, .. } if opts.generic);
+        if params.len() < n && !generic {
             return err("08P01", format!("the statement needs {n} parameters, but {} were given", params.len()));
         }
         let params: Vec<Value> = params
@@ -41241,8 +41582,8 @@ impl Statement {
                  session makes its temporary tables",
             ),
             Stmt::CreateAsExecute { .. } => err(UNSUPPORTED, "CREATE TABLE AS EXECUTE needs a session"),
-            Stmt::CreateAs { table, cols, query, if_not_exists, data, space, .. } => {
-                x.create_table_as(table, cols, query, *if_not_exists, *data, self.2, space.as_deref())
+            Stmt::CreateAs { table, cols, query, if_not_exists, data, space, am, .. } => {
+                x.create_table_as(table, cols, query, *if_not_exists, *data, self.2, (space.as_deref(), am.as_deref()))
             }
             Stmt::ShowPath => {
                 let columns = self.columns(db, branch, &[])?;
@@ -41509,7 +41850,8 @@ impl Statement {
                             || (t.has_key() && t.pkey_name() == of))
                 });
                 let Some(t) = owner else {
-                    if load(&v, &text_rel(name))?.is_some() {
+                    // (a table, a view or a sequence: RangeVarCallbackForAlterRelation's refusal)
+                    if relation_kind(&v, &text_rel(name))?.is_some() {
                         return err("42809", format!("\"{of}\" is not an index"));
                     }
                     if *if_exists {
@@ -42663,7 +43005,61 @@ impl Statement {
             Stmt::Locking(s, clauses) if self.2 && !branch.contains('@') => x.write(|_| x.locking(s, clauses)),
             Stmt::Locking(s, clauses) => x.locking(s, clauses),
             Stmt::CreateFunction(f, replace, procedure) => x.create_function(f, *replace, *procedure),
-            Stmt::UserDef { key, json, tag, missing, exists, needs } => {
+            Stmt::UserDef { key, json, tag, missing, exists, needs, cascade } => {
+                // a hash operator class a partition key hashes with: what depends on it stops the drop, or goes
+                // first with CASCADE (findDependentObjects: the table depends on its key's class)
+                if *tag == "DROP OPERATOR CLASS" {
+                    let v = db.view_tx(branch)?;
+                    let users = userdefs::opclass_users(&v, key)?;
+                    // the indexes that use it, but those of a table that goes with it
+                    let indexes: Vec<String> = (userdefs::opclass_indexes(&v, key)?.into_iter())
+                        .filter(|(t, _)| !users.contains(t))
+                        .map(|(_, x)| x)
+                        .collect();
+                    // (and the session's temporary ones, kept in a database of their own: see `TEMP`)
+                    let temps = session_temp_view(|tv| userdefs::opclass_users(tv, key))?.unwrap_or_default();
+                    let temp_indexes: Vec<String> =
+                        (session_temp_view(|tv| userdefs::opclass_indexes(tv, key))?.unwrap_or_default().into_iter())
+                            .filter(|(t, _)| !temps.contains(t))
+                            .map(|(_, x)| x)
+                            .collect();
+                    if !(users.is_empty() && temps.is_empty() && indexes.is_empty() && temp_indexes.is_empty()) {
+                        if !*cascade {
+                            let (on, tables) =
+                                ([&indexes[..], &temp_indexes[..]].concat(), [&users[..], &temps[..]].concat());
+                            return Err(userdefs::opclass_in_use(key, &on, &tables));
+                        }
+                        for i in &indexes {
+                            x.drop_index(i, true, false)?;
+                        }
+                        if !users.is_empty() {
+                            x.drop_relations("table", &users, true, true)?;
+                        }
+                        // on the statement's fork of their database: kept with it, or not at all (see `temp_fork`)
+                        if !(temps.is_empty() && temp_indexes.is_empty())
+                            && let Some(d) = session_temp()
+                        {
+                            let at = temp_fork(&d)?;
+                            let actor = crate::disk::actor();
+                            let _private = crate::acting_as(""); // its own database: see `Session::temp_db`
+                            let mut sts: Vec<Stmt> = (temp_indexes.into_iter())
+                                .map(|name| Stmt::DropIndex {
+                                    name,
+                                    if_exists: true,
+                                    more: vec![],
+                                    concurrently: false,
+                                })
+                                .collect();
+                            if !temps.is_empty() {
+                                sts.push(Stmt::Drop { tables: temps, if_exists: true, cascade: true });
+                            }
+                            for st in sts {
+                                let st = Statement(st, PlanCache::default(), false);
+                                catalog::at_home(&db.core, branch, &actor, || st.execute(&d, &at, &[], &[]))?;
+                            }
+                        }
+                    }
+                }
                 db.batch_with(branch, |v| {
                     if *tag == "CREATE EVENT TRIGGER" {
                         userdefs::event_function(v, json.as_deref())?;
@@ -42874,22 +43270,38 @@ impl Statement {
                 concurrently,
                 options,
                 space,
-            } => x
-                .create_index(
-                    name.as_deref(),
-                    table,
-                    (cols, colls),
-                    include,
-                    *unique,
-                    *nnd,
-                    *if_not_exists,
-                    filter.as_deref(),
-                    (*using, trgm.as_deref()),
-                    *only,
-                    *concurrently,
-                    (options, space.as_deref()),
-                )
-                .map_err(index_build_failed),
+                said,
+            } => {
+                // (each table the index is built on gets its pages and tuples counted, as index_update_stats counts
+                // them: the table, or the partitions below it, once the index is there)
+                let before: Vec<(String, Vec<String>)> =
+                    x.table_tree(table)?.iter().map(|t| (t.name.clone(), built_indexes(t))).collect();
+                let out = x
+                    .create_index(
+                        name.as_deref(),
+                        table,
+                        (cols, colls),
+                        include,
+                        *unique,
+                        *nnd,
+                        *if_not_exists,
+                        filter.as_deref(),
+                        (*using, trgm.as_deref()),
+                        *only,
+                        *concurrently,
+                        (options, space.as_deref()),
+                        said,
+                    )
+                    .map_err(index_build_failed)?;
+                let mut todo = vec![];
+                for t in x.table_tree(table)? {
+                    if before.iter().any(|(n, was)| *n == t.name && *was != built_indexes(&t)) {
+                        todo.push((t.name, Some(false), vec![], true));
+                    }
+                }
+                x.relstats(&todo)?;
+                Ok(out)
+            }
             Stmt::AttachIndex { parent, child } => x.attach_index(parent, child),
             Stmt::DropIndex { name, if_exists, more, concurrently } => {
                 let mut out = x.drop_index(name, *if_exists, *concurrently)?;
@@ -42901,9 +43313,7 @@ impl Statement {
             Stmt::VectorIndex { name, table, col, ops, if_not_exists } => {
                 x.vector_index(name.as_deref(), table, col, ops.as_deref(), *if_not_exists)
             }
-            Stmt::Explain { analyze, pg_plan, stmt, original } => {
-                x.explain(stmt, *analyze, *pg_plan, original.as_deref())
-            }
+            Stmt::Explain { opts, stmt, original, text } => x.explain(stmt, opts, original.as_deref(), text.as_deref()),
             Stmt::With(w) => x.with_dml(w),
             Stmt::Merge(m) => x.merge_into(m),
             Stmt::Alter { table, changes, if_exists, .. } if matches!(&changes[..], [Alter::IndexOptions(..)]) => {
@@ -43039,6 +43449,14 @@ impl Statement {
                     (Some("sequence"), [c @ (Alter::RenameTable(_) | Alter::SetSchema(_))]) => {
                         x.move_sequence(table, c)
                     }
+                    // (and what it does to the planner's statistics of the table and the tables below it: see
+                    // `Exec::altered_stats`)
+                    (Some("table"), _) if altered_name(table, changes).is_none() => {
+                        let before = x.table_tree(table)?;
+                        let out = x.alter(table, changes, *only)?;
+                        x.altered_stats(&before, changes)?;
+                        Ok(out)
+                    }
                     _ => x.alter(table, changes, *only),
                 }?;
                 if let Some(to) = altered_name(table, changes) {
@@ -43096,11 +43514,40 @@ impl Statement {
                 *overriding,
                 checks.as_deref(),
             ),
-            Stmt::PlannerStats(sql) => {
+            Stmt::PlannerStats(sql, keep) => {
                 let Some(st) = parse(sql)?.pop() else { return err(SYNTAX, "pg_class's statistics") };
                 let out = x.run_body(&st.0, false)?;
-                let n = out.rows.first().and_then(|r| r.first().cloned()).unwrap_or(Value::Int(0));
-                Ok(Output::tag(format!("UPDATE {}", n.to_text())))
+                if !*keep {
+                    let n = out.rows.first().and_then(|r| r.first().cloned()).unwrap_or(Value::Int(0));
+                    return Ok(Output::tag(format!("UPDATE {}", n.to_text())));
+                }
+                // each table's new values, where VACUUM and ANALYZE keep them; another relation's (an index's, a
+                // view's) aren't kept, as there is nothing here that reads them
+                x.db.batch_with::<(), SqlError>(x.branch, |v| {
+                    let cat = catalog::Catalog::of(v.core, &v.branch)?;
+                    let mut writes = vec![];
+                    for row in &out.rows {
+                        let Some(Value::Int(oid)) = row.first() else { continue };
+                        let Some(i) = (0..cat.rels.len()).find(|&i| cat.rel_oid(i) == *oid) else { continue };
+                        let r = &cat.rels[i];
+                        if !matches!(r.kind, 'r' | 'm' | 'p') {
+                            continue;
+                        }
+                        let mut s = opt::stats::load(v, &r.name)?.unwrap_or_default();
+                        if let Some(Value::Float(t)) = row.get(1) {
+                            s.reltuples = opt::stats::float4(*t);
+                        }
+                        if let Some(Value::Int(p)) = row.get(2) {
+                            s.relpages = *p;
+                        }
+                        if let Some(Value::Int(a)) = row.get(3) {
+                            s.relallvisible = *a;
+                        }
+                        writes.push(s.write(&r.name));
+                    }
+                    Ok((writes, ()))
+                })?;
+                Ok(Output::tag(format!("UPDATE {}", out.rows.len())))
             }
             Stmt::Update { table, only, sets, filter, returning, from, checks } => x.update_tree(
                 table,
@@ -43462,6 +43909,15 @@ fn lock_level(changes: &[Alter]) -> &'static str {
     })
 }
 
+/// The indexes of table `t` that Postgres builds over its rows: its primary key's, its unique constraints', its
+/// exclusion constraints' and those CREATE INDEX made, by name.
+fn built_indexes(t: &Table) -> Vec<String> {
+    let mut out = index_names(t);
+    out.extend(t.excludes.iter().map(|x| x.name.clone()));
+    out.extend(t.ann.iter().map(|x| x.0.clone()));
+    out
+}
+
 /// The stored names of a table's indexes: its primary key's, its unique constraints' and those CREATE INDEX made.
 fn index_names(t: &Table) -> Vec<String> {
     let names = (t.has_key().then(|| t.pkey_name()).into_iter())
@@ -43792,6 +44248,7 @@ fn ctx_call(f: CtxFn, a: &[Value]) -> Result<Value> {
         | CtxFn::ToReg(_)
         | CtxFn::ConstraintDef
         | CtxFn::IndexDef
+        | CtxFn::IndexProperty(_)
         | CtxFn::PartKeyDef
         | CtxFn::PartConstraintDef
         | CtxFn::PartRoot
@@ -45486,9 +45943,7 @@ fn relation_kind(v: &View, name: &str) -> Result<Option<&'static str>> {
 /// Whether `name` is one of Postgres's own catalog tables (pg_class, pg_attribute, ...), which ALTER TABLE refuses
 /// to change, as Postgres refuses anyone but a superuser with allow_system_table_mods on; not a view of them.
 fn system_catalog(name: &str) -> bool {
-    const CATALOG_VIEWS: &[&str] =
-        &["pg_tables", "pg_views", "pg_matviews", "pg_indexes", "pg_sequences", "pg_roles", "pg_user", "pg_settings"];
-    catalog::table_oid(name).is_some() && !CATALOG_VIEWS.contains(&name)
+    catalog::table_oid(name).is_some() && !catalog_view(name)
 }
 
 /// What Postgres calls a change of ALTER TABLE in the error refusing it for a kind of relation that can't have it
@@ -45518,6 +45973,7 @@ fn alter_action(c: &Alter) -> Option<&'static str> {
         Alter::Cluster(None) => "SET WITHOUT CLUSTER",
         Alter::Unlogged(true) => "SET UNLOGGED",
         Alter::Unlogged(false) => "SET LOGGED",
+        Alter::SetAccessMethod(_) => "SET ACCESS METHOD",
         Alter::ReplicaIdentity(..) => "REPLICA IDENTITY",
         Alter::Inherit(_, true) => "INHERIT",
         Alter::Inherit(_, false) => "NO INHERIT",
@@ -45615,10 +46071,14 @@ fn new_pkey_name(v: &View, t: &Table) -> Result<Option<String>> {
 }
 
 /// The columns a query reading relation `name` sees: a table's (or materialized view's), a view's, a sequence's read
-/// as a table, or a catalog table's; None if there's nothing of that name.
+/// as a table, or a catalog table's; None if there's nothing of that name. A table's system columns too (each of
+/// `SYSTEM_COLUMNS`, `xmin` as much as `ctid`), as a view has none: a SQL function's parameter named `tableoid` or
+/// `xmin` is the column in a query of a table, but the parameter in one of a view (sql_fn_post_column_ref never
+/// overrides a column, functions.c:289, and PL/pgSQL's is ambiguous beside one, pl_comp.c:1133).
 fn relation_columns(v: &View, name: &str) -> Result<Option<Vec<String>>> {
+    let system = || SYSTEM_COLUMNS.map(String::from);
     if let Some(t) = load(v, name)? {
-        return Ok(Some(t.cols.into_iter().map(|c| c.name).collect()));
+        return Ok(Some(t.cols.into_iter().map(|c| c.name).chain(system()).collect()));
     }
     if let Some(d) = view_def(v, name)? {
         return Ok(Some(d.cols));
@@ -45629,9 +46089,15 @@ fn relation_columns(v: &View, name: &str) -> Result<Option<Vec<String>>> {
     if !catalog_table(name) {
         return Ok(None);
     }
-    // (its columns are the same whatever rows the world gives it)
+    // (its columns are the same whatever rows the world gives it; a catalog table's rows end with two of its system
+    // columns, see `catalog_rows`, and it has the others as well)
     let q = catalog_query("", name, &catalog::Catalog::default());
-    Ok(Some(q.items.into_iter().filter_map(|i| if let Item::Expr(_, a) = i { a } else { None }).collect()))
+    let named = q.items.into_iter().filter_map(|i| if let Item::Expr(_, a) = i { a } else { None });
+    let mut cols: Vec<String> = named.filter(|n| !system_name(n)).collect();
+    if !catalog_view(name) {
+        cols.extend(system());
+    }
+    Ok(Some(cols))
 }
 
 /// Refuses writes to a materialized view (only REFRESH changes its rows).
@@ -45852,6 +46318,7 @@ fn relation_gone(v: &View, name: &str, kind: &str) -> Result<Vec<(String, Option
         }
         w.extend(index_rows(v, name)?.into_iter().map(|k| (k, None)));
         w.extend(tablespace::gens_dropped(v, name)?);
+        w.extend(opt::stats::dropped(v, name)?);
         w.push((schema_key(name), None));
     }
     for r in v.prefix(&rules::prefix_of(name))? {
@@ -46325,6 +46792,13 @@ impl Expand {
     }
 }
 
+/// Whether `src`'s alias list names one of its columns `tableoid`: a read of `tableoid` of it is that column, not the
+/// system column (scanRTEForColumn tries those only where no column matches, parse_relation.c:840-866), so it isn't
+/// one `hier::plain_tableoid` makes the table's oid.
+fn renames_tableoid(src: &Source) -> bool {
+    src.names.iter().any(|n| n == "tableoid")
+}
+
 /// What a query level reads of the system column `ctid`: whether it names it bare, and the tables it names it of
 /// (`t.ctid`), by the names the level calls them.
 fn ctid_reads(q: &Select) -> (bool, Vec<String>) {
@@ -46566,7 +47040,7 @@ fn expand_select(
                             // column `*` doesn't give)
                             body.items.push(Item::Expr(Expr::Col(None, "tableoid".into()), Some("tableoid".into())));
                             src.hier = true;
-                        } else if mention {
+                        } else if mention && !renames_tableoid(src) {
                             plain.push((src.alias.clone(), src.table.clone()));
                         }
                         expand_select(v, &mut body, params, any, deep, x)?;
@@ -46578,6 +47052,7 @@ fn expand_select(
             // a table: the tables it is partitioned into or that inherit from it are read with it
             match hier::expand_source(v, src, past.as_ref(), mention)? {
                 hier::Expanded::Skip => {}
+                hier::Expanded::Plain if renames_tableoid(src) => {}
                 hier::Expanded::Plain => plain.push((src.alias.clone(), src.table.clone())),
                 hier::Expanded::Hier => changed = true,
             }
@@ -47630,7 +48105,7 @@ impl Exec<'_> {
         if_not_exists: bool,
         data: bool,
         calls: bool,
-        space: Option<&str>,
+        (space, am): (Option<&str>, Option<&str>),
     ) -> Result<Output> {
         let v = self.db.view_tx(self.branch)?;
         let select = Stmt::Select(Box::new(query.clone()));
@@ -47656,7 +48131,7 @@ impl Exec<'_> {
             true => Some(self.run_body(&select, false)?.rows),
             false => None,
         };
-        self.run_stmt(&ctas_create(table, made, if_not_exists, false, space))?;
+        self.run_stmt(&ctas_create(table, made, if_not_exists, false, (space, am)))?;
         for st in ctas_masks(table, &names, &masks)? {
             self.run_stmt(&st.0)?;
         }
@@ -47755,6 +48230,7 @@ impl Exec<'_> {
             }
             let deps = column_deps(&v, query);
             let space = reloptions.iter().find(|(o, _)| o == "tablespace").map(|(_, n)| n.as_str());
+            let am = reloptions.iter().find(|(o, _)| o == "access_method").map(|(_, n)| n.as_str());
             return self.create_matview(
                 name,
                 &names,
@@ -47763,7 +48239,7 @@ impl Exec<'_> {
                 sql,
                 (reads, deps),
                 data,
-                (if_not_exists, space),
+                (if_not_exists, space, am),
             );
         }
         let types: Vec<_> = found.iter().map(|(_, t)| t.name()).collect();
@@ -47974,7 +48450,7 @@ impl Exec<'_> {
         sql: &str,
         (reads, deps): (Vec<String>, Option<Json>),
         data: bool,
-        (if_not_exists, space): (bool, Option<&str>),
+        (if_not_exists, space, am): (bool, Option<&str>, Option<&str>),
     ) -> Result<Output> {
         let rows = if data { self.select(q)?.rows } else { vec![] };
         // made by a person from masked columns: its copies of them are masked too (an agent's query read masks)
@@ -48013,9 +48489,11 @@ impl Exec<'_> {
                 return err(TABLE_EXISTS, format!("relation \"{name}\" already exists"));
             }
             no_type_named(v, name, false)?;
-            // (TABLESPACE: where it is kept, else default_tablespace's, as a table's)
+            // (TABLESPACE: where it is kept, else default_tablespace's, and USING: its access method, else
+            // default_table_access_method's, as a table's)
             let mut t = t.clone();
             t.hier.tablespace = tablespace::place(v, space, 0, false, true)?;
+            t.hier.am = accessmethod::for_new(v, am, false)?;
             let mut w = vec![(schema_key(name), Some(schema_json(&t)))];
             w.extend(matview_rows(&t, &rows)?);
             Ok((w, ()))
@@ -48414,8 +48892,9 @@ impl Exec<'_> {
                             t.cols.iter().filter(|c| c.auto == Some(Auto::Serial)).filter_map(|c| c.seq.clone()),
                         );
                     }
-                    // (and how many times its storage was made anew)
+                    // (and how many times its storage was made anew, and its statistics)
                     w.extend(tablespace::gens_dropped(v, n)?);
+                    w.extend(opt::stats::dropped(v, n)?);
                     w.push((schema_key(n), None));
                 }
             }
@@ -49008,6 +49487,8 @@ impl Exec<'_> {
                     w.push((r?.0, None));
                 }
                 w.extend(index_rows(v, &t.name)?.into_iter().map(|k| (k, None)));
+                // (a new, empty heap: pg_class's statistics as a table's never vacuumed)
+                w.extend(opt::stats::truncated(v, &t.name)?);
             }
             let serials: Vec<String> = all
                 .iter()
@@ -49130,30 +49611,69 @@ fn udt_name(t: Type) -> String {
     .into()
 }
 
-/// Rows of constants as a query: `SELECT a AS x, b AS y UNION ALL SELECT ...`.
-/// A catalog table's rows as a query, with the `tableoid` column Postgres gives every table (last:
-/// pg_dump reads it; the oid is that of the Postgres catalog table of the name).
-fn catalog_rows(name: &str, cols: &[(&str, Type)], rows: Vec<Vec<Value>>) -> Select {
+/// The system columns a catalog table's rows end with (see `catalog_rows`).
+const CATALOG_SYSTEM: [(&str, Type); 2] = [("ctid", Type::Tid), ("tableoid", Type::Oid)];
+
+/// `CATALOG_SYSTEM` as a table's columns.
+fn catalog_system_cols() -> [(String, Type); 2] {
+    CATALOG_SYSTEM.map(|(n, t)| (n.to_string(), t))
+}
+
+/// Each of `rows` of catalog table `name`, the first of them the table's row `first` (from 0), with the values of its
+/// system columns (see `CATALOG_SYSTEM`).
+fn catalog_system(name: &str, rows: &mut [Vec<Value>], first: usize) {
     let oid = catalog::table_oid(name.trim_start_matches("pg_catalog.")).unwrap_or(0);
+    for (k, r) in rows.iter_mut().enumerate() {
+        r.push(catalog_ctid(first + k));
+        r.push(Value::Int(oid));
+    }
+}
+
+/// The `ctid` of a catalog table's row `k` (from 0): its row number laid out 291 rows to a page, which is only the cap
+/// MaxHeapTuplesPerPage (htup_details.h) that `ctid_source` also keeps, not where Postgres's pages would put the rows:
+/// `ctid_source` fills a page by the rows' sizes too (PAGE_SPACE), and a real heap page holds far fewer pg_proc rows.
+/// Chronos keeps no heap for the catalog, so it is worked out again on every read, from the rows as the catalog has
+/// them then: DDL that adds or drops a catalog row moves the rows after it, where Postgres would leave them be.
+fn catalog_ctid(k: usize) -> Value {
+    Value::Text(format!("({},{})", k / 291, k % 291 + 1))
+}
+
+/// Whether catalog relation `name` is one of Postgres's views (pg_roles, pg_tables, pg_settings, pg_stat_activity, ...;
+/// see `viewdef::system_views`), information_schema's, or pg_stat_statements (the extension's view): a view has no
+/// system columns, so `SELECT ctid FROM pg_roles` is 42703, and a `ctid` beside one names the other table's. A view
+/// isn't one of the catalog's tables either, for ALTER TABLE (see `system_catalog`) or an object's description
+/// (`objaddr`), though it has an oid of its own (see `catalog::CATALOG_OIDS`).
+fn catalog_view(name: &str) -> bool {
+    let plain = name.trim_start_matches("pg_catalog.");
+    name.starts_with("information_schema.")
+        || plain == "pg_stat_statements"
+        || viewdef::system_views().iter().any(|(n, _)| n == plain)
+}
+
+/// Rows of constants as a query: `SELECT a AS x, b AS y UNION ALL SELECT ...`.
+/// A catalog table's rows as a query, with the system columns Postgres gives every table last, where a `*` doesn't
+/// give them (see `inline`): `ctid`, which oidjoins reports the rows it finds by, and `tableoid`, which pg_dump reads
+/// (the oid of the Postgres catalog table of the name). A view has none.
+fn catalog_rows(name: &str, cols: &[(&str, Type)], rows: Vec<Vec<Value>>) -> Select {
     if name.starts_with("information_schema.") {
         return rows_select(cols, rows); // (its tables are views: no system columns)
     }
     let plain = name.trim_start_matches("pg_catalog.");
     let (mut all, mut rows) = catalog_schema::complete(plain, cols, rows);
-    all.push(("tableoid".into(), Type::Oid));
-    for r in &mut rows {
-        r.push(Value::Int(oid));
+    if !catalog_view(name) {
+        all.extend(catalog_system_cols());
+        catalog_system(name, &mut rows, 0);
     }
     let named: Vec<(&str, Type)> = all.iter().map(|(n, t)| (n.as_str(), *t)).collect();
     rows_select(&named, rows)
 }
 
-/// `catalog_rows` for rows that have every column already (see `catalog_schema::named_row`).
-fn whole_rows(name: &str, mut cols: Vec<(String, Type)>, mut rows: Vec<Vec<Value>>) -> Select {
-    let oid = catalog::table_oid(name.trim_start_matches("pg_catalog.")).unwrap_or(0);
-    cols.push(("tableoid".into(), Type::Oid));
-    for r in &mut rows {
-        r.push(Value::Int(oid));
+/// `catalog_rows` for rows that have every column already (see `catalog_schema::named_row`), the first of them the
+/// table's row `first` (pg_proc's own functions come after the built-in ones).
+fn whole_rows(name: &str, mut cols: Vec<(String, Type)>, mut rows: Vec<Vec<Value>>, first: usize) -> Select {
+    if !catalog_view(name) {
+        cols.extend(catalog_system_cols());
+        catalog_system(name, &mut rows, first);
     }
     let named: Vec<(&str, Type)> = cols.iter().map(|(n, t)| (n.as_str(), *t)).collect();
     rows_select(&named, rows)
@@ -49284,6 +49804,43 @@ fn rows_select(cols: &[(&str, Type)], rows: Vec<Vec<Value>>) -> Select {
     Select { set: rows.map(|r| (SetOp::Union, true, Box::new(part(r)))).collect(), ..part(first) }
 }
 
+/// `SELECT <columns> FROM f()`, `f` the function of Postgres's own rows of catalog table `table` (see `BUILTIN_ROWS`,
+/// `BUILTIN_PROCS`): each column named, as `catalog_rows` names them, so the system columns its rows end with are not
+/// in a `*` (see `inline`).
+fn builtin_rows_query(f: &str, table: &str) -> Select {
+    let names = catalog_schema::columns(table).into_iter().chain(catalog_system_cols()).map(|(n, _)| n);
+    Select {
+        set: vec![],
+        distinct: false,
+        distinct_on: vec![],
+        items: names.map(|n| Item::Expr(Expr::Col(None, n.clone()), Some(n))).collect(),
+        from: Some(Source {
+            table: f.into(),
+            alias: f.into(),
+            sub: None,
+            names: vec![],
+            rec: None,
+            working: false,
+            at: None,
+            lateral: false,
+            srf: Some(Box::new((f.into(), vec![]))),
+            cte: 0,
+            only: false,
+            hier: false,
+            policed: false,
+            bound: false,
+        }),
+        joins: vec![],
+        filter: None,
+        group: vec![],
+        having: None,
+        order: vec![],
+        limit: None,
+        offset: None,
+        locking: vec![],
+    }
+}
+
 /// Catalog table `name` for world `branch`, whose relations are `info` (see `tables`).
 fn catalog_query(branch: &str, name: &str, cat: &catalog::Catalog) -> Select {
     if let Some((cols, rows)) = catalog::rows(branch, name, cat) {
@@ -49291,42 +49848,15 @@ fn catalog_query(branch: &str, name: &str, cat: &catalog::Catalog) -> Select {
     }
     // the world's own objects, every column Postgres has for them (see `catalog_objects`)
     if let Some((cols, rows)) = catalog_objects::objects(name, cat) {
-        let empty = rows.is_empty();
-        let mut q = whole_rows(name, cols, rows);
         if name.trim_start_matches("pg_catalog.") != "pg_proc" {
-            return q;
+            return whole_rows(name, cols, rows, 0);
         }
-        // and the built-in functions, from a function's rows (3,286 of them: not a query of constants)
-        let mut all = Select {
-            set: vec![],
-            distinct: false,
-            distinct_on: vec![],
-            items: vec![Item::Star],
-            from: Some(Source {
-                table: BUILTIN_PROCS.into(),
-                alias: BUILTIN_PROCS.into(),
-                sub: None,
-                names: vec![],
-                rec: None,
-                working: false,
-                at: None,
-                lateral: false,
-                srf: Some(Box::new((BUILTIN_PROCS.into(), vec![]))),
-                cte: 0,
-                only: false,
-                hier: false,
-                policed: false,
-                bound: false,
-            }),
-            joins: vec![],
-            filter: None,
-            group: vec![],
-            having: None,
-            order: vec![],
-            limit: None,
-            offset: None,
-            locking: vec![],
-        };
+        // and the built-in functions, from a function's rows (3,286 of them: not a query of constants), before the
+        // world's own
+        let empty = rows.is_empty();
+        let first = if empty { 0 } else { catalog_schema::builtin_proc_rows().len() };
+        let mut q = whole_rows(name, cols, rows, first);
+        let mut all = builtin_rows_query(BUILTIN_PROCS, "pg_proc");
         if !empty {
             let rest = std::mem::take(&mut q.set);
             all.set.push((SetOp::Union, true, Box::new(q)));
@@ -49340,36 +49870,7 @@ fn catalog_query(branch: &str, name: &str, cat: &catalog::Catalog) -> Select {
     if !CATALOG.contains(&name) && catalog_schema::known(name.trim_start_matches("pg_catalog.")) {
         let plain = name.trim_start_matches("pg_catalog.");
         if let Some(f) = BUILTIN_ROWS.iter().find(|f| f.trim_start_matches("?builtin:") == plain) {
-            return Select {
-                set: vec![],
-                distinct: false,
-                distinct_on: vec![],
-                items: vec![Item::Star],
-                from: Some(Source {
-                    table: (*f).into(),
-                    alias: (*f).into(),
-                    sub: None,
-                    names: vec![],
-                    rec: None,
-                    working: false,
-                    at: None,
-                    lateral: false,
-                    srf: Some(Box::new(((*f).into(), vec![]))),
-                    cte: 0,
-                    only: false,
-                    hier: false,
-                    policed: false,
-                    bound: false,
-                }),
-                joins: vec![],
-                filter: None,
-                group: vec![],
-                having: None,
-                order: vec![],
-                limit: None,
-                offset: None,
-                locking: vec![],
-            };
+            return builtin_rows_query(f, plain);
         }
         return catalog_rows(name, &[], vec![]);
     }
@@ -50571,6 +51072,76 @@ impl<'a> Exec<'a> {
         self.nest.pending.borrow_mut().extend(rows);
     }
 
+    /// The statistics of tables an index was just built on, or that ALTER TABLE just changed (see
+    /// `opt::stats::altered`): for each, its name, whether its heap was rewritten, the columns whose type changed, and
+    /// whether an index was built on it. Each table's rows are counted on the branch as it is now, outside its lock,
+    /// and what changed is written then (see `maintain::write_stats`); inside a function or trigger of a statement
+    /// that holds the branch, counted on the branch as that statement sees it and written with its rows.
+    fn relstats(&self, todo: &[(String, Option<bool>, Vec<u32>, bool)]) -> Result<()> {
+        let v = self.view()?;
+        let mut changed = vec![];
+        for (name, rewrite, altered, built) in todo {
+            let Some(mut t) = load_world(&v, name)? else { continue };
+            if t.hier.part.is_some() || !t.schema || changed.iter().any(|c: &maintain::Counted<'_>| c.0 == name) {
+                continue;
+            }
+            let (schema, raw) = (v.get(&schema_key(name))?, v.get(&opt::stats::key(name))?);
+            let old = opt::stats::load(&v, name)?;
+            if let Some(st) = opt::stats::altered(&v, &mut t, old, *rewrite, altered, *built)? {
+                changed.push((name.as_str(), schema, raw, st));
+            }
+        }
+        if self.nest.state.borrow().is_none() {
+            return maintain::write_stats(self.db, self.branch, &changed);
+        }
+        self.push(changed.into_iter().map(|(name, _, _, st)| st.write(name)).collect());
+        Ok(())
+    }
+
+    /// What ALTER TABLE `changes` did to the planner's statistics of the tables `before` (the one it names and those
+    /// below it, as they were): a heap Postgres rewrites (see `opt::rewrites`) starts again from a never-vacuumed
+    /// table's counts, and an index built (a constraint's, or each index again after a rewrite) counts its table's
+    /// pages and tuples (see `opt::stats::altered`).
+    fn altered_stats(&self, before: &[Table], changes: &[Alter]) -> Result<()> {
+        let v = self.view()?;
+        let mut todo = vec![];
+        for b in before {
+            let Some(a) = load_world(&v, &b.name)? else { continue };
+            let rewrite = opt::rewrites(b, &a, changes);
+            let retyped: Vec<u32> = (b.cols.iter())
+                .filter(|c| a.cols.iter().any(|x| x.id == c.id && (x.ty != c.ty || col_typmod(x) != col_typmod(c))))
+                .map(|c| c.id)
+                .collect();
+            let built = built_indexes(b) != built_indexes(&a);
+            if rewrite != Some(false) || built {
+                todo.push((a.name.clone(), rewrite, retyped, built));
+            }
+        }
+        self.relstats(&todo)
+    }
+
+    /// Table `name` and the tables below it (its partitions, and the tables inheriting from it, at any depth), as they
+    /// are now: none where it isn't a table.
+    fn table_tree(&self, name: &str) -> Result<Vec<Table>> {
+        let v = self.view()?;
+        let Some(t) = load(&v, name)? else { return Ok(vec![]) };
+        let mut out = vec![t];
+        let mut k = 0;
+        while k < out.len() {
+            if out[k].hier.part.is_some() || out[k].hier.kids {
+                for n in hier::child_names(&v, &out[k].name)? {
+                    if !out.iter().any(|x| x.name == n)
+                        && let Some(c) = load_world(&v, &n)?
+                    {
+                        out.push(c);
+                    }
+                }
+            }
+            k += 1;
+        }
+        Ok(out)
+    }
+
     /// Where the write under way stands, for a PL/pgSQL block with EXCEPTION handlers to go back
     /// to (its implicit savepoint): how many rows are pushed, and the branch with them (O(1)),
     /// None outside a write; and, when the session has temporary tables, the block's own fork of
@@ -50793,8 +51364,8 @@ impl<'a> Exec<'a> {
             ),
             Stmt::With(w) => self.with_dml(w),
             Stmt::Merge(m) => self.merge_into(m),
-            Stmt::Explain { analyze, pg_plan, stmt, original } => {
-                self.explain(stmt, *analyze, *pg_plan, original.as_deref())
+            Stmt::Explain { opts, stmt, original, text } => {
+                self.explain(stmt, opts, original.as_deref(), text.as_deref())
             }
             // DDL from a dynamic EXECUTE: a statement of its own, written at once; the statement's view then
             // starts from what it made, with the rows it has pushed put over it again
@@ -51279,6 +51850,172 @@ impl<'a> Exec<'a> {
 
 /// Stored rows: (key, value).
 type Rows = Vec<(String, Val)>;
+
+/// What running a statement under EXPLAIN did (see `Exec::explain_trace`): Chronos's steps above its table reads,
+/// the rows it gave or changed, each table read, and the time it took.
+struct Run {
+    nodes: Vec<String>,
+    rows: usize,
+    traced: Vec<Traced>,
+    took_ms: f64,
+}
+
+/// Whether `e` is a data error: SQLSTATE class 22 (a value a cast or a function refuses) or 21000 (a subquery's
+/// second row), which only meets a query that runs.
+fn data_error(e: &SqlError) -> bool {
+    e.code.starts_with("22") || e.code == "21000"
+}
+
+/// Whether `x`, under the cast to boolean the parser puts on IS [NOT] DISTINCT FROM's other side where it is one, is
+/// the boolean constant written there (`true`, `false`, `NULL::boolean`): see `Parser`'s IS.
+fn written_bool(x: &Expr) -> bool {
+    match x {
+        Expr::Lit(Value::Bool(_)) => true,
+        Expr::Cast(n, Type::Bool) => matches!(**n, Expr::Lit(Value::Null)),
+        _ => false,
+    }
+}
+
+/// Whether the planner works `e` out to a constant when it makes the plan (eval_const_expressions,
+/// optimizer/util/clauses.c:2236): it reads no column, parameter or subquery, and calls no function that isn't
+/// immutable (evaluate_function, clauses.c:4406): no aggregate or window function, no function made with CREATE
+/// FUNCTION (which this doesn't say the volatility of), nothing that reaches past the row (sequences, the catalog,
+/// the session: `Func::Ctx`), no time of the transaction or the clock, no domain's checks (CoerceToDomain is kept).
+fn foldable(e: &Expr) -> bool {
+    let mut ok = true;
+    walk(e, &mut |x| {
+        ok &= match x {
+            Expr::Lit(_)
+            | Expr::Neg(_)
+            | Expr::Not(_)
+            | Expr::IsNull(..)
+            | Expr::Cast(..)
+            | Expr::Bin(..)
+            | Expr::Like(..)
+            | Expr::In(..)
+            | Expr::Case(..) => true,
+            Expr::Func(f, _) => match f {
+                Func::Collate(_) | Func::Distinct(_) | Func::Quant(..) | Func::QuantArray(..) | Func::Coalesce => true,
+                Func::Ctx(_)
+                | Func::Now
+                | Func::StatementTs
+                | Func::ClockTs
+                | Func::CurrentDate
+                | Func::GenRandomUuid
+                | Func::Domain(_)
+                | Func::Record(_)
+                | Func::FieldOf
+                | Func::FieldStar
+                | Func::Row
+                | Func::RowValue
+                | Func::WithTies
+                | Func::Enum(..)
+                | Func::CollateNamed => false,
+                f => {
+                    let name = func_name(f);
+                    !catalog_schema::builtin_signatures(&name).is_empty() && !catalog_schema::builtin_mutable(&name)
+                }
+            },
+            _ => false,
+        }
+    });
+    ok
+}
+
+/// The expressions directly inside `e` (not a subquery's, which is a scope of its own).
+fn kids(e: &Expr) -> Vec<&Expr> {
+    match e {
+        Expr::Neg(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) | Expr::InSub(a, ..) => vec![a],
+        Expr::Agg(_, Some(a), _) => vec![a],
+        Expr::Bin(a, _, b) | Expr::Like(a, b, ..) => vec![a, b],
+        Expr::In(a, l, _) => std::iter::once(&**a).chain(l.iter()).collect(),
+        Expr::Func(_, args) => args.iter().collect(),
+        Expr::Call(c) => c.args.iter().collect(),
+        Expr::Case(o, ws, el) => {
+            let mut out: Vec<&Expr> = o.iter().map(|x| &**x).collect();
+            for (w, t) in ws {
+                out.push(w);
+                out.push(t);
+            }
+            out.extend(el.iter().map(|x| &**x));
+            out
+        }
+        Expr::Window(w) => w.args.iter().chain(&w.partition).chain(w.order.iter().map(|(x, _)| x)).collect(),
+        _ => vec![],
+    }
+}
+
+/// Chronos's own steps for `run` as a plan to print: the steps one above the other, the table reads under the last,
+/// each with what it found (and, under ANALYZE, the rows the top gave). Its text is the layout EXPLAIN has always
+/// shown them in.
+fn steps_of(run: &Run, analyze: bool) -> explain::PlannedStmt {
+    use explain::{Node, Plan, Step};
+    let rows = run.rows;
+    let d = run.nodes.len();
+    let mut reads = vec![];
+    for tr in &run.traced {
+        let loops = if tr.per_row { format!(" loops={}", tr.loops) } else { String::new() };
+        let suffix = match (analyze, tr.rows) {
+            (true, Some(n)) => format!("  (actual rows={n}{loops})"),
+            (false, Some(_)) if tr.per_row => format!("  (loops={})", tr.loops),
+            (false, Some(_)) if pg_exact() => String::new(),
+            (false, Some(n)) => format!("  (rows={n})"),
+            _ if analyze && d == 0 => format!("  (actual rows={rows})"),
+            _ => String::new(),
+        };
+        let actual_rows = match (analyze, tr.rows) {
+            (true, Some(n)) => Some(n),
+            (true, None) if d == 0 => Some(rows),
+            _ => None,
+        };
+        let cond = (!tr.cond.is_empty()).then(|| {
+            let label = if tr.how.starts_with("Index Scan") { "Index Cond" } else { "Cond" };
+            // looked up per joined row: the values come from that row
+            let conds: Vec<String> = tr
+                .cond
+                .iter()
+                .map(|(c, op, x)| format!("({c} {op} {})", if tr.per_row { "<joined row>" } else { x }))
+                .collect();
+            (label.to_string(), conds.join(" AND "))
+        });
+        reads.push(Plan::new(Node::Step(Step {
+            name: tr.how.clone(),
+            target: Some(tr.table.clone()),
+            suffix,
+            cond,
+            actual_rows,
+            found_rows: if analyze { None } else { tr.rows },
+            loops: tr.per_row.then_some(tr.loops),
+        })));
+    }
+    let mut roots = reads;
+    for (i, n) in run.nodes.iter().enumerate().rev() {
+        let top = analyze && i == 0;
+        let step = Step {
+            name: n.clone(),
+            suffix: if top { format!("  (actual rows={rows})") } else { String::new() },
+            actual_rows: top.then_some(rows),
+            ..Step::default()
+        };
+        roots = vec![Plan { kids: roots, ..Plan::new(Node::Step(step)) }];
+    }
+    explain::PlannedStmt { rtable: vec![], roots }
+}
+
+/// The settings EXPLAIN (SETTINGS) shows: those that change planning (`explain::EXPLAIN_SETTINGS`) whose value
+/// isn't their default, with the value SHOW gives.
+fn explain_settings() -> Vec<(String, String)> {
+    let mut out = vec![];
+    for name in explain::EXPLAIN_SETTINGS {
+        let Some(d) = settings::find(name) else { continue };
+        if let Some(v) = session_setting(name)
+            && v != d.default_text()
+        {
+            out.push((name.to_string(), v));
+        }
+    }
+    out
+}
 
 /// One table read, as EXPLAIN shows it.
 struct Traced {
@@ -53549,7 +54286,19 @@ impl Exec<'_> {
 
         // the order to join in, and each table's way in (found while choosing)
         let mut accesses: Vec<Option<Access>> = (0..n).map(|_| None).collect();
-        let order: Vec<usize> = if n <= 1 || any_left {
+        // with chronos.follow_pg_plan, PostgreSQL 16's order where its plan can only be nested loops (cross joins,
+        // conditions no hash or merge join uses: see `opt`), so the rows come out in its order. Such a join reads
+        // every row of every table whichever goes first, so only the order changes.
+        let pg_order = match n > 1 && !any_left && opt::following() {
+            true => {
+                let j = opt::Join { s, p, tables: &*tables, views: &views, conds, ons: &ons, types: self.types };
+                opt::join_order(&j)?
+            }
+            false => None,
+        };
+        let order: Vec<usize> = if let Some(o) = pg_order {
+            o
+        } else if n <= 1 || any_left {
             (0..n).collect()
         } else {
             let mut size = vec![usize::MAX; n];
@@ -55615,6 +56364,10 @@ impl Exec<'_> {
                 t.mem = Some(match once {
                     Some(rows) => rows,
                     None => {
+                        // (a subquery Postgres would pull up into this query, its only FROM item: its joins are
+                        // ordered as this query's would be: see `opt::pulls_up`)
+                        let only = s.from.as_ref().is_some_and(|f| std::ptr::eq(f, src));
+                        let _pulled = opt::PulledUp::enter(src.cte == 0 && only && opt::pulls_up(s, q));
                         let rows = Arc::new(self.select(q)?.rows);
                         if src.cte != 0 {
                             self.ctes.borrow_mut().insert(src.cte, rows.clone());
@@ -56134,8 +56887,16 @@ impl Exec<'_> {
                 })
                 .collect();
             let Some(cols) = ids else { continue };
-            let names: Vec<&str> =
-                cols.iter().filter_map(|id| t.cols.iter().find(|c| c.id == *id)).map(|c| c.name.as_str()).collect();
+            // (its INCLUDE columns are the new table's columns of their names)
+            let include: Vec<u32> = (x.include.iter())
+                .filter_map(|id| src.cols.iter().find(|c| c.id == *id))
+                .filter_map(|c| t.cols.iter().find(|n| n.name == c.name).map(|n| n.id))
+                .collect();
+            // (named for all its columns, INCLUDE's too, as DefineIndex names one)
+            let names: Vec<&str> = (cols.iter().chain(&include))
+                .filter_map(|id| t.cols.iter().find(|c| c.id == *id))
+                .map(|c| c.name.as_str())
+                .collect();
             let base =
                 format!("{}_{}_idx", rel_part(table), if names.is_empty() { "expr".into() } else { names.join("_") });
             let name = (0..)
@@ -56148,15 +56909,19 @@ impl Exec<'_> {
                             .any(|c| matches!(c, ConstraintDef::Unique { name: Some(u), .. } if u == n))
                 })
                 .unwrap_or(base);
-            t.indexes.push(btree::Index {
-                name,
-                cols,
-                exprs: x.exprs.clone(),
-                filter: x.filter.clone(),
-                gin: x.gin,
-                trgm: x.trgm.clone(),
-                colls: x.colls.clone(),
-            });
+            t.indexes.push(
+                btree::Index {
+                    name,
+                    cols,
+                    exprs: x.exprs.clone(),
+                    filter: x.filter.clone(),
+                    gin: x.gin,
+                    trgm: x.trgm.clone(),
+                    colls: x.colls.clone(),
+                    ..btree::Index::default()
+                }
+                .said_as(x, include),
+            );
         }
         self.db.batch_with(self.branch, |v| {
             if let Some(k) = relation_kind(v, table)? {
@@ -56182,6 +56947,13 @@ impl Exec<'_> {
             if hier.foreign.is_some() {
                 t.hier.tablespace = 0;
             }
+            // USING method, else default_table_access_method's: its table access method, as DefineRelation chooses it
+            // (tablecmds.c:962); a partitioned table and a foreign table have none (a partition gets the default, not
+            // its table's, as in Postgres 16)
+            t.hier.am = match hier.foreign {
+                Some(_) => None,
+                None => accessmethod::for_new(v, hier.am.as_deref(), partitioned)?,
+            };
             // (the checks first, then the unique constraints, then the foreign keys, as Postgres makes
             // them: an unnamed one is named after the names those before it took)
             let mut given: Vec<&ConstraintDef> =
@@ -56384,6 +57156,24 @@ impl Exec<'_> {
     }
 
     fn alter(&self, table: &str, changes: &[Alter], only: bool) -> Result<Output> {
+        // SET ACCESS METHOD: checked first, as ATPrepCmd checks it before anything changes (tablecmds.c:4866), and
+        // recorded after the statement's other changes: the table's own, not its partitions' or children's
+        if changes.iter().any(|c| matches!(c, Alter::SetAccessMethod(_))) {
+            let to = self.access_method_change(table, changes)?;
+            let rest: Vec<Alter> =
+                changes.iter().filter(|c| !matches!(c, Alter::SetAccessMethod(_))).cloned().collect();
+            if !rest.is_empty() {
+                self.alter(table, &rest, only)?;
+            }
+            if let Some(am) = to {
+                self.db.batch_with::<(), SqlError>(self.branch, |v| {
+                    let mut t = need_table(v, table)?;
+                    t.hier.am = am.clone();
+                    Ok((vec![(schema_key(table), Some(schema_json(&t)))], ()))
+                })?;
+            }
+            return Ok(Output::tag("ALTER TABLE"));
+        }
         // SET TABLESPACE: the relation's own, not its partitions' (see `set_tablespace`), made after the statement's
         // other changes and written with them (one statement is one write: a move made apart from them could fail, or
         // be lost to a crash, after they were written). As Postgres's ATPrepSetTableSpace, each one's relation and
@@ -56477,6 +57267,50 @@ impl Exec<'_> {
     fn set_tablespace(&self, name: &str, space: &str) -> Result<Output> {
         self.db.batch_with::<(), SqlError>(self.branch, |v| Ok((tablespace::set_writes(v, name, space)?, ())))?;
         Ok(Output::tag("ALTER TABLE"))
+    }
+
+    /// ALTER TABLE | MATERIALIZED VIEW name SET ACCESS METHOD m: the access method it is to have (None: heap), or None
+    /// when it has it already, checked as ATPrepCmd and ATPrepSetAccessMethod check each SET ACCESS METHOD in turn
+    /// (tablecmds.c:4866, 14530): only of a table or materialized view (ATSimplePermissions: not a sequence, an index
+    /// or a foreign table), not of a partitioned table (it has none), once in a statement (a second refused only once
+    /// the first changes it), of a table access method.
+    fn access_method_change(&self, table: &str, changes: &[Alter]) -> Result<Option<Option<String>>> {
+        let v = self.view()?;
+        let refused = |kind: &str| SqlError {
+            code: "42809",
+            message: format!("ALTER action SET ACCESS METHOD cannot be performed on relation \"{}\"", rel_part(table)),
+            info: Some(Box::new(Violation {
+                detail: Some(format!("This operation is not supported for {kind}.")),
+                ..Violation::default()
+            })),
+        };
+        if relation_kind(&v, table)? == Some("sequence") {
+            return Err(refused("sequences"));
+        }
+        if let Some(owner) = index_owner(&v, table)? {
+            let partitioned = load(&v, &owner)?.is_some_and(|t| t.hier.part.is_some());
+            return Err(refused(if partitioned { "partitioned indexes" } else { "indexes" }));
+        }
+        let t = need_table(&v, table)?;
+        let now = t.hier.am.clone().unwrap_or_else(|| "heap".into());
+        let mut to = None;
+        for c in changes {
+            let Alter::SetAccessMethod(m) = c else { continue };
+            if t.hier.foreign.is_some() {
+                return Err(refused("foreign tables"));
+            }
+            if t.hier.part.is_some() {
+                return err("42809", "cannot change access method of a partitioned table");
+            }
+            if to.is_some() {
+                return err(UNSUPPORTED, "cannot have multiple SET ACCESS METHOD subcommands");
+            }
+            accessmethod::table_am(&v, m)?;
+            if *m != now {
+                to = Some(Some(m.clone()).filter(|m| m != "heap"));
+            }
+        }
+        Ok(to)
     }
 
     /// ALTER SEQUENCE (or ALTER TABLE, ALTER INDEX) name RENAME TO new | SET SCHEMA s: the sequence's row moved to
@@ -56644,7 +57478,14 @@ impl Exec<'_> {
         };
         stats_target(target)?;
         let cols = t.index_cols(&ix);
-        let Some(&id) = usize::try_from(col - 1).ok().and_then(|k| cols.get(k)) else {
+        // (INCLUDE's columns are after the key's: they have no statistics, as ATExecSetStatistics says)
+        let include = t.indexes.iter().find(|x| x.name == ix).map_or(&[][..], |x| &x.include[..]);
+        let at = usize::try_from(col - 1).ok();
+        if let Some(id) = at.and_then(|k| k.checked_sub(cols.len())).and_then(|k| include.get(k)) {
+            let c = t.cols.iter().find(|c| c.id == *id).map_or("", |c| c.name.as_str());
+            return err(UNSUPPORTED, format!("cannot alter statistics on included column \"{c}\" of index \"{ix}\""));
+        }
+        let Some(&id) = at.and_then(|k| cols.get(k)) else {
             return err("42703", format!("column number {col} of relation \"{ix}\" does not exist"));
         };
         if id != btree::EXPR {
@@ -58367,11 +59208,45 @@ impl Exec<'_> {
                     // the statistics objects on it (a column or an expression's) go with it, as their automatic
                     // dependencies take them in Postgres
                     extra.extend(statistics::dropped_column(v, &t.name, c)?);
+                    // (an index INCLUDE named it in goes too, and the unique constraint it is: the foreign keys that
+                    // reference that depend on its index, which depends on the column)
+                    let included: Vec<String> =
+                        t.indexes.iter().filter(|x| x.include.contains(&id)).map(|x| x.name.clone()).collect();
+                    let included_uniques: Vec<Unique> =
+                        t.uniques.iter().filter(|u| included.contains(&u.name)).cloned().collect();
                     if *cascade {
-                        let fks = referencing_fks(v, &t, None, t.cols[i].id)?;
+                        let mut fks = referencing_fks(v, &t, None, t.cols[i].id)?;
+                        for u in &included_uniques {
+                            for f in referencing_fks(v, &t, Some(u), 0)? {
+                                if !fks.contains(&f) {
+                                    fks.push(f);
+                                }
+                            }
+                        }
                         drop_referencing(v, &mut t, &fks, &mut extra)?;
                     } else if let Some((on, fk)) = column_referenced(v, &t, t.cols[i].id)? {
                         return err_referenced(&format!("column {c}"), table, &on, &fk);
+                    } else {
+                        for u in &included_uniques {
+                            if let Some((on, fk)) = unique_referenced(v, &t, u)? {
+                                return Err(SqlError {
+                                    code: "2BP01",
+                                    message: format!(
+                                        "cannot drop column {c} of table {} because other objects depend on it",
+                                        rel_part(table)
+                                    ),
+                                    info: Some(Box::new(Violation {
+                                        detail: Some(format!(
+                                            "constraint {fk} on table {} depends on index {}",
+                                            rel_part(&on),
+                                            u.name
+                                        )),
+                                        hint: Some("Use DROP ... CASCADE to drop the dependent objects too.".into()),
+                                        ..Violation::default()
+                                    })),
+                                });
+                            }
+                        }
                     }
                     let key_id = t.key.map(|k| t.cols[k].id);
                     let pk_ids: Vec<u32> = t.pk.iter().map(|&k| t.cols[k].id).collect();
@@ -58379,7 +59254,8 @@ impl Exec<'_> {
                     let id = t.cols[i].id;
                     t.uniques.retain(|u| !u.cols.contains(&id));
                     t.fks.retain(|f| !f.cols.contains(&id));
-                    t.indexes.retain(|x| !x.cols.contains(&id));
+                    t.uniques.retain(|u| !included.contains(&u.name));
+                    t.indexes.retain(|x| !x.cols.contains(&id) && !x.include.contains(&id));
                     t.ann.retain(|(_, c, _)| *c != id);
                     // a sequence the column owns (an identity column's, or OWNED BY) goes with it
                     for r in v.prefix(&format!("{SEQUENCES}/"))? {
@@ -59207,6 +60083,48 @@ impl Exec<'_> {
                             ),
                         );
                     }
+                    // an index's operator class written as one that isn't its type's default is the new type's
+                    // too, as Postgres makes the index again from pg_get_indexdef (which leaves a default class out),
+                    // before any row converts: one that doesn't take the new type is refused (ResolveOpClass,
+                    // indexcmds.c:2260), and one that is the new type's default is none from then on
+                    let new_coll =
+                        mods.coll.as_ref().and_then(|c| c.resolve(Some(v)).ok()).unwrap_or(collation::Coll::DEFAULT);
+                    let retyped_col = Col {
+                        ty: *ty,
+                        chars: mods.chars,
+                        numeric: mods.numeric,
+                        dim: mods.dim,
+                        small: mods.small,
+                        coll: new_coll,
+                        ..t.cols[i].clone()
+                    };
+                    let (id, old_ty, old_oid, new_oid) =
+                        (t.cols[i].id, t.cols[i].ty, col_oid(&t.cols[i]), col_oid(&retyped_col));
+                    for x in &mut t.indexes {
+                        let am = x.method().to_string();
+                        for k in (0..x.cols.len()).filter(|&k| x.cols[k] == id) {
+                            let Some(n) = x.said_class(k).map(String::from) else { continue };
+                            let now_default = indexam::is_default(&am, &n, old_ty, old_oid)
+                                || match indexam::accepts(&am, &n, *ty, new_oid) {
+                                    Some(false) => {
+                                        return err(
+                                            WRONG_TYPE,
+                                            format!(
+                                                "operator class \"{n}\" does not accept data type {}",
+                                                ty.pg_name()
+                                            ),
+                                        );
+                                    }
+                                    _ => indexam::is_default(&am, &n, *ty, new_oid),
+                                };
+                            if now_default && let Some(c) = x.classes.get_mut(k) {
+                                *c = None;
+                            }
+                        }
+                        if x.classes.iter().all(Option::is_none) {
+                            x.classes.clear();
+                        }
+                    }
                     // every existing value must convert, and fit the new length, precision or dimensions; rows
                     // convert as they're read, but a regproc's are converted now, by USING's casts, and written again
                     // (as text it is its function's name as the search_path shows it now; `p::oid::text` its oid's)
@@ -59542,8 +60460,8 @@ impl Exec<'_> {
                 // (Postgres does these without a word)
                 Alter::Noop(message) if !pg_exact() => notice("NOTICE", (*message).into()),
                 Alter::Noop(_) => {}
-                // (moved apart, by `set_tablespace`)
-                Alter::SetTablespace(_) => {}
+                // (made apart: the tablespace by `set_tablespace`, the access method by `alter` itself)
+                Alter::SetTablespace(_) | Alter::SetAccessMethod(_) => {}
                 Alter::SetSchema(schema) => {
                     need_schema(v, &qualify(schema, "x"))?;
                     let to = qualify(schema, rel_part(table));
@@ -59661,13 +60579,14 @@ impl Exec<'_> {
                     if x.filter.is_some() {
                         return Err(fail("42809", format!("\"{ix}\" is a partial index"), true));
                     }
-                    // (each column in its own collation, as a constraint's index has it)
+                    // (each column in its own collation, its type's default operator class and ascending with nulls
+                    // last, as a constraint's index has it: parse_utilcmd.c:2399)
                     for (k, id) in x.cols.iter().enumerate() {
-                        if t.cols
-                            .iter()
-                            .find(|c| c.id == *id)
-                            .is_some_and(|c| collation::collatable(c.ty) && x.coll(k) != c.coll)
-                        {
+                        let other_class =
+                            |c: &Col| x.class(k).is_some_and(|n| !indexam::is_default("btree", n, c.ty, col_oid(c)));
+                        if t.cols.iter().find(|c| c.id == *id).is_some_and(|c| {
+                            (collation::collatable(c.ty) && x.coll(k) != c.coll) || x.opt(k) != 0 || other_class(c)
+                        }) {
                             let m = format!(
                                 "index \"{ix}\" column number {} does not have default sorting behavior",
                                 k + 1
@@ -59979,7 +60898,7 @@ impl Exec<'_> {
                 }
                 writes.push((schema_key(table), None));
                 writes.push((schema_key(to), Some(schema_json(&t))));
-                // (and its storage's generations, which a rename leaves)
+                // (and its storage's generations, which a rename leaves, and its statistics)
                 let none = tablespace::Gens::default();
                 if gens_was != none {
                     writes.push(none.write(table));
@@ -59987,6 +60906,7 @@ impl Exec<'_> {
                 if gens != none {
                     writes.push(gens.write(to));
                 }
+                writes.extend(opt::stats::renamed(v, table, to)?);
             }
         }
         if (backfill || !rewritten.is_empty()) && has_rows {
@@ -60048,7 +60968,9 @@ impl Exec<'_> {
     }
 
     /// A select's row count, run for at most a few seconds as one that changes nothing (see `dry_run`): a statement
-    /// that takes longer, or is stopped from changing something, is explained by what it read so far (0 rows).
+    /// that takes longer, or is stopped from changing something, is explained by what it read so far (0 rows). A data
+    /// error on the way (a value a cast refuses, SQLSTATE class 22, or a subquery's second row, 21000) is too:
+    /// Postgres's EXPLAIN never runs the query, so never meets it.
     fn select_briefly(&self, s: &Select) -> Result<usize> {
         let limit = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let cap = || Some(Arc::new(Mem { cap: 256 << 20, used: Default::default(), agent: false }));
@@ -60080,7 +61002,7 @@ impl Exec<'_> {
         });
         match r {
             Ok(n) => Ok(n.unwrap_or(0)),
-            Err(e) if e.code == CANCELED || e.code == OUT_OF_MEMORY => Ok(0),
+            Err(e) if e.code == CANCELED || e.code == OUT_OF_MEMORY || data_error(&e) => Ok(0),
             Err(e) => Err(e),
         }
     }
@@ -60096,19 +61018,215 @@ impl Exec<'_> {
         Ok(dry_run(|| Ok(self.matching(&v, &mut need_table(&v, table)?, filter)?.len()))?.unwrap_or(0))
     }
 
-    /// EXPLAIN [ANALYZE]: the steps a statement takes and how each table is read, in Postgres's
-    /// text layout. Without ANALYZE nothing that changes anything is carried out: a write's rows are
-    /// only found, and a query only run where that changes nothing (see `safe::effects`); with it,
-    /// the statement runs for real and the plan shows row counts and the time taken.
-    fn explain(&self, stmt: &Stmt, analyze: bool, pg_plan: bool, original: Option<&Stmt>) -> Result<Output> {
-        // EXPLAIN (COSTS OFF) with chronos.explain = postgres: the plan PostgreSQL 16 would choose, where this can make
-        // it (see `plan`), from the query as written. Chronos may run the query another way, which the NOTICE says
-        // (exact mode, the regression suite's, says nothing, as Postgres says nothing)
-        if pg_plan
-            && !analyze
-            && explain_shows_postgres()
-            && let Ok(Some(Some(lines))) = dry_run(|| self.pg_plan(original.unwrap_or(stmt)))
-        {
+    /// The data errors Postgres meets in `stmt` making its plan, before it runs anything: a part the planner works
+    /// out to a constant (see `foldable`) that fails (`1/0`, 22012; `'abc'::int`, 22P02), which EXPLAIN without
+    /// ANALYZE fails on as Postgres's does. The errors of the rows a query reads it never meets (see `select_briefly`).
+    fn planning_errors(&self, stmt: &Stmt) -> Result<()> {
+        match stmt {
+            Stmt::Select(s) | Stmt::Locking(s, _) => self.select_planning_errors(s),
+            Stmt::Insert { rows, query, .. } => {
+                for e in rows.iter().flatten() {
+                    self.folding_errors(e)?;
+                }
+                query.as_ref().map_or(Ok(()), |q| self.select_planning_errors(q))
+            }
+            Stmt::Update { sets, filter, .. } => {
+                for (_, e) in sets {
+                    self.folding_errors(e)?;
+                }
+                filter.as_ref().map_or(Ok(()), |f| self.folding_errors(f))
+            }
+            Stmt::Delete { filter, .. } => filter.as_ref().map_or(Ok(()), |f| self.folding_errors(f)),
+            _ => Ok(()),
+        }
+    }
+
+    /// `planning_errors` of a query: its target list (the select list, and the ORDER BY's, GROUP BY's and DISTINCT
+    /// ON's expressions in it), its conditions, LIMIT and OFFSET (subquery_planner's preprocess_expression, in its
+    /// order: planner.c:830-1040), then the subqueries in FROM and the set operation's queries.
+    fn select_planning_errors(&self, s: &Select) -> Result<()> {
+        let items = s.items.iter().filter_map(|it| match it {
+            Item::Expr(e, _) => Some(e),
+            _ => None,
+        });
+        let exprs = items
+            .chain(s.order.iter().map(|(e, _)| e))
+            .chain(&s.group)
+            .chain(&s.distinct_on)
+            .chain(s.joins.iter().filter_map(|j| j.on.as_ref()))
+            .chain(&s.filter)
+            .chain(&s.having)
+            .chain(&s.offset)
+            .chain(&s.limit);
+        for e in exprs {
+            self.folding_errors(e)?;
+        }
+        for src in s.from.iter().chain(s.joins.iter().map(|j| &j.src)) {
+            if let Some(q) = &src.sub {
+                self.select_planning_errors(q)?;
+            }
+            for e in src.srf.iter().flat_map(|f| &f.1) {
+                self.folding_errors(e)?;
+            }
+        }
+        for (_, _, q) in &s.set {
+            self.select_planning_errors(q)?;
+        }
+        Ok(())
+    }
+
+    /// The data error working out the constant parts of `e` meets, as eval_const_expressions_mutator
+    /// (clauses.c:2422) works them out: each part `foldable` says is, whole; a CASE as far as a WHEN that is true
+    /// (clauses.c:3100), a COALESCE as far as a constant that isn't null (:3271), an AND as far as a false and an OR
+    /// as far as a true (simplify_and_arguments :3877, simplify_or_arguments :3771), what comes after left as it is.
+    fn folding_errors(&self, e: &Expr) -> Result<()> {
+        // (an error that isn't a data error is the running statement's to meet, if it is one)
+        let value = |x: &Expr| -> Result<Option<Value>> {
+            match self.constant(x) {
+                Ok(v) => Ok(Some(v)),
+                Err(err) if data_error(&err) => Err(err),
+                Err(_) => Ok(None),
+            }
+        };
+        if foldable(e) {
+            if !matches!(e, Expr::Lit(_)) {
+                value(e)?;
+            }
+            return Ok(());
+        }
+        match e {
+            Expr::Case(operand, whens, els) => {
+                if let Some(o) = operand {
+                    self.folding_errors(o)?;
+                }
+                for (w, t) in whens {
+                    self.folding_errors(w)?;
+                    // (with an operand a WHEN is compared with it: true, false or null by itself where both are
+                    // constants, as eval_const_expressions works out `operand = WHEN`)
+                    let known = match operand {
+                        None if foldable(w) => value(w)?,
+                        Some(o) if foldable(o) && foldable(w) => {
+                            value(&Expr::Bin(Box::new((**o).clone()), Op::Eq, Box::new(w.clone())))?
+                        }
+                        _ => None,
+                    };
+                    // (an arm whose WHEN is false or null is dropped before its result is worked out: clauses.c:3100)
+                    if matches!(known, Some(Value::Bool(false) | Value::Null)) {
+                        continue;
+                    }
+                    let always = known == Some(Value::Bool(true));
+                    self.folding_errors(t)?;
+                    if always {
+                        return Ok(());
+                    }
+                }
+                els.as_ref().map_or(Ok(()), |x| self.folding_errors(x))
+            }
+            Expr::Func(Func::Coalesce, args) => {
+                for a in args {
+                    self.folding_errors(a)?;
+                    if foldable(a) && !matches!(value(a)?, Some(Value::Null) | None) {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            Expr::Bin(_, op @ (Op::And | Op::Or), _) => {
+                fn arms<'a>(e: &'a Expr, op: Op, out: &mut Vec<&'a Expr>) {
+                    match e {
+                        Expr::Bin(a, o, b) if *o == op => {
+                            arms(a, op, out);
+                            arms(b, op, out);
+                        }
+                        e => out.push(e),
+                    }
+                }
+                let mut all = vec![];
+                arms(e, *op, &mut all);
+                let ends = Value::Bool(*op == Op::Or);
+                for a in all {
+                    self.folding_errors(a)?;
+                    if foldable(a) && value(a)?.as_ref() == Some(&ends) {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            Expr::Sub(sq) | Expr::Exists(sq, _) => self.select_planning_errors(&sq.q),
+            Expr::InSub(x, sq, _) => {
+                self.folding_errors(x)?;
+                self.select_planning_errors(&sq.q)
+            }
+            e => {
+                for k in kids(e) {
+                    self.folding_errors(k)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// EXPLAIN (see `Stmt::Explain`): the plan PostgreSQL 16 would choose, where `plan` can make it and the session
+    /// asks for it (with ANALYZE, what Chronos's executor did running each node), or else Chronos's own steps: how
+    /// each table is read. Without ANALYZE a write isn't carried out (its rows are only found); with it, the statement
+    /// runs for real. In the format the options ask for, as explain.c writes it (see `explain`).
+    fn explain(
+        &self,
+        stmt: &Stmt,
+        o: &explain::ExplainOpts,
+        original: Option<&Stmt>,
+        text: Option<&str>,
+    ) -> Result<Output> {
+        // what the options say together (explain.c:236-251)
+        if o.wal && !o.analyze {
+            return err("22023", "EXPLAIN option WAL requires ANALYZE");
+        }
+        if o.timing && !o.analyze {
+            return err("22023", "EXPLAIN option TIMING requires ANALYZE");
+        }
+        if o.generic && o.analyze {
+            return err("22023", "EXPLAIN options ANALYZE and GENERIC_PLAN cannot be used together");
+        }
+        // (a query identifier where compute_query_id is on: pg_stat_statements's for the statement's text; regress hides it)
+        let query_id = match session_setting("compute_query_id").as_deref() {
+            Some("on") => text.and_then(stmtstats::query_id),
+            _ => None,
+        };
+        let mut summary = explain::Summary {
+            query_id,
+            settings: if o.settings { explain_settings() } else { vec![] },
+            io_timing: session_setting("track_io_timing").is_some_and(|v| settings::parse_bool(&v) == Some(true)),
+            ..explain::Summary::default()
+        };
+        // the plan PostgreSQL 16 would choose, from the query as written, and how long making it took
+        let planned = match explain_shows_postgres() {
+            true => {
+                let start = std::time::Instant::now();
+                match dry_run(|| self.pg_plan(original.unwrap_or(stmt), o)) {
+                    Ok(Some(Some(p))) => Some((p, start.elapsed().as_secs_f64() * 1e3)),
+                    _ => None,
+                }
+            }
+            false => None,
+        };
+        let out = |text: String| {
+            let rows = match o.format {
+                // (no steps at all: no rows)
+                explain::Format::Text if text.is_empty() => vec![],
+                explain::Format::Text => text.split('\n').map(|l| vec![Value::Text(l.to_string())]).collect(),
+                explain::Format::Json => vec![vec![Value::JsonText(text)]],
+                _ => vec![vec![Value::Text(text)]],
+            };
+            Output {
+                typmods: vec![],
+                columns: Some(vec![("QUERY PLAN".into(), o.column_type())]),
+                rows,
+                tag: "EXPLAIN".into(),
+            }
+        };
+        // (Chronos may run the query another way, which the NOTICE says; exact mode, the regression suite's, says
+        // nothing, as Postgres says nothing)
+        let notice = || {
             if !pg_exact() {
                 unkept();
                 NOTICES.with_borrow_mut(|n| {
@@ -60121,29 +61239,106 @@ impl Exec<'_> {
                     })
                 });
             }
-            let rows = lines.into_iter().map(|l| vec![Value::Text(l)]).collect();
-            return Ok(Output {
-                typmods: vec![],
-                columns: Some(vec![("QUERY PLAN".into(), Type::Text)]),
-                rows,
-                tag: "EXPLAIN".into(),
-            });
+        };
+        if o.analyze {
+            let run = self.explain_trace(stmt, true)?;
+            if let Some((mut p, plan_ms)) = planned
+                && self.analyzed(&mut p, &run)?
+                && p.roots.iter().all(|r| r.complete(o))
+            {
+                summary.planning_ms = Some(plan_ms);
+                summary.execution_ms = Some(run.took_ms);
+                if let Some(text) = explain::print(&p, o, &summary) {
+                    notice();
+                    return Ok(out(text));
+                }
+            }
+            summary.execution_ms = Some(run.took_ms);
+            let text = explain::print(&steps_of(&run, true), o, &summary);
+            return Ok(out(text.unwrap_or_default()));
         }
-        if analyze {
-            return self.explain_run(stmt, analyze);
+        if let Some((p, plan_ms)) = planned
+            && p.roots.iter().all(|r| r.complete(o))
+        {
+            // (what Postgres meets making the plan, worked out as one that changes nothing: see `planning_errors`)
+            dry_run(|| self.planning_errors(stmt))?;
+            summary.planning_ms = Some(plan_ms);
+            if let Some(text) = explain::print(&p, o, &summary) {
+                notice();
+                return Ok(out(text));
+            }
+        }
+        // (Chronos's steps are found by running the statement, which a generic plan's parameters have no values for)
+        if o.generic {
+            return err(
+                UNSUPPORTED,
+                "EXPLAIN (GENERIC_PLAN) shows only the plan PostgreSQL would choose, which isn't made here for this statement",
+            );
         }
         // without ANALYZE Postgres runs nothing: the query is run here only to see how it reads its tables, and only
         // when that changes nothing (see `explain_run`); it sends no notices either
         let mark = NOTICES.with_borrow(Vec::len);
-        let out = self.explain_run(stmt, analyze);
+        let run = self.explain_trace(stmt, false);
         NOTICES.with_borrow_mut(|n| n.truncate(mark));
-        out
+        // (an error the statement's names or types meet comes first, as Postgres meets them analyzing it; then what
+        // making the plan meets)
+        let run = run?;
+        dry_run(|| self.planning_errors(stmt))?;
+        let text = explain::print(&steps_of(&run, false), o, &summary);
+        Ok(out(text.unwrap_or_default()))
     }
 
-    fn explain_run(&self, stmt: &Stmt, analyze: bool) -> Result<Output> {
+    /// Under ANALYZE, puts on `p` what Chronos's executor did running `run`: only for a plan of one Seq Scan of a
+    /// table Chronos read whole, the rows it gave and (where it has a Filter) the rows the condition left out, and the
+    /// time the statement took (Chronos makes every row before it gives the first, so that is the time to the first
+    /// row too). False for any other plan: its nodes aren't ones Chronos's executor ran.
+    fn analyzed(&self, p: &mut explain::PlannedStmt, run: &Run) -> Result<bool> {
+        let [root] = &mut p.roots[..] else { return Ok(false) };
+        let explain::Node::SeqScan { varno } = root.node else { return Ok(false) };
+        let Some(rte) = p.rtable.get(varno - 1) else { return Ok(false) };
+        let name = match rte.schema.as_str() {
+            "public" => rte.relname.clone(),
+            s => format!("{s}.{}", rte.relname),
+        };
+        let [tr] = &run.traced[..] else { return Ok(false) };
+        if tr.table != name || tr.how != "Seq Scan" || !root.kids.is_empty() {
+            return Ok(false);
+        }
+        let filtered = if root.qual.is_empty() {
+            0.0
+        } else {
+            let v = self.db.view_tx(self.branch)?;
+            let Some(t) = load(&v, &name)? else { return Ok(false) };
+            if t.mem.is_some() {
+                return Ok(false);
+            }
+            let mut n = 0usize;
+            for r in v.prefix(&format!("{name}/"))? {
+                r?;
+                n += 1;
+            }
+            n.saturating_sub(run.rows) as f64
+        };
+        root.actual = Some(explain::Actual {
+            startup_ms: run.took_ms,
+            total_ms: run.took_ms,
+            rows: run.rows as f64,
+            loops: 1.0,
+            filtered,
+        });
+        Ok(true)
+    }
+
+    /// Runs `stmt` (with ANALYZE for real; without, only to see how it reads its tables), recording each table read.
+    fn explain_trace(&self, stmt: &Stmt, analyze: bool) -> Result<Run> {
         *self.trace.borrow_mut() = Some(vec![]);
         let start = std::time::Instant::now();
         let count = |o: Output| o.tag.rsplit(' ').next().and_then(|n| n.parse().ok()).unwrap_or(o.rows.len());
+        // (a data error where nothing is carried out: Postgres's EXPLAIN never meets it, as it runs nothing)
+        let briefly = |r: Result<usize>| match r {
+            Err(e) if !analyze && data_error(&e) => Ok(0),
+            r => r,
+        };
         let (nodes, rows): (Vec<String>, usize) = match stmt {
             Stmt::Select(s) => {
                 let mut nodes = vec![];
@@ -60225,7 +61420,7 @@ impl Exec<'_> {
                         checks.as_deref(),
                     )?)
                 } else {
-                    self.explain_matching(table, filter.as_ref())?
+                    briefly(self.explain_matching(table, filter.as_ref()))?
                 };
                 (vec![format!("Update on {table}")], n)
             }
@@ -60240,7 +61435,7 @@ impl Exec<'_> {
                         checks.as_deref(),
                     )?)
                 } else {
-                    self.explain_matching(table, filter.as_ref())?
+                    briefly(self.explain_matching(table, filter.as_ref()))?
                 };
                 (vec![format!("Delete on {table}")], n)
             }
@@ -60249,7 +61444,7 @@ impl Exec<'_> {
                 let n = match analyze {
                     true => self.select(s)?.rows.len(),
                     false if safe::effects(&Stmt::Select(s.clone()), Some(&self.view()?)) => 0,
-                    false => dry_run(|| self.select(s).map(|o| o.rows.len()))?.unwrap_or(0),
+                    false => briefly(dry_run(|| self.select(s).map(|o| o.rows.len())).map(|n| n.unwrap_or(0)))?,
                 };
                 (vec!["LockRows".to_string()], n)
             }
@@ -60268,49 +61463,9 @@ impl Exec<'_> {
             }
             _ => return err(UNSUPPORTED, "EXPLAIN works on SELECT, INSERT, UPDATE, DELETE, MERGE and WITH"),
         };
-        let took = start.elapsed();
+        let took_ms = start.elapsed().as_secs_f64() * 1e3;
         let traced = self.trace.borrow_mut().take().unwrap_or_default();
-        // Postgres's layout: a child is "->  " under its parent, details two columns in
-        let at = |d: usize| if d == 0 { String::new() } else { format!("{}->  ", " ".repeat(6 * d - 4)) };
-        let detail = |d: usize| " ".repeat(if d == 0 { 2 } else { 6 * d + 2 });
-        let mut lines = vec![];
-        for (d, n) in nodes.iter().enumerate() {
-            let actual = if analyze && d == 0 { format!("  (actual rows={rows})") } else { String::new() };
-            lines.push(format!("{}{n}{actual}", at(d)));
-        }
-        let d = nodes.len();
-        for tr in &traced {
-            let loops = if tr.per_row { format!(" loops={}", tr.loops) } else { String::new() };
-            let actual = match (analyze, tr.rows) {
-                (true, Some(n)) => format!("  (actual rows={n}{loops})"),
-                (false, Some(_)) if tr.per_row => format!("  (loops={})", tr.loops),
-                (false, Some(_)) if pg_exact() => String::new(),
-                (false, Some(n)) => format!("  (rows={n})"),
-                _ if analyze && d == 0 => format!("  (actual rows={rows})"),
-                _ => String::new(),
-            };
-            lines.push(format!("{}{} on {}{actual}", at(d), tr.how, tr.table));
-            if !tr.cond.is_empty() {
-                let label = if tr.how.starts_with("Index Scan") { "Index Cond" } else { "Cond" };
-                // looked up per joined row: the values come from that row
-                let conds: Vec<String> = tr
-                    .cond
-                    .iter()
-                    .map(|(c, op, x)| format!("({c} {op} {})", if tr.per_row { "<joined row>" } else { x }))
-                    .collect();
-                lines.push(format!("{}{label}: {}", detail(d), conds.join(" AND ")));
-            }
-        }
-        if analyze {
-            lines.push(format!("Execution Time: {:.3} ms", took.as_secs_f64() * 1e3));
-        }
-        let rows = lines.into_iter().map(|l| vec![Value::Text(l)]).collect();
-        Ok(Output {
-            typmods: vec![],
-            columns: Some(vec![("QUERY PLAN".into(), Type::Text)]),
-            rows,
-            tag: "EXPLAIN".into(),
-        })
+        Ok(Run { nodes, rows, traced, took_ms })
     }
 
     /// Adds a B-tree index and writes an entry for every row, in one atomic batch (with UNIQUE,
@@ -60372,6 +61527,7 @@ impl Exec<'_> {
         only: bool,
         concurrently: bool,
         (options, space): (&[String], Option<&str>),
+        said: &IndexSaid,
     ) -> Result<Output> {
         self.long_write(spill::work_mem(), |v, flush| {
             let mut t = need_table(v, table)?;
@@ -60383,6 +61539,19 @@ impl Exec<'_> {
             if concurrently && t.hier.part.is_some() {
                 return err(UNSUPPORTED, format!("cannot create index on partitioned table \"{}\" concurrently", rel_part(table)));
             }
+            // its access method, which must be able to make what was asked (rtree is gist, as DefineIndex has it,
+            // indexcmds.c:832)
+            let am = match said.method.as_str() {
+                "rtree" => {
+                    notice("NOTICE", "substituting access method \"gist\" for obsolete method \"rtree\"".into());
+                    "gist"
+                }
+                m => m,
+            };
+            // (what it can do is its built-in method's: an access method made here, its handler's)
+            let kind = said.builtin.as_deref().unwrap_or(am);
+            indexam::check_create(kind, unique, !include.is_empty(), cols.len())
+                .map_err(|e| SqlError { message: e.message.replace(&format!("\"{kind}\""), &format!("\"{am}\"")), ..e })?;
             // gist and gin on inet, cidr or a mac address (inet_ops) find what a btree finds: it is one here
             let on_addresses = !cols.is_empty()
                 && cols.iter().all(|c| {
@@ -60487,6 +61656,7 @@ impl Exec<'_> {
                 return err(UNSUPPORTED, "index creation on system columns is not supported");
             }
             let (mut ids, mut exprs, mut words, mut colls) = (vec![], vec![], vec![], vec![]);
+            let (mut opts, mut classes) = (vec![], vec![]);
             for (k, c) in cols.iter().enumerate() {
                 // its collation: COLLATE's, else its column's or its expression's (only text has one)
                 let (ty, own) = match c {
@@ -60551,6 +61721,54 @@ impl Exec<'_> {
                         words.push(catalog_objects::expr_name(text));
                     }
                 }
+                // then, its column or expression found, its operator class and ordering, in ComputeIndexAttrs's order
+                // (indexcmds.c:1880-2167): a class the method has, or one CREATE OPERATOR CLASS made for it
+                // (ResolveOpClass, indexcmds.c:2207); kept as written but where it is its type's default, which is
+                // none (pg_get_indexdef leaves it out, and the column's type changed, the new type's is the index's)
+                let class = said.classes.get(k).and_then(Option::as_deref);
+                // (looked for in `v`, then in the session's world: a temporary table's index is made in the session's
+                // own database, which has none, as `accessmethod::table_am` looks for a method)
+                let made = |n: &str| -> Result<bool> {
+                    Ok(userdefs::opclass_made(v, n, am)?
+                        || with_path_view(|w| userdefs::opclass_made(w, n, am)).transpose()?.unwrap_or(false))
+                };
+                if let Some(n) = class.filter(|n| said.made.iter().any(|m| m == n))
+                    && !made(n)?
+                {
+                    return err("42704", format!("operator class \"{n}\" does not exist for access method \"{am}\""));
+                }
+                let oid = match c {
+                    IndexPart::Col(n) => t.cols.iter().find(|x| x.name == *n).map_or(i64::from(ty.oid()), col_oid),
+                    IndexPart::Expr(_) => i64::from(ty.oid()),
+                };
+                // (an access method made here has the classes made for it alone: a column naming none needs one made
+                // the default for its type, as ResolveOpClass finds it, indexcmds.c:2216)
+                if said.builtin.is_some()
+                    && class.is_none()
+                    && accessmethod::made_default_class(v, am, ty, oid)?.is_none()
+                    && with_path_view(|w| accessmethod::made_default_class(w, am, ty, oid)).transpose()?.flatten().is_none()
+                {
+                    return Err(SqlError {
+                        code: "42704",
+                        message: format!(
+                            "data type {} has no default operator class for access method \"{am}\"",
+                            catalog::builtin_typname(oid)
+                                .and_then(catalog::builtin_type_shown)
+                                .map_or_else(|| ty.pg_name().into_owned(), String::from)
+                        ),
+                        info: Some(Box::new(Violation {
+                            hint: Some("You must specify an operator class for the index or define a default operator class for the data type.".into()),
+                            ..Violation::default()
+                        })),
+                    });
+                }
+                classes.push(class.filter(|n| !indexam::is_default(am, n, ty, oid)).map(String::from));
+                // its ASC/DESC and NULLS FIRST/LAST, which a method that doesn't order refuses
+                let (desc, nulls_first) = said.orders.get(k).copied().unwrap_or_default();
+                opts.push(
+                    indexam::indoption(kind, desc, nulls_first)
+                        .map_err(|e| SqlError { message: e.message.replace(&format!("\"{kind}\""), &format!("\"{am}\"")), ..e })?,
+                );
             }
             if let Some(f) = filter {
                 let e = index_expr(&t, f)?;
@@ -60620,6 +61838,9 @@ impl Exec<'_> {
                 return Err(collation::indeterminate()); // (an expression of two columns' collations)
             }
             let colls = if colls.iter().all(|c| *c == collation::Coll::DEFAULT) { vec![] } else { colls };
+            // what was said of it beyond its entries, kept for the catalog: its method (btree as none), each part's
+            // ordering and class, and INCLUDE's columns (a spatial index's two parts are its own: it keeps none)
+            let said_too = !spatial;
             let ix = btree::Index {
                 name: name.clone(),
                 cols: ids.clone(),
@@ -60628,6 +61849,14 @@ impl Exec<'_> {
                 gin,
                 trgm: trgm.filter(|_| gin).map(String::from), // (not where it became a btree: on an ltree)
                 colls,
+                am: Some(am).filter(|m| *m != "btree" && said_too).map(String::from),
+                opts: if opts.iter().all(|o| *o == 0) || !said_too { vec![] } else { opts },
+                include: include
+                    .iter()
+                    .filter_map(|n| t.cols.iter().find(|c| c.name == *n).map(|c| c.id))
+                    .collect(),
+                classes: if classes.iter().all(Option::is_none) || !said_too { vec![] } else { classes },
+                builtin: said.builtin.clone().filter(|_| said_too),
             };
             if unique && t.hier.part.is_some() {
                 hier::check_covers(&t, &ids, "UNIQUE")?;
@@ -61012,6 +62241,9 @@ impl Exec<'_> {
     ) -> Result<Output> {
         // COPY ... FROM hands its rows over this way (see `copy`)
         let copied = if rows.is_empty() && query.is_none() { COPIED.take() } else { None };
+        // (CREATE TABLE AS fills its new table in bulk in Postgres, whose heap then isn't the planner model's: see
+        // `opt::stats::bulk_filled`)
+        let bulk = acl::filled_now(table);
         if conflict.is_some() {
             self.nest.claim_new.set(true);
         }
@@ -61118,6 +62350,8 @@ impl Exec<'_> {
             let mut local: HashMap<(String, Vec<HKey>), String> = HashMap::new();
             // (the rows each table got, for the cumulative statistics: counted as the statement ends)
             let mut tally = pgstat::Tally::default();
+            // (the tables whose heap Postgres would have filled in bulk)
+            let mut filled: Vec<String> = vec![];
             let remember = |t: &Table, id: &str, vals: &[Value], local: &mut HashMap<(String, Vec<HKey>), String>| {
                 for u in &t.uniques {
                     if let Some(these) = uniq_keys(t, u, vals) {
@@ -61296,6 +62530,9 @@ impl Exec<'_> {
                         bytes += k.len() + json.len() + 64;
                         count += 1;
                         tally.add(&leaf.name, 1, 0);
+                        if bulk && !filled.contains(&leaf.name) {
+                            filled.push(leaf.name.clone());
+                        }
                         seen.insert(k.clone());
                         writes.push((k, Some(json)));
                         match (vals, &ct) {
@@ -61420,12 +62657,19 @@ impl Exec<'_> {
                 }
                 (None, None) => part(rows.take().unwrap_or_default())?,
             }
+            let mut marked = vec![];
+            for n in &filled {
+                marked.extend(opt::stats::bulk_filled(v, n)?);
+            }
             if parts && self.spill_due(bytes, true) {
                 let keys: Vec<String> = writes.iter().map(|(k, _)| k.clone()).collect();
                 enforce_in(v, &mut writes, &keys, &[], Some(&mut marks))?;
+                // (the statistics go with its last part: a statement that spills holds nothing pending, see `spill`)
+                writes.extend(marked);
                 self.spill(&mut writes, &mut marks)?;
                 return Ok(Output::tag(format!("INSERT 0 {count}")));
             }
+            self.push(marked);
             let (columns, rows) =
                 self.returning_with(returning, &t, &made, conflict.is_some().then_some(&xmax[..]), Some(&leaves))?;
             let keys: Vec<String> = writes.iter().map(|(k, _)| k.clone()).collect();
@@ -68619,9 +69863,10 @@ fn sources(v: &View, s: &Select, params: Option<&[Value]>) -> Result<Vec<Table>>
                 }
                 None => columns(&f.0, &f.1, &tys, &src.alias)?,
             };
+            // (42P10, as buildRelationAliases has it, parse_relation.c:1234)
             if src.names.len() > found.len() {
                 return err(
-                    SYNTAX,
+                    "42P10",
                     format!(
                         "table \"{}\" has {} columns available but {} columns specified",
                         src.alias,
@@ -68672,7 +69917,13 @@ fn sources(v: &View, s: &Select, params: Option<&[Value]>) -> Result<Vec<Table>>
                 select_columns_full(v, q, &[], &[]).map_err(|e| lateral_hint(e, &out))?
             };
             let (found, colls, widths) = found;
-            if src.names.len() > found.len() {
+            // (the system columns its rows end with, which a `*` doesn't give: the `tableoid` of a hierarchy's rows,
+            // the `ctid` of a table's, both of a catalog table's; the last column at least): an alias list names the
+            // others only
+            let system = found.iter().rev().take_while(|(n, _)| system_name(n)).count().max(1);
+            let system = found.len().saturating_sub(system);
+            let shown = if src.hier { system } else { found.len() };
+            if src.names.len() > shown {
                 // (a WITH query's: its own name)
                 if src.cte != 0 || src.working || src.rec.is_some() {
                     return err(
@@ -68685,12 +69936,13 @@ fn sources(v: &View, s: &Select, params: Option<&[Value]>) -> Result<Vec<Table>>
                         ),
                     );
                 }
+                // (addRangeTableEntryForSubquery's, parse_relation.c:1689)
                 return err(
-                    SYNTAX,
+                    "42P10",
                     format!(
                         "table \"{}\" has {} columns available but {} columns specified",
                         src.alias,
-                        found.len(),
+                        shown,
                         src.names.len()
                     ),
                 );
@@ -68719,7 +69971,7 @@ fn sources(v: &View, s: &Select, params: Option<&[Value]>) -> Result<Vec<Table>>
                 .enumerate()
                 .map(|(i, (n, ty))| Col {
                     id: i as u32,
-                    hidden: src.hier && i + 1 == found.len(), // (the `tableoid` of a hierarchy's rows)
+                    hidden: src.hier && i >= system,
                     coll: colls.get(i).map_or(collation::Coll::DEFAULT, |s| s.column()),
                     // (a char(n) or varchar column of the subquery stays one: a char(n)'s values held without their blanks)
                     chars: held_chars(widths.get(i).copied().flatten())
@@ -68736,13 +69988,16 @@ fn sources(v: &View, s: &Select, params: Option<&[Value]>) -> Result<Vec<Table>>
         let mut t = need_src(v, src)?;
         populated(&t)?;
         foreign::readable(v, &t)?;
-        if src.names.len() > t.cols.iter().filter(|c| !c.hidden).count() {
+        // (a table's: its system columns aren't among those an alias list names, buildRelationAliases at
+        // parse_relation.c:1234)
+        let shown = t.cols.iter().filter(|c| !c.hidden).count();
+        if src.names.len() > shown {
             return err(
-                SYNTAX,
+                "42P10",
                 format!(
                     "table \"{}\" has {} columns available but {} columns specified",
                     src.alias,
-                    t.cols.len(),
+                    shown,
                     src.names.len()
                 ),
             );

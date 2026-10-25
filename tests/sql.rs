@@ -1295,7 +1295,8 @@ fn derived_tables_and_with() {
     );
     assert_eq!(q("with t(n) as (select 1 union all select 2) select sum(n) from t"), ["3"]);
     assert_eq!(q("with c as (select id from customers) select count(*) from c a join c b on a.id = b.id"), ["4"]);
-    assert_eq!(fails(&db, "select * from (select 1, 2) t(a, b, c)").0, "42601");
+    // (42P10, as Postgres's addRangeTableEntryForSubquery)
+    assert_eq!(fails(&db, "select * from (select 1, 2) t(a, b, c)").0, "42P10");
 }
 
 #[test]

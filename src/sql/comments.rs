@@ -149,6 +149,7 @@ pub(super) fn sql(key: &str, text: Option<&str>) -> Option<String> {
         "schema" => format!("schema {}", ident(rest)),
         "type" => format!("type {}", ident_rel(rest)),
         "function" => format!("function {rest}"),
+        "am" => format!("access method {}", ident(rest)),
         // (`column/<table>/<column>` and `constraint/<table>/<name>`: the table's name ends at
         // the last `/`, the column's or constraint's begins after it)
         "column" => {

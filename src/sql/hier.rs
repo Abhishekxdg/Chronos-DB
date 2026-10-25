@@ -64,6 +64,10 @@ pub(super) struct Hier {
     /// a partition's indexes that are copies of its parent's (or were attached to one), each with the parent's
     /// index's name: which of several alike indexes is which one's (see `kid_constraint`)
     pub(super) index_ups: Vec<(String, String)>,
+    /// its table access method where it isn't heap: one CREATE ACCESS METHOD made, as CREATE TABLE ... USING,
+    /// default_table_access_method or ALTER TABLE ... SET ACCESS METHOD gave it (pg_class.relam). Its rows are kept
+    /// as every table's: there is one store (see `accessmethod`)
+    pub(super) am: Option<String>,
 }
 
 impl Hier {
@@ -103,6 +107,7 @@ impl Hier {
                 .flatten()
                 .filter_map(|(x, up)| Some((x.clone(), up.as_str()?.to_string())))
                 .collect(),
+            am: j["table_am"].as_str().map(String::from),
         }
     }
 
@@ -159,6 +164,9 @@ impl Hier {
             j["index_parents"] =
                 Json::Object(self.index_ups.iter().map(|(x, up)| (x.clone(), Json::String(up.clone()))).collect());
         }
+        if let Some(am) = &self.am {
+            j["table_am"] = Json::String(am.clone());
+        }
     }
 
     /// The tablespace index `x` is kept in (0: the database's default).
@@ -214,11 +222,11 @@ impl Hier {
 
 // ---------------------------------------------------------------- parsed statements
 
-/// A partition key item as written: a column, or an expression with its text.
+/// A partition key item as written: a column, or an expression with its text; and its COLLATE and operator class.
 #[derive(Clone, Debug)]
 pub(super) enum PartItem {
-    Col(String),
-    Expr(Expr, String),
+    Col(String, PartExtra),
+    Expr(Expr, String, PartExtra),
 }
 
 /// One end of a range bound as written.
@@ -262,6 +270,8 @@ pub(super) struct CreateHier {
     /// the parents (of PARTITION OF and INHERITS) written with their schema, as stored: `public.p` is the permanent
     /// table even where a temporary one has its name, which a stored name doesn't tell
     pub(super) qualified: Vec<String>,
+    /// USING method: its table access method (see `Hier::am`)
+    pub(super) am: Option<String>,
 }
 
 /// How ALTER TABLE ... DETACH PARTITION goes about it.
@@ -290,20 +300,45 @@ impl Parser {
         loop {
             let (start, toks) = (self.i, self.ahead(true));
             let e = self.expr()?;
-            let text = tokens_shown(self.since(&toks, start)?);
+            let mut shown = self.since(&toks, start)?.to_vec();
+            let mut extra = PartExtra::default();
+            // COLLATE: the key's collation (the expression read takes it in as its own; it is the key's)
+            let e = match e {
+                Expr::Func(Func::Collate(c), args) if args.len() == 1 => {
+                    if !c.bytes() {
+                        return err(UNSUPPORTED, "a partition key in an ICU collation isn't supported yet");
+                    }
+                    if let Some(at) = shown.iter().rposition(|t| matches!(t, Tok::Word(w) if w == "collate")) {
+                        shown.truncate(at);
+                    }
+                    extra.coll = Some(c.name().0);
+                    args.into_iter().next().expect("one")
+                }
+                e => e,
+            };
+            let text = tokens_shown(&shown);
+            if self.kw("collate") {
+                let n = self.collation_name()?;
+                // (one of bytes is how keys compare here; ranges in an ICU one would route rows differently)
+                if !n.bytes() {
+                    return err(UNSUPPORTED, "a partition key in an ICU collation isn't supported yet");
+                }
+                extra.coll = n.resolve(None).ok().map(|c| c.name().0);
+            }
+            // an operator class, by name (maybe with its schema): what a hash key made with one hashes its values with.
+            // Kept by its own name, as the classes made here are (a quoted one's periods are its own)
+            if matches!(self.peek(), Some(Tok::Word(_) | Tok::Ident(_))) {
+                let mut n = self.name()?;
+                while self.sym(".") {
+                    n = self.name()?;
+                }
+                extra.ops = Some(n);
+            }
             // a parenthesized expression or a function call; a bare column
             items.push(match &e {
-                Expr::Col(None, n) => PartItem::Col(n.clone()),
-                _ => PartItem::Expr(e, text),
+                Expr::Col(None, n) => PartItem::Col(n.clone(), extra),
+                _ => PartItem::Expr(e, text, extra),
             });
-            // COLLATE: one of bytes is how keys compare here; ranges in an ICU one would route rows differently
-            if self.kw("collate") && !self.collation_name()?.bytes() {
-                return err(UNSUPPORTED, "a partition key in an ICU collation isn't supported yet");
-            }
-            // an operator class, by name: what it is for is the type's default's business here
-            if matches!(self.peek(), Some(Tok::Word(_) | Tok::Ident(_))) {
-                self.name()?;
-            }
             if !self.sym(",") {
                 break;
             }
@@ -785,6 +820,17 @@ pub(super) fn map_ids(ids: &[u32], from: &Table, to: &Table) -> Option<Vec<u32>>
         .collect()
 }
 
+/// Whether index `a` of `at` and index `b` of `bt` (a partition of it, or its parent) agree in what CompareIndexInfo
+/// (index.c:2541) compares beyond their key columns, expressions and predicate: the access method, the INCLUDE
+/// columns (by name), and each key part's collation and operator family (a class written that is its type's default
+/// is none). Not each part's ordering: Postgres 16 doesn't compare indoption, and attaches an `(a DESC)` to an `(a)`.
+pub(super) fn same_said(a: &btree::Index, at: &Table, b: &btree::Index, bt: &Table) -> bool {
+    a.method() == b.method()
+        && map_ids(&a.include, at, bt).as_ref() == Some(&b.include)
+        && (0..a.cols.len().max(b.cols.len())).all(|k| a.coll(k) == b.coll(k))
+        && indexam::families(at, a) == indexam::families(bt, b)
+}
+
 // ---------------------------------------------------------------- partition keys and bounds
 
 /// Whether an expression in a partition key is one Postgres would refuse as not immutable: the
@@ -838,9 +884,13 @@ impl Exec<'_> {
             return err("42P17", "cannot use \"list\" partition strategy with more than one column");
         }
         let mut parts = vec![];
+        let mut extras = vec![];
         for item in items {
             match item {
-                PartItem::Col(n) => {
+                PartItem::Col(_, x) | PartItem::Expr(_, _, x) => extras.push(x.clone()),
+            }
+            match item {
+                PartItem::Col(n, x) => {
                     if system_column(n).is_some() || n == "tableoid" || n == "ctid" {
                         return err("42P17", format!("cannot use system column \"{n}\" in partition key"));
                     }
@@ -855,16 +905,17 @@ impl Exec<'_> {
                         );
                     }
                     // ranges of text in an ICU collation would route rows by its order, which bounds here don't keep
-                    if strategy == Strategy::Range && c.coll.icu() {
+                    // (a COLLATE written with the key is the key's collation, and only one of bytes is taken)
+                    if strategy == Strategy::Range && x.coll.is_none() && c.coll.icu() {
                         return err(UNSUPPORTED, "range partitioning by text in an ICU collation isn't supported yet");
                     }
                     // (a row finds its partition by its key's bytes)
-                    if c.coll.nondeterministic() {
+                    if x.coll.is_none() && c.coll.nondeterministic() {
                         return Err(super::collation::nd_refused("partitioning by a key"));
                     }
                     parts.push(KeyPart::Col(c.id));
                 }
-                PartItem::Expr(e, text) => {
+                PartItem::Expr(e, text, _) => {
                     let (mut sub, mut agg, mut win, mut srf) = (false, false, false, false);
                     let mut reads: Vec<String> = vec![];
                     walk(e, &mut |x| match x {
@@ -924,7 +975,7 @@ impl Exec<'_> {
                 }
             }
         }
-        let key = PartKey { strategy, parts };
+        let key = PartKey { strategy, parts, extras };
         for (ty, what) in key.types(t)?.into_iter().zip(0..) {
             let c = key.parts.get(what);
             let _ = c;
@@ -2093,6 +2144,8 @@ impl Exec<'_> {
         let compiled = key.compile(parent)?;
         let typed = bound.typed(&types)?;
         let siblings = if bound == PartBound::Default { kids_in_order(v, parent)? } else { vec![] };
+        let procs = self.hash_procs(v, &key)?;
+        let part = |i: usize, x: &Value| self.part_hash(&procs, &types, i, x);
         let mut holders = vec![];
         if kid.hier.part.is_none() {
             holders.push(kid.clone());
@@ -2113,7 +2166,7 @@ impl Exec<'_> {
                     }
                     taken
                 } else {
-                    !typed.holds(&kv, &types)?
+                    !typed.holds_with(&kv, &types, &part)?
                 };
                 Ok(!bad)
             })?;
@@ -2390,12 +2443,17 @@ impl Exec<'_> {
                     map_ids(&p, pt, ct) == Some(c)
                 }
             } else if let Some(pu) = pt.uniques.iter().find(|u| u.name == pn) {
-                let backed = pt.indexes.iter().any(|x| x.name == pn);
+                let px = pt.indexes.iter().find(|x| x.name == pn);
+                let cx = ct.indexes.iter().find(|x| x.name == cn);
                 ct.uniques.iter().any(|u| {
                     u.name == cn
                         && u.nnd == pu.nnd
                         && map_ids(&pu.cols, pt, ct).as_ref() == Some(&u.cols)
-                        && ct.indexes.iter().any(|x| x.name == cn) == backed
+                        && match (px, cx) {
+                            (Some(px), Some(cx)) => same_said(px, pt, cx, ct),
+                            (None, None) => true,
+                            _ => false,
+                        }
                 })
             } else {
                 let px = pt.indexes.iter().find(|x| x.name == pn);
@@ -2404,6 +2462,7 @@ impl Exec<'_> {
                         map_ids(&px.cols, pt, ct).as_ref() == Some(&cx.cols)
                             && px.exprs == cx.exprs
                             && px.filter == cx.filter
+                            && same_said(px, pt, cx, ct)
                             && !ct.uniques.iter().any(|u| u.name == cn)
                     }
                     _ => false,
@@ -2872,6 +2931,9 @@ pub(super) struct Level {
     key: Vec<KeyEval>,
     router: Router,
     pub(super) kids: Vec<Table>,
+    /// a hash key's parts' support functions, where their operator class is one made with CREATE OPERATOR CLASS
+    procs: Vec<Option<String>>,
+    types: Vec<Type>,
 }
 
 /// The levels a statement has looked at, by table name.
@@ -3010,14 +3072,76 @@ impl Exec<'_> {
             let b = k.hier.of.as_ref().map(|(_, b)| b.typed(&types)).transpose()?.unwrap_or(PartBound::Default);
             of.push(Kid { bound: b });
         }
+        let procs = self.hash_procs(v, &key)?;
         let level = std::rc::Rc::new(Level {
             key: key.compile(&table)?,
             router: Router::new(key.strategy, of, types.clone())?,
             table,
             kids,
+            procs,
+            types,
         });
         self.routes.borrow_mut().insert(name.to_string(), level.clone());
         Ok(level)
+    }
+
+    /// The support functions (FUNCTION 2) a hash partition key's parts are hashed with, where a part names an operator
+    /// class made with CREATE OPERATOR CLASS; None for a part hashed by its type's own function.
+    pub(super) fn hash_procs(&self, v: &View, key: &PartKey) -> Result<Vec<Option<String>>> {
+        let mut out = vec![];
+        for i in 0..key.parts.len() {
+            out.push(match (key.strategy, key.ops(i)) {
+                // (looked for in `v`, then in the session's world: a temporary table is kept in the session's own
+                // database, which has no classes, as a temporary index's are looked for)
+                (Strategy::Hash, Some(o)) => match userdefs::opclass_proc(v, o, "hash", 2)? {
+                    Some(p) => Some(p),
+                    None => super::with_path_view(|w| userdefs::opclass_proc(w, o, "hash", 2)).transpose()?.flatten(),
+                },
+                _ => None,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Key part `i`'s hash of `v` where `procs` names its support function (see `hash_procs`): a call of it with the
+    /// value and HASH_PARTITION_SEED (compute_partition_hash_value, partbounds.c:4729).
+    pub(super) fn part_hash(
+        &self,
+        procs: &[Option<String>],
+        types: &[Type],
+        i: usize,
+        v: &Value,
+    ) -> Option<Result<u64>> {
+        let proc = procs.get(i)?.as_ref()?;
+        let ty = types.get(i).copied().unwrap_or(Type::Text);
+        let call = Call {
+            name: proc.clone(),
+            args: vec![
+                Expr::Cast(Box::new(Expr::Lit(v.clone())), ty),
+                Expr::Cast(Box::new(Expr::Lit(Value::Int(SEED))), Type::BigInt),
+            ],
+            names: vec![],
+            def: None,
+            via_call: false,
+            builtin: false,
+        };
+        // a built-in the class named (kept as pg_catalog's: see `userdefs`), run as any call of it is; else one made
+        // with CREATE FUNCTION, or (a class kept before built-ins were marked) a built-in of the name
+        let out = match proc.strip_prefix("pg_catalog.") {
+            Some(f) => builtin_of_call(&Call { name: f.to_string(), ..call }).and_then(|e| self.constant(&e)),
+            None => match self.call_function(&call, vec![v.clone(), Value::Int(SEED)], &[]) {
+                Err(e) if e.code == NO_FUNCTION && builtin_of(written(&call.name)).is_some() => {
+                    builtin_of_call(&call).and_then(|e| self.constant(&e))
+                }
+                r => r,
+            },
+        };
+        Some(match out {
+            Ok(Value::Int(n)) => Ok(n as u64),
+            Ok(Value::Null) => Ok(0),
+            Ok(other) => coerce(other, Type::BigInt).map(|x| if let Value::Int(n) = x { n as u64 } else { 0 }),
+            Err(e) => Err(e),
+        })
     }
 
     /// The partition (a table that holds rows) a row of partitioned table `t` goes to, and the row
@@ -3027,7 +3151,7 @@ impl Exec<'_> {
         let mut vals = vals.to_vec();
         loop {
             let kv = row_key_values(&level.table, &level.key, &vals)?;
-            let Some(i) = level.router.find(&kv)? else {
+            let Some(i) = level.router.find_with(&kv, &|i, v| self.part_hash(&level.procs, &level.types, i, v))? else {
                 return Err(no_partition(&level.table, &kv));
             };
             let kid = &level.kids[i];
@@ -3049,7 +3173,8 @@ impl Exec<'_> {
             let pv = to_layout(&vals, &cur, &level.table);
             let kv = row_key_values(&level.table, &level.key, &pv)?;
             let mine = level.kids.iter().position(|k| k.name == cur.name);
-            if mine.is_none() || level.router.find(&kv)? != mine {
+            let found = level.router.find_with(&kv, &|i, v| self.part_hash(&level.procs, &level.types, i, v))?;
+            if mine.is_none() || found != mine {
                 return Ok(false);
             }
             (cur, vals) = (level.table.clone(), pv);
@@ -3315,21 +3440,22 @@ pub(super) fn clone_constraints(
     }
     for u in &parent.uniques {
         let Some(cols) = map_ids(&u.cols, parent, child) else { continue };
-        let backed = parent.indexes.iter().any(|x| x.name == u.name);
-        if attaching
-            && let Some(x) = child
-                .uniques
-                .iter()
-                .find(|x| x.cols == cols && x.nnd == u.nnd && child.indexes.iter().any(|i| i.name == x.name) == backed)
-        {
+        let backing = parent.indexes.iter().find(|x| x.name == u.name);
+        // (a unique index's the same where its index is: see `same_said`)
+        let same_index = |x: &Unique| match (backing, child.indexes.iter().find(|i| i.name == x.name)) {
+            (Some(p), Some(c)) => same_said(p, parent, c, child),
+            (None, None) => true,
+            _ => false,
+        };
+        if attaching && let Some(x) = child.uniques.iter().find(|x| x.cols == cols && x.nnd == u.nnd && same_index(x)) {
             let n = x.name.clone();
             if !child.hier.inherited.contains(&n) {
                 child.hier.inherited.push(n);
             }
             continue;
         }
-        let backing = parent.indexes.iter().find(|x| x.name == u.name);
-        let cn = index_words(parent, &u.cols, backing.map_or(&[][..], |x| &x.exprs));
+        let all: Vec<u32> = u.cols.iter().chain(backing.map_or(&[][..], |x| &x.include[..])).copied().collect();
+        let cn = index_words(parent, &all, backing.map_or(&[][..], |x| &x.exprs));
         let taken = |n: &str| {
             child.uniques.iter().any(|x| x.name == n)
                 || child.indexes.iter().any(|x| x.name == n)
@@ -3339,15 +3465,20 @@ pub(super) fn clone_constraints(
         let name = index_name(&child.name, &cn, if backing.is_some() { "idx" } else { "key" }, &taken);
         child.uniques.push(Unique { name: name.clone(), cols: cols.clone(), nnd: u.nnd, primary: u.primary });
         if let Some(x) = backing {
-            child.indexes.push(btree::Index {
-                name: name.clone(),
-                cols,
-                exprs: x.exprs.clone(),
-                filter: x.filter.clone(),
-                gin: x.gin,
-                trgm: x.trgm.clone(),
-                colls: x.colls.clone(),
-            });
+            let include = map_ids(&x.include, parent, child).unwrap_or_default();
+            child.indexes.push(
+                btree::Index {
+                    name: name.clone(),
+                    cols,
+                    exprs: x.exprs.clone(),
+                    filter: x.filter.clone(),
+                    gin: x.gin,
+                    trgm: x.trgm.clone(),
+                    colls: x.colls.clone(),
+                    ..btree::Index::default()
+                }
+                .said_as(x, include),
+            );
         }
         clone_space(v, child, &name, parent.hier.index_space(&u.name))?;
         child.hier.inherited.push(name);
@@ -3358,14 +3489,14 @@ pub(super) fn clone_constraints(
         parent.indexes.iter().filter(|x| !parent.uniques.iter().any(|u| u.name == x.name) && !kept.contains(&x.name))
     {
         let Some(cols) = map_ids(&x.cols, parent, child) else { continue };
-        // (one in another collation, or already a partition of another index, is not it)
+        // (one of another method, collation, class or INCLUDE, or a partition of another index already, isn't it)
         let attached = kid_constraint(parent, child, &x.name);
         if attaching
             && let Some(o) = child.indexes.iter().find(|o| {
                 o.cols == cols
                     && o.exprs == x.exprs
                     && o.filter == x.filter
-                    && (0..cols.len()).all(|k| o.coll(k) == x.coll(k))
+                    && same_said(x, parent, o, child)
                     && (attached.as_deref() == Some(o.name.as_str()) || !child.hier.inherited.contains(&o.name))
                     && !child.uniques.iter().any(|u| u.name == o.name)
                     // (nor is an invalid one: a partitioned table's that its partitions don't all have)
@@ -3379,20 +3510,27 @@ pub(super) fn clone_constraints(
             }
             continue;
         }
-        let cn = index_words(parent, &x.cols, &x.exprs);
+        // (named for all its columns, INCLUDE's too, as DefineIndex names one)
+        let all: Vec<u32> = x.cols.iter().chain(&x.include).copied().collect();
+        let cn = index_words(parent, &all, &x.exprs);
         let taken = |n: &str| {
             child.uniques.iter().any(|u| u.name == n) || child.indexes.iter().any(|i| i.name == n) || others.contains(n)
         };
         let name = index_name(&child.name, &cn, "idx", &taken);
-        child.indexes.push(btree::Index {
-            name: name.clone(),
-            cols,
-            exprs: x.exprs.clone(),
-            filter: x.filter.clone(),
-            gin: x.gin,
-            trgm: x.trgm.clone(),
-            colls: x.colls.clone(),
-        });
+        let include = map_ids(&x.include, parent, child).unwrap_or_default();
+        child.indexes.push(
+            btree::Index {
+                name: name.clone(),
+                cols,
+                exprs: x.exprs.clone(),
+                filter: x.filter.clone(),
+                gin: x.gin,
+                trgm: x.trgm.clone(),
+                colls: x.colls.clone(),
+                ..btree::Index::default()
+            }
+            .said_as(x, include),
+        );
         clone_space(v, child, &name, parent.hier.index_space(&x.name))?;
         child.hier.link_index(&name, &x.name);
         child.hier.inherited.push(name);
@@ -3500,6 +3638,11 @@ pub struct HierInfo {
     /// `tablespace::Gens`)
     pub tablespace: i64,
     pub filenode: i64,
+    /// its table access method where it isn't heap (see `Hier::am`)
+    pub am: Option<String>,
+    /// pg_class.relpages, reltuples and relallvisible as VACUUM and ANALYZE recorded them (see `opt::stats`); None
+    /// for a table never vacuumed or analyzed
+    pub stats: Option<(i64, f64, i64)>,
 }
 
 #[derive(Clone, Debug)]
@@ -3755,6 +3898,7 @@ pub(super) fn info(v: &View, t: &Table) -> Result<HierInfo> {
         reloptions: t.hier.reloptions.clone(),
         index_reloptions: t.hier.index_reloptions.clone(),
         tablespace: t.hier.tablespace,
+        am: t.hier.am.clone(),
         ..HierInfo::default()
     };
     h.parents = t.hier.all_parents().into_iter().map(String::from).collect();
@@ -3828,13 +3972,13 @@ pub(super) fn spread_index(
             continue;
         }
         let Some(cols) = map_ids(&ix.cols, parent, &kid) else { continue };
-        // (one in another collation, or already a partition of another index, is not it)
+        // (one of another method, collation, class or INCLUDE, or a partition of another index already, isn't it)
         let attached = kid_constraint(parent, &kid, &ix.name);
         let same = |o: &btree::Index| {
             o.cols == cols
                 && o.exprs == ix.exprs
                 && o.filter == ix.filter
-                && (0..cols.len()).all(|k| o.coll(k) == ix.coll(k))
+                && same_said(ix, parent, o, &kid)
                 && (attached.as_deref() == Some(o.name.as_str()) || !kid.hier.inherited.contains(&o.name))
                 && kid.uniques.iter().any(|k| k.name == o.name) == u.is_some()
         };
@@ -3843,18 +3987,25 @@ pub(super) fn spread_index(
         let name = match kid.indexes.iter().find(|o| same(o)) {
             Some(o) => o.name.clone(),
             None => {
-                let cn = index_words(&kid, &cols, &ix.exprs);
+                let include = map_ids(&ix.include, parent, &kid).unwrap_or_default();
+                // (named for all its columns, INCLUDE's too, as DefineIndex names one)
+                let all: Vec<u32> = cols.iter().chain(&include).copied().collect();
+                let cn = index_words(&kid, &all, &ix.exprs);
                 let name = index_name(&kid.name, &cn, "idx", &|n: &str| taken.contains(n));
                 taken.insert(name.clone());
-                kid.indexes.push(btree::Index {
-                    name: name.clone(),
-                    cols: cols.clone(),
-                    exprs: ix.exprs.clone(),
-                    filter: ix.filter.clone(),
-                    gin: ix.gin,
-                    trgm: ix.trgm.clone(),
-                    colls: ix.colls.clone(),
-                });
+                kid.indexes.push(
+                    btree::Index {
+                        name: name.clone(),
+                        cols: cols.clone(),
+                        exprs: ix.exprs.clone(),
+                        filter: ix.filter.clone(),
+                        gin: ix.gin,
+                        trgm: ix.trgm.clone(),
+                        colls: ix.colls.clone(),
+                        ..btree::Index::default()
+                    }
+                    .said_as(ix, include),
+                );
                 if let Some(u) = u {
                     kid.uniques.push(Unique { name: name.clone(), cols, nnd: u.nnd, primary: u.primary });
                 }

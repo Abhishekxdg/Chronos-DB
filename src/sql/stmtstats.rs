@@ -70,6 +70,11 @@ struct Stats {
 static STATS: LazyLock<Mutex<Stats>> =
     LazyLock::new(|| Mutex::new(Stats { by_query: HashMap::new(), seen: HashMap::new() }));
 
+/// The query identifier pg_stat_statements keeps statement `sql` by (see `Shape::id`); None for text that doesn't lex.
+pub(super) fn query_id(sql: &str) -> Option<i64> {
+    normalized(sql).map(|s| s.id())
+}
+
 /// `sql` with each constant (a number, a quoted string) made a parameter, `$1`, `$2`, ..., after the ones it has,
 /// and the kinds of the constants taken out (`i` int4, `b` int8, `n` numeric, `s` a string). None for text that
 /// doesn't lex.

@@ -369,7 +369,9 @@ pub(crate) fn readers(
             }
         }
         for x in &t.indexes {
+            // (its INCLUDE columns too: it depends on them, and goes with one dropped)
             let mut cols = names_of(&x.cols);
+            cols.extend(names_of(&x.include));
             for text in x.exprs.iter().chain(&x.filter) {
                 if let Ok(e) = check_expr(text) {
                     walk(&e, &mut |e| {

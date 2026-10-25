@@ -22,6 +22,8 @@ const PG_ATTRDEF: i64 = 2604;
 const PG_REWRITE: i64 = 2618;
 const PG_TRIGGER: i64 = 2620;
 const PG_POLICY: i64 = 3256;
+const PG_AM: i64 = 2601;
+const PG_NAMESPACE: i64 = 2615;
 
 /// A catalog table with every column of Postgres's: their names and types, and the rows.
 pub(super) type Whole = (Vec<(String, Type)>, Vec<Vec<Value>>);
@@ -521,6 +523,23 @@ impl Catalog {
             let ty = self.of_type_oid(r);
             if ty != 0 {
                 out.push((PG_CLASS, rel(i), 0, PG_TYPE, ty, 0, 'n'));
+            }
+        }
+        // a relation depends on its schema (pg_catalog is pinned), as heap_create_with_catalog records it (heap.c:1464);
+        // an index doesn't (index_create records its columns)
+        for (i, r) in self.rels.iter().enumerate() {
+            let ns = self.schema_oid(schema_part(&r.name));
+            if matches!(r.kind, 'r' | 'p' | 'v' | 'm' | 'S' | 'f') && !matches!(ns, 0 | 11) {
+                out.push((PG_CLASS, rel(i), 0, PG_NAMESPACE, ns, 0, 'n'));
+            }
+        }
+        // a table or materialized view depends on its access method, unless that is heap, which is pinned (heap.c:1480)
+        for (i, r) in self.rels.iter().enumerate() {
+            if let Some(am) = r.hier.am.as_deref().filter(|_| matches!(r.kind, 'r' | 'm')) {
+                let o = self.am_oid(am);
+                if o != 0 {
+                    out.push((PG_CLASS, rel(i), 0, PG_AM, o, 0, 'n'));
+                }
             }
         }
         // a partition goes with its table (and is dumped after it); what it has of its parent's goes with the
@@ -1591,9 +1610,13 @@ fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
         let table = matches!(r.kind, 'r' | 'm');
         let natts = if r.kind == 'S' { 3 } else { r.columns.len() as i64 };
         let (owner, acl) = cat.rel_acl(r);
-        // a sequence is one page holding one row, as Postgres counts it; a table or index that was never
-        // analyzed has none counted (-1), as in Postgres (Chronos keeps no statistics)
-        let (pages, tuples) = if r.kind == 'S' { (1, 1.0) } else { (0, -1.0) };
+        // a sequence is one page holding one row, as Postgres counts it; a table, what VACUUM and ANALYZE last
+        // recorded (see `opt::stats`), and one never vacuumed or analyzed none counted (-1), as in Postgres
+        let (pages, tuples, visible) = match (r.kind, r.hier.stats) {
+            ('S', _) => (1, 1.0, 0),
+            (_, Some(s)) => s,
+            _ => (0, -1.0, 0),
+        };
         let toasted = toasted(cat, r);
         row(vec![
             ("oid", int(cat.rel_oid(i))),
@@ -1602,7 +1625,8 @@ fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             ("reltype", int(if r.kind == 'S' { 0 } else { cat.row_type_oid(i) })),
             ("reloftype", int(cat.of_type_oid(r))),
             ("relowner", int(owner)),
-            ("relam", int(if table { 2 } else { 0 })),
+            // (heap, or the access method CREATE TABLE ... USING or default_table_access_method gave it)
+            ("relam", int(if table { cat.am_oid(r.hier.am.as_deref().unwrap_or("heap")) } else { 0 })),
             // (a view, a partitioned table and a foreign table have no storage of their own)
             (
                 "relfilenode",
@@ -1614,7 +1638,7 @@ fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             ("reltablespace", int(r.hier.tablespace)),
             ("relpages", int(pages)),
             ("reltuples", Value::Float(tuples)),
-            ("relallvisible", int(0)),
+            ("relallvisible", int(visible)),
             ("reltoastrelid", int(if toasted { cat.rel_oid(i) | (1 << 31) } else { 0 })),
             ("relhasindex", b(!r.indexes.is_empty())),
             ("relisshared", b(false)),
@@ -1684,7 +1708,7 @@ fn class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             ("reloftype", int(0)),
             // (an index is its table's owner's)
             ("relowner", int(cat.rel_acl(r).0)),
-            ("relam", int(super::catalog::am_oid(x.method))),
+            ("relam", int(cat.am_oid(x.am_name()))),
             // (a partitioned table's index has no storage of its own)
             (
                 "relfilenode",
@@ -1909,13 +1933,12 @@ fn attribute_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             }
             names.push(name.clone());
             let oid = if own != 0 { own } else { cat.type_oid(ty) };
-            // (a column holds its operator class's key type where that isn't its table column's, as Postgres's
-            // opckeytype says: a gin index on an array its elements, a btree on a name C strings)
-            let keyed = match (x.method, ty) {
-                ("gin", Type::Array(e)) if at.is_some() => Some(i64::from(e)),
-                ("btree", Type::Name) if at.is_some() => Some(2275),
-                _ => None,
-            };
+            // (a key column holds its operator class's key type where that isn't its table column's, as Postgres's
+            // opckeytype says (ConstructTupleDescriptor, index.c:435): a gin index on an array its elements, a btree on
+            // a name C strings, a gist on a point boxes; an INCLUDE column holds its own)
+            let keyed = (n < x.nkey).then(|| x.keytypes.get(n).copied()).flatten().filter(|k| *k != 0 && *k != oid);
+            // (its collation is the indexed type's, whatever it holds: a name's is "C")
+            let own_collation = catalog_schema::type_facts(oid).map_or(0, |f| f.4);
             let (oid, typmod) = keyed.map_or((oid, typmod), |k| (k, -1));
             let (len, byval, align, storage, collation) = catalog_schema::type_facts(oid).unwrap_or_else(|| match ty {
                 Type::Enum(_) => (4, true, "i".into(), "p".into(), 0),
@@ -1935,8 +1958,14 @@ fn attribute_rows(cat: &Catalog) -> Vec<Vec<Value>> {
             if let Some(m) = opts.and_then(|o| o.2) {
                 set(&mut row, "attcompression", t(&m.to_string()));
             }
-            // (an index's column has the index's collation, as pg_index.indcollation has it)
-            let collation = x.colls.get(n).copied().flatten().map_or(collation, |c| cat.collation_oid(c));
+            // (an index's column has the index's collation, as pg_index.indcollation has it; an INCLUDE column none,
+            // index.c:332)
+            let collation = match x.colls.get(n).copied().flatten() {
+                _ if n >= x.nkey => 0,
+                Some(c) => cat.collation_oid(c),
+                None if keyed.is_some() => own_collation,
+                None => collation,
+            };
             set(&mut row, "attcollation", int(collation));
             set(&mut row, "attndims", int(i64::from(matches!(ty, Type::Array(_)) && keyed.is_none())));
             rows.push(row);

@@ -750,6 +750,11 @@ pub(super) fn aggregate_at(i: u8) -> Option<AggDef> {
 
 const PREFIX: &str = "_sonos_defs/";
 
+/// Whether CREATE OPERATOR CLASS made class `name` of access method `am` (kept as its name: see `named_stmt`).
+pub(super) fn opclass_made(v: &View, name: &str, am: &str) -> Result<bool> {
+    Ok(v.get(&format!("{PREFIX}opclass/{name}/{am}"))?.is_some())
+}
+
 /// The registered operators' symbols, longest first, for the lexer.
 pub(super) fn symbols() -> Vec<String> {
     let mut v: Vec<String> = DEFS.lock().unwrap().ops.iter().map(|o| o.sym.clone()).collect();
@@ -952,6 +957,75 @@ pub(super) fn hydrate() {
     }
 }
 
+/// Support function `n` of operator class `name` of access method `am`, made with CREATE OPERATOR CLASS: the
+/// function's name as it is stored. None for one of Postgres's own, or one without it.
+pub(super) fn opclass_proc(v: &View, name: &str, am: &str, n: u32) -> Result<Option<String>> {
+    let Some(raw) = v.get(&format!("{PREFIX}opclass/{name}/{am}"))? else { return Ok(None) };
+    let j: Json = serde_json::from_str(&raw).unwrap_or(Json::Null);
+    Ok(j["procs"][n.to_string()].as_str().map(String::from))
+}
+
+/// The partitioned tables whose hash key names operator class `key` (`_sonos_defs/opclass/<name>/<method>`): what
+/// depends on the class, as a table depends on its partition key's classes (StorePartitionKey, heap.c:3830).
+pub(super) fn opclass_users(v: &View, key: &str) -> Result<Vec<String>> {
+    let Some((name, am)) = key.strip_prefix(&format!("{PREFIX}opclass/")).and_then(|r| r.rsplit_once('/')) else {
+        return Ok(vec![]);
+    };
+    if am != "hash" {
+        return Ok(vec![]);
+    }
+    Ok(super::schemas(v)?
+        .into_iter()
+        .filter(|t| {
+            t.hier.part.as_ref().is_some_and(|k| {
+                k.strategy == super::partition::Strategy::Hash && (0..k.parts.len()).any(|i| k.ops(i) == Some(name))
+            })
+        })
+        .map(|t| t.name)
+        .collect())
+}
+
+/// The indexes whose parts name operator class `key` (`_sonos_defs/opclass/<name>/<method>`) of their access method,
+/// each as (its table, its name): what depends on the class, as an index depends on its parts' classes
+/// (index_create, index.c:1050). A partition's copy of its parent's goes with that one.
+pub(super) fn opclass_indexes(v: &View, key: &str) -> Result<Vec<(String, String)>> {
+    let Some((name, am)) = key.strip_prefix(&format!("{PREFIX}opclass/")).and_then(|r| r.rsplit_once('/')) else {
+        return Ok(vec![]);
+    };
+    let mut out = vec![];
+    for t in super::schemas(v)? {
+        for x in &t.indexes {
+            if x.method() == am
+                && !t.hier.inherited.contains(&x.name)
+                && x.classes.iter().any(|c| c.as_deref() == Some(name))
+            {
+                out.push((t.name.clone(), super::qualify(schema_part(&t.name), &x.name)));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// DROP OPERATOR CLASS's refusal while indexes `indexes` use the class `key` names, or partition keys `users` hash
+/// with it (2BP01).
+pub(super) fn opclass_in_use(key: &str, indexes: &[String], users: &[String]) -> SqlError {
+    let (name, am) =
+        key.strip_prefix(&format!("{PREFIX}opclass/")).and_then(|r| r.rsplit_once('/')).unwrap_or(("", ""));
+    let on = format!("operator class {name} for access method {am}");
+    let lines: Vec<String> = (indexes.iter().map(|x| format!("index {} depends on {on}", rel_part(x))))
+        .chain(users.iter().map(|t| format!("table {} depends on {on}", rel_part(t))))
+        .collect();
+    SqlError {
+        code: "2BP01",
+        message: format!("cannot drop {on} because other objects depend on it"),
+        info: Some(Box::new(Violation {
+            detail: Some(lines.join("\n")),
+            hint: Some("Use DROP ... CASCADE to drop the dependent objects too.".into()),
+            ..Violation::default()
+        })),
+    }
+}
+
 /// Takes a dropped definition out of the registry.
 pub(super) fn forget(key: &str) {
     if let Some(n) = key.strip_prefix(&format!("{PREFIX}tsdictionary/")) {
@@ -1116,6 +1190,7 @@ impl Parser {
             tag: "CREATE OPERATOR",
             missing: None,
             exists: Some(format!("operator {sym} already exists")),
+            cascade: false,
         })
     }
 
@@ -1136,7 +1211,7 @@ impl Parser {
         });
         // a side's type not looked up yet has to be there (`type "x" does not exist`, before the operator is looked for)
         let needs = [l, r].into_iter().flatten().find_map(|t| unresolved_needs(t, if_exists));
-        Ok(Stmt::UserDef { needs, key, json: None, tag: "DROP OPERATOR", missing, exists: None })
+        Ok(Stmt::UserDef { needs, key, json: None, tag: "DROP OPERATOR", missing, exists: None, cascade: false })
     }
 
     /// After ALTER OPERATOR: `symbol (left, right) SET (...) | OWNER TO role | SET SCHEMA s`. The operator has to be
@@ -1153,6 +1228,7 @@ impl Parser {
             tag: "ALTER OPERATOR",
             missing,
             exists: None,
+            cascade: false,
         })
     }
 
@@ -1348,6 +1424,7 @@ impl Parser {
             tag: "ALTER AGGREGATE",
             missing: Some(format!("aggregate {name}({}) does not exist", sig.shown())),
             exists: None,
+            cascade: false,
         })
     }
 
@@ -1519,6 +1596,7 @@ impl Parser {
             tag: "CREATE AGGREGATE",
             missing: None,
             exists: None,
+            cascade: false,
         })
     }
 
@@ -1558,6 +1636,7 @@ impl Parser {
             tag: "DROP AGGREGATE",
             missing: Some(missing),
             exists: None,
+            cascade: false,
         })
     }
 
@@ -1611,6 +1690,7 @@ impl Parser {
             tag: "CREATE CAST",
             missing: None,
             exists: Some(format!("cast from type {} to type {} already exists", from.name(), to.name())),
+            cascade: false,
         })
     }
 
@@ -1626,7 +1706,15 @@ impl Parser {
         let missing = Some(if if_exists { format!("{SKIP}{missing}, skipping") } else { missing });
         // a type not looked up yet has to be there, as Postgres looks the types up first
         let needs = [from, to].into_iter().find_map(|t| unresolved_needs(t, if_exists));
-        Ok(Stmt::UserDef { needs, key: cast_key(from, to), json: None, tag: "DROP CAST", missing, exists: None })
+        Ok(Stmt::UserDef {
+            needs,
+            key: cast_key(from, to),
+            json: None,
+            tag: "DROP CAST",
+            missing,
+            exists: None,
+            cascade: false,
+        })
     }
 
     /// `OPERATOR(schema.sym)` next, as pg_dump writes an operator that isn't in pg_catalog: the symbol, and how
@@ -1851,6 +1939,7 @@ impl Parser {
             || at(0, "statistics")
             || at(0, "tablespace")
             || (at(0, "operator") && (at(1, "class") || at(1, "family")))
+            || (at(0, "access") && at(1, "method"))
     }
 
     /// CREATE, ALTER and DROP of the objects kept as names only: publications, subscriptions, extended statistics,
@@ -1912,6 +2001,26 @@ impl Parser {
             }
             n
         };
+        // an operator class's DEFAULT FOR TYPE type: what an index of its access method gets for a column of that type
+        // that names no class (see `accessmethod::made_default_class`), kept with it
+        let mut facts = serde_json::json!({});
+        if kind == "opclass" && verb == "create" {
+            let default = self.kw("default");
+            if self.kw("for") {
+                self.expect_kw("type")?;
+                let at = self.i;
+                match self.ty() {
+                    Ok(t) => {
+                        facts["type"] = Json::from(t.oid());
+                        if default {
+                            facts["default"] = Json::Bool(true);
+                        }
+                    }
+                    // (a type this can't read: the class is kept as its name only)
+                    Err(_) => self.i = at,
+                }
+            }
+        }
         // an operator class or family is of an access method
         let using = if kind.starts_with("op") {
             let mut j = self.i;
@@ -1928,10 +2037,83 @@ impl Parser {
         } else {
             String::new()
         };
-        // (the access method is looked up first, IF EXISTS or not)
-        if !using.is_empty() && !ACCESS_METHODS.contains(&using.as_str()) {
-            return err("42704", format!("access method \"{using}\" does not exist"));
+        // (the access method is looked up first, IF EXISTS or not: Postgres's own, or an index method made here)
+        if !using.is_empty() {
+            super::accessmethod::opclass_am_at_parse(&using)?;
         }
+        // an operator class's support functions (`FUNCTION n [(types)] name(argument types)`), by number: what a hash
+        // partition key naming the class hashes its values with (its function 2)
+        let (mut procs, mut sigs) = (serde_json::Map::new(), serde_json::Map::new());
+        if kind == "opclass" && verb == "create" {
+            let mut j = self.i;
+            while j < self.t.len() && self.t[j] != Tok::Sym(";") {
+                if matches!(&self.t[j], Tok::Word(w) if w == "function")
+                    && let Some(Tok::Num(n)) = self.t.get(j + 1)
+                {
+                    // (its own copy: the types after it are read with the parser, which the tokens' borrow would hold)
+                    let n = n.clone();
+                    let mut k = j + 2;
+                    if self.t.get(k) == Some(&Tok::Sym("(")) {
+                        while k < self.t.len() && self.t[k] != Tok::Sym(")") {
+                            k += 1;
+                        }
+                        k += 1;
+                    }
+                    let mut fname = String::new();
+                    while let Some(Tok::Word(w) | Tok::Ident(w)) = self.t.get(k) {
+                        fname.push_str(w);
+                        k += 1;
+                        if self.t.get(k) != Some(&Tok::Sym(".")) {
+                            break;
+                        }
+                        fname.push('.');
+                        k += 1;
+                    }
+                    // (kept as the function is stored: a schema's name qualified as `qualify` keeps it, public's bare; a
+                    // plain name as the search_path finds it. A built-in, named in pg_catalog or found as no function
+                    // made here is, is kept as pg_catalog's, so one made later of its name isn't taken for it)
+                    if !fname.is_empty() {
+                        let builtin = |f: &str| super::builtin_of(f).is_some();
+                        let stored = match fname.rsplit_once('.') {
+                            Some(("pg_catalog", f)) if builtin(f) => format!("pg_catalog.{f}"),
+                            Some((schema, f)) => super::qualify(schema, f),
+                            None if builtin(&fname) && super::funcs_on_path(&fname).is_empty() => {
+                                format!("pg_catalog.{fname}")
+                            }
+                            None => super::find_named(&fname, Kind::Func),
+                        };
+                        procs.insert(n.clone(), Json::String(stored));
+                        // and its argument types, which tell it from the function's overloads (see `opclasses_using`)
+                        if self.t.get(k) == Some(&Tok::Sym("(")) {
+                            let at = std::mem::replace(&mut self.i, k + 1);
+                            let mut types = vec![];
+                            let read = (|| -> Result<()> {
+                                while !self.sym(")") {
+                                    types.push(Json::String(self.ty()?.name().to_string()));
+                                    self.sym(",");
+                                }
+                                Ok(())
+                            })();
+                            self.i = at;
+                            if read.is_ok() {
+                                sigs.insert(n.clone(), Json::Array(types));
+                            }
+                        }
+                    }
+                }
+                j += 1;
+            }
+        }
+        if !procs.is_empty() {
+            facts["procs"] = Json::Object(procs);
+            facts["sigs"] = Json::Object(sigs);
+        }
+        // (DROP ... CASCADE: an operator class's partition keys go with it; see `opclass_users`)
+        let cascade = verb == "drop"
+            && self.t[self.i..]
+                .iter()
+                .take_while(|t| **t != Tok::Sym(";"))
+                .any(|t| matches!(t, Tok::Word(w) if w == "cascade"));
         self.skip_rest();
         let key = format!("{PREFIX}{kind}/{name}/{using}");
         let on = if using.is_empty() { String::new() } else { format!(" for access method \"{using}\"") };
@@ -1940,10 +2122,11 @@ impl Parser {
             "create" => Stmt::UserDef {
                 needs: None,
                 key,
-                json: Some("{}".into()),
+                json: Some(facts.to_string()),
                 tag,
                 missing: None,
                 exists: (!if_not).then(|| format!("{label} already exists")),
+                cascade: false,
             },
             _ => Stmt::UserDef {
                 needs: None,
@@ -1955,6 +2138,7 @@ impl Parser {
                     false => format!("{what} \"{name}\" does not exist{on}"),
                 }),
                 exists: None,
+                cascade,
             },
         })
     }
@@ -1984,26 +2168,8 @@ impl Parser {
             tag,
             missing: Some(if if_exists { format!("{SKIP}{missing}, skipping") } else { missing }),
             exists: Some(format!("conversion \"{name}\" already exists")),
+            cascade: false,
         })
-    }
-
-    /// After DROP ACCESS METHOD: `[IF EXISTS] name [CASCADE | RESTRICT]`. The access methods are Postgres's own,
-    /// which none drops; there are no others.
-    pub(super) fn drop_access_method(&mut self) -> Result<Stmt> {
-        let if_exists = self.guard(false)?;
-        let name = self.name()?;
-        self.cascade();
-        if ACCESS_METHODS.contains(&name.as_str()) {
-            return err(
-                "2BP01",
-                format!("cannot drop access method {name} because it is required by the database system"),
-            );
-        }
-        let missing = format!("access method \"{name}\" does not exist");
-        match if_exists {
-            true => Ok(Stmt::NoopNotices("DROP ACCESS METHOD", vec![format!("{missing}, skipping")])),
-            false => err("42704", missing),
-        }
     }
 
     /// `[IF [NOT] EXISTS]`, as (taken, whether it was there).
@@ -2021,6 +2187,9 @@ impl Parser {
     /// CREATE, ALTER and DROP of text search objects, of the objects kept as names only (see `named_stmt`), and of
     /// foreign-data wrappers, servers, user mappings and foreign tables (see `foreign`).
     pub(super) fn foreign_stmt(&mut self, verb: &str) -> Result<Stmt> {
+        if self.is_kw("access") {
+            return self.access_method_stmt(verb);
+        }
         if self.is_kw("text") {
             return self.tsearch_stmt(verb);
         }
@@ -2146,6 +2315,7 @@ impl Parser {
             tag: "CREATE EVENT TRIGGER",
             missing: None,
             exists: Some(format!("event trigger \"{name}\" already exists")),
+            cascade: false,
         })
     }
 
@@ -2165,6 +2335,7 @@ impl Parser {
                 tag: "DROP EVENT TRIGGER",
                 missing,
                 exists: None,
+                cascade: false,
             });
         }
         let json = if self.kw("disable") {
@@ -2178,7 +2349,7 @@ impl Parser {
             None // OWNER TO, RENAME TO: nothing is kept of them
         };
         self.skip_rest();
-        Ok(Stmt::UserDef { needs: None, key, json, tag: "ALTER EVENT TRIGGER", missing, exists: None })
+        Ok(Stmt::UserDef { needs: None, key, json, tag: "ALTER EVENT TRIGGER", missing, exists: None, cascade: false })
     }
 }
 
@@ -2362,7 +2533,7 @@ impl Parser {
         });
         if verb == "drop" {
             self.cascade();
-            return Ok(Stmt::UserDef { needs: None, key, json: None, tag, missing, exists: None });
+            return Ok(Stmt::UserDef { needs: None, key, json: None, tag, missing, exists: None, cascade: false });
         }
         if verb == "create" {
             let opts = self.ts_options()?;
@@ -2413,6 +2584,7 @@ impl Parser {
                 tag,
                 missing: None,
                 exists: Some(format!("{what} already exists")),
+                cascade: false,
             });
         }
         // ALTER
@@ -2462,12 +2634,17 @@ impl Parser {
             }
         };
         let json = json.or_else(|| Some(String::new())).filter(|j| !j.is_empty());
-        Ok(Stmt::UserDef { needs: None, key, json, tag, missing: Some(format!("{what} does not exist")), exists: None })
+        Ok(Stmt::UserDef {
+            needs: None,
+            key,
+            json,
+            tag,
+            missing: Some(format!("{what} does not exist")),
+            exists: None,
+            cascade: false,
+        })
     }
 }
-
-/// Postgres's access methods: its index methods and `heap`.
-pub(super) const ACCESS_METHODS: [&str; 7] = ["btree", "hash", "gist", "gin", "spgist", "brin", "heap"];
 
 /// The default mappings of a built-in configuration, or of a user's, as (token class, dictionaries).
 pub(super) fn ts_maps_of(name: &str) -> Vec<(String, Vec<String>)> {
@@ -3313,6 +3490,31 @@ pub(super) fn aggregates_using(v: &View, f: &functions::Function) -> Result<Vec<
         if uses {
             let (name, types) = key_parts(&k);
             out.push((k.clone(), format!("function {name}({})", pg_types(&types, ","))));
+        }
+    }
+    Ok(out)
+}
+
+/// The operator classes function `f` is a support function of (`FUNCTION n` of CREATE OPERATOR CLASS, kept by the
+/// name the function is stored under): each class's key, and how Postgres names it.
+pub(super) fn opclasses_using(v: &View, f: &functions::Function) -> Result<Vec<(String, String)>> {
+    let mut out = vec![];
+    for r in v.prefix(&format!("{PREFIX}opclass/"))? {
+        let (k, raw) = r?;
+        let j: Json = serde_json::from_str(&raw).unwrap_or_default();
+        // (by its name and, where the class kept them, its argument types: an overload of the name isn't the one)
+        let args: Vec<String> = f.args.iter().map(|a| a.1.name().to_string()).collect();
+        let uses = j["procs"].as_object().is_some_and(|ps| {
+            ps.iter().any(|(n, p)| {
+                p.as_str() == Some(f.name.as_str())
+                    && j["sigs"][n].as_array().is_none_or(|ts| {
+                        ts.iter().map(|t| t.as_str().unwrap_or("")).eq(args.iter().map(String::as_str))
+                    })
+            })
+        });
+        if uses && let Some((name, am)) = k.strip_prefix(&format!("{PREFIX}opclass/")).and_then(|r| r.rsplit_once('/'))
+        {
+            out.push((k.clone(), format!("operator class {name} for access method {am}")));
         }
     }
     Ok(out)

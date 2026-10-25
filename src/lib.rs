@@ -5238,9 +5238,15 @@ impl Core {
             }
             // both sides made a relation's storage anew (REINDEX, SET TABLESPACE: see `sql::FILENODES`), which is
             // maintenance and no definition: the parent's stands, unless this side dropped the table it is of
-            if ch.key.starts_with(sql::FILENODES) {
+            // (and both recorded a table's planner statistics: VACUUM, ANALYZE, see `sql::RELSTATS`; a heap this side
+            // made anew, which the planner model doesn't follow, stays marked so where the parent's stands)
+            if ch.key.starts_with(sql::FILENODES) || ch.key.starts_with(sql::RELSTATS) {
                 if ch.after.is_none() {
                     apply.push(ch);
+                } else if ch.key.starts_with(sql::RELSTATS)
+                    && let Some(kept) = sql::relstats_merged(theirs.as_deref(), ch.after.as_deref())
+                {
+                    apply.push(Change { key: ch.key, before: ch.before, after: Some(Val::from(kept.as_str())) });
                 }
                 continue;
             }
@@ -6789,7 +6795,7 @@ fn settles(o: &MergeOptions) -> HashMap<String, Settle> {
 
 /// The table a key belongs to: a row's, or the one a schema, constraint or index row is for.
 fn table_of(key: &str) -> &str {
-    let k = ["_sonos_tables/", "_sonos_uniq/", "_sonos_ref/", "_sonos_idx/", sql::FILENODES]
+    let k = ["_sonos_tables/", "_sonos_uniq/", "_sonos_ref/", "_sonos_idx/", sql::FILENODES, sql::RELSTATS]
         .iter()
         .find_map(|p| key.strip_prefix(p));
     let k = k.unwrap_or(key);

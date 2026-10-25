@@ -1,6 +1,7 @@
 //! Statements Postgres has for looking after storage and sessions, that a database made of
 //! copy-on-write pages has little or nothing to do for: VACUUM, ANALYZE and REINDEX (no dead rows
-//! to reclaim, indexes always current, no statistics kept), CLUSTER (marks its index, and orders
+//! to reclaim, indexes always current; VACUUM and ANALYZE record the planner's statistics pg_class
+//! shows, see `opt::stats`), CLUSTER (marks its index, and orders
 //! the rows of a table without a primary key: see `cluster`), DISCARD (resets a session: what
 //! pools send between clients), COMMENT ON (checked, not kept) and LOCK TABLE.
 //!
@@ -58,6 +59,10 @@ pub(super) struct Maintain {
     pub vacuum: bool,
     /// VACUUM (PARALLEL n), n > 0: which a temporary table can't be vacuumed with
     pub parallel: bool,
+    /// ANALYZE, or VACUUM (ANALYZE): the tables' columns get statistics (see `opt::stats`)
+    pub analyze: bool,
+    /// VACUUM FULL: each table's heap is rewritten (cluster_rel), which its statistics say (see `opt::stats::How`)
+    pub full: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -98,6 +103,8 @@ pub(super) enum Commented {
     Publication(String),
     /// a large object, by its oid
     LargeObject(i64),
+    /// an access method, by name: Postgres's own or one CREATE ACCESS METHOD made
+    AccessMethod(String),
     /// a database, extension, function, role...: nothing here to look up
     Other,
 }
@@ -321,7 +328,8 @@ impl Parser {
         if only && (others || analyze || full) {
             return bad("ONLY_DATABASE_STATS cannot be specified with other VACUUM options");
         }
-        if targets.is_empty() {
+        // (ONLY_DATABASE_STATS processes no table at all: "We don't process any tables in this case", vacuum.c:525)
+        if targets.is_empty() && !only {
             targets.push(Target::Everything);
         }
         Ok(Stmt::Maintain(Box::new(Maintain {
@@ -332,6 +340,8 @@ impl Parser {
             tablespace: None,
             vacuum: verb == Verb::Vacuum,
             parallel: workers > 0,
+            analyze,
+            full,
         })))
     }
 
@@ -375,6 +385,8 @@ impl Parser {
             tablespace,
             vacuum: false,
             parallel: false,
+            analyze: false,
+            full: false,
         })))
     }
 
@@ -403,6 +415,8 @@ impl Parser {
             tablespace: None,
             vacuum: false,
             parallel: false,
+            analyze: false,
+            full: false,
         })))
     }
 
@@ -502,6 +516,10 @@ impl Parser {
             "large" => {
                 self.expect_kw("object")?;
                 Commented::LargeObject(self.large_object_oid()?)
+            }
+            "access" if self.is_kw("method") => {
+                self.i += 1;
+                Commented::AccessMethod(self.name()?)
             }
             "database" | "extension" | "routine" | "user" | "group" | "policy" | "subscription" | "collation"
             | "conversion" | "language" | "operator" | "cast" | "transform" | "tablespace" | "statistics" | "text"
@@ -622,8 +640,8 @@ fn no_column(column: &str, rel: &str) -> SqlError {
     }
 }
 
-/// VACUUM and ANALYZE: nothing to do, once the names check out. REINDEX: what pg_class shows of a rebuild (see
-/// `rebuild`). CLUSTER: see `cluster`.
+/// VACUUM and ANALYZE: the planner's statistics of the tables they name, once the names check out (see
+/// `record_stats`). REINDEX: what pg_class shows of a rebuild (see `rebuild`). CLUSTER: see `cluster`.
 pub(super) fn maintain(db: &Db, branch: &str, m: &Maintain) -> Result<Output> {
     if m.verb == Verb::Cluster {
         return cluster(db, branch, m);
@@ -659,6 +677,10 @@ pub(super) fn maintain(db: &Db, branch: &str, m: &Maintain) -> Result<Output> {
     // RangeVarCallbackForReindexIndex and ReindexMultipleTables ask, after the tablespace; REINDEX TABLE's is asked
     // with the statement's privileges, see `acl`)
     let who = if m.verb == Verb::Reindex { roles::checked() } else { None };
+    // (the tables VACUUM and ANALYZE record statistics for)
+    let mut record: Vec<Recorded> = vec![];
+    // (whether this runs in the session's temporary tables' database: see `catalog::at_home`)
+    let temp_db = super::catalog::home().is_some_and(|(core, ..)| !std::ptr::eq(&*core, &*db.core));
     for target in &m.targets {
         match target {
             Target::Everything | Target::Database => {}
@@ -687,10 +709,12 @@ pub(super) fn maintain(db: &Db, branch: &str, m: &Maintain) -> Result<Output> {
             Target::Rel(name, cols) => {
                 let vacuuming = matches!(m.verb, Verb::Vacuum | Verb::Analyze);
                 // (as Postgres's vacuum_is_permitted_for_relation: a table's owner, or a role with its privileges, or
-                // a superuser; another is warned and the table skipped)
+                // a superuser; another is warned and the table skipped. In the session's temporary tables' database
+                // every table is the session's own, which Postgres's temporary tables are: their maker's, and no
+                // other session's to see; that database keeps no owners)
                 let skipped = |owner: i64, table: &str| {
                     let Some(who) = super::roles::checked() else { return false };
-                    if who.has_privs_of(owner) {
+                    if temp_db || who.has_privs_of(owner) {
                         return false;
                     }
                     let what = if m.vacuum { "vacuum" } else { "analyze" };
@@ -764,9 +788,11 @@ pub(super) fn maintain(db: &Db, branch: &str, m: &Maintain) -> Result<Output> {
                     if cat.rels[i].kind != 'p' {
                         tree.truncate(1);
                     }
-                    for j in tree {
+                    for &j in &tree {
                         let r = &cat.rels[j];
-                        skipped(cat.rel_acl(r).0, rel_part(&r.name));
+                        if !skipped(cat.rel_acl(r).0, rel_part(&r.name)) {
+                            record.push(recorded(&cat, j, cols));
+                        }
                     }
                 }
                 if let Some(idx) = &m.using
@@ -778,9 +804,153 @@ pub(super) fn maintain(db: &Db, branch: &str, m: &Maintain) -> Result<Output> {
         }
     }
     if m.verb == Verb::Reindex {
-        rebuild(db, branch, m, space)?;
+        // (and the tables' statistics, as each index_build updates its table's: see `index_stats`)
+        let tables = rebuild(db, branch, m, space)?;
+        index_stats(db, branch, &tables)?;
+    }
+    if matches!(m.verb, Verb::Vacuum | Verb::Analyze) {
+        // (the whole database: every table the role may vacuum, without a warning for the others, as Postgres's
+        // get_all_vacuum_rels has it)
+        if m.targets.iter().any(|t| matches!(t, Target::Everything)) {
+            let who = roles::checked();
+            for (j, r) in cat.rels.iter().enumerate() {
+                if matches!(r.kind, 'r' | 'm' | 'p')
+                    && who.as_ref().is_none_or(|w| w.has_privs_of(cat.rel_acl(r).0))
+                    && !record.iter().any(|x: &Recorded| x.name == r.name)
+                {
+                    record.push(recorded(&cat, j, &[]));
+                }
+            }
+        }
+        record_stats(db, branch, m, &record)?;
     }
     Ok(Output::tag(m.verb.tag()))
+}
+
+/// A table VACUUM or ANALYZE records statistics for: its name, whether it is partitioned (and then its
+/// partitions with rows, at any depth), and the columns ANALYZE was given.
+struct Recorded {
+    name: String,
+    partitioned: bool,
+    leaves: Vec<String>,
+    cols: Vec<String>,
+}
+
+fn recorded(cat: &Catalog, i: usize, cols: &[String]) -> Recorded {
+    let r = &cat.rels[i];
+    let mut leaves = vec![];
+    let mut todo = vec![i];
+    while let Some(k) = todo.pop() {
+        for n in &cat.rels[k].hier.created {
+            if let Some(c) = cat.rels.iter().position(|x| x.name == *n) {
+                if cat.rels[c].kind == 'p' {
+                    todo.push(c);
+                } else {
+                    leaves.push(n.clone());
+                }
+            }
+        }
+    }
+    Recorded { name: r.name.clone(), partitioned: r.kind == 'p', leaves, cols: cols.to_vec() }
+}
+
+/// What VACUUM and ANALYZE record of each table (see `opt::stats`): vac_update_relstats's relpages, reltuples and
+/// relallvisible, and the columns ANALYZE gave statistics. A partitioned table has no storage: ANALYZE records its
+/// partitions' rows as its reltuples and -1 pages, VACUUM nothing.
+///
+/// The rows are counted on the world as it is, outside its lock (as Postgres's VACUUM and ANALYZE let writers go
+/// on), and only the statistics that changed are written then, in a write of their own: a table dropped, made
+/// again, altered or given statistics by another statement meanwhile keeps what it has then.
+// ponytail: a TRUNCATE between the two is not seen (it leaves no row to compare when the table had no statistics)
+fn record_stats(db: &Db, branch: &str, m: &Maintain, todo: &[Recorded]) -> Result<()> {
+    use super::opt::stats::{self, How, RelStats};
+    if todo.is_empty() {
+        return Ok(());
+    }
+    let v = db.view_tx(branch)?;
+    let how = How { vacuum: m.vacuum, full: m.full, analyze: m.analyze };
+    // (table, its schema row and statistics row as they were counted, its new statistics)
+    let mut changed: Vec<Counted<'_>> = vec![];
+    let mut counted: HashMap<&str, u64> = HashMap::new();
+    for r in todo.iter().filter(|r| !r.partitioned) {
+        let (schema, raw) = (v.get(&schema_key(&r.name))?, v.get(&stats::key(&r.name))?);
+        let old = stats::load(&v, &r.name)?;
+        let (st, n) = stats::recorded(&v, &r.name, how, &r.cols, old.clone())?;
+        counted.insert(&r.name, n);
+        if old.as_ref() != Some(&st) {
+            changed.push((r.name.as_str(), schema, raw, st));
+        }
+    }
+    if m.analyze {
+        let none = How { vacuum: false, full: false, analyze: false };
+        for r in todo.iter().filter(|r| r.partitioned) {
+            let mut total = 0;
+            for leaf in &r.leaves {
+                total += match counted.get(leaf.as_str()) {
+                    Some(n) => *n,
+                    None => stats::recorded(&v, leaf, none, &[], None)?.1,
+                };
+            }
+            let (schema, raw) = (v.get(&schema_key(&r.name))?, v.get(&stats::key(&r.name))?);
+            let old = stats::load(&v, &r.name)?.unwrap_or_default();
+            let st = RelStats {
+                relpages: -1,
+                reltuples: stats::float4(total as f64),
+                relallvisible: 0,
+                modelled: true,
+                analyzed: old.analyzed.clone(),
+                heap_unknown: old.heap_unknown,
+            };
+            if old != st {
+                changed.push((r.name.as_str(), schema, raw, st));
+            }
+        }
+    }
+    write_stats(db, branch, &changed)
+}
+
+/// A table's new statistics, counted on the world outside its lock: its name, its schema row and statistics row as
+/// they were then, and what they are now (see `write_stats`).
+pub(super) type Counted<'a> = (&'a str, Option<crate::Val>, Option<crate::Val>, super::opt::stats::RelStats);
+
+/// Writes statistics counted outside the branch's lock, in a short write of their own: each where its table's
+/// schema row and statistics row are still as they were counted (a table dropped, made again or altered since, or
+/// given statistics by another statement, keeps what it has).
+pub(super) fn write_stats(db: &Db, branch: &str, changed: &[Counted<'_>]) -> Result<()> {
+    if changed.is_empty() {
+        return Ok(());
+    }
+    db.batch_with::<(), SqlError>(branch, |w| {
+        let mut writes = vec![];
+        for (name, schema, raw, st) in changed {
+            if w.get(&schema_key(name))? == *schema && w.get(&super::opt::stats::key(name))? == *raw {
+                writes.push(st.write(name));
+            }
+        }
+        Ok((writes, ()))
+    })?;
+    Ok(())
+}
+
+/// index_update_stats (index.c:2811) for tables `tables`, each of which had an index built (REINDEX; CREATE INDEX
+/// and ALTER TABLE's, see `Exec::index_stats`): their rows counted on the world as it is, outside its lock, and
+/// their pages and tuples written as `write_stats` writes them. A partitioned table, which has no storage, is left
+/// as it is (DefineIndex builds only its partitions' indexes).
+pub(super) fn index_stats(db: &Db, branch: &str, tables: &[String]) -> Result<()> {
+    use super::opt::stats;
+    let v = db.view_tx(branch)?;
+    let mut changed: Vec<Counted<'_>> = vec![];
+    for name in tables {
+        let Some(mut t) = load_world(&v, name)? else { continue };
+        if t.hier.part.is_some() || !t.schema || changed.iter().any(|c| c.0 == name.as_str()) {
+            continue;
+        }
+        let (schema, raw) = (v.get(&schema_key(name))?, v.get(&stats::key(name))?);
+        if let Some(st) = stats::index_built(&v, &mut t, stats::load(&v, name)?)? {
+            changed.push((name.as_str(), schema, raw, st));
+        }
+    }
+    write_stats(db, branch, &changed)
 }
 
 /// What REINDEX shows of the indexes it rebuilds (each named, or each of a table's; a partitioned table's or index's
@@ -788,8 +958,8 @@ pub(super) fn maintain(db: &Db, branch: &str, m: &Maintain) -> Result<Output> {
 /// `tablespace::move_rel`). Their entries are always current here; this is what pg_class says of a rebuild, in the
 /// statement's transaction. A rebuild is written to the tables' filenode rows alone (see `tablespace::Gens`), so it
 /// merges with any change to their schemas; only a move changes a schema row.
-fn rebuild(db: &Db, branch: &str, m: &Maintain, space: Option<i64>) -> Result<()> {
-    db.batch_with::<(), SqlError>(branch, |v| {
+fn rebuild(db: &Db, branch: &str, m: &Maintain, space: Option<i64>) -> Result<Vec<String>> {
+    let (_, tables) = db.batch_with::<Vec<String>, SqlError>(branch, |v| {
         let cat = Catalog::of(v.core, &v.branch)?;
         // (table, index), each once
         let mut todo: Vec<(String, String)> = vec![];
@@ -881,9 +1051,9 @@ fn rebuild(db: &Db, branch: &str, m: &Maintain, space: Option<i64>) -> Result<()
             }
             writes.push(gens.write(&t.name));
         }
-        Ok((writes, ()))
+        Ok((writes, tables.into_iter().map(|(t, ..)| t.name).collect()))
     })?;
-    Ok(())
+    Ok(tables)
 }
 
 /// Whether table `t` has an index named `ix`: its primary key's, a unique constraint's, or one CREATE INDEX made.
@@ -907,7 +1077,9 @@ pub(super) fn clusterable(v: &View, t: &Table, ix: &str) -> Result<()> {
         return err("42704", format!("index \"{ix}\" for table \"{table}\" does not exist"));
     }
     let x = t.indexes.iter().find(|x| x.name == ix);
-    if t.ann.iter().any(|(n, _, _)| n == ix) || x.is_some_and(|x| x.gin) {
+    // (nor one of an access method that doesn't order, hash or brin: amclusterable)
+    let unordered = x.is_some_and(|x| super::indexam::method(x.kind()).is_some_and(|a| !a.clusterable));
+    if t.ann.iter().any(|(n, _, _)| n == ix) || x.is_some_and(|x| x.gin) || unordered {
         return err(
             UNSUPPORTED,
             format!("cannot cluster on index \"{ix}\" because access method does not support clustering"),
@@ -1147,6 +1319,17 @@ pub(super) fn comment(db: &Db, branch: &str, c: &Comment) -> Result<Output> {
                 return err(NO_FUNCTION, format!("aggregate {shown} does not exist"));
             }
             return Ok(Output::tag("COMMENT"));
+        }
+        // an access method's, which has to be there, and is a superuser's to give (check_object_ownership)
+        Commented::AccessMethod(name) => {
+            let cat = Catalog::of(&db.core, branch)?;
+            if cat.am_oid(name) == 0 {
+                return err("42704", format!("access method \"{name}\" does not exist"));
+            }
+            if !super::roles::current().is_none_or(|w| w.superuser) {
+                return err("42501", "must be superuser");
+            }
+            Some(format!("am/{name}"))
         }
         Commented::Schema(s) => {
             let cat = Catalog::of(&db.core, branch)?;

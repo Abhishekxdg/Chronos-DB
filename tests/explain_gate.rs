@@ -54,9 +54,16 @@ fn chronos_steps_by_default_and_postgres_plan_when_asked() {
     assert_eq!(n.level, "NOTICE");
     assert_eq!(n.detail.as_deref(), Some("Chronos may run the query differently."));
     assert_eq!(n.hint.as_deref(), Some("SET chronos.explain = chronos shows how Chronos runs it."));
-    // (only EXPLAIN (COSTS OFF) without ANALYZE shows it: the others are Chronos's steps, with no NOTICE)
-    assert!(!plan(&db, &mut s, "explain select * from pl where a = 1").1);
-    assert!(!plan(&db, &mut s, "explain (analyze, costs off) select * from pl where a = 1").1);
+    // (with COSTS too, the model's numbers; ANALYZE only where Chronos's executor ran the plan's nodes: here it found
+    // the row through its search index, not a Seq Scan's Filter, so its own steps, with no NOTICE)
+    let (costed, said) = plan(&db, &mut s, "explain select * from pl where a = 1");
+    assert!(said);
+    assert_eq!(costed, ["Seq Scan on pl  (cost=0.00..25.88 rows=6 width=36)", "  Filter: (a = 1)"]);
+    run(&db, &mut s, "insert into pl values (1, 'x')");
+    let (analyzed, said) = plan(&db, &mut s, "explain (analyze, costs off, timing off) select * from pl where a = 1");
+    assert!(!said, "{analyzed:?}");
+    assert!(analyzed[0].contains("search index"), "{analyzed:?}");
+    run(&db, &mut s, "delete from pl");
     run(&db, &mut s, "reset chronos.explain");
     assert_eq!(one(&db, &mut s, "show chronos.explain"), "chronos");
     assert_eq!(plan(&db, &mut s, Q), (own, false));

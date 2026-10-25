@@ -95,7 +95,7 @@ fn trigger_con(name: &str, deferrable: bool, deferred: bool) -> Con {
 }
 
 /// An index, as pg_index shows it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Idx {
     pub name: String,
     pub unique: bool,
@@ -112,7 +112,11 @@ pub struct Idx {
     pub pred_pretty: Option<String>,
     /// false for an index made ON ONLY a partitioned table that a partition has no index of
     pub valid: bool,
+    /// the built-in access method it is and does as (pg_index's properties: see `indexam`)
     pub method: &'static str,
+    /// the access method CREATE ACCESS METHOD made that it is of (`method` is its handler's), as pg_class.relam and
+    /// pg_get_indexdef name it
+    pub made: Option<String>,
     /// NULLS NOT DISTINCT
     pub nnd: bool,
     /// a partition's index that is its parent's: that one's name
@@ -129,6 +133,77 @@ pub struct Idx {
     /// and `tablespace::Gens`, which `tables` gives it from)
     pub tablespace: i64,
     pub filenode: i64,
+    /// how many of `cols` (and `parts`, `colls`) are key columns: those after them are INCLUDE's
+    /// (pg_index.indnkeyatts)
+    pub nkey: usize,
+    /// each key column's pg_index.indoption, pg_index.indclass (0 for a class that isn't one of Postgres's own) and
+    /// its class's name ("" for none), and the type its index column holds where that isn't the indexed type's
+    /// (opckeytype; 0 where it is)
+    pub opts: Vec<i64>,
+    pub classes: Vec<i64>,
+    pub class_names: Vec<String>,
+    pub keytypes: Vec<i64>,
+    /// each key column's operator class as pg_get_indexdef writes it after the column: ` text_pattern_ops`, empty
+    /// for its type's default
+    pub shown_classes: Vec<String>,
+}
+
+impl Idx {
+    /// Its access method's name, as pg_am has it: the one CREATE ACCESS METHOD made that it is of, or its own.
+    pub fn am_name(&self) -> &str {
+        self.made.as_deref().unwrap_or(self.method)
+    }
+
+    /// Its columns as pg_get_indexdef writes them (ruleutils.c:1338-1452): `(a, b DESC) INCLUDE (c)`, each key
+    /// column with its COLLATE, its operator class where it isn't its type's default, and its ordering where the
+    /// access method orders (DESC with nulls first, its default, is just DESC). `pretty`: pg_get_indexdef(.., true)'s
+    /// forms of expressions.
+    pub fn columns_def(&self, pretty: bool) -> String {
+        let parts = if pretty { &self.parts_pretty } else { &self.parts };
+        let mut d = String::from("(");
+        for (k, p) in parts.iter().enumerate() {
+            if k == self.nkey {
+                d.push_str(") INCLUDE (");
+            } else if k > 0 {
+                d.push_str(", ");
+            }
+            d.push_str(p);
+            if k >= self.nkey {
+                continue;
+            }
+            d.push_str(self.collate.get(k).map_or("", String::as_str));
+            d.push_str(self.shown_classes.get(k).map_or("", String::as_str));
+            let opt = self.opts.get(k).copied().unwrap_or(0);
+            let (desc, first) =
+                (opt & i64::from(btree::INDOPTION_DESC) != 0, opt & i64::from(btree::INDOPTION_NULLS_FIRST) != 0);
+            d.push_str(match (desc, first) {
+                (true, true) => " DESC",
+                (true, false) => " DESC NULLS LAST",
+                (false, true) => " NULLS FIRST",
+                (false, false) => "",
+            });
+        }
+        d.push(')');
+        d
+    }
+}
+
+/// What an index's key columns are beyond their values (see `Idx`): of access method `am`, each column's type, its
+/// type's id (a varchar's and a char(n)'s own), the operator class it names and its indoption.
+fn key_facts(idx: &mut Idx, am: &str, keys: &[(Type, i64, Option<&str>, i16)]) {
+    idx.nkey = keys.len();
+    for &(ty, oid, named, opt) in keys {
+        let class = super::indexam::class_of(am, named, ty, oid);
+        let (class_oid, name, keytype) = class.unwrap_or((0, String::new(), 0));
+        idx.opts.push(i64::from(opt));
+        idx.classes.push(class_oid);
+        idx.shown_classes.push(match named {
+            Some(n) if !super::indexam::is_default(am, n, ty, oid) => format!(" {}", ident(n)),
+            _ => String::new(),
+        });
+        idx.class_names.push(name);
+        idx.keytypes.push(keytype);
+    }
 }
 
 /// A table's constraints and indexes. A UNIQUE constraint makes an index of its name, as in
@@ -138,6 +213,19 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
     let named = |id: u32| t.cols.iter().find(|c| c.id == id).map_or_else(String::new, |c| ident(&c.name));
     // a column's collation, for text
     let coll_of = |id: u32| t.cols.iter().find(|c| c.id == id).and_then(|c| collatable(c.ty).then_some(c.coll));
+    // a column's type, and its type's id as pg_attribute has it (a varchar's and a char(n)'s their own)
+    let typed = |id: u32| match t.cols.iter().find(|c| c.id == id) {
+        Some(c) => (c.ty, super::col_oid(c)),
+        None => (Type::Text, 25),
+    };
+    // a constraint's index: a btree of its columns' default classes, in their own order
+    let plain_keys = |ids: &mut dyn Iterator<Item = u32>| -> Vec<(Type, i64, Option<&'static str>, i16)> {
+        ids.map(|id| {
+            let (ty, oid) = typed(id);
+            (ty, oid, None, 0)
+        })
+        .collect()
+    };
     let (mut cons, mut idx) = (vec![], vec![]);
     // what a partition has of its parent's (see `hier::clone_constraints`): the parent's name for it
     let up = t.hier.of.as_ref().and_then(|(p, _)| load(v, p).ok().flatten());
@@ -184,7 +272,7 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
         let is_clustered = clustered(&name);
         let is_replident = replident(&name);
         let pkey = name.clone();
-        idx.push(Idx {
+        let mut x = Idx {
             name,
             unique: true,
             primary: true,
@@ -203,7 +291,10 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
             collate: vec![],
             tablespace: t.hier.index_space(&pkey),
             filenode: 0,
-        });
+            ..Idx::default()
+        };
+        key_facts(&mut x, "btree", &plain_keys(&mut keys.iter().map(|&i| t.cols[i].id)));
+        idx.push(x);
     }
     for u in t.uniques.iter().filter(|u| !t.indexes.iter().any(|x| x.name == u.name)) {
         let parts: Vec<String> = u.cols.iter().map(|&c| named(c)).collect();
@@ -229,7 +320,7 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
             bin: None,
             given_here: false,
         });
-        idx.push(Idx {
+        let mut x = Idx {
             name: u.name.clone(),
             unique: true,
             primary: u.primary,
@@ -248,12 +339,15 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
             collate: vec![],
             tablespace: t.hier.index_space(&u.name),
             filenode: 0,
-        });
+            ..Idx::default()
+        };
+        key_facts(&mut x, "btree", &plain_keys(&mut u.cols.iter().copied()));
+        idx.push(x);
     }
     for x in &t.indexes {
         let mut exprs = x.exprs.iter();
-        let (mut colls, mut collate) = (vec![], vec![]);
-        let (cols, parts): (Vec<i64>, Vec<String>) = x
+        let (mut colls, mut collate, mut types) = (vec![], vec![], vec![]);
+        let (mut cols, parts): (Vec<i64>, Vec<String>) = x
             .cols
             .iter()
             .enumerate()
@@ -262,11 +356,17 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
                 let (n, part, own) = match c {
                     btree::EXPR => {
                         let text = exprs.next().map_or("", String::as_str);
-                        let text_typed = super::index_expr(t, text)
-                            .is_ok_and(|e| super::ty_in(&e, &t.cols, &[], &[]).is_ok_and(collatable));
-                        (0, expr_def(text, &t.cols, false), text_typed.then_some(Coll::DEFAULT))
+                        let ty = super::index_expr(t, text)
+                            .ok()
+                            .and_then(|e| super::ty_in(&e, &t.cols, &[], &[]).ok())
+                            .unwrap_or(Type::Text);
+                        types.push((ty, i64::from(ty.oid())));
+                        (0, expr_def(text, &t.cols, false), collatable(ty).then_some(Coll::DEFAULT))
                     }
-                    c => (num(c), named(c), coll_of(c)),
+                    c => {
+                        types.push(typed(c));
+                        (num(c), named(c), coll_of(c))
+                    }
                 };
                 colls.push(own.map(|_| x.coll(k)));
                 collate.push(match own {
@@ -279,11 +379,9 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
         let pred = x.filter.as_deref().map(|f| expr_def(f, &t.cols, true));
         let unique = t.uniques.iter().any(|u| u.name == x.name);
         let nnd = t.uniques.iter().any(|u| u.name == x.name && u.nnd);
-        let method = match &x.trgm {
-            Some(class) if class.starts_with("gist") => "gist",
-            _ if x.gin => "gin",
-            _ => "btree",
-        };
+        // (as pg_am names it: the built-in one it does as, which an access method made here is over, and that one)
+        let method = AMS.iter().find(|(_, n, ..)| *n == x.kind()).map_or("btree", |(_, n, ..)| *n);
+        let made = x.builtin.as_ref().map(|_| x.method().to_string());
         let from = up.as_ref().filter(|_| given(&x.name)).and_then(|p| {
             if unique {
                 p.uniques.iter().find(|pu| same_cols(&pu.cols, &x.cols)).map(|pu| pu.name.clone())
@@ -323,12 +421,19 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
                 }
             })
             .collect();
-        // (a trigram index's one part has its operator class after it, as Postgres shows one that isn't the default)
+        // each key part's operator class as written (a trigram index kept before classes were has its one in `trgm`)
+        let keys: Vec<(Type, i64, Option<&str>, i16)> =
+            types.iter().enumerate().map(|(k, &(ty, oid))| (ty, oid, x.said_class(k), x.opt(k))).collect();
+        // INCLUDE's columns after the key parts: no collation, class or ordering of their own
         let (mut parts, mut parts_pretty) = (parts, parts_pretty);
-        if let Some(class) = &x.trgm {
-            parts.iter_mut().chain(parts_pretty.iter_mut()).for_each(|p| *p = format!("{p} {class}"));
+        for &c in &x.include {
+            cols.push(num(c));
+            parts.push(named(c));
+            parts_pretty.push(named(c));
+            colls.push(None);
+            collate.push(String::new());
         }
-        idx.push(Idx {
+        let mut ix = Idx {
             name: x.name.clone(),
             unique,
             primary: false,
@@ -339,6 +444,7 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
             pred_pretty,
             valid: valid_up(&x.name),
             method,
+            made: made.clone(),
             nnd,
             given: from,
             clustered: clustered(&x.name),
@@ -347,7 +453,21 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
             collate,
             tablespace: t.hier.index_space(&x.name),
             filenode: 0,
-        });
+            ..Idx::default()
+        };
+        key_facts(&mut ix, made.as_deref().unwrap_or(method), &keys);
+        // (an access method made here: each key column's class is one made for it, the one it names or the default
+        // made for its type, which pg_get_indexdef leaves out)
+        if let Some(am) = &made {
+            for (k, &(ty, oid, named, _)) in keys.iter().enumerate() {
+                let default = super::accessmethod::made_default_class(v, am, ty, oid).ok().flatten();
+                if named.is_none() || named.map(String::from) == default {
+                    ix.shown_classes[k] = String::new();
+                }
+                ix.class_names[k] = named.map(String::from).or(default).unwrap_or_default();
+            }
+        }
+        idx.push(ix);
     }
     for (name, c, ops) in &t.ann {
         // the operator class, as Postgres writes it: only when it isn't the type's default
@@ -366,6 +486,7 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
             pred_pretty: None,
             valid: true,
             method: "hnsw",
+            made: None,
             nnd: false,
             given: None,
             clustered: false,
@@ -374,6 +495,13 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
             collate: vec![],
             tablespace: t.hier.index_space(name),
             filenode: 0,
+            // (pgvector's classes have no pg_opclass row here: its part shows its own)
+            nkey: 1,
+            opts: vec![0],
+            classes: vec![0],
+            class_names: vec![ops.clone().unwrap_or_else(|| "vector_l2_ops".into())],
+            keytypes: vec![0],
+            shown_classes: vec![String::new()],
         });
     }
     for f in &t.fks {
@@ -847,6 +975,8 @@ pub(crate) struct Catalog {
     pub(super) evts: Vec<(String, Json)>,
     /// the tablespaces, Postgres's two first (see `tablespace`)
     pub(super) spaces: Vec<super::tablespace::Space>,
+    /// the access methods CREATE ACCESS METHOD made, by name (see `accessmethod`)
+    pub(super) ams: Vec<super::accessmethod::MadeAm>,
     /// the oids of the relations, indexes, constraints, schemas, enum types, collations and row types, worked out
     /// from their names (see `Named`)
     pub(super) named: Named,
@@ -1056,6 +1186,7 @@ impl Catalog {
         let extensions = super::pgcrypto::extensions(&v)?;
         let evts = super::userdefs::event_triggers(&v)?;
         let spaces = super::tablespace::load(&v)?;
+        let ams = super::accessmethod::all(&v)?;
         let mut cat = Catalog {
             colls,
             rels,
@@ -1083,6 +1214,7 @@ impl Catalog {
             extensions,
             evts,
             spaces,
+            ams,
             named: Named::default(),
         };
         cat.named = Named::of(&cat);
@@ -1118,6 +1250,7 @@ impl Catalog {
             extensions: vec![],
             evts: vec![],
             spaces: vec![],
+            ams: vec![],
             named: Named::default(),
         }
     }
@@ -1162,6 +1295,7 @@ impl Catalog {
             "function" => self.funcs.iter().any(|f| f.sig() == rest),
             // (lo_unlink takes a large object's comment with it)
             "large object" => true,
+            "am" => self.am_oid(rest) != 0,
             _ => false,
         }
     }
@@ -1215,6 +1349,7 @@ impl Catalog {
                     .find(|(_, k)| self.pubs[*k].name == rest)
                     .map(|(o, _)| (o, 6104, 0)),
                 "large object" => rest.parse().ok().map(|o| (o, 2613, 0)),
+                "am" => Some((self.am_oid(rest), 2601, 0)).filter(|(o, ..)| *o != 0),
                 _ => None,
             };
             if let Some((oid, class, sub)) = found {
@@ -1277,6 +1412,10 @@ impl Catalog {
             // (a role's, which Postgres keeps in pg_shdescription: by its oid, so it stays through a rename)
             (None, _) if sub == 0 && is("pg_authid") && self.reg.by_oid(oid).is_some() => format!("role/{oid}"),
             _ if sub == 0 && class.as_deref() == Some("pg_largeobject") => format!("large object/{oid}"),
+            // (an access method's, by name)
+            (None, _) if sub == 0 && is("pg_am") && self.access_methods().iter().any(|a| a.0 == oid) => {
+                format!("am/{}", self.access_methods().into_iter().find(|a| a.0 == oid)?.1)
+            }
             (None, _) if sub == 0 && is("pg_proc") && self.func_oids.contains(&oid) => {
                 let k = self.func_oids.iter().position(|o| *o == oid)?;
                 format!("function/{}", self.funcs[k].sig())
@@ -1296,6 +1435,24 @@ impl Catalog {
             _ => super::roles::BOOTSTRAP,
         };
         super::acl::shown(&self.reg, e, owner)
+    }
+
+    /// The access methods as pg_am lists them: Postgres's own (pgvector's hnsw once an index uses it, as Postgres has
+    /// it only where the extension is), then those CREATE ACCESS METHOD made: oid, name, handler, kind (`i`, `t`).
+    pub(super) fn access_methods(&self) -> Vec<(i64, String, String, char)> {
+        let own = AMS
+            .iter()
+            .filter(|(_, n, ..)| *n != "hnsw" || self.idx.iter().any(|(_, x)| x.method == "hnsw"))
+            .map(|(o, n, h, k)| (*o, n.to_string(), h.to_string(), k.chars().next().unwrap_or('i')));
+        own.chain(self.ams.iter().map(|a| (a.oid, a.name.clone(), a.handler.clone(), a.kind))).collect()
+    }
+
+    /// Access method `name`'s oid, Postgres's own or one made here (0: none).
+    pub(super) fn am_oid(&self, name: &str) -> i64 {
+        match AMS.iter().find(|(_, n, ..)| *n == name) {
+            Some((o, ..)) => *o,
+            None => self.ams.iter().find(|a| a.name == name).map_or(0, |a| a.oid),
+        }
     }
 
     /// Relation `i`'s oid, worked out from its name (see `Named`).
@@ -1461,9 +1618,12 @@ impl Catalog {
             Some(s) => return self.oid_of(&qualify(s, name)),
             None => {}
         }
-        // a temporary table first, as Postgres reads pg_temp first; else the first schema of the path that has a
-        // relation or an index of the name (a serial's sequence too), public only where it is on the path
-        if has_temp(name)
+        // a temporary table (or a temporary table's index) first, as Postgres reads pg_temp first; else the first
+        // schema of the path that has a relation or an index of the name (a serial's sequence too), public only where
+        // it is on the path
+        let temp_index =
+            || self.idx.iter().any(|(r, x)| x.name == name && schema_part(&self.rels[*r].name) == TEMP_SCHEMA);
+        if (has_temp(name) || temp_index())
             && let Some(o) = self.oid_of(&format!("{TEMP_SCHEMA}.{name}"))
         {
             return Some(o);
@@ -1522,13 +1682,12 @@ impl Catalog {
         let unique = if x.unique { "UNIQUE " } else { "" };
         // (an index of a partitioned table is made on the table alone, and its partitions' attached to it)
         let only = if self.rels[rel].kind == 'p' { "ONLY " } else { "" };
-        let parts: Vec<String> = (if pretty { &x.parts_pretty } else { &x.parts })
-            .iter()
-            .enumerate()
-            .map(|(k, p)| format!("{p}{}", x.collate.get(k).map_or("", String::as_str)))
-            .collect();
-        let mut d =
-            format!("CREATE {unique}INDEX {} ON {only}{on} USING {} ({})", ident(&x.name), x.method, parts.join(", "));
+        let mut d = format!(
+            "CREATE {unique}INDEX {} ON {only}{on} USING {} {}",
+            ident(&x.name),
+            ident(x.am_name()),
+            x.columns_def(pretty)
+        );
         if x.nnd {
             d.push_str(" NULLS NOT DISTINCT");
         }
@@ -1856,6 +2015,31 @@ static BINARY_CASTS: std::sync::LazyLock<HashSet<(i64, i64)>> = std::sync::LazyL
         .collect()
 });
 
+/// Postgres's built-in casts that are binary-coercible (castmethod `b`), in any context: (source, target).
+static RELABEL_CASTS: std::sync::LazyLock<HashSet<(i64, i64)>> = std::sync::LazyLock::new(|| {
+    let cols = catalog_schema::columns("pg_cast");
+    let at = |n: &str| cols.iter().position(|(c, _)| c == n);
+    let (Some(s), Some(t), Some(method)) = (at("castsource"), at("casttarget"), at("castmethod")) else {
+        return HashSet::new();
+    };
+    let int = |v: &Value| if let Value::Int(n) = v { *n } else { 0 };
+    (catalog_schema::builtin_rows("pg_cast").iter())
+        .filter(|r| r[method].to_text() == "b")
+        .map(|r| (int(&r[s]), int(&r[t])))
+        .collect()
+});
+
+/// Whether a value of built-in type `source` becomes one of `target` by a cast that only relabels it (castmethod
+/// `b`): coerce_type makes a RelabelType of it, not a function call.
+pub(super) fn relabels(source: i64, target: i64) -> bool {
+    RELABEL_CASTS.contains(&(source, target))
+}
+
+/// Whether `oid` is a built-in base type (typtype `b`) that isn't an array.
+pub(super) fn builtin_scalar(oid: i64) -> bool {
+    TYPE_SHAPES.get(&oid).is_some_and(|&(kind, elem, _)| kind == 'b' && elem.is_none())
+}
+
 /// The typtype of a type made with CREATE TYPE or CREATE DOMAIN, by its row: a domain's `d`, an enum's `e` (one with
 /// no labels too), a composite type's `c` (one of no attributes too, whose row says `"empty": true`; a shell type's,
 /// `CREATE TYPE name`, whose fields are none and whose row doesn't, `p`: see `sql::shell_row`), a range type's `r` and
@@ -2094,6 +2278,40 @@ pub(super) fn call(f: CtxFn, a: &[Value]) -> Result<Value> {
                 Some(Obj::Index(r, x)) => Text(cat.index_def(r, x, col, a.get(2) == Some(&Bool(true)))),
                 _ => Null,
             }
+        }
+        // what an index access method, an index or an index's column can do (see `indexam::property`): NULL for
+        // what isn't one, or a property no method has
+        CtxFn::IndexProperty(which) => {
+            let Some(prop) = a.last().filter(|p| **p != Null).map(Value::to_text) else { return Ok(Null) };
+            let col = match which {
+                2 => match coerce(a[1].clone(), Type::BigInt)? {
+                    Int(n) if n > 0 => n,
+                    _ => return Ok(Null),
+                },
+                _ => 0,
+            };
+            let found = match (which, oid(&a[0])?) {
+                (0, Some(o)) => AMS
+                    .iter()
+                    .find(|(x, ..)| *x == o)
+                    .map(|(_, n, ..)| *n)
+                    .or_else(|| cat.ams.iter().find(|a| a.oid == o && a.kind == 'i').map(|a| a.builtin()))
+                    .and_then(super::indexam::method)
+                    .map(|am| (am, None)),
+                (_, Some(o)) => match cat.find(o) {
+                    Some(Obj::Index(_, x)) => super::indexam::method(x.method).map(|am| (am, Some(x))),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some((am, x)) = found else { return Ok(Null) };
+            let facts = x.map(|x| super::indexam::Facts {
+                natts: x.cols.len(),
+                nkey: x.nkey,
+                opts: &x.opts,
+                classes: &x.class_names,
+            });
+            super::indexam::property(am, facts.as_ref(), col, &prop).map_or(Null, Bool)
         }
         CtxFn::PartKeyDef => match oid(&a[0])?.and_then(|o| cat.find(o)) {
             Some(Obj::Rel(i)) => cat.rels[i].hier.part.as_ref().map_or(Null, |p| Text(p.def.clone())),
@@ -3252,21 +3470,24 @@ pub(super) const TEMP_SCHEMA: &str = "pg_temp";
 pub(super) const TEMP_SCHEMA_OID: i64 = 16384;
 
 /// The oid Postgres gives the catalog table or view of this name (what `tableoid` says, and
-/// `'pg_class'::regclass`).
+/// `'pg_class'::regclass`). A view has its own, the one initdb gives it in Postgres 16.15 (system_views.sql makes
+/// them from 12000, FirstUnpinnedObjectId), so `'pg_roles'::regclass` shows pg_roles and `1260::regclass` pg_authid.
 pub(super) const CATALOG_OIDS: &[(&str, i64)] = &[
     ("pg_class", 1259),
-    ("pg_tables", 1259),
-    ("pg_views", 1259),
-    ("pg_matviews", 1259),
-    ("pg_indexes", 1259),
-    ("pg_sequences", 1259),
+    ("pg_roles", 12000),
+    ("pg_shadow", 12005),
+    ("pg_user", 12014),
+    ("pg_views", 12028),
+    ("pg_tables", 12033),
+    ("pg_matviews", 12038),
+    ("pg_indexes", 12043),
+    ("pg_sequences", 12048),
+    ("pg_settings", 12104),
     ("pg_type", 1247),
     ("pg_attribute", 1249),
     ("pg_proc", 1255),
     ("pg_database", 1262),
-    ("pg_roles", 1260),
     ("pg_authid", 1260),
-    ("pg_user", 1260),
     ("pg_namespace", 2615),
     ("pg_constraint", 2606),
     ("pg_index", 2610),
@@ -3284,7 +3505,6 @@ pub(super) const CATALOG_OIDS: &[(&str, i64)] = &[
     ("pg_rewrite", 2618),
     ("pg_collation", 3456),
     ("pg_partitioned_table", 3350),
-    ("pg_settings", 1259),
     ("pg_tablespace", 1213),
     ("pg_operator", 2617),
     ("pg_cast", 2605),
@@ -3330,11 +3550,6 @@ pub(super) const CATALOG_OIDS: &[(&str, i64)] = &[
 
 pub(super) fn table_oid(name: &str) -> Option<i64> {
     CATALOG_OIDS.iter().find(|(n, _)| *n == name).map(|(_, o)| *o)
-}
-
-/// pg_am's oid of an index method.
-pub(super) fn am_oid(method: &str) -> i64 {
-    AMS.iter().find(|(_, n, ..)| *n == method).map_or(0, |(o, ..)| *o)
 }
 
 /// pg_am: oid, name, handler function, and kind (t table, i index); hnsw is pgvector's.
@@ -3441,10 +3656,13 @@ pub(super) fn rows(branch: &str, name: &str, cat: &Catalog) -> Option<Rows> {
                 .enumerate()
                 .map(|(k, (i, x))| {
                     let n = x.cols.len() as i64;
-                    let zeros = vector(&vec![0; x.cols.len()]);
-                    let colls: Vec<i64> = (0..x.cols.len())
+                    // (indcollation, indclass and indoption are the key columns' alone: INCLUDE's have none)
+                    let nkey = x.nkey.min(x.cols.len());
+                    let colls: Vec<i64> = (0..nkey)
                         .map(|p| x.colls.get(p).copied().flatten().map_or(0, |c| cat.collation_oid(c)))
                         .collect();
+                    let keyed =
+                        |v: &[i64]| vector(&(0..nkey).map(|p| v.get(p).copied().unwrap_or(0)).collect::<Vec<_>>());
                     let exprs: Vec<&String> =
                         x.cols.iter().zip(&x.parts).filter(|(c, _)| **c == 0).map(|(_, p)| p).collect();
                     let exprs = if exprs.is_empty() {
@@ -3456,7 +3674,7 @@ pub(super) fn rows(branch: &str, name: &str, cat: &Catalog) -> Option<Rows> {
                         int(cat.idx_oid(k)),
                         int(cat.rel_oid(*i)),
                         int(n),
-                        int(n),
+                        int(nkey as i64),
                         b(x.unique),
                         b(x.nnd),
                         b(x.primary),
@@ -3470,8 +3688,8 @@ pub(super) fn rows(branch: &str, name: &str, cat: &Catalog) -> Option<Rows> {
                         b(x.replident),
                         vector(&x.cols),
                         vector(&colls),
-                        zeros.clone(),
-                        zeros,
+                        keyed(&x.classes),
+                        keyed(&x.opts),
                         exprs,
                         x.pred.as_deref().map_or(Null, t),
                     ]
@@ -3635,12 +3853,11 @@ pub(super) fn rows(branch: &str, name: &str, cat: &Catalog) -> Option<Rows> {
         ),
         "pg_am" => (
             &[("oid", Oid), ("amname", T), ("amhandler", Type::Reg(Reg::Proc)), ("amtype", T)],
-            // (hnsw is pgvector's: listed once an index uses it, as Postgres lists it only where the extension is)
-            AMS.iter()
-                .filter(|(_, n, ..)| *n != "hnsw" || cat.idx.iter().any(|(_, x)| x.method == "hnsw"))
+            cat.access_methods()
+                .into_iter()
                 .map(|(o, n, h, k)| {
-                    let handler = catalog_schema::builtin_procs(h).first().copied().unwrap_or(0);
-                    vec![int(*o), t(n), Value::Reg(handler, Reg::Proc), t(k)]
+                    let handler = catalog_schema::builtin_procs(&h).first().copied().unwrap_or(0);
+                    vec![int(o), t(&n), Value::Reg(handler, Reg::Proc), t(&k.to_string())]
                 })
                 .collect(),
         ),
@@ -3765,7 +3982,7 @@ pub(super) fn rows(branch: &str, name: &str, cat: &Catalog) -> Option<Rows> {
                         t(&value),
                         Null,
                         t("Customized Options"),
-                        t(if name == "chronos.explain" { super::EXPLAIN_SETTING_ABOUT } else { "" }),
+                        t(super::chronos_setting_about(&name)),
                         Null,
                         t(if read_only { "internal" } else { "user" }),
                         t("string"),

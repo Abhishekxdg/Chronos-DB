@@ -44,7 +44,7 @@ also brought over (5):
 
 brought over in part (2):
   - database name: Postgres's shop is the world main here (current_database() says main)
-  - index orders_status: a hash index came over as a btree (it finds the same rows)
+  - index orders_status: a hash index is kept and shown as one, but is a btree here (it finds the same rows)
 
 not imported (3):
   - extension isn: not in Chronos (the ones it has are built in: pgvector, PostGIS points, pgcrypto, uuid-ossp, citext, hstore, ltree, pg_trgm and others)
@@ -60,7 +60,7 @@ Read the whole report. An extension Chronos has built in is made as Postgres had
 
 **What comes over:** schemas; enum, composite, range and domain types (with defaults, `NOT NULL` and checks); sequences (with `CACHE`, set to where they were, so `serial` and identity columns go on from there); tables with their columns, defaults, `GENERATED ... AS IDENTITY`, primary keys, `UNIQUE`, `CHECK`, `NOT NULL`, exclusion constraints, partitions and inheritance; every row; foreign keys; indexes; views and materialized views; SQL and PL/pgSQL functions and procedures; plain aggregates; triggers; rules; comments. The full list is in [SQL: Moving from Postgres](sql.md#moving-from-postgres).
 
-**What comes over in part, and is listed:** an index method Chronos has no use for (`hash` and `brin` become btrees; they find the same rows), `DESC`/`NULLS FIRST` and `INCLUDE` on an index, operator classes (but pgvector's and pg_trgm's, which are kept) and storage parameters. A table whose partitioning or inheritance Chronos refuses comes over as one plain table with all its rows.
+**What comes over in part, and is listed:** an index's method where Chronos has no index of its own for it (`hash`, `brin`), its `DESC`/`NULLS FIRST`, its `INCLUDE` columns and its operator classes are kept and shown in the catalog as Postgres had them (`pg_get_indexdef`, `\d`), but the index itself is one ascending btree, which finds the same rows (pgvector's and pg_trgm's classes, which pick the index Chronos builds, aren't listed); and storage parameters. A table whose partitioning or inheritance Chronos refuses comes over as one plain table with all its rows.
 
 **What doesn't come over, and is listed:** extensions other than the ones built in (`vector`, `postgis` points, `citext`, `hstore`, `ltree`, `pg_trgm`, `pgcrypto` and the others on [Postgres compatibility](postgres-compatibility.md#known-gaps)); functions in languages other than SQL and PL/pgSQL (C, PL/Python, PL/v8, ...); ordered-set aggregates; operators; event triggers; publications; foreign tables; row-level security and its policies (make them again with `CREATE POLICY`: Chronos has row-level security, the importer doesn't carry it yet); columns' collations (text sorts by bytes, as `COLLATE "C"` does, unless you give a column an ICU collation); roles, grants and passwords.
 
@@ -159,7 +159,7 @@ The full list is on [Postgres compatibility](postgres-compatibility.md#known-gap
 - **`ALTER TABLE ... ADD COLUMN` with a default that differs per row** (`random()`, `gen_random_uuid()`, `serial`, a sequence's value, a function of your own) is refused (0A000) on a table that has rows, where Postgres fills each row: add the column, `UPDATE` it, then `ALTER COLUMN ... SET DEFAULT`. A constant, `now()` or `current_date` default works as in Postgres. Migration tools that add such columns to existing tables need that step by hand.
 - **History is kept for 1 hour by default.** Chronos keeps old versions of rows for time travel and undo. A new database keeps 1 hour (`alter system set history_retention = '30 days'` keeps more, at the cost of disk); a database made by an earlier release keeps the 30 days it had.
 - **Text sorts by bytes** (`COLLATE "C"`) unless a column has an ICU collation, where your Postgres probably used `en_US.UTF-8`. `ORDER BY name` can give a different order; give the column `collate "en-US-x-icu"` if it matters. `chronos import` says so first in its report when the source database's collation isn't `C`, `POSIX` or `C.UTF-8`, naming the collation to use.
-- **`EXPLAIN` output** shows how Chronos runs the statement, not Postgres's plan; don't parse it. `SET chronos.explain = postgres` makes `EXPLAIN (COSTS OFF)` of simple statements show PostgreSQL 16's plan, with a NOTICE (see [EXPLAIN](sql.md#explain)).
+- **`EXPLAIN` output** shows how Chronos runs the statement, not Postgres's plan; don't parse it. `SET chronos.explain = postgres` makes `EXPLAIN` of simple statements show PostgreSQL 16's plan, with a NOTICE; its costs are the model's estimates over an emulated heap, not what Chronos spends, and stay a never-vacuumed table's after `VACUUM` or `ANALYZE` (see [EXPLAIN](sql.md#explain)).
 - **Function signatures** in the catalog show `text` where a parameter was declared `varchar` (`\df`, `pg_get_function_arguments`).
 - **A multi-statement simple query** (`insert ...; insert ...;` in one string) commits statement by statement, where Postgres runs it as one implicit transaction. Wrap such strings in `BEGIN ... COMMIT`.
 - **Speed:** in the trials, point reads ran at about half Postgres's rate and writes at a fraction of it on the same machine. Measure your own workload before moving one that is sensitive to latency.

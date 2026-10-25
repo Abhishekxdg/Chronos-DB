@@ -390,14 +390,8 @@ impl Def {
                     format!("default_text_search_config = {value} isn't supported: english and simple are"),
                 ),
             },
-            "default_table_access_method" if lower != "heap" => Err(SqlError {
-                code: "22023",
-                message: format!("invalid value for parameter \"default_table_access_method\": \"{value}\""),
-                info: Some(Box::new(super::Violation {
-                    detail: Some(format!("Table access method \"{value}\" does not exist.")),
-                    ..Default::default()
-                })),
-            }),
+            // (heap, or a table access method CREATE ACCESS METHOD made: see `accessmethod`)
+            "default_table_access_method" => super::accessmethod::check_default(&value),
             _ => Ok(value),
         }
     }

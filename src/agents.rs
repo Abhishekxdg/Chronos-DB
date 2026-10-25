@@ -1456,6 +1456,9 @@ impl MergePolicy {
                 _ if crate::sql::internal(&c.key) => continue,
                 // (and when an object was made, kept beside it, follows the object)
                 _ if crate::sql::made_row(&c.key) => continue,
+                // (and so do the planner's statistics VACUUM, ANALYZE and an index build record of a table, which
+                // define nothing: see `sql::RELSTATS`)
+                _ if c.key.starts_with(crate::sql::RELSTATS) => continue,
                 // effects queued for main (see `outbox`): no rows or schema of the parent change, but
                 // things that happen outside the database once they land, so they're counted too
                 _ if crate::outbox::entry(&c.key) => {
@@ -2219,5 +2222,13 @@ mod tests {
     fn a_merge_check_is_a_schema_change() {
         let c = crate::Change { key: "_sonos_checks/keep".into(), before: None, after: Some("{}".into()) };
         assert_eq!(super::MergePolicy::default().broken(&[c], 0), ["changes the schema: check keep"]);
+    }
+
+    /// The planner's statistics a VACUUM or ANALYZE in a world records define nothing: no schema change.
+    #[test]
+    fn table_statistics_are_no_schema_change() {
+        let key = format!("{}t", crate::sql::RELSTATS);
+        let c = crate::Change { key, before: None, after: Some(r#"{"relpages":1}"#.into()) };
+        assert!(super::MergePolicy::default().broken(&[c], 0).is_empty());
     }
 }

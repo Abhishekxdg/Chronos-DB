@@ -386,7 +386,9 @@ fn explain_shows_how_rows_are_found() {
     assert_eq!(sql(&db, "select count(*) from t where v = 499").rows[0][0], Value::Int(6));
     assert_eq!(plan(&db, "explain analyze delete from t where v = 499", &[])[0], "Delete on t  (actual rows=6)");
     assert_eq!(sql(&db, "select count(*) from t where v = 499").rows[0][0], Value::Int(0));
-    assert_eq!(fails(&db, "explain (format json) select 1").0, "0A000");
+    // (the other formats too, as Postgres writes them)
+    let json = sql(&db, "explain (format json) select * from t where id = 7").rows[0][0].to_text();
+    assert!(json.contains("\"Node Type\": \"Index Scan"), "{json}");
     assert_eq!(fails(&db, "explain create table x (id int)").0, "0A000");
 }
 

@@ -4666,6 +4666,41 @@ impl Exec<'_> {
                         writes.push((k, None));
                     }
                 }
+                // the operator classes it is a support function of: refused, or dropped with it (CASCADE) where no
+                // partition key hashes with them (a table is dropped by its own DROP, which this batch can't make)
+                let classes = userdefs::opclasses_using(v, &f)?;
+                if !classes.is_empty() {
+                    let it = format!(
+                        "function {}({})",
+                        f.name,
+                        f.args.iter().map(|a| type_named(&a.1)).collect::<Vec<_>>().join(",")
+                    );
+                    if !cascade {
+                        let detail: Vec<String> = classes.iter().map(|(_, c)| format!("{c} depends on {it}")).collect();
+                        return Err(SqlError {
+                            code: "2BP01",
+                            message: format!("cannot drop {it} because other objects depend on it"),
+                            info: Some(Box::new(Violation {
+                                detail: Some(detail.join("\n")),
+                                hint: Some("Use DROP ... CASCADE to drop the dependent objects too.".into()),
+                                ..Violation::default()
+                            })),
+                        });
+                    }
+                    for (k, c) in &classes {
+                        if let Some(t) = userdefs::opclass_users(v, k)?.first() {
+                            return err(
+                                UNSUPPORTED,
+                                format!("cannot drop {it} with CASCADE: table {} hashes its partition key with {c}; drop the table first", rel_part(t)),
+                            );
+                        }
+                    }
+                    for (k, c) in classes {
+                        notice("NOTICE", format!("drop cascades to {c}"));
+                        userdefs::forget(&k);
+                        writes.push((k, None));
+                    }
+                }
                 writes.push((f.key(), None));
             }
             Ok((writes, ()))

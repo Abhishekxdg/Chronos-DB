@@ -259,10 +259,6 @@ const UNQUALIFIED: [Ot; 13] = [
     Ot::Tablespace,
 ];
 
-/// The catalog tables whose oid Chronos gives views too (`pg_tables` is pg_class's here): an oid names the table.
-const CATALOG_VIEWS: [&str; 8] =
-    ["pg_tables", "pg_views", "pg_matviews", "pg_indexes", "pg_sequences", "pg_settings", "pg_roles", "pg_user"];
-
 /// Postgres 16's text search parser and templates, all in pg_catalog.
 const TS_PARSERS: [(i64, &str); 1] = [(3722, "default")];
 const TS_TEMPLATES: [(i64, &str); 4] = [(3727, "simple"), (3730, "synonym"), (3733, "ispell"), (3742, "thesaurus")];
@@ -398,7 +394,7 @@ fn need_schema(cat: &Catalog, s: &str) -> Result<i64> {
 }
 
 /// A name list read as DeconstructQualifiedName reads one: its schema, if it names one, and its name.
-fn qualified(names: &[String]) -> Result<(Option<&str>, &str)> {
+pub(super) fn qualified(names: &[String]) -> Result<(Option<&str>, &str)> {
     match names {
         [n] => Ok((None, n.as_str())),
         [s, n] => Ok((Some(s.as_str()), n.as_str())),
@@ -439,9 +435,10 @@ struct RelFacts {
     cols: Vec<String>,
 }
 
-/// The catalog table with this oid, by name.
+/// The catalog table with this oid, by name (not one of its views, pg_roles, pg_tables, ..., which `facts` would
+/// describe as a table: see `catalog_view`).
 fn catalog_table(oid: i64) -> Option<&'static str> {
-    catalog::CATALOG_OIDS.iter().find(|(n, o)| *o == oid && !CATALOG_VIEWS.contains(n)).map(|(n, _)| *n)
+    catalog::CATALOG_OIDS.iter().find(|(n, o)| *o == oid && !super::catalog_view(n)).map(|(n, _)| *n)
 }
 
 /// The relation with this oid.
@@ -781,9 +778,10 @@ fn resolve(cat: &Catalog, ot: Ot, names: &[String], args: &[String]) -> Result<(
             }
             return no_oid(&member);
         }
-        Ot::AccessMethod => match catalog::AMS.iter().find(|a| a.1 == only) {
-            Some(a) => (PG_AM, a.0, 0),
-            None => return missing("42704", format!("access method \"{only}\" does not exist")),
+        // (Postgres's own, or one CREATE ACCESS METHOD made)
+        Ot::AccessMethod => match cat.am_oid(only) {
+            0 => return missing("42704", format!("access method \"{only}\" does not exist")),
+            o => (PG_AM, o, 0),
         },
         Ot::Schema => (PG_NAMESPACE, need_schema(cat, only)?, 0),
         Ot::TsParser | Ot::TsDict | Ot::TsTemplate | Ot::TsConfig => text_search(cat, ot, names)?,
@@ -1387,9 +1385,10 @@ fn identify(cat: &Catalog, class: i64, oid: i64, sub: i64) -> Result<(String, Op
             some(&ty, found.at("pg_catalog").named(name))
         }
         PG_AM => {
-            let Some(a) = catalog::AMS.iter().find(|a| a.0 == oid) else { return none(ty) };
-            let found = Found::new(quoted(a.1), vec![a.1.to_string()], format!("access method {}", a.1));
-            some(&ty, found.named(a.1))
+            let all = cat.access_methods();
+            let Some((_, name, ..)) = all.iter().find(|a| a.0 == oid) else { return none(ty) };
+            let found = Found::new(quoted(name), vec![name.clone()], format!("access method {name}"));
+            some(&ty, found.named(name))
         }
         PG_REWRITE => {
             let Some(n) = (0..cat.rewrites.len()).find(|&n| cat.rewrite_oid(n) == oid) else { return none(ty) };

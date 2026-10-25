@@ -57,6 +57,12 @@ pub(super) fn filling<T>(table: &str, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Whether CREATE TABLE AS (or SELECT INTO) is filling table `table` (its stored name) with its query's rows (see
+/// `filling`).
+pub(super) fn filled_now(table: &str) -> bool {
+    FILLING.with_borrow(|f| f.as_deref().is_some_and(|f| rel_part(f) == rel_part(table)))
+}
+
 /// What an ACL is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kind {
@@ -903,10 +909,10 @@ impl<'a, 'v> Checker<'a, 'v> {
             // a materialized view's rows are its query's, read as it is made (WITH NO DATA reads nothing)
             Stmt::CreateView { query, materialized: true, data: true, .. } => self.select(query, &mut vec![]),
             Stmt::Do(q) | Stmt::Call(q) => self.select(q, &mut vec![]),
-            // UPDATE pg_class SET reltuples ... (or a MERGE into it): it changes nothing here (see
-            // `Stmt::PlannerStats`), but is a write to the catalog all the same, refused to all but a
-            // superuser as Postgres refuses it; its WHERE reads what the query it runs reads
-            Stmt::PlannerStats(sql) => {
+            // UPDATE pg_class SET reltuples ... (or a MERGE into it): what it changes is kept apart from the
+            // catalog (see `Stmt::PlannerStats`), but it is a write to the catalog all the same, refused to all but
+            // a superuser as Postgres refuses it; its WHERE reads what the query it runs reads
+            Stmt::PlannerStats(sql, _) => {
                 self.writes_catalog("pg_catalog.pg_class")?;
                 for st in super::parse(sql)? {
                     self.stmt(&st.0)?;
@@ -1707,6 +1713,19 @@ fn ddl(v: &View, who: &Who, st: &Stmt) -> Result<()> {
                 format!("must be owner of event trigger {}", key.rsplit('/').next().unwrap_or_default()),
             );
         }
+        // DROP OPERATOR CLASS ... CASCADE drops the partitioned tables hashing with the class (see
+        // `userdefs::opclass_users`): only by a role that may drop each, as DROP TABLE asks
+        Stmt::UserDef { tag: "DROP OPERATOR CLASS", key, cascade: true, .. } => {
+            for n in super::userdefs::opclass_users(v, key)? {
+                if let Some(o) = rel(v, &n)? {
+                    may_drop(&o, &n)?;
+                }
+            }
+            // and the indexes that use it, as DROP INDEX asks
+            for (_, x) in super::userdefs::opclass_indexes(v, key)? {
+                own_index(&x)?;
+            }
+        }
         Stmt::Drop { tables: names, .. } | Stmt::DropObjects { names, .. } => {
             for n in names {
                 // (one dropped because what it depends on goes: its owner isn't asked, see `dropping_dependents`)
@@ -1821,8 +1840,9 @@ fn ddl(v: &View, who: &Who, st: &Stmt) -> Result<()> {
                 }
             }
             // (a wrapper's or server's owner: see `foreign::comment_target`)
-            // (a role's: see `maintain::comment`)
+            // (a role's and an access method's: see `maintain::comment`)
             maintain::Commented::Other
+            | maintain::Commented::AccessMethod(_)
             | maintain::Commented::Role(_)
             | maintain::Commented::Publication(_)
             | maintain::Commented::Aggregate(..)
@@ -4467,11 +4487,9 @@ pub(crate) fn has_privilege(
                 if !catalog_table(plain) && !catalog_table(&stored) {
                     return Ok(Some(who.superuser));
                 }
-                // (`'pg_authid'::regclass` reads as pg_roles here: the name as given says which)
-                let given = name.trim().trim_start_matches("pg_catalog.").to_string();
                 // a column of it, by name or number: one it hasn't is 42703, a number past its last null
                 if let ("column", Some(c)) = (kind, col) {
-                    let table = [given.as_str(), plain].into_iter().find(|n| !catalog_schema::columns(n).is_empty());
+                    let table = Some(plain).filter(|n| !catalog_schema::columns(n).is_empty());
                     if let Some(table) = table {
                         let cols = catalog_schema::columns(table);
                         match c {
@@ -4487,8 +4505,9 @@ pub(crate) fn has_privilege(
                         }
                     }
                 }
-                let secret =
-                    [plain, given.as_str()].iter().any(|n| matches!(*n, "pg_authid" | "pg_shadow" | "pg_user_mapping"));
+                // (pg_roles and pg_user may be read by everyone, pg_authid not: the views have oids of their own, see
+                // `catalog::CATALOG_OIDS`, so a name, an oid and a regclass all say which)
+                let secret = matches!(plain, "pg_authid" | "pg_shadow" | "pg_user_mapping");
                 let reads = asked.iter().any(|(b, opt)| *b == SELECT && !opt);
                 return Ok(Some(who.superuser || (reads && !secret)));
             };

@@ -254,31 +254,37 @@ fn collation_warning(
     Some(said + &fix)
 }
 
-/// How an index came over short of Postgres's: what pg_get_indexdef says it has that Chronos keeps
-/// no part of (it only finds rows by it, in one order).
+/// How an index came over short of Postgres's: what pg_get_indexdef says it has that the catalog keeps and shows
+/// as Postgres had it, but that the index Chronos builds doesn't follow (it is one ascending btree, which finds the
+/// same rows), and what Chronos keeps no part of.
 fn index_losses(def: &str) -> Vec<String> {
     let mut out = vec![];
     if let Some(m) = def.split(" USING ").nth(1).and_then(|r| r.split([' ', '(']).next())
         && ["hash", "brin"].contains(&m)
     {
-        out.push(format!("a {m} index came over as a btree (it finds the same rows)"));
+        out.push(format!("a {m} index is kept and shown as one, but is a btree here (it finds the same rows)"));
     }
     let key = def.split_once(" (").map_or("", |(_, r)| r);
     let words: Vec<&str> = key.split([' ', ',', '(', ')']).collect();
     if words.iter().any(|w| *w == "DESC" || *w == "NULLS") {
-        out.push("DESC and NULLS FIRST/LAST aren't kept: it is one ascending order".into());
+        out.push(
+            "DESC and NULLS FIRST/LAST are kept and shown, but the index is one ascending order (read backward for \
+             DESC)"
+                .into(),
+        );
     }
     if def.contains(") INCLUDE (") {
-        out.push("INCLUDE columns aren't kept".into());
+        out.push("INCLUDE columns are kept and shown, but the index holds none of their values".into());
     }
-    // (pgvector's are kept: they pick the distance an hnsw index's graph is for; pg_trgm's too: the index is one
-    // of trigrams)
+    // (pgvector's pick the distance an hnsw index's graph is for; pg_trgm's make the index one of trigrams)
     let kept = |w: &str| {
         let w = w.rsplit('.').next().unwrap_or(w);
         ["vector_cosine_ops", "vector_l2_ops", "vector_ip_ops", "gin_trgm_ops", "gist_trgm_ops"].contains(&w)
     };
     if let Some(c) = words.iter().find(|w| w.ends_with("_ops") && !w.starts_with('"') && !kept(w)) {
-        out.push(format!("operator class {c} isn't kept (the index finds the same rows without it)"));
+        out.push(format!(
+            "operator class {c} is kept and shown, but the index finds the same rows as its type's default class"
+        ));
     }
     if def.contains(" WITH (") {
         out.push("storage parameters aren't kept".into());

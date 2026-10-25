@@ -173,6 +173,7 @@ impl Parser {
             tag: "CREATE RULE",
             missing: None,
             exists: Some(format!("rule \"{name}\" for relation \"{}\" already exists", rel_part(&table))),
+            cascade: false,
         })
     }
 
@@ -210,7 +211,15 @@ impl Parser {
         let missing = format!("rule \"{name}\" for relation \"{}\" does not exist", rel_part(&table));
         // (IF EXISTS: a notice, see `userdefs::SKIP`)
         let missing = Some(if if_exists { format!("{}{missing}, skipping", super::userdefs::SKIP) } else { missing });
-        Ok(Stmt::UserDef { needs: None, key: key(&table, &name), json: None, tag: "DROP RULE", missing, exists: None })
+        Ok(Stmt::UserDef {
+            needs: None,
+            key: key(&table, &name),
+            json: None,
+            tag: "DROP RULE",
+            missing,
+            exists: None,
+            cascade: false,
+        })
     }
 }
 

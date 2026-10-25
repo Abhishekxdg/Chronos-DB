@@ -312,7 +312,10 @@ fn says_what_came_over_in_part() {
     let _ = std::fs::remove_dir_all(&dir);
     let (ok, out) = import(&url, &dir);
     assert!(ok, "{out}");
-    assert!(out.contains("index words_h") && out.contains("hash index came over as a btree"), "{out}");
+    assert!(
+        out.contains("index words_h") && out.contains("hash index is kept and shown as one, but is a btree here"),
+        "{out}"
+    );
     assert!(out.contains("index words_d") && out.contains("DESC"), "{out}");
     let db = Db::open(&dir).unwrap();
     assert_eq!(cell(&db, "select count(*) from h"), "10", "{out}");

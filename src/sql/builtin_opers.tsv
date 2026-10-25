@@ -2,802 +2,807 @@
 # (0 for a prefix operator's left) and those types as format_type names them (NONE for none). What regoper and
 # regoperator read and show; made from a real Postgres 16 with
 #   select oid, oprname, oprleft, oprright, format_type(oprleft), format_type(oprright) from pg_operator
-15	=	23	20	integer	bigint
-36	<>	23	20	integer	bigint
-37	<	23	20	integer	bigint
-58	<	16	16	boolean	boolean
-59	>	16	16	boolean	boolean
-76	>	23	20	integer	bigint
-80	<=	23	20	integer	bigint
-82	>=	23	20	integer	bigint
-85	<>	16	16	boolean	boolean
-91	=	16	16	boolean	boolean
-92	=	18	18	"char"	"char"
-93	=	19	19	name	name
-94	=	21	21	smallint	smallint
-95	<	21	21	smallint	smallint
-96	=	23	23	integer	integer
-97	<	23	23	integer	integer
-98	=	25	25	text	text
-254	=	19	25	name	text
-255	<	19	25	name	text
-256	<=	19	25	name	text
-257	>=	19	25	name	text
-258	>	19	25	name	text
-259	<>	19	25	name	text
-260	=	25	19	text	name
-261	<	25	19	text	name
-262	<=	25	19	text	name
-263	>=	25	19	text	name
-264	>	25	19	text	name
-265	<>	25	19	text	name
-349	||	5078	5077	anycompatiblearray	anycompatible
-352	=	28	28	xid	xid
-353	=	28	23	xid	integer
-374	||	5077	5078	anycompatible	anycompatiblearray
-375	||	5078	5078	anycompatiblearray	anycompatiblearray
-385	=	29	29	cid	cid
-387	=	27	27	tid	tid
-402	<>	27	27	tid	tid
-410	=	20	20	bigint	bigint
-411	<>	20	20	bigint	bigint
-412	<	20	20	bigint	bigint
-413	>	20	20	bigint	bigint
-414	<=	20	20	bigint	bigint
-415	>=	20	20	bigint	bigint
-416	=	20	23	bigint	integer
-417	<>	20	23	bigint	integer
-418	<	20	23	bigint	integer
-419	>	20	23	bigint	integer
-420	<=	20	23	bigint	integer
-430	>=	20	23	bigint	integer
-433	@>	603	600	box	point
-439	%	20	20	bigint	bigint
-473	@	0	20	NONE	bigint
-484	-	0	20	NONE	bigint
-485	<<	604	604	polygon	polygon
-486	&<	604	604	polygon	polygon
-487	&>	604	604	polygon	polygon
-488	>>	604	604	polygon	polygon
-489	<@	604	604	polygon	polygon
-490	@>	604	604	polygon	polygon
-491	~=	604	604	polygon	polygon
-492	&&	604	604	polygon	polygon
-493	<<	603	603	box	box
-494	&<	603	603	box	box
-495	&>	603	603	box	box
-496	>>	603	603	box	box
-497	<@	603	603	box	box
-498	@>	603	603	box	box
-499	~=	603	603	box	box
-500	&&	603	603	box	box
-501	>=	603	603	box	box
-502	>	603	603	box	box
-503	=	603	603	box	box
-504	<	603	603	box	box
-505	<=	603	603	box	box
-506	>^	600	600	point	point
-507	<<	600	600	point	point
-508	>>	600	600	point	point
-509	<^	600	600	point	point
-510	~=	600	600	point	point
-511	<@	600	603	point	box
-512	<@	600	602	point	path
-513	@@	0	603	NONE	box
-514	*	23	23	integer	integer
-517	<->	600	600	point	point
-518	<>	23	23	integer	integer
-519	<>	21	21	smallint	smallint
-520	>	21	21	smallint	smallint
-521	>	23	23	integer	integer
-522	<=	21	21	smallint	smallint
-523	<=	23	23	integer	integer
-524	>=	21	21	smallint	smallint
-525	>=	23	23	integer	integer
-526	*	21	21	smallint	smallint
-527	/	21	21	smallint	smallint
-528	/	23	23	integer	integer
-529	%	21	21	smallint	smallint
-530	%	23	23	integer	integer
-531	<>	25	25	text	text
-532	=	21	23	smallint	integer
-533	=	23	21	integer	smallint
-534	<	21	23	smallint	integer
-535	<	23	21	integer	smallint
-536	>	21	23	smallint	integer
-537	>	23	21	integer	smallint
-538	<>	21	23	smallint	integer
-539	<>	23	21	integer	smallint
-540	<=	21	23	smallint	integer
-541	<=	23	21	integer	smallint
-542	>=	21	23	smallint	integer
-543	>=	23	21	integer	smallint
-544	*	21	23	smallint	integer
-545	*	23	21	integer	smallint
-546	/	21	23	smallint	integer
-547	/	23	21	integer	smallint
-550	+	21	21	smallint	smallint
-551	+	23	23	integer	integer
-552	+	21	23	smallint	integer
-553	+	23	21	integer	smallint
-554	-	21	21	smallint	smallint
-555	-	23	23	integer	integer
-556	-	21	23	smallint	integer
-557	-	23	21	integer	smallint
-558	-	0	23	NONE	integer
-559	-	0	21	NONE	smallint
-584	-	0	700	NONE	real
-585	-	0	701	NONE	double precision
-586	+	700	700	real	real
-587	-	700	700	real	real
-588	/	700	700	real	real
-589	*	700	700	real	real
-590	@	0	700	NONE	real
-591	+	701	701	double precision	double precision
-592	-	701	701	double precision	double precision
-593	/	701	701	double precision	double precision
-594	*	701	701	double precision	double precision
-595	@	0	701	NONE	double precision
-596	|/	0	701	NONE	double precision
-597	||/	0	701	NONE	double precision
-606	<->	603	600	box	point
-607	=	26	26	oid	oid
-608	<>	26	26	oid	oid
-609	<	26	26	oid	oid
-610	>	26	26	oid	oid
-611	<=	26	26	oid	oid
-612	>=	26	26	oid	oid
-613	<->	600	628	point	line
-614	<->	600	601	point	lseg
-615	<->	600	603	point	box
-616	<->	601	628	lseg	line
-617	<->	601	603	lseg	box
-618	<->	600	602	point	path
-620	=	700	700	real	real
-621	<>	700	700	real	real
-622	<	700	700	real	real
-623	>	700	700	real	real
-624	<=	700	700	real	real
-625	>=	700	700	real	real
-630	<>	18	18	"char"	"char"
-631	<	18	18	"char"	"char"
-632	<=	18	18	"char"	"char"
-633	>	18	18	"char"	"char"
-634	>=	18	18	"char"	"char"
-639	~	19	25	name	text
-640	!~	19	25	name	text
-641	~	25	25	text	text
-642	!~	25	25	text	text
-643	<>	19	19	name	name
-644	<>	30	30	oidvector	oidvector
-645	<	30	30	oidvector	oidvector
-646	>	30	30	oidvector	oidvector
-647	<=	30	30	oidvector	oidvector
-648	>=	30	30	oidvector	oidvector
-649	=	30	30	oidvector	oidvector
-654	||	25	25	text	text
-660	<	19	19	name	name
-661	<=	19	19	name	name
-662	>	19	19	name	name
-663	>=	19	19	name	name
-664	<	25	25	text	text
-665	<=	25	25	text	text
-666	>	25	25	text	text
-667	>=	25	25	text	text
-670	=	701	701	double precision	double precision
-671	<>	701	701	double precision	double precision
-672	<	701	701	double precision	double precision
-673	<=	701	701	double precision	double precision
-674	>	701	701	double precision	double precision
-675	>=	701	701	double precision	double precision
-682	@	0	21	NONE	smallint
-684	+	20	20	bigint	bigint
-685	-	20	20	bigint	bigint
-686	*	20	20	bigint	bigint
-687	/	20	20	bigint	bigint
-688	+	20	23	bigint	integer
-689	-	20	23	bigint	integer
-690	*	20	23	bigint	integer
-691	/	20	23	bigint	integer
-692	+	23	20	integer	bigint
-693	-	23	20	integer	bigint
-694	*	23	20	integer	bigint
-695	/	23	20	integer	bigint
-706	<->	603	603	box	box
-707	<->	602	602	path	path
-708	<->	628	628	line	line
-709	<->	601	601	lseg	lseg
-712	<->	604	604	polygon	polygon
-713	<>	600	600	point	point
-731	+	600	600	point	point
-732	-	600	600	point	point
-733	*	600	600	point	point
-734	/	600	600	point	point
-735	+	602	602	path	path
-736	+	602	600	path	point
-737	-	602	600	path	point
-738	*	602	600	path	point
-739	/	602	600	path	point
-755	@>	602	600	path	point
-756	<@	600	604	point	polygon
-757	@>	604	600	polygon	point
-758	<@	600	718	point	circle
-759	@>	718	600	circle	point
-760	<->	628	600	line	point
-761	<->	601	600	lseg	point
-762	<->	628	601	line	lseg
-763	<->	603	601	box	lseg
-773	@	0	23	NONE	integer
-784	<->	602	600	path	point
-792	=	602	602	path	path
-793	<	602	602	path	path
-794	>	602	602	path	path
-795	<=	602	602	path	path
-796	>=	602	602	path	path
-797	#	0	602	NONE	path
-798	?#	602	602	path	path
-799	@-@	0	602	NONE	path
-800	>^	603	603	box	box
-801	<^	603	603	box	box
-802	?#	603	603	box	box
-803	#	603	603	box	box
-804	+	603	600	box	point
-805	-	603	600	box	point
-806	*	603	600	box	point
-807	/	603	600	box	point
-808	?-	600	600	point	point
-809	?|	600	600	point	point
-818	+	20	21	bigint	smallint
-819	-	20	21	bigint	smallint
-820	*	20	21	bigint	smallint
-821	/	20	21	bigint	smallint
-822	+	21	20	smallint	bigint
-823	-	21	20	smallint	bigint
-824	*	21	20	smallint	bigint
-825	/	21	20	smallint	bigint
-843	*	790	700	money	real
-844	/	790	700	money	real
-845	*	700	790	real	money
-900	=	790	790	money	money
-901	<>	790	790	money	money
-902	<	790	790	money	money
-903	>	790	790	money	money
-904	<=	790	790	money	money
-905	>=	790	790	money	money
-906	+	790	790	money	money
-907	-	790	790	money	money
-908	*	790	701	money	double precision
-909	/	790	701	money	double precision
-912	*	790	23	money	integer
-913	/	790	23	money	integer
-914	*	790	21	money	smallint
-915	/	790	21	money	smallint
-916	*	701	790	double precision	money
-917	*	23	790	integer	money
-918	*	21	790	smallint	money
-931	<<	869	869	inet	inet
-932	<<=	869	869	inet	inet
-933	>>	869	869	inet	inet
-934	>>=	869	869	inet	inet
-965	^	701	701	double precision	double precision
-966	+	1034	1033	aclitem[]	aclitem
-967	-	1034	1033	aclitem[]	aclitem
-968	@>	1034	1033	aclitem[]	aclitem
-969	@@	0	601	NONE	lseg
-971	@@	0	604	NONE	polygon
-974	=	1033	1033	aclitem	aclitem
-1038	^	1700	1700	numeric	numeric
-1054	=	1042	1042	character	character
-1055	~	1042	25	character	text
-1056	!~	1042	25	character	text
-1057	<>	1042	1042	character	character
-1058	<	1042	1042	character	character
-1059	<=	1042	1042	character	character
-1060	>	1042	1042	character	character
-1061	>=	1042	1042	character	character
-1070	=	2277	2277	anyarray	anyarray
-1071	<>	2277	2277	anyarray	anyarray
-1072	<	2277	2277	anyarray	anyarray
-1073	>	2277	2277	anyarray	anyarray
-1074	<=	2277	2277	anyarray	anyarray
-1075	>=	2277	2277	anyarray	anyarray
-1076	+	1082	1186	date	interval
-1077	-	1082	1186	date	interval
-1093	=	1082	1082	date	date
-1094	<>	1082	1082	date	date
-1095	<	1082	1082	date	date
-1096	<=	1082	1082	date	date
-1097	>	1082	1082	date	date
-1098	>=	1082	1082	date	date
-1099	-	1082	1082	date	date
-1100	+	1082	23	date	integer
-1101	-	1082	23	date	integer
-1108	=	1083	1083	time without time zone	time without time zone
-1109	<>	1083	1083	time without time zone	time without time zone
-1110	<	1083	1083	time without time zone	time without time zone
-1111	<=	1083	1083	time without time zone	time without time zone
-1112	>	1083	1083	time without time zone	time without time zone
-1113	>=	1083	1083	time without time zone	time without time zone
-1116	+	700	701	real	double precision
-1117	-	700	701	real	double precision
-1118	/	700	701	real	double precision
-1119	*	700	701	real	double precision
-1120	=	700	701	real	double precision
-1121	<>	700	701	real	double precision
-1122	<	700	701	real	double precision
-1123	>	700	701	real	double precision
-1124	<=	700	701	real	double precision
-1125	>=	700	701	real	double precision
-1126	+	701	700	double precision	real
-1127	-	701	700	double precision	real
-1128	/	701	700	double precision	real
-1129	*	701	700	double precision	real
-1130	=	701	700	double precision	real
-1131	<>	701	700	double precision	real
-1132	<	701	700	double precision	real
-1133	>	701	700	double precision	real
-1134	<=	701	700	double precision	real
-1135	>=	701	700	double precision	real
-1201	=	869	869	inet	inet
-1202	<>	869	869	inet	inet
-1203	<	869	869	inet	inet
-1204	<=	869	869	inet	inet
-1205	>	869	869	inet	inet
-1206	>=	869	869	inet	inet
-1207	~~	19	25	name	text
-1208	!~~	19	25	name	text
-1209	~~	25	25	text	text
-1210	!~~	25	25	text	text
-1211	~~	1042	25	character	text
-1212	!~~	1042	25	character	text
-1220	=	829	829	macaddr	macaddr
-1221	<>	829	829	macaddr	macaddr
-1222	<	829	829	macaddr	macaddr
-1223	<=	829	829	macaddr	macaddr
-1224	>	829	829	macaddr	macaddr
-1225	>=	829	829	macaddr	macaddr
-1226	~*	19	25	name	text
-1227	!~*	19	25	name	text
-1228	~*	25	25	text	text
-1229	!~*	25	25	text	text
-1234	~*	1042	25	character	text
-1235	!~*	1042	25	character	text
-1320	=	1184	1184	timestamp with time zone	timestamp with time zone
-1321	<>	1184	1184	timestamp with time zone	timestamp with time zone
-1322	<	1184	1184	timestamp with time zone	timestamp with time zone
-1323	<=	1184	1184	timestamp with time zone	timestamp with time zone
-1324	>	1184	1184	timestamp with time zone	timestamp with time zone
-1325	>=	1184	1184	timestamp with time zone	timestamp with time zone
-1327	+	1184	1186	timestamp with time zone	interval
-1328	-	1184	1184	timestamp with time zone	timestamp with time zone
-1329	-	1184	1186	timestamp with time zone	interval
-1330	=	1186	1186	interval	interval
-1331	<>	1186	1186	interval	interval
-1332	<	1186	1186	interval	interval
-1333	<=	1186	1186	interval	interval
-1334	>	1186	1186	interval	interval
-1335	>=	1186	1186	interval	interval
-1336	-	0	1186	NONE	interval
-1337	+	1186	1186	interval	interval
-1338	-	1186	1186	interval	interval
-1360	+	1082	1083	date	time without time zone
-1361	+	1082	1266	date	time with time zone
-1363	+	1083	1082	time without time zone	date
-1366	+	1266	1082	time with time zone	date
-1383	<->	604	718	polygon	circle
-1399	-	1083	1083	time without time zone	time without time zone
-1420	@@	0	718	NONE	circle
-1500	=	718	718	circle	circle
-1501	<>	718	718	circle	circle
-1502	<	718	718	circle	circle
-1503	>	718	718	circle	circle
-1504	<=	718	718	circle	circle
-1505	>=	718	718	circle	circle
-1506	<<	718	718	circle	circle
-1507	&<	718	718	circle	circle
-1508	&>	718	718	circle	circle
-1509	>>	718	718	circle	circle
-1510	<@	718	718	circle	circle
-1511	@>	718	718	circle	circle
-1512	~=	718	718	circle	circle
-1513	&&	718	718	circle	circle
-1514	|>>	718	718	circle	circle
-1515	<<|	718	718	circle	circle
-1516	+	718	600	circle	point
-1517	-	718	600	circle	point
-1518	*	718	600	circle	point
-1519	/	718	600	circle	point
-1520	<->	718	718	circle	circle
-1521	#	0	604	NONE	polygon
-1522	<->	600	718	point	circle
-1523	<->	718	604	circle	polygon
-1525	?#	601	601	lseg	lseg
-1526	?||	601	601	lseg	lseg
-1527	?-|	601	601	lseg	lseg
-1528	?-	0	601	NONE	lseg
-1529	?|	0	601	NONE	lseg
-1535	=	601	601	lseg	lseg
-1536	#	601	601	lseg	lseg
-1537	?#	601	628	lseg	line
-1538	?#	601	603	lseg	box
-1539	?#	628	603	line	box
-1546	<@	600	628	point	line
-1547	<@	600	601	point	lseg
-1548	<@	601	628	lseg	line
-1549	<@	601	603	lseg	box
-1550	=	1266	1266	time with time zone	time with time zone
-1551	<>	1266	1266	time with time zone	time with time zone
-1552	<	1266	1266	time with time zone	time with time zone
-1553	<=	1266	1266	time with time zone	time with time zone
-1554	>	1266	1266	time with time zone	time with time zone
-1555	>=	1266	1266	time with time zone	time with time zone
-1557	##	600	628	point	line
-1558	##	600	601	point	lseg
-1559	##	600	603	point	box
-1567	##	601	603	lseg	box
-1577	##	628	601	line	lseg
-1578	##	601	601	lseg	lseg
-1583	*	1186	701	interval	double precision
-1584	*	701	1186	double precision	interval
-1585	/	1186	701	interval	double precision
-1586	<>	601	601	lseg	lseg
-1587	<	601	601	lseg	lseg
-1588	<=	601	601	lseg	lseg
-1589	>	601	601	lseg	lseg
-1590	>=	601	601	lseg	lseg
-1591	@-@	0	601	NONE	lseg
-1611	?#	628	628	line	line
-1612	?||	628	628	line	line
-1613	?-|	628	628	line	line
-1614	?-	0	628	NONE	line
-1615	?|	0	628	NONE	line
-1616	=	628	628	line	line
-1617	#	628	628	line	line
-1625	~~*	19	25	name	text
-1626	!~~*	19	25	name	text
-1627	~~*	25	25	text	text
-1628	!~~*	25	25	text	text
-1629	~~*	1042	25	character	text
-1630	!~~*	1042	25	character	text
-1694	<=	16	16	boolean	boolean
-1695	>=	16	16	boolean	boolean
-1751	-	0	1700	NONE	numeric
-1752	=	1700	1700	numeric	numeric
-1753	<>	1700	1700	numeric	numeric
-1754	<	1700	1700	numeric	numeric
-1755	<=	1700	1700	numeric	numeric
-1756	>	1700	1700	numeric	numeric
-1757	>=	1700	1700	numeric	numeric
-1758	+	1700	1700	numeric	numeric
-1759	-	1700	1700	numeric	numeric
-1760	*	1700	1700	numeric	numeric
-1761	/	1700	1700	numeric	numeric
-1762	%	1700	1700	numeric	numeric
-1763	@	0	1700	NONE	numeric
-1784	=	1560	1560	bit	bit
-1785	<>	1560	1560	bit	bit
-1786	<	1560	1560	bit	bit
-1787	>	1560	1560	bit	bit
-1788	<=	1560	1560	bit	bit
-1789	>=	1560	1560	bit	bit
-1791	&	1560	1560	bit	bit
-1792	|	1560	1560	bit	bit
-1793	#	1560	1560	bit	bit
-1794	~	0	1560	NONE	bit
-1795	<<	1560	23	bit	integer
-1796	>>	1560	23	bit	integer
-1797	||	1562	1562	bit varying	bit varying
-1800	+	1083	1186	time without time zone	interval
-1801	-	1083	1186	time without time zone	interval
-1802	+	1266	1186	time with time zone	interval
-1803	-	1266	1186	time with time zone	interval
-1804	=	1562	1562	bit varying	bit varying
-1805	<>	1562	1562	bit varying	bit varying
-1806	<	1562	1562	bit varying	bit varying
-1807	>	1562	1562	bit varying	bit varying
-1808	<=	1562	1562	bit varying	bit varying
-1809	>=	1562	1562	bit varying	bit varying
-1849	+	1186	1083	interval	time without time zone
-1862	=	21	20	smallint	bigint
-1863	<>	21	20	smallint	bigint
-1864	<	21	20	smallint	bigint
-1865	>	21	20	smallint	bigint
-1866	<=	21	20	smallint	bigint
-1867	>=	21	20	smallint	bigint
-1868	=	20	21	bigint	smallint
-1869	<>	20	21	bigint	smallint
-1870	<	20	21	bigint	smallint
-1871	>	20	21	bigint	smallint
-1872	<=	20	21	bigint	smallint
-1873	>=	20	21	bigint	smallint
-1874	&	21	21	smallint	smallint
-1875	|	21	21	smallint	smallint
-1876	#	21	21	smallint	smallint
-1877	~	0	21	NONE	smallint
-1878	<<	21	23	smallint	integer
-1879	>>	21	23	smallint	integer
-1880	&	23	23	integer	integer
-1881	|	23	23	integer	integer
-1882	#	23	23	integer	integer
-1883	~	0	23	NONE	integer
-1884	<<	23	23	integer	integer
-1885	>>	23	23	integer	integer
-1886	&	20	20	bigint	bigint
-1887	|	20	20	bigint	bigint
-1888	#	20	20	bigint	bigint
-1889	~	0	20	NONE	bigint
-1890	<<	20	23	bigint	integer
-1891	>>	20	23	bigint	integer
-1916	+	0	20	NONE	bigint
-1917	+	0	21	NONE	smallint
-1918	+	0	23	NONE	integer
-1919	+	0	700	NONE	real
-1920	+	0	701	NONE	double precision
-1921	+	0	1700	NONE	numeric
-1955	=	17	17	bytea	bytea
-1956	<>	17	17	bytea	bytea
-1957	<	17	17	bytea	bytea
-1958	<=	17	17	bytea	bytea
-1959	>	17	17	bytea	bytea
-1960	>=	17	17	bytea	bytea
-2016	~~	17	17	bytea	bytea
-2017	!~~	17	17	bytea	bytea
-2018	||	17	17	bytea	bytea
-2060	=	1114	1114	timestamp without time zone	timestamp without time zone
-2061	<>	1114	1114	timestamp without time zone	timestamp without time zone
-2062	<	1114	1114	timestamp without time zone	timestamp without time zone
-2063	<=	1114	1114	timestamp without time zone	timestamp without time zone
-2064	>	1114	1114	timestamp without time zone	timestamp without time zone
-2065	>=	1114	1114	timestamp without time zone	timestamp without time zone
-2066	+	1114	1186	timestamp without time zone	interval
-2067	-	1114	1114	timestamp without time zone	timestamp without time zone
-2068	-	1114	1186	timestamp without time zone	interval
-2314	~<~	25	25	text	text
-2315	~<=~	25	25	text	text
-2317	~>=~	25	25	text	text
-2318	~>~	25	25	text	text
-2326	~<~	1042	1042	character	character
-2327	~<=~	1042	1042	character	character
-2329	~>=~	1042	1042	character	character
-2330	~>~	1042	1042	character	character
-2345	<	1082	1114	date	timestamp without time zone
-2346	<=	1082	1114	date	timestamp without time zone
-2347	=	1082	1114	date	timestamp without time zone
-2348	>=	1082	1114	date	timestamp without time zone
-2349	>	1082	1114	date	timestamp without time zone
-2350	<>	1082	1114	date	timestamp without time zone
-2358	<	1082	1184	date	timestamp with time zone
-2359	<=	1082	1184	date	timestamp with time zone
-2360	=	1082	1184	date	timestamp with time zone
-2361	>=	1082	1184	date	timestamp with time zone
-2362	>	1082	1184	date	timestamp with time zone
-2363	<>	1082	1184	date	timestamp with time zone
-2371	<	1114	1082	timestamp without time zone	date
-2372	<=	1114	1082	timestamp without time zone	date
-2373	=	1114	1082	timestamp without time zone	date
-2374	>=	1114	1082	timestamp without time zone	date
-2375	>	1114	1082	timestamp without time zone	date
-2376	<>	1114	1082	timestamp without time zone	date
-2384	<	1184	1082	timestamp with time zone	date
-2385	<=	1184	1082	timestamp with time zone	date
-2386	=	1184	1082	timestamp with time zone	date
-2387	>=	1184	1082	timestamp with time zone	date
-2388	>	1184	1082	timestamp with time zone	date
-2389	<>	1184	1082	timestamp with time zone	date
-2534	<	1114	1184	timestamp without time zone	timestamp with time zone
-2535	<=	1114	1184	timestamp without time zone	timestamp with time zone
-2536	=	1114	1184	timestamp without time zone	timestamp with time zone
-2537	>=	1114	1184	timestamp without time zone	timestamp with time zone
-2538	>	1114	1184	timestamp without time zone	timestamp with time zone
-2539	<>	1114	1184	timestamp without time zone	timestamp with time zone
-2540	<	1184	1114	timestamp with time zone	timestamp without time zone
-2541	<=	1184	1114	timestamp with time zone	timestamp without time zone
-2542	=	1184	1114	timestamp with time zone	timestamp without time zone
-2543	>=	1184	1114	timestamp with time zone	timestamp without time zone
-2544	>	1184	1114	timestamp with time zone	timestamp without time zone
-2545	<>	1184	1114	timestamp with time zone	timestamp without time zone
-2551	+	1186	1082	interval	date
-2552	+	1186	1266	interval	time with time zone
-2553	+	1186	1114	interval	timestamp without time zone
-2554	+	1186	1184	interval	timestamp with time zone
-2555	+	23	1082	integer	date
-2570	<<|	603	603	box	box
-2571	&<|	603	603	box	box
-2572	|&>	603	603	box	box
-2573	|>>	603	603	box	box
-2574	<<|	604	604	polygon	polygon
-2575	&<|	604	604	polygon	polygon
-2576	|&>	604	604	polygon	polygon
-2577	|>>	604	604	polygon	polygon
-2589	&<|	718	718	circle	circle
-2590	|&>	718	718	circle	circle
-2634	~	0	869	NONE	inet
-2635	&	869	869	inet	inet
-2636	|	869	869	inet	inet
-2637	+	869	20	inet	bigint
-2638	+	20	869	bigint	inet
-2639	-	869	20	inet	bigint
-2640	-	869	869	inet	inet
-2750	&&	2277	2277	anyarray	anyarray
-2751	@>	2277	2277	anyarray	anyarray
-2752	<@	2277	2277	anyarray	anyarray
-2779	||	25	2776	text	anynonarray
-2780	||	2776	25	anynonarray	text
-2799	<	27	27	tid	tid
-2800	>	27	27	tid	tid
-2801	<=	27	27	tid	tid
-2802	>=	27	27	tid	tid
-2860	=	4537	4537	anymultirange	anymultirange
-2861	<>	4537	4537	anymultirange	anymultirange
-2862	<	4537	4537	anymultirange	anymultirange
-2863	<=	4537	4537	anymultirange	anymultirange
-2864	>=	4537	4537	anymultirange	anymultirange
-2865	>	4537	4537	anymultirange	anymultirange
-2866	&&	3831	4537	anyrange	anymultirange
-2867	&&	4537	3831	anymultirange	anyrange
-2868	&&	4537	4537	anymultirange	anymultirange
-2869	@>	4537	2283	anymultirange	anyelement
-2870	@>	4537	3831	anymultirange	anyrange
-2871	@>	4537	4537	anymultirange	anymultirange
-2872	<@	2283	4537	anyelement	anymultirange
-2873	<@	3831	4537	anyrange	anymultirange
-2874	<@	4537	4537	anymultirange	anymultirange
-2875	&<	3831	4537	anyrange	anymultirange
-2876	&<	4537	3831	anymultirange	anyrange
-2877	&<	4537	4537	anymultirange	anymultirange
-2972	=	2950	2950	uuid	uuid
-2973	<>	2950	2950	uuid	uuid
-2974	<	2950	2950	uuid	uuid
-2975	>	2950	2950	uuid	uuid
-2976	<=	2950	2950	uuid	uuid
-2977	>=	2950	2950	uuid	uuid
-2988	=	2249	2249	record	record
-2989	<>	2249	2249	record	record
-2990	<	2249	2249	record	record
-2991	>	2249	2249	record	record
-2992	<=	2249	2249	record	record
-2993	>=	2249	2249	record	record
-3147	~	0	829	NONE	macaddr
-3148	&	829	829	macaddr	macaddr
-3149	|	829	829	macaddr	macaddr
-3188	*=	2249	2249	record	record
-3189	*<>	2249	2249	record	record
-3190	*<	2249	2249	record	record
-3191	*>	2249	2249	record	record
-3192	*<=	2249	2249	record	record
-3193	*>=	2249	2249	record	record
-3206	#>>	3802	1009	jsonb	text[]
-3211	->	3802	25	jsonb	text
-3212	->	3802	23	jsonb	integer
-3213	#>	3802	1009	jsonb	text[]
-3222	=	3220	3220	pg_lsn	pg_lsn
-3223	<>	3220	3220	pg_lsn	pg_lsn
-3224	<	3220	3220	pg_lsn	pg_lsn
-3225	>	3220	3220	pg_lsn	pg_lsn
-3226	<=	3220	3220	pg_lsn	pg_lsn
-3227	>=	3220	3220	pg_lsn	pg_lsn
-3228	-	3220	3220	pg_lsn	pg_lsn
-3240	=	3802	3802	jsonb	jsonb
-3241	<>	3802	3802	jsonb	jsonb
-3242	<	3802	3802	jsonb	jsonb
-3243	>	3802	3802	jsonb	jsonb
-3244	<=	3802	3802	jsonb	jsonb
-3245	>=	3802	3802	jsonb	jsonb
-3246	@>	3802	3802	jsonb	jsonb
-3247	?	3802	25	jsonb	text
-3248	?|	3802	1009	jsonb	text[]
-3249	?&	3802	1009	jsonb	text[]
-3250	<@	3802	3802	jsonb	jsonb
-3276	<->	600	604	point	polygon
-3284	||	3802	3802	jsonb	jsonb
-3285	-	3802	25	jsonb	text
-3286	-	3802	23	jsonb	integer
-3287	#-	3802	1009	jsonb	text[]
-3289	<->	604	600	polygon	point
-3291	<->	718	600	circle	point
-3315	<>	28	28	xid	xid
-3316	<>	28	23	xid	integer
-3346	*	790	20	money	bigint
-3347	/	790	20	money	bigint
-3349	*	20	790	bigint	money
-3362	=	774	774	macaddr8	macaddr8
-3363	<>	774	774	macaddr8	macaddr8
-3364	<	774	774	macaddr8	macaddr8
-3365	<=	774	774	macaddr8	macaddr8
-3366	>	774	774	macaddr8	macaddr8
-3367	>=	774	774	macaddr8	macaddr8
-3368	~	0	774	NONE	macaddr8
-3369	&	774	774	macaddr8	macaddr8
-3370	|	774	774	macaddr8	macaddr8
-3398	-	3802	1009	jsonb	text[]
-3477	->>	3802	25	jsonb	text
-3481	->>	3802	23	jsonb	integer
-3516	=	3500	3500	anyenum	anyenum
-3517	<>	3500	3500	anyenum	anyenum
-3518	<	3500	3500	anyenum	anyenum
-3519	>	3500	3500	anyenum	anyenum
-3520	<=	3500	3500	anyenum	anyenum
-3521	>=	3500	3500	anyenum	anyenum
-3552	&&	869	869	inet	inet
-3585	&>	3831	4537	anyrange	anymultirange
-3627	<	3614	3614	tsvector	tsvector
-3628	<=	3614	3614	tsvector	tsvector
-3629	=	3614	3614	tsvector	tsvector
-3630	<>	3614	3614	tsvector	tsvector
-3631	>=	3614	3614	tsvector	tsvector
-3632	>	3614	3614	tsvector	tsvector
-3633	||	3614	3614	tsvector	tsvector
-3636	@@	3614	3615	tsvector	tsquery
-3637	@@	3615	3614	tsquery	tsvector
-3660	@@@	3614	3615	tsvector	tsquery
-3661	@@@	3615	3614	tsquery	tsvector
-3674	<	3615	3615	tsquery	tsquery
-3675	<=	3615	3615	tsquery	tsquery
-3676	=	3615	3615	tsquery	tsquery
-3677	<>	3615	3615	tsquery	tsquery
-3678	>=	3615	3615	tsquery	tsquery
-3679	>	3615	3615	tsquery	tsquery
-3680	&&	3615	3615	tsquery	tsquery
-3681	||	3615	3615	tsquery	tsquery
-3682	!!	0	3615	NONE	tsquery
-3693	@>	3615	3615	tsquery	tsquery
-3694	<@	3615	3615	tsquery	tsquery
-3762	@@	25	25	text	text
-3763	@@	25	3615	text	tsquery
-3825	/	790	790	money	money
-3877	^@	25	25	text	text
-3882	=	3831	3831	anyrange	anyrange
-3883	<>	3831	3831	anyrange	anyrange
-3884	<	3831	3831	anyrange	anyrange
-3885	<=	3831	3831	anyrange	anyrange
-3886	>=	3831	3831	anyrange	anyrange
-3887	>	3831	3831	anyrange	anyrange
-3888	&&	3831	3831	anyrange	anyrange
-3889	@>	3831	2283	anyrange	anyelement
-3890	@>	3831	3831	anyrange	anyrange
-3891	<@	2283	3831	anyelement	anyrange
-3892	<@	3831	3831	anyrange	anyrange
-3893	<<	3831	3831	anyrange	anyrange
-3894	>>	3831	3831	anyrange	anyrange
-3895	&<	3831	3831	anyrange	anyrange
-3896	&>	3831	3831	anyrange	anyrange
-3897	-|-	3831	3831	anyrange	anyrange
-3898	+	3831	3831	anyrange	anyrange
-3899	-	3831	3831	anyrange	anyrange
-3900	*	3831	3831	anyrange	anyrange
-3962	->	114	25	json	text
-3963	->>	114	25	json	text
-3964	->	114	23	json	integer
-3965	->>	114	23	json	integer
-3966	#>	114	1009	json	text[]
-3967	#>>	114	1009	json	text[]
-4012	@?	3802	4072	jsonb	jsonpath
-4013	@@	3802	4072	jsonb	jsonpath
-4035	&>	4537	3831	anymultirange	anyrange
-4142	&>	4537	4537	anymultirange	anymultirange
-4161	|>>	600	600	point	point
-4162	<<|	600	600	point	point
-4179	-|-	3831	4537	anyrange	anymultirange
-4180	-|-	4537	3831	anymultirange	anyrange
-4198	-|-	4537	4537	anymultirange	anymultirange
-4392	+	4537	4537	anymultirange	anymultirange
-4393	-	4537	4537	anymultirange	anymultirange
-4394	*	4537	4537	anymultirange	anymultirange
-4395	<<	3831	4537	anyrange	anymultirange
-4396	<<	4537	3831	anymultirange	anyrange
-4397	<<	4537	4537	anymultirange	anymultirange
-4398	>>	3831	4537	anyrange	anymultirange
-4399	>>	4537	3831	anymultirange	anyrange
-4400	>>	4537	4537	anymultirange	anymultirange
-4539	@>	3831	4537	anyrange	anymultirange
-4540	<@	4537	3831	anymultirange	anyrange
-5005	<->	3615	3615	tsquery	tsquery
-5025	+	3220	1700	pg_lsn	numeric
-5026	+	1700	3220	numeric	pg_lsn
-5027	-	3220	1700	pg_lsn	numeric
-5068	=	5069	5069	xid8	xid8
-5072	<>	5069	5069	xid8	xid8
-5073	<	5069	5069	xid8	xid8
-5074	>	5069	5069	xid8	xid8
-5075	<=	5069	5069	xid8	xid8
-5076	>=	5069	5069	xid8	xid8
+# Then what the planner reads of each (see `opt`): oprrest and oprjoin (their functions' names, - for none),
+# oprcanhash and oprcanmerge (t or f), and the oids of oprcode, oprnegate and oprcom (0 for none). Those are from
+# src/include/catalog/pg_operator.dat (16.14), joined on oid, with oprcode's oid from pg_proc.dat; they equal
+#   select oid, oprrest, oprjoin, oprcanhash, oprcanmerge, oprcode::oid, oprnegate, oprcom from pg_operator
+# of a real Postgres 16.15.
+15	=	23	20	integer	bigint	eqsel	eqjoinsel	t	t	852	36	416
+36	<>	23	20	integer	bigint	neqsel	neqjoinsel	f	f	853	15	417
+37	<	23	20	integer	bigint	scalarltsel	scalarltjoinsel	f	f	854	82	419
+58	<	16	16	boolean	boolean	scalarltsel	scalarltjoinsel	f	f	56	1695	59
+59	>	16	16	boolean	boolean	scalargtsel	scalargtjoinsel	f	f	57	1694	58
+76	>	23	20	integer	bigint	scalargtsel	scalargtjoinsel	f	f	855	80	418
+80	<=	23	20	integer	bigint	scalarlesel	scalarlejoinsel	f	f	856	76	430
+82	>=	23	20	integer	bigint	scalargesel	scalargejoinsel	f	f	857	37	420
+85	<>	16	16	boolean	boolean	neqsel	neqjoinsel	f	f	84	91	85
+91	=	16	16	boolean	boolean	eqsel	eqjoinsel	t	t	60	85	91
+92	=	18	18	"char"	"char"	eqsel	eqjoinsel	t	t	61	630	92
+93	=	19	19	name	name	eqsel	eqjoinsel	t	t	62	643	93
+94	=	21	21	smallint	smallint	eqsel	eqjoinsel	t	t	63	519	94
+95	<	21	21	smallint	smallint	scalarltsel	scalarltjoinsel	f	f	64	524	520
+96	=	23	23	integer	integer	eqsel	eqjoinsel	t	t	65	518	96
+97	<	23	23	integer	integer	scalarltsel	scalarltjoinsel	f	f	66	525	521
+98	=	25	25	text	text	eqsel	eqjoinsel	t	t	67	531	98
+254	=	19	25	name	text	eqsel	eqjoinsel	t	t	240	259	260
+255	<	19	25	name	text	scalarltsel	scalarltjoinsel	f	f	241	257	264
+256	<=	19	25	name	text	scalarlesel	scalarlejoinsel	f	f	242	258	263
+257	>=	19	25	name	text	scalargesel	scalargejoinsel	f	f	243	255	262
+258	>	19	25	name	text	scalargtsel	scalargtjoinsel	f	f	244	256	261
+259	<>	19	25	name	text	neqsel	neqjoinsel	f	f	245	254	265
+260	=	25	19	text	name	eqsel	eqjoinsel	t	t	247	265	254
+261	<	25	19	text	name	scalarltsel	scalarltjoinsel	f	f	248	263	258
+262	<=	25	19	text	name	scalarlesel	scalarlejoinsel	f	f	249	264	257
+263	>=	25	19	text	name	scalargesel	scalargejoinsel	f	f	250	261	256
+264	>	25	19	text	name	scalargtsel	scalargtjoinsel	f	f	251	262	255
+265	<>	25	19	text	name	neqsel	neqjoinsel	f	f	252	260	259
+349	||	5078	5077	anycompatiblearray	anycompatible	-	-	f	f	378	0	0
+352	=	28	28	xid	xid	eqsel	eqjoinsel	t	f	68	3315	352
+353	=	28	23	xid	integer	eqsel	eqjoinsel	f	f	1319	3316	0
+374	||	5077	5078	anycompatible	anycompatiblearray	-	-	f	f	379	0	0
+375	||	5078	5078	anycompatiblearray	anycompatiblearray	-	-	f	f	383	0	0
+385	=	29	29	cid	cid	eqsel	eqjoinsel	t	f	69	0	385
+387	=	27	27	tid	tid	eqsel	eqjoinsel	t	t	1292	402	387
+402	<>	27	27	tid	tid	neqsel	neqjoinsel	f	f	1265	387	402
+410	=	20	20	bigint	bigint	eqsel	eqjoinsel	t	t	467	411	410
+411	<>	20	20	bigint	bigint	neqsel	neqjoinsel	f	f	468	410	411
+412	<	20	20	bigint	bigint	scalarltsel	scalarltjoinsel	f	f	469	415	413
+413	>	20	20	bigint	bigint	scalargtsel	scalargtjoinsel	f	f	470	414	412
+414	<=	20	20	bigint	bigint	scalarlesel	scalarlejoinsel	f	f	471	413	415
+415	>=	20	20	bigint	bigint	scalargesel	scalargejoinsel	f	f	472	412	414
+416	=	20	23	bigint	integer	eqsel	eqjoinsel	t	t	474	417	15
+417	<>	20	23	bigint	integer	neqsel	neqjoinsel	f	f	475	416	36
+418	<	20	23	bigint	integer	scalarltsel	scalarltjoinsel	f	f	476	430	76
+419	>	20	23	bigint	integer	scalargtsel	scalargtjoinsel	f	f	477	420	37
+420	<=	20	23	bigint	integer	scalarlesel	scalarlejoinsel	f	f	478	419	82
+430	>=	20	23	bigint	integer	scalargesel	scalargejoinsel	f	f	479	418	80
+433	@>	603	600	box	point	contsel	contjoinsel	f	f	193	0	511
+439	%	20	20	bigint	bigint	-	-	f	f	945	0	0
+473	@	0	20	NONE	bigint	-	-	f	f	1230	0	0
+484	-	0	20	NONE	bigint	-	-	f	f	462	0	0
+485	<<	604	604	polygon	polygon	positionsel	positionjoinsel	f	f	341	0	0
+486	&<	604	604	polygon	polygon	positionsel	positionjoinsel	f	f	342	0	0
+487	&>	604	604	polygon	polygon	positionsel	positionjoinsel	f	f	343	0	0
+488	>>	604	604	polygon	polygon	positionsel	positionjoinsel	f	f	344	0	0
+489	<@	604	604	polygon	polygon	contsel	contjoinsel	f	f	345	0	490
+490	@>	604	604	polygon	polygon	contsel	contjoinsel	f	f	340	0	489
+491	~=	604	604	polygon	polygon	eqsel	eqjoinsel	f	f	339	0	491
+492	&&	604	604	polygon	polygon	areasel	areajoinsel	f	f	346	0	492
+493	<<	603	603	box	box	positionsel	positionjoinsel	f	f	188	0	0
+494	&<	603	603	box	box	positionsel	positionjoinsel	f	f	189	0	0
+495	&>	603	603	box	box	positionsel	positionjoinsel	f	f	190	0	0
+496	>>	603	603	box	box	positionsel	positionjoinsel	f	f	191	0	0
+497	<@	603	603	box	box	contsel	contjoinsel	f	f	192	0	498
+498	@>	603	603	box	box	contsel	contjoinsel	f	f	187	0	497
+499	~=	603	603	box	box	eqsel	eqjoinsel	f	f	186	0	499
+500	&&	603	603	box	box	areasel	areajoinsel	f	f	125	0	500
+501	>=	603	603	box	box	areasel	areajoinsel	f	f	126	504	505
+502	>	603	603	box	box	areasel	areajoinsel	f	f	127	505	504
+503	=	603	603	box	box	eqsel	eqjoinsel	f	f	128	0	503
+504	<	603	603	box	box	areasel	areajoinsel	f	f	129	501	502
+505	<=	603	603	box	box	areasel	areajoinsel	f	f	130	502	501
+506	>^	600	600	point	point	positionsel	positionjoinsel	f	f	131	0	0
+507	<<	600	600	point	point	positionsel	positionjoinsel	f	f	132	0	0
+508	>>	600	600	point	point	positionsel	positionjoinsel	f	f	133	0	0
+509	<^	600	600	point	point	positionsel	positionjoinsel	f	f	134	0	0
+510	~=	600	600	point	point	eqsel	eqjoinsel	f	f	135	713	510
+511	<@	600	603	point	box	contsel	contjoinsel	f	f	136	0	433
+512	<@	600	602	point	path	-	-	f	f	137	0	755
+513	@@	0	603	NONE	box	-	-	f	f	138	0	0
+514	*	23	23	integer	integer	-	-	f	f	141	0	514
+517	<->	600	600	point	point	-	-	f	f	991	0	517
+518	<>	23	23	integer	integer	neqsel	neqjoinsel	f	f	144	96	518
+519	<>	21	21	smallint	smallint	neqsel	neqjoinsel	f	f	145	94	519
+520	>	21	21	smallint	smallint	scalargtsel	scalargtjoinsel	f	f	146	522	95
+521	>	23	23	integer	integer	scalargtsel	scalargtjoinsel	f	f	147	523	97
+522	<=	21	21	smallint	smallint	scalarlesel	scalarlejoinsel	f	f	148	520	524
+523	<=	23	23	integer	integer	scalarlesel	scalarlejoinsel	f	f	149	521	525
+524	>=	21	21	smallint	smallint	scalargesel	scalargejoinsel	f	f	151	95	522
+525	>=	23	23	integer	integer	scalargesel	scalargejoinsel	f	f	150	97	523
+526	*	21	21	smallint	smallint	-	-	f	f	152	0	526
+527	/	21	21	smallint	smallint	-	-	f	f	153	0	0
+528	/	23	23	integer	integer	-	-	f	f	154	0	0
+529	%	21	21	smallint	smallint	-	-	f	f	155	0	0
+530	%	23	23	integer	integer	-	-	f	f	156	0	0
+531	<>	25	25	text	text	neqsel	neqjoinsel	f	f	157	98	531
+532	=	21	23	smallint	integer	eqsel	eqjoinsel	t	t	158	538	533
+533	=	23	21	integer	smallint	eqsel	eqjoinsel	t	t	159	539	532
+534	<	21	23	smallint	integer	scalarltsel	scalarltjoinsel	f	f	160	542	537
+535	<	23	21	integer	smallint	scalarltsel	scalarltjoinsel	f	f	161	543	536
+536	>	21	23	smallint	integer	scalargtsel	scalargtjoinsel	f	f	162	540	535
+537	>	23	21	integer	smallint	scalargtsel	scalargtjoinsel	f	f	163	541	534
+538	<>	21	23	smallint	integer	neqsel	neqjoinsel	f	f	164	532	539
+539	<>	23	21	integer	smallint	neqsel	neqjoinsel	f	f	165	533	538
+540	<=	21	23	smallint	integer	scalarlesel	scalarlejoinsel	f	f	166	536	543
+541	<=	23	21	integer	smallint	scalarlesel	scalarlejoinsel	f	f	167	537	542
+542	>=	21	23	smallint	integer	scalargesel	scalargejoinsel	f	f	168	534	541
+543	>=	23	21	integer	smallint	scalargesel	scalargejoinsel	f	f	169	535	540
+544	*	21	23	smallint	integer	-	-	f	f	170	0	545
+545	*	23	21	integer	smallint	-	-	f	f	171	0	544
+546	/	21	23	smallint	integer	-	-	f	f	172	0	0
+547	/	23	21	integer	smallint	-	-	f	f	173	0	0
+550	+	21	21	smallint	smallint	-	-	f	f	176	0	550
+551	+	23	23	integer	integer	-	-	f	f	177	0	551
+552	+	21	23	smallint	integer	-	-	f	f	178	0	553
+553	+	23	21	integer	smallint	-	-	f	f	179	0	552
+554	-	21	21	smallint	smallint	-	-	f	f	180	0	0
+555	-	23	23	integer	integer	-	-	f	f	181	0	0
+556	-	21	23	smallint	integer	-	-	f	f	182	0	0
+557	-	23	21	integer	smallint	-	-	f	f	183	0	0
+558	-	0	23	NONE	integer	-	-	f	f	212	0	0
+559	-	0	21	NONE	smallint	-	-	f	f	213	0	0
+584	-	0	700	NONE	real	-	-	f	f	206	0	0
+585	-	0	701	NONE	double precision	-	-	f	f	220	0	0
+586	+	700	700	real	real	-	-	f	f	204	0	586
+587	-	700	700	real	real	-	-	f	f	205	0	0
+588	/	700	700	real	real	-	-	f	f	203	0	0
+589	*	700	700	real	real	-	-	f	f	202	0	589
+590	@	0	700	NONE	real	-	-	f	f	207	0	0
+591	+	701	701	double precision	double precision	-	-	f	f	218	0	591
+592	-	701	701	double precision	double precision	-	-	f	f	219	0	0
+593	/	701	701	double precision	double precision	-	-	f	f	217	0	0
+594	*	701	701	double precision	double precision	-	-	f	f	216	0	594
+595	@	0	701	NONE	double precision	-	-	f	f	221	0	0
+596	|/	0	701	NONE	double precision	-	-	f	f	230	0	0
+597	||/	0	701	NONE	double precision	-	-	f	f	231	0	0
+606	<->	603	600	box	point	-	-	f	f	357	0	615
+607	=	26	26	oid	oid	eqsel	eqjoinsel	t	t	184	608	607
+608	<>	26	26	oid	oid	neqsel	neqjoinsel	f	f	185	607	608
+609	<	26	26	oid	oid	scalarltsel	scalarltjoinsel	f	f	716	612	610
+610	>	26	26	oid	oid	scalargtsel	scalargtjoinsel	f	f	1638	611	609
+611	<=	26	26	oid	oid	scalarlesel	scalarlejoinsel	f	f	717	610	612
+612	>=	26	26	oid	oid	scalargesel	scalargejoinsel	f	f	1639	609	611
+613	<->	600	628	point	line	-	-	f	f	725	0	760
+614	<->	600	601	point	lseg	-	-	f	f	363	0	761
+615	<->	600	603	point	box	-	-	f	f	364	0	606
+616	<->	601	628	lseg	line	-	-	f	f	727	0	762
+617	<->	601	603	lseg	box	-	-	f	f	365	0	763
+618	<->	600	602	point	path	-	-	f	f	371	0	784
+620	=	700	700	real	real	eqsel	eqjoinsel	t	t	287	621	620
+621	<>	700	700	real	real	neqsel	neqjoinsel	f	f	288	620	621
+622	<	700	700	real	real	scalarltsel	scalarltjoinsel	f	f	289	625	623
+623	>	700	700	real	real	scalargtsel	scalargtjoinsel	f	f	291	624	622
+624	<=	700	700	real	real	scalarlesel	scalarlejoinsel	f	f	290	623	625
+625	>=	700	700	real	real	scalargesel	scalargejoinsel	f	f	292	622	624
+630	<>	18	18	"char"	"char"	neqsel	neqjoinsel	f	f	70	92	630
+631	<	18	18	"char"	"char"	scalarltsel	scalarltjoinsel	f	f	1246	634	633
+632	<=	18	18	"char"	"char"	scalarlesel	scalarlejoinsel	f	f	72	633	634
+633	>	18	18	"char"	"char"	scalargtsel	scalargtjoinsel	f	f	73	632	631
+634	>=	18	18	"char"	"char"	scalargesel	scalargejoinsel	f	f	74	631	632
+639	~	19	25	name	text	regexeqsel	regexeqjoinsel	f	f	79	640	0
+640	!~	19	25	name	text	regexnesel	regexnejoinsel	f	f	1252	639	0
+641	~	25	25	text	text	regexeqsel	regexeqjoinsel	f	f	1254	642	0
+642	!~	25	25	text	text	regexnesel	regexnejoinsel	f	f	1256	641	0
+643	<>	19	19	name	name	neqsel	neqjoinsel	f	f	659	93	643
+644	<>	30	30	oidvector	oidvector	neqsel	neqjoinsel	f	f	619	649	644
+645	<	30	30	oidvector	oidvector	scalarltsel	scalarltjoinsel	f	f	677	648	646
+646	>	30	30	oidvector	oidvector	scalargtsel	scalargtjoinsel	f	f	681	647	645
+647	<=	30	30	oidvector	oidvector	scalarlesel	scalarlejoinsel	f	f	678	646	648
+648	>=	30	30	oidvector	oidvector	scalargesel	scalargejoinsel	f	f	680	645	647
+649	=	30	30	oidvector	oidvector	eqsel	eqjoinsel	t	t	679	644	649
+654	||	25	25	text	text	-	-	f	f	1258	0	0
+660	<	19	19	name	name	scalarltsel	scalarltjoinsel	f	f	655	663	662
+661	<=	19	19	name	name	scalarlesel	scalarlejoinsel	f	f	656	662	663
+662	>	19	19	name	name	scalargtsel	scalargtjoinsel	f	f	657	661	660
+663	>=	19	19	name	name	scalargesel	scalargejoinsel	f	f	658	660	661
+664	<	25	25	text	text	scalarltsel	scalarltjoinsel	f	f	740	667	666
+665	<=	25	25	text	text	scalarlesel	scalarlejoinsel	f	f	741	666	667
+666	>	25	25	text	text	scalargtsel	scalargtjoinsel	f	f	742	665	664
+667	>=	25	25	text	text	scalargesel	scalargejoinsel	f	f	743	664	665
+670	=	701	701	double precision	double precision	eqsel	eqjoinsel	t	t	293	671	670
+671	<>	701	701	double precision	double precision	neqsel	neqjoinsel	f	f	294	670	671
+672	<	701	701	double precision	double precision	scalarltsel	scalarltjoinsel	f	f	295	675	674
+673	<=	701	701	double precision	double precision	scalarlesel	scalarlejoinsel	f	f	296	674	675
+674	>	701	701	double precision	double precision	scalargtsel	scalargtjoinsel	f	f	297	673	672
+675	>=	701	701	double precision	double precision	scalargesel	scalargejoinsel	f	f	298	672	673
+682	@	0	21	NONE	smallint	-	-	f	f	1253	0	0
+684	+	20	20	bigint	bigint	-	-	f	f	463	0	684
+685	-	20	20	bigint	bigint	-	-	f	f	464	0	0
+686	*	20	20	bigint	bigint	-	-	f	f	465	0	686
+687	/	20	20	bigint	bigint	-	-	f	f	466	0	0
+688	+	20	23	bigint	integer	-	-	f	f	1274	0	692
+689	-	20	23	bigint	integer	-	-	f	f	1275	0	0
+690	*	20	23	bigint	integer	-	-	f	f	1276	0	694
+691	/	20	23	bigint	integer	-	-	f	f	1277	0	0
+692	+	23	20	integer	bigint	-	-	f	f	1278	0	688
+693	-	23	20	integer	bigint	-	-	f	f	1279	0	0
+694	*	23	20	integer	bigint	-	-	f	f	1280	0	690
+695	/	23	20	integer	bigint	-	-	f	f	1281	0	0
+706	<->	603	603	box	box	-	-	f	f	978	0	706
+707	<->	602	602	path	path	-	-	f	f	370	0	707
+708	<->	628	628	line	line	-	-	f	f	239	0	708
+709	<->	601	601	lseg	lseg	-	-	f	f	361	0	709
+712	<->	604	604	polygon	polygon	-	-	f	f	729	0	712
+713	<>	600	600	point	point	neqsel	neqjoinsel	f	f	988	510	713
+731	+	600	600	point	point	-	-	f	f	1441	0	731
+732	-	600	600	point	point	-	-	f	f	1442	0	0
+733	*	600	600	point	point	-	-	f	f	1443	0	733
+734	/	600	600	point	point	-	-	f	f	1444	0	0
+735	+	602	602	path	path	-	-	f	f	1435	0	735
+736	+	602	600	path	point	-	-	f	f	1436	0	0
+737	-	602	600	path	point	-	-	f	f	1437	0	0
+738	*	602	600	path	point	-	-	f	f	1438	0	0
+739	/	602	600	path	point	-	-	f	f	1439	0	0
+755	@>	602	600	path	point	-	-	f	f	1426	0	512
+756	<@	600	604	point	polygon	contsel	contjoinsel	f	f	1429	0	757
+757	@>	604	600	polygon	point	contsel	contjoinsel	f	f	1428	0	756
+758	<@	600	718	point	circle	contsel	contjoinsel	f	f	1478	0	759
+759	@>	718	600	circle	point	contsel	contjoinsel	f	f	1477	0	758
+760	<->	628	600	line	point	-	-	f	f	702	0	613
+761	<->	601	600	lseg	point	-	-	f	f	380	0	614
+762	<->	628	601	line	lseg	-	-	f	f	704	0	616
+763	<->	603	601	box	lseg	-	-	f	f	381	0	617
+773	@	0	23	NONE	integer	-	-	f	f	1251	0	0
+784	<->	602	600	path	point	-	-	f	f	421	0	618
+792	=	602	602	path	path	eqsel	eqjoinsel	f	f	984	0	792
+793	<	602	602	path	path	-	-	f	f	982	0	794
+794	>	602	602	path	path	-	-	f	f	983	0	793
+795	<=	602	602	path	path	-	-	f	f	985	0	796
+796	>=	602	602	path	path	-	-	f	f	986	0	795
+797	#	0	602	NONE	path	-	-	f	f	1432	0	0
+798	?#	602	602	path	path	-	-	f	f	973	0	0
+799	@-@	0	602	NONE	path	-	-	f	f	987	0	0
+800	>^	603	603	box	box	positionsel	positionjoinsel	f	f	115	0	0
+801	<^	603	603	box	box	positionsel	positionjoinsel	f	f	116	0	0
+802	?#	603	603	box	box	areasel	areajoinsel	f	f	125	0	0
+803	#	603	603	box	box	-	-	f	f	980	0	0
+804	+	603	600	box	point	-	-	f	f	1422	0	0
+805	-	603	600	box	point	-	-	f	f	1423	0	0
+806	*	603	600	box	point	-	-	f	f	1424	0	0
+807	/	603	600	box	point	-	-	f	f	1425	0	0
+808	?-	600	600	point	point	-	-	f	f	990	0	808
+809	?|	600	600	point	point	-	-	f	f	989	0	809
+818	+	20	21	bigint	smallint	-	-	f	f	837	0	822
+819	-	20	21	bigint	smallint	-	-	f	f	838	0	0
+820	*	20	21	bigint	smallint	-	-	f	f	839	0	824
+821	/	20	21	bigint	smallint	-	-	f	f	840	0	0
+822	+	21	20	smallint	bigint	-	-	f	f	841	0	818
+823	-	21	20	smallint	bigint	-	-	f	f	942	0	0
+824	*	21	20	smallint	bigint	-	-	f	f	943	0	820
+825	/	21	20	smallint	bigint	-	-	f	f	948	0	0
+843	*	790	700	money	real	-	-	f	f	846	0	845
+844	/	790	700	money	real	-	-	f	f	847	0	0
+845	*	700	790	real	money	-	-	f	f	848	0	843
+900	=	790	790	money	money	eqsel	eqjoinsel	f	t	888	901	900
+901	<>	790	790	money	money	neqsel	neqjoinsel	f	f	889	900	901
+902	<	790	790	money	money	scalarltsel	scalarltjoinsel	f	f	890	905	903
+903	>	790	790	money	money	scalargtsel	scalargtjoinsel	f	f	892	904	902
+904	<=	790	790	money	money	scalarlesel	scalarlejoinsel	f	f	891	903	905
+905	>=	790	790	money	money	scalargesel	scalargejoinsel	f	f	893	902	904
+906	+	790	790	money	money	-	-	f	f	894	0	906
+907	-	790	790	money	money	-	-	f	f	895	0	0
+908	*	790	701	money	double precision	-	-	f	f	896	0	916
+909	/	790	701	money	double precision	-	-	f	f	897	0	0
+912	*	790	23	money	integer	-	-	f	f	864	0	917
+913	/	790	23	money	integer	-	-	f	f	865	0	0
+914	*	790	21	money	smallint	-	-	f	f	866	0	918
+915	/	790	21	money	smallint	-	-	f	f	867	0	0
+916	*	701	790	double precision	money	-	-	f	f	919	0	908
+917	*	23	790	integer	money	-	-	f	f	862	0	912
+918	*	21	790	smallint	money	-	-	f	f	863	0	914
+931	<<	869	869	inet	inet	networksel	networkjoinsel	f	f	927	0	933
+932	<<=	869	869	inet	inet	networksel	networkjoinsel	f	f	928	0	934
+933	>>	869	869	inet	inet	networksel	networkjoinsel	f	f	929	0	931
+934	>>=	869	869	inet	inet	networksel	networkjoinsel	f	f	930	0	932
+965	^	701	701	double precision	double precision	-	-	f	f	232	0	0
+966	+	1034	1033	aclitem[]	aclitem	-	-	f	f	1035	0	0
+967	-	1034	1033	aclitem[]	aclitem	-	-	f	f	1036	0	0
+968	@>	1034	1033	aclitem[]	aclitem	-	-	f	f	1037	0	0
+969	@@	0	601	NONE	lseg	-	-	f	f	225	0	0
+971	@@	0	604	NONE	polygon	-	-	f	f	227	0	0
+974	=	1033	1033	aclitem	aclitem	eqsel	eqjoinsel	t	f	1062	0	974
+1038	^	1700	1700	numeric	numeric	-	-	f	f	1739	0	0
+1054	=	1042	1042	character	character	eqsel	eqjoinsel	t	t	1048	1057	1054
+1055	~	1042	25	character	text	regexeqsel	regexeqjoinsel	f	f	1658	1056	0
+1056	!~	1042	25	character	text	regexnesel	regexnejoinsel	f	f	1659	1055	0
+1057	<>	1042	1042	character	character	neqsel	neqjoinsel	f	f	1053	1054	1057
+1058	<	1042	1042	character	character	scalarltsel	scalarltjoinsel	f	f	1049	1061	1060
+1059	<=	1042	1042	character	character	scalarlesel	scalarlejoinsel	f	f	1050	1060	1061
+1060	>	1042	1042	character	character	scalargtsel	scalargtjoinsel	f	f	1051	1059	1058
+1061	>=	1042	1042	character	character	scalargesel	scalargejoinsel	f	f	1052	1058	1059
+1070	=	2277	2277	anyarray	anyarray	eqsel	eqjoinsel	t	t	744	1071	1070
+1071	<>	2277	2277	anyarray	anyarray	neqsel	neqjoinsel	f	f	390	1070	1071
+1072	<	2277	2277	anyarray	anyarray	scalarltsel	scalarltjoinsel	f	f	391	1075	1073
+1073	>	2277	2277	anyarray	anyarray	scalargtsel	scalargtjoinsel	f	f	392	1074	1072
+1074	<=	2277	2277	anyarray	anyarray	scalarlesel	scalarlejoinsel	f	f	393	1073	1075
+1075	>=	2277	2277	anyarray	anyarray	scalargesel	scalargejoinsel	f	f	396	1072	1074
+1076	+	1082	1186	date	interval	-	-	f	f	2071	0	2551
+1077	-	1082	1186	date	interval	-	-	f	f	2072	0	0
+1093	=	1082	1082	date	date	eqsel	eqjoinsel	t	t	1086	1094	1093
+1094	<>	1082	1082	date	date	neqsel	neqjoinsel	f	f	1091	1093	1094
+1095	<	1082	1082	date	date	scalarltsel	scalarltjoinsel	f	f	1087	1098	1097
+1096	<=	1082	1082	date	date	scalarlesel	scalarlejoinsel	f	f	1088	1097	1098
+1097	>	1082	1082	date	date	scalargtsel	scalargtjoinsel	f	f	1089	1096	1095
+1098	>=	1082	1082	date	date	scalargesel	scalargejoinsel	f	f	1090	1095	1096
+1099	-	1082	1082	date	date	-	-	f	f	1140	0	0
+1100	+	1082	23	date	integer	-	-	f	f	1141	0	2555
+1101	-	1082	23	date	integer	-	-	f	f	1142	0	0
+1108	=	1083	1083	time without time zone	time without time zone	eqsel	eqjoinsel	t	t	1145	1109	1108
+1109	<>	1083	1083	time without time zone	time without time zone	neqsel	neqjoinsel	f	f	1106	1108	1109
+1110	<	1083	1083	time without time zone	time without time zone	scalarltsel	scalarltjoinsel	f	f	1102	1113	1112
+1111	<=	1083	1083	time without time zone	time without time zone	scalarlesel	scalarlejoinsel	f	f	1103	1112	1113
+1112	>	1083	1083	time without time zone	time without time zone	scalargtsel	scalargtjoinsel	f	f	1104	1111	1110
+1113	>=	1083	1083	time without time zone	time without time zone	scalargesel	scalargejoinsel	f	f	1105	1110	1111
+1116	+	700	701	real	double precision	-	-	f	f	281	0	1126
+1117	-	700	701	real	double precision	-	-	f	f	282	0	0
+1118	/	700	701	real	double precision	-	-	f	f	280	0	0
+1119	*	700	701	real	double precision	-	-	f	f	279	0	1129
+1120	=	700	701	real	double precision	eqsel	eqjoinsel	t	t	299	1121	1130
+1121	<>	700	701	real	double precision	neqsel	neqjoinsel	f	f	300	1120	1131
+1122	<	700	701	real	double precision	scalarltsel	scalarltjoinsel	f	f	301	1125	1133
+1123	>	700	701	real	double precision	scalargtsel	scalargtjoinsel	f	f	303	1124	1132
+1124	<=	700	701	real	double precision	scalarlesel	scalarlejoinsel	f	f	302	1123	1135
+1125	>=	700	701	real	double precision	scalargesel	scalargejoinsel	f	f	304	1122	1134
+1126	+	701	700	double precision	real	-	-	f	f	285	0	1116
+1127	-	701	700	double precision	real	-	-	f	f	286	0	0
+1128	/	701	700	double precision	real	-	-	f	f	284	0	0
+1129	*	701	700	double precision	real	-	-	f	f	283	0	1119
+1130	=	701	700	double precision	real	eqsel	eqjoinsel	t	t	305	1131	1120
+1131	<>	701	700	double precision	real	neqsel	neqjoinsel	f	f	306	1130	1121
+1132	<	701	700	double precision	real	scalarltsel	scalarltjoinsel	f	f	307	1135	1123
+1133	>	701	700	double precision	real	scalargtsel	scalargtjoinsel	f	f	309	1134	1122
+1134	<=	701	700	double precision	real	scalarlesel	scalarlejoinsel	f	f	308	1133	1125
+1135	>=	701	700	double precision	real	scalargesel	scalargejoinsel	f	f	310	1132	1124
+1201	=	869	869	inet	inet	eqsel	eqjoinsel	t	t	920	1202	1201
+1202	<>	869	869	inet	inet	neqsel	neqjoinsel	f	f	925	1201	1202
+1203	<	869	869	inet	inet	scalarltsel	scalarltjoinsel	f	f	921	1206	1205
+1204	<=	869	869	inet	inet	scalarlesel	scalarlejoinsel	f	f	922	1205	1206
+1205	>	869	869	inet	inet	scalargtsel	scalargtjoinsel	f	f	923	1204	1203
+1206	>=	869	869	inet	inet	scalargesel	scalargejoinsel	f	f	924	1203	1204
+1207	~~	19	25	name	text	likesel	likejoinsel	f	f	858	1208	0
+1208	!~~	19	25	name	text	nlikesel	nlikejoinsel	f	f	859	1207	0
+1209	~~	25	25	text	text	likesel	likejoinsel	f	f	850	1210	0
+1210	!~~	25	25	text	text	nlikesel	nlikejoinsel	f	f	851	1209	0
+1211	~~	1042	25	character	text	likesel	likejoinsel	f	f	1631	1212	0
+1212	!~~	1042	25	character	text	nlikesel	nlikejoinsel	f	f	1632	1211	0
+1220	=	829	829	macaddr	macaddr	eqsel	eqjoinsel	t	t	830	1221	1220
+1221	<>	829	829	macaddr	macaddr	neqsel	neqjoinsel	f	f	835	1220	1221
+1222	<	829	829	macaddr	macaddr	scalarltsel	scalarltjoinsel	f	f	831	1225	1224
+1223	<=	829	829	macaddr	macaddr	scalarlesel	scalarlejoinsel	f	f	832	1224	1225
+1224	>	829	829	macaddr	macaddr	scalargtsel	scalargtjoinsel	f	f	833	1223	1222
+1225	>=	829	829	macaddr	macaddr	scalargesel	scalargejoinsel	f	f	834	1222	1223
+1226	~*	19	25	name	text	icregexeqsel	icregexeqjoinsel	f	f	1240	1227	0
+1227	!~*	19	25	name	text	icregexnesel	icregexnejoinsel	f	f	1241	1226	0
+1228	~*	25	25	text	text	icregexeqsel	icregexeqjoinsel	f	f	1238	1229	0
+1229	!~*	25	25	text	text	icregexnesel	icregexnejoinsel	f	f	1239	1228	0
+1234	~*	1042	25	character	text	icregexeqsel	icregexeqjoinsel	f	f	1656	1235	0
+1235	!~*	1042	25	character	text	icregexnesel	icregexnejoinsel	f	f	1657	1234	0
+1320	=	1184	1184	timestamp with time zone	timestamp with time zone	eqsel	eqjoinsel	t	t	1152	1321	1320
+1321	<>	1184	1184	timestamp with time zone	timestamp with time zone	neqsel	neqjoinsel	f	f	1153	1320	1321
+1322	<	1184	1184	timestamp with time zone	timestamp with time zone	scalarltsel	scalarltjoinsel	f	f	1154	1325	1324
+1323	<=	1184	1184	timestamp with time zone	timestamp with time zone	scalarlesel	scalarlejoinsel	f	f	1155	1324	1325
+1324	>	1184	1184	timestamp with time zone	timestamp with time zone	scalargtsel	scalargtjoinsel	f	f	1157	1323	1322
+1325	>=	1184	1184	timestamp with time zone	timestamp with time zone	scalargesel	scalargejoinsel	f	f	1156	1322	1323
+1327	+	1184	1186	timestamp with time zone	interval	-	-	f	f	1189	0	2554
+1328	-	1184	1184	timestamp with time zone	timestamp with time zone	-	-	f	f	1188	0	0
+1329	-	1184	1186	timestamp with time zone	interval	-	-	f	f	1190	0	0
+1330	=	1186	1186	interval	interval	eqsel	eqjoinsel	t	t	1162	1331	1330
+1331	<>	1186	1186	interval	interval	neqsel	neqjoinsel	f	f	1163	1330	1331
+1332	<	1186	1186	interval	interval	scalarltsel	scalarltjoinsel	f	f	1164	1335	1334
+1333	<=	1186	1186	interval	interval	scalarlesel	scalarlejoinsel	f	f	1165	1334	1335
+1334	>	1186	1186	interval	interval	scalargtsel	scalargtjoinsel	f	f	1167	1333	1332
+1335	>=	1186	1186	interval	interval	scalargesel	scalargejoinsel	f	f	1166	1332	1333
+1336	-	0	1186	NONE	interval	-	-	f	f	1168	0	0
+1337	+	1186	1186	interval	interval	-	-	f	f	1169	0	1337
+1338	-	1186	1186	interval	interval	-	-	f	f	1170	0	0
+1360	+	1082	1083	date	time without time zone	-	-	f	f	1272	0	1363
+1361	+	1082	1266	date	time with time zone	-	-	f	f	1297	0	1366
+1363	+	1083	1082	time without time zone	date	-	-	f	f	1296	0	1360
+1366	+	1266	1082	time with time zone	date	-	-	f	f	1298	0	1361
+1383	<->	604	718	polygon	circle	-	-	f	f	785	0	1523
+1399	-	1083	1083	time without time zone	time without time zone	-	-	f	f	1690	0	0
+1420	@@	0	718	NONE	circle	-	-	f	f	1472	0	0
+1500	=	718	718	circle	circle	eqsel	eqjoinsel	f	f	1462	1501	1500
+1501	<>	718	718	circle	circle	neqsel	neqjoinsel	f	f	1463	1500	1501
+1502	<	718	718	circle	circle	areasel	areajoinsel	f	f	1464	1505	1503
+1503	>	718	718	circle	circle	areasel	areajoinsel	f	f	1465	1504	1502
+1504	<=	718	718	circle	circle	areasel	areajoinsel	f	f	1466	1503	1505
+1505	>=	718	718	circle	circle	areasel	areajoinsel	f	f	1467	1502	1504
+1506	<<	718	718	circle	circle	positionsel	positionjoinsel	f	f	1454	0	0
+1507	&<	718	718	circle	circle	positionsel	positionjoinsel	f	f	1455	0	0
+1508	&>	718	718	circle	circle	positionsel	positionjoinsel	f	f	1456	0	0
+1509	>>	718	718	circle	circle	positionsel	positionjoinsel	f	f	1457	0	0
+1510	<@	718	718	circle	circle	contsel	contjoinsel	f	f	1458	0	1511
+1511	@>	718	718	circle	circle	contsel	contjoinsel	f	f	1453	0	1510
+1512	~=	718	718	circle	circle	eqsel	eqjoinsel	f	f	1452	0	1512
+1513	&&	718	718	circle	circle	areasel	areajoinsel	f	f	1459	0	1513
+1514	|>>	718	718	circle	circle	positionsel	positionjoinsel	f	f	1461	0	0
+1515	<<|	718	718	circle	circle	positionsel	positionjoinsel	f	f	1460	0	0
+1516	+	718	600	circle	point	-	-	f	f	1146	0	0
+1517	-	718	600	circle	point	-	-	f	f	1147	0	0
+1518	*	718	600	circle	point	-	-	f	f	1148	0	0
+1519	/	718	600	circle	point	-	-	f	f	1149	0	0
+1520	<->	718	718	circle	circle	-	-	f	f	1471	0	1520
+1521	#	0	604	NONE	polygon	-	-	f	f	1445	0	0
+1522	<->	600	718	point	circle	-	-	f	f	1476	0	3291
+1523	<->	718	604	circle	polygon	-	-	f	f	728	0	1383
+1525	?#	601	601	lseg	lseg	-	-	f	f	994	0	1525
+1526	?||	601	601	lseg	lseg	-	-	f	f	995	0	1526
+1527	?-|	601	601	lseg	lseg	-	-	f	f	996	0	1527
+1528	?-	0	601	NONE	lseg	-	-	f	f	998	0	0
+1529	?|	0	601	NONE	lseg	-	-	f	f	997	0	0
+1535	=	601	601	lseg	lseg	eqsel	eqjoinsel	f	f	999	1586	1535
+1536	#	601	601	lseg	lseg	-	-	f	f	362	0	1536
+1537	?#	601	628	lseg	line	-	-	f	f	277	0	0
+1538	?#	601	603	lseg	box	-	-	f	f	373	0	0
+1539	?#	628	603	line	box	-	-	f	f	278	0	0
+1546	<@	600	628	point	line	-	-	f	f	959	0	0
+1547	<@	600	601	point	lseg	-	-	f	f	369	0	0
+1548	<@	601	628	lseg	line	-	-	f	f	960	0	0
+1549	<@	601	603	lseg	box	-	-	f	f	372	0	0
+1550	=	1266	1266	time with time zone	time with time zone	eqsel	eqjoinsel	t	t	1352	1551	1550
+1551	<>	1266	1266	time with time zone	time with time zone	neqsel	neqjoinsel	f	f	1353	1550	1551
+1552	<	1266	1266	time with time zone	time with time zone	scalarltsel	scalarltjoinsel	f	f	1354	1555	1554
+1553	<=	1266	1266	time with time zone	time with time zone	scalarlesel	scalarlejoinsel	f	f	1355	1554	1555
+1554	>	1266	1266	time with time zone	time with time zone	scalargtsel	scalargtjoinsel	f	f	1357	1553	1552
+1555	>=	1266	1266	time with time zone	time with time zone	scalargesel	scalargejoinsel	f	f	1356	1552	1553
+1557	##	600	628	point	line	-	-	f	f	961	0	0
+1558	##	600	601	point	lseg	-	-	f	f	366	0	0
+1559	##	600	603	point	box	-	-	f	f	367	0	0
+1567	##	601	603	lseg	box	-	-	f	f	368	0	0
+1577	##	628	601	line	lseg	-	-	f	f	1488	0	0
+1578	##	601	601	lseg	lseg	-	-	f	f	1489	0	0
+1583	*	1186	701	interval	double precision	-	-	f	f	1618	0	1584
+1584	*	701	1186	double precision	interval	-	-	f	f	1624	0	1583
+1585	/	1186	701	interval	double precision	-	-	f	f	1326	0	0
+1586	<>	601	601	lseg	lseg	neqsel	neqjoinsel	f	f	1482	1535	1586
+1587	<	601	601	lseg	lseg	-	-	f	f	1483	1590	1589
+1588	<=	601	601	lseg	lseg	-	-	f	f	1484	1589	1590
+1589	>	601	601	lseg	lseg	-	-	f	f	1485	1588	1587
+1590	>=	601	601	lseg	lseg	-	-	f	f	1486	1587	1588
+1591	@-@	0	601	NONE	lseg	-	-	f	f	1487	0	0
+1611	?#	628	628	line	line	-	-	f	f	1495	0	1611
+1612	?||	628	628	line	line	-	-	f	f	1496	0	1612
+1613	?-|	628	628	line	line	-	-	f	f	1497	0	1613
+1614	?-	0	628	NONE	line	-	-	f	f	1499	0	0
+1615	?|	0	628	NONE	line	-	-	f	f	1498	0	0
+1616	=	628	628	line	line	eqsel	eqjoinsel	f	f	1492	0	1616
+1617	#	628	628	line	line	-	-	f	f	1494	0	1617
+1625	~~*	19	25	name	text	iclikesel	iclikejoinsel	f	f	1635	1626	0
+1626	!~~*	19	25	name	text	icnlikesel	icnlikejoinsel	f	f	1636	1625	0
+1627	~~*	25	25	text	text	iclikesel	iclikejoinsel	f	f	1633	1628	0
+1628	!~~*	25	25	text	text	icnlikesel	icnlikejoinsel	f	f	1634	1627	0
+1629	~~*	1042	25	character	text	iclikesel	iclikejoinsel	f	f	1660	1630	0
+1630	!~~*	1042	25	character	text	icnlikesel	icnlikejoinsel	f	f	1661	1629	0
+1694	<=	16	16	boolean	boolean	scalarlesel	scalarlejoinsel	f	f	1691	59	1695
+1695	>=	16	16	boolean	boolean	scalargesel	scalargejoinsel	f	f	1692	58	1694
+1751	-	0	1700	NONE	numeric	-	-	f	f	1771	0	0
+1752	=	1700	1700	numeric	numeric	eqsel	eqjoinsel	t	t	1718	1753	1752
+1753	<>	1700	1700	numeric	numeric	neqsel	neqjoinsel	f	f	1719	1752	1753
+1754	<	1700	1700	numeric	numeric	scalarltsel	scalarltjoinsel	f	f	1722	1757	1756
+1755	<=	1700	1700	numeric	numeric	scalarlesel	scalarlejoinsel	f	f	1723	1756	1757
+1756	>	1700	1700	numeric	numeric	scalargtsel	scalargtjoinsel	f	f	1720	1755	1754
+1757	>=	1700	1700	numeric	numeric	scalargesel	scalargejoinsel	f	f	1721	1754	1755
+1758	+	1700	1700	numeric	numeric	-	-	f	f	1724	0	1758
+1759	-	1700	1700	numeric	numeric	-	-	f	f	1725	0	0
+1760	*	1700	1700	numeric	numeric	-	-	f	f	1726	0	1760
+1761	/	1700	1700	numeric	numeric	-	-	f	f	1727	0	0
+1762	%	1700	1700	numeric	numeric	-	-	f	f	1729	0	0
+1763	@	0	1700	NONE	numeric	-	-	f	f	1704	0	0
+1784	=	1560	1560	bit	bit	eqsel	eqjoinsel	f	t	1581	1785	1784
+1785	<>	1560	1560	bit	bit	neqsel	neqjoinsel	f	f	1582	1784	1785
+1786	<	1560	1560	bit	bit	scalarltsel	scalarltjoinsel	f	f	1595	1789	1787
+1787	>	1560	1560	bit	bit	scalargtsel	scalargtjoinsel	f	f	1593	1788	1786
+1788	<=	1560	1560	bit	bit	scalarlesel	scalarlejoinsel	f	f	1594	1787	1789
+1789	>=	1560	1560	bit	bit	scalargesel	scalargejoinsel	f	f	1592	1786	1788
+1791	&	1560	1560	bit	bit	-	-	f	f	1673	0	1791
+1792	|	1560	1560	bit	bit	-	-	f	f	1674	0	1792
+1793	#	1560	1560	bit	bit	-	-	f	f	1675	0	1793
+1794	~	0	1560	NONE	bit	-	-	f	f	1676	0	0
+1795	<<	1560	23	bit	integer	-	-	f	f	1677	0	0
+1796	>>	1560	23	bit	integer	-	-	f	f	1678	0	0
+1797	||	1562	1562	bit varying	bit varying	-	-	f	f	1679	0	0
+1800	+	1083	1186	time without time zone	interval	-	-	f	f	1747	0	1849
+1801	-	1083	1186	time without time zone	interval	-	-	f	f	1748	0	0
+1802	+	1266	1186	time with time zone	interval	-	-	f	f	1749	0	2552
+1803	-	1266	1186	time with time zone	interval	-	-	f	f	1750	0	0
+1804	=	1562	1562	bit varying	bit varying	eqsel	eqjoinsel	f	t	1666	1805	1804
+1805	<>	1562	1562	bit varying	bit varying	neqsel	neqjoinsel	f	f	1667	1804	1805
+1806	<	1562	1562	bit varying	bit varying	scalarltsel	scalarltjoinsel	f	f	1671	1809	1807
+1807	>	1562	1562	bit varying	bit varying	scalargtsel	scalargtjoinsel	f	f	1669	1808	1806
+1808	<=	1562	1562	bit varying	bit varying	scalarlesel	scalarlejoinsel	f	f	1670	1807	1809
+1809	>=	1562	1562	bit varying	bit varying	scalargesel	scalargejoinsel	f	f	1668	1806	1808
+1849	+	1186	1083	interval	time without time zone	-	-	f	f	1848	0	1800
+1862	=	21	20	smallint	bigint	eqsel	eqjoinsel	t	t	1850	1863	1868
+1863	<>	21	20	smallint	bigint	neqsel	neqjoinsel	f	f	1851	1862	1869
+1864	<	21	20	smallint	bigint	scalarltsel	scalarltjoinsel	f	f	1852	1867	1871
+1865	>	21	20	smallint	bigint	scalargtsel	scalargtjoinsel	f	f	1853	1866	1870
+1866	<=	21	20	smallint	bigint	scalarlesel	scalarlejoinsel	f	f	1854	1865	1873
+1867	>=	21	20	smallint	bigint	scalargesel	scalargejoinsel	f	f	1855	1864	1872
+1868	=	20	21	bigint	smallint	eqsel	eqjoinsel	t	t	1856	1869	1862
+1869	<>	20	21	bigint	smallint	neqsel	neqjoinsel	f	f	1857	1868	1863
+1870	<	20	21	bigint	smallint	scalarltsel	scalarltjoinsel	f	f	1858	1873	1865
+1871	>	20	21	bigint	smallint	scalargtsel	scalargtjoinsel	f	f	1859	1872	1864
+1872	<=	20	21	bigint	smallint	scalarlesel	scalarlejoinsel	f	f	1860	1871	1867
+1873	>=	20	21	bigint	smallint	scalargesel	scalargejoinsel	f	f	1861	1870	1866
+1874	&	21	21	smallint	smallint	-	-	f	f	1892	0	1874
+1875	|	21	21	smallint	smallint	-	-	f	f	1893	0	1875
+1876	#	21	21	smallint	smallint	-	-	f	f	1894	0	1876
+1877	~	0	21	NONE	smallint	-	-	f	f	1895	0	0
+1878	<<	21	23	smallint	integer	-	-	f	f	1896	0	0
+1879	>>	21	23	smallint	integer	-	-	f	f	1897	0	0
+1880	&	23	23	integer	integer	-	-	f	f	1898	0	1880
+1881	|	23	23	integer	integer	-	-	f	f	1899	0	1881
+1882	#	23	23	integer	integer	-	-	f	f	1900	0	1882
+1883	~	0	23	NONE	integer	-	-	f	f	1901	0	0
+1884	<<	23	23	integer	integer	-	-	f	f	1902	0	0
+1885	>>	23	23	integer	integer	-	-	f	f	1903	0	0
+1886	&	20	20	bigint	bigint	-	-	f	f	1904	0	1886
+1887	|	20	20	bigint	bigint	-	-	f	f	1905	0	1887
+1888	#	20	20	bigint	bigint	-	-	f	f	1906	0	1888
+1889	~	0	20	NONE	bigint	-	-	f	f	1907	0	0
+1890	<<	20	23	bigint	integer	-	-	f	f	1908	0	0
+1891	>>	20	23	bigint	integer	-	-	f	f	1909	0	0
+1916	+	0	20	NONE	bigint	-	-	f	f	1910	0	0
+1917	+	0	21	NONE	smallint	-	-	f	f	1911	0	0
+1918	+	0	23	NONE	integer	-	-	f	f	1912	0	0
+1919	+	0	700	NONE	real	-	-	f	f	1913	0	0
+1920	+	0	701	NONE	double precision	-	-	f	f	1914	0	0
+1921	+	0	1700	NONE	numeric	-	-	f	f	1915	0	0
+1955	=	17	17	bytea	bytea	eqsel	eqjoinsel	t	t	1948	1956	1955
+1956	<>	17	17	bytea	bytea	neqsel	neqjoinsel	f	f	1953	1955	1956
+1957	<	17	17	bytea	bytea	scalarltsel	scalarltjoinsel	f	f	1949	1960	1959
+1958	<=	17	17	bytea	bytea	scalarlesel	scalarlejoinsel	f	f	1950	1959	1960
+1959	>	17	17	bytea	bytea	scalargtsel	scalargtjoinsel	f	f	1951	1958	1957
+1960	>=	17	17	bytea	bytea	scalargesel	scalargejoinsel	f	f	1952	1957	1958
+2016	~~	17	17	bytea	bytea	likesel	likejoinsel	f	f	2005	2017	0
+2017	!~~	17	17	bytea	bytea	nlikesel	nlikejoinsel	f	f	2006	2016	0
+2018	||	17	17	bytea	bytea	-	-	f	f	2011	0	0
+2060	=	1114	1114	timestamp without time zone	timestamp without time zone	eqsel	eqjoinsel	t	t	2052	2061	2060
+2061	<>	1114	1114	timestamp without time zone	timestamp without time zone	neqsel	neqjoinsel	f	f	2053	2060	2061
+2062	<	1114	1114	timestamp without time zone	timestamp without time zone	scalarltsel	scalarltjoinsel	f	f	2054	2065	2064
+2063	<=	1114	1114	timestamp without time zone	timestamp without time zone	scalarlesel	scalarlejoinsel	f	f	2055	2064	2065
+2064	>	1114	1114	timestamp without time zone	timestamp without time zone	scalargtsel	scalargtjoinsel	f	f	2057	2063	2062
+2065	>=	1114	1114	timestamp without time zone	timestamp without time zone	scalargesel	scalargejoinsel	f	f	2056	2062	2063
+2066	+	1114	1186	timestamp without time zone	interval	-	-	f	f	2032	0	2553
+2067	-	1114	1114	timestamp without time zone	timestamp without time zone	-	-	f	f	2031	0	0
+2068	-	1114	1186	timestamp without time zone	interval	-	-	f	f	2033	0	0
+2314	~<~	25	25	text	text	scalarltsel	scalarltjoinsel	f	f	2160	2317	2318
+2315	~<=~	25	25	text	text	scalarlesel	scalarlejoinsel	f	f	2161	2318	2317
+2317	~>=~	25	25	text	text	scalargesel	scalargejoinsel	f	f	2163	2314	2315
+2318	~>~	25	25	text	text	scalargtsel	scalargtjoinsel	f	f	2164	2315	2314
+2326	~<~	1042	1042	character	character	scalarltsel	scalarltjoinsel	f	f	2174	2329	2330
+2327	~<=~	1042	1042	character	character	scalarlesel	scalarlejoinsel	f	f	2175	2330	2329
+2329	~>=~	1042	1042	character	character	scalargesel	scalargejoinsel	f	f	2177	2326	2327
+2330	~>~	1042	1042	character	character	scalargtsel	scalargtjoinsel	f	f	2178	2327	2326
+2345	<	1082	1114	date	timestamp without time zone	scalarltsel	scalarltjoinsel	f	f	2338	2348	2375
+2346	<=	1082	1114	date	timestamp without time zone	scalarlesel	scalarlejoinsel	f	f	2339	2349	2374
+2347	=	1082	1114	date	timestamp without time zone	eqsel	eqjoinsel	f	t	2340	2350	2373
+2348	>=	1082	1114	date	timestamp without time zone	scalargesel	scalargejoinsel	f	f	2342	2345	2372
+2349	>	1082	1114	date	timestamp without time zone	scalargtsel	scalargtjoinsel	f	f	2341	2346	2371
+2350	<>	1082	1114	date	timestamp without time zone	neqsel	neqjoinsel	f	f	2343	2347	2376
+2358	<	1082	1184	date	timestamp with time zone	scalarltsel	scalarltjoinsel	f	f	2351	2361	2388
+2359	<=	1082	1184	date	timestamp with time zone	scalarlesel	scalarlejoinsel	f	f	2352	2362	2387
+2360	=	1082	1184	date	timestamp with time zone	eqsel	eqjoinsel	f	t	2353	2363	2386
+2361	>=	1082	1184	date	timestamp with time zone	scalargesel	scalargejoinsel	f	f	2355	2358	2385
+2362	>	1082	1184	date	timestamp with time zone	scalargtsel	scalargtjoinsel	f	f	2354	2359	2384
+2363	<>	1082	1184	date	timestamp with time zone	neqsel	neqjoinsel	f	f	2356	2360	2389
+2371	<	1114	1082	timestamp without time zone	date	scalarltsel	scalarltjoinsel	f	f	2364	2374	2349
+2372	<=	1114	1082	timestamp without time zone	date	scalarlesel	scalarlejoinsel	f	f	2365	2375	2348
+2373	=	1114	1082	timestamp without time zone	date	eqsel	eqjoinsel	f	t	2366	2376	2347
+2374	>=	1114	1082	timestamp without time zone	date	scalargesel	scalargejoinsel	f	f	2368	2371	2346
+2375	>	1114	1082	timestamp without time zone	date	scalargtsel	scalargtjoinsel	f	f	2367	2372	2345
+2376	<>	1114	1082	timestamp without time zone	date	neqsel	neqjoinsel	f	f	2369	2373	2350
+2384	<	1184	1082	timestamp with time zone	date	scalarltsel	scalarltjoinsel	f	f	2377	2387	2362
+2385	<=	1184	1082	timestamp with time zone	date	scalarlesel	scalarlejoinsel	f	f	2378	2388	2361
+2386	=	1184	1082	timestamp with time zone	date	eqsel	eqjoinsel	f	t	2379	2389	2360
+2387	>=	1184	1082	timestamp with time zone	date	scalargesel	scalargejoinsel	f	f	2381	2384	2359
+2388	>	1184	1082	timestamp with time zone	date	scalargtsel	scalargtjoinsel	f	f	2380	2385	2358
+2389	<>	1184	1082	timestamp with time zone	date	neqsel	neqjoinsel	f	f	2382	2386	2363
+2534	<	1114	1184	timestamp without time zone	timestamp with time zone	scalarltsel	scalarltjoinsel	f	f	2520	2537	2544
+2535	<=	1114	1184	timestamp without time zone	timestamp with time zone	scalarlesel	scalarlejoinsel	f	f	2521	2538	2543
+2536	=	1114	1184	timestamp without time zone	timestamp with time zone	eqsel	eqjoinsel	f	t	2522	2539	2542
+2537	>=	1114	1184	timestamp without time zone	timestamp with time zone	scalargesel	scalargejoinsel	f	f	2524	2534	2541
+2538	>	1114	1184	timestamp without time zone	timestamp with time zone	scalargtsel	scalargtjoinsel	f	f	2523	2535	2540
+2539	<>	1114	1184	timestamp without time zone	timestamp with time zone	neqsel	neqjoinsel	f	f	2525	2536	2545
+2540	<	1184	1114	timestamp with time zone	timestamp without time zone	scalarltsel	scalarltjoinsel	f	f	2527	2543	2538
+2541	<=	1184	1114	timestamp with time zone	timestamp without time zone	scalarlesel	scalarlejoinsel	f	f	2528	2544	2537
+2542	=	1184	1114	timestamp with time zone	timestamp without time zone	eqsel	eqjoinsel	f	t	2529	2545	2536
+2543	>=	1184	1114	timestamp with time zone	timestamp without time zone	scalargesel	scalargejoinsel	f	f	2531	2540	2535
+2544	>	1184	1114	timestamp with time zone	timestamp without time zone	scalargtsel	scalargtjoinsel	f	f	2530	2541	2534
+2545	<>	1184	1114	timestamp with time zone	timestamp without time zone	neqsel	neqjoinsel	f	f	2532	2542	2539
+2551	+	1186	1082	interval	date	-	-	f	f	2546	0	1076
+2552	+	1186	1266	interval	time with time zone	-	-	f	f	2547	0	1802
+2553	+	1186	1114	interval	timestamp without time zone	-	-	f	f	2548	0	2066
+2554	+	1186	1184	interval	timestamp with time zone	-	-	f	f	2549	0	1327
+2555	+	23	1082	integer	date	-	-	f	f	2550	0	1100
+2570	<<|	603	603	box	box	positionsel	positionjoinsel	f	f	2562	0	0
+2571	&<|	603	603	box	box	positionsel	positionjoinsel	f	f	2563	0	0
+2572	|&>	603	603	box	box	positionsel	positionjoinsel	f	f	2564	0	0
+2573	|>>	603	603	box	box	positionsel	positionjoinsel	f	f	2565	0	0
+2574	<<|	604	604	polygon	polygon	positionsel	positionjoinsel	f	f	2566	0	0
+2575	&<|	604	604	polygon	polygon	positionsel	positionjoinsel	f	f	2567	0	0
+2576	|&>	604	604	polygon	polygon	positionsel	positionjoinsel	f	f	2568	0	0
+2577	|>>	604	604	polygon	polygon	positionsel	positionjoinsel	f	f	2569	0	0
+2589	&<|	718	718	circle	circle	positionsel	positionjoinsel	f	f	2587	0	0
+2590	|&>	718	718	circle	circle	positionsel	positionjoinsel	f	f	2588	0	0
+2634	~	0	869	NONE	inet	-	-	f	f	2627	0	0
+2635	&	869	869	inet	inet	-	-	f	f	2628	0	0
+2636	|	869	869	inet	inet	-	-	f	f	2629	0	0
+2637	+	869	20	inet	bigint	-	-	f	f	2630	0	2638
+2638	+	20	869	bigint	inet	-	-	f	f	2631	0	2637
+2639	-	869	20	inet	bigint	-	-	f	f	2632	0	0
+2640	-	869	869	inet	inet	-	-	f	f	2633	0	0
+2750	&&	2277	2277	anyarray	anyarray	arraycontsel	arraycontjoinsel	f	f	2747	0	2750
+2751	@>	2277	2277	anyarray	anyarray	arraycontsel	arraycontjoinsel	f	f	2748	0	2752
+2752	<@	2277	2277	anyarray	anyarray	arraycontsel	arraycontjoinsel	f	f	2749	0	2751
+2779	||	25	2776	text	anynonarray	-	-	f	f	2003	0	0
+2780	||	2776	25	anynonarray	text	-	-	f	f	2004	0	0
+2799	<	27	27	tid	tid	scalarltsel	scalarltjoinsel	f	f	2791	2802	2800
+2800	>	27	27	tid	tid	scalargtsel	scalargtjoinsel	f	f	2790	2801	2799
+2801	<=	27	27	tid	tid	scalarlesel	scalarlejoinsel	f	f	2793	2800	2802
+2802	>=	27	27	tid	tid	scalargesel	scalargejoinsel	f	f	2792	2799	2801
+2860	=	4537	4537	anymultirange	anymultirange	eqsel	eqjoinsel	t	t	4244	2861	2860
+2861	<>	4537	4537	anymultirange	anymultirange	neqsel	neqjoinsel	f	f	4245	2860	2861
+2862	<	4537	4537	anymultirange	anymultirange	multirangesel	scalarltjoinsel	f	f	4274	2864	2865
+2863	<=	4537	4537	anymultirange	anymultirange	multirangesel	scalarlejoinsel	f	f	4275	2865	2864
+2864	>=	4537	4537	anymultirange	anymultirange	multirangesel	scalargejoinsel	f	f	4276	2862	2863
+2865	>	4537	4537	anymultirange	anymultirange	multirangesel	scalargtjoinsel	f	f	4277	2863	2862
+2866	&&	3831	4537	anyrange	anymultirange	multirangesel	areajoinsel	f	f	4246	0	2867
+2867	&&	4537	3831	anymultirange	anyrange	multirangesel	areajoinsel	f	f	4247	0	2866
+2868	&&	4537	4537	anymultirange	anymultirange	multirangesel	areajoinsel	f	f	4248	0	2868
+2869	@>	4537	2283	anymultirange	anyelement	multirangesel	contjoinsel	f	f	4249	0	2872
+2870	@>	4537	3831	anymultirange	anyrange	multirangesel	contjoinsel	f	f	4250	0	2873
+2871	@>	4537	4537	anymultirange	anymultirange	multirangesel	contjoinsel	f	f	4251	0	2874
+2872	<@	2283	4537	anyelement	anymultirange	multirangesel	contjoinsel	f	f	4252	0	2869
+2873	<@	3831	4537	anyrange	anymultirange	multirangesel	contjoinsel	f	f	4253	0	2870
+2874	<@	4537	4537	anymultirange	anymultirange	multirangesel	contjoinsel	f	f	4254	0	2871
+2875	&<	3831	4537	anyrange	anymultirange	multirangesel	scalarltjoinsel	f	f	4264	0	0
+2876	&<	4537	3831	anymultirange	anyrange	multirangesel	scalarltjoinsel	f	f	4265	0	0
+2877	&<	4537	4537	anymultirange	anymultirange	multirangesel	scalarltjoinsel	f	f	4266	0	0
+2972	=	2950	2950	uuid	uuid	eqsel	eqjoinsel	t	t	2956	2973	2972
+2973	<>	2950	2950	uuid	uuid	neqsel	neqjoinsel	f	f	2959	2972	2973
+2974	<	2950	2950	uuid	uuid	scalarltsel	scalarltjoinsel	f	f	2954	2977	2975
+2975	>	2950	2950	uuid	uuid	scalargtsel	scalargtjoinsel	f	f	2958	2976	2974
+2976	<=	2950	2950	uuid	uuid	scalarlesel	scalarlejoinsel	f	f	2955	2975	2977
+2977	>=	2950	2950	uuid	uuid	scalargesel	scalargejoinsel	f	f	2957	2974	2976
+2988	=	2249	2249	record	record	eqsel	eqjoinsel	t	t	2981	2989	2988
+2989	<>	2249	2249	record	record	neqsel	neqjoinsel	f	f	2982	2988	2989
+2990	<	2249	2249	record	record	scalarltsel	scalarltjoinsel	f	f	2983	2993	2991
+2991	>	2249	2249	record	record	scalargtsel	scalargtjoinsel	f	f	2984	2992	2990
+2992	<=	2249	2249	record	record	scalarlesel	scalarlejoinsel	f	f	2985	2991	2993
+2993	>=	2249	2249	record	record	scalargesel	scalargejoinsel	f	f	2986	2990	2992
+3147	~	0	829	NONE	macaddr	-	-	f	f	3144	0	0
+3148	&	829	829	macaddr	macaddr	-	-	f	f	3145	0	0
+3149	|	829	829	macaddr	macaddr	-	-	f	f	3146	0	0
+3188	*=	2249	2249	record	record	eqsel	eqjoinsel	f	t	3181	3189	3188
+3189	*<>	2249	2249	record	record	neqsel	neqjoinsel	f	f	3182	3188	3189
+3190	*<	2249	2249	record	record	scalarltsel	scalarltjoinsel	f	f	3183	3193	3191
+3191	*>	2249	2249	record	record	scalargtsel	scalargtjoinsel	f	f	3184	3192	3190
+3192	*<=	2249	2249	record	record	scalarlesel	scalarlejoinsel	f	f	3185	3191	3193
+3193	*>=	2249	2249	record	record	scalargesel	scalargejoinsel	f	f	3186	3190	3192
+3206	#>>	3802	1009	jsonb	text[]	-	-	f	f	3940	0	0
+3211	->	3802	25	jsonb	text	-	-	f	f	3478	0	0
+3212	->	3802	23	jsonb	integer	-	-	f	f	3215	0	0
+3213	#>	3802	1009	jsonb	text[]	-	-	f	f	3217	0	0
+3222	=	3220	3220	pg_lsn	pg_lsn	eqsel	eqjoinsel	t	t	3233	3223	3222
+3223	<>	3220	3220	pg_lsn	pg_lsn	neqsel	neqjoinsel	f	f	3236	3222	3223
+3224	<	3220	3220	pg_lsn	pg_lsn	scalarltsel	scalarltjoinsel	f	f	3231	3227	3225
+3225	>	3220	3220	pg_lsn	pg_lsn	scalargtsel	scalargtjoinsel	f	f	3235	3226	3224
+3226	<=	3220	3220	pg_lsn	pg_lsn	scalarlesel	scalarlejoinsel	f	f	3232	3225	3227
+3227	>=	3220	3220	pg_lsn	pg_lsn	scalargesel	scalargejoinsel	f	f	3234	3224	3226
+3228	-	3220	3220	pg_lsn	pg_lsn	-	-	f	f	3237	0	0
+3240	=	3802	3802	jsonb	jsonb	eqsel	eqjoinsel	t	t	4043	3241	3240
+3241	<>	3802	3802	jsonb	jsonb	neqsel	neqjoinsel	f	f	4038	3240	3241
+3242	<	3802	3802	jsonb	jsonb	scalarltsel	scalarltjoinsel	f	f	4039	3245	3243
+3243	>	3802	3802	jsonb	jsonb	scalargtsel	scalargtjoinsel	f	f	4040	3244	3242
+3244	<=	3802	3802	jsonb	jsonb	scalarlesel	scalarlejoinsel	f	f	4041	3243	3245
+3245	>=	3802	3802	jsonb	jsonb	scalargesel	scalargejoinsel	f	f	4042	3242	3244
+3246	@>	3802	3802	jsonb	jsonb	matchingsel	matchingjoinsel	f	f	4046	0	3250
+3247	?	3802	25	jsonb	text	matchingsel	matchingjoinsel	f	f	4047	0	0
+3248	?|	3802	1009	jsonb	text[]	matchingsel	matchingjoinsel	f	f	4048	0	0
+3249	?&	3802	1009	jsonb	text[]	matchingsel	matchingjoinsel	f	f	4049	0	0
+3250	<@	3802	3802	jsonb	jsonb	matchingsel	matchingjoinsel	f	f	4050	0	3246
+3276	<->	600	604	point	polygon	-	-	f	f	3275	0	3289
+3284	||	3802	3802	jsonb	jsonb	-	-	f	f	3301	0	0
+3285	-	3802	25	jsonb	text	-	-	f	f	3302	0	0
+3286	-	3802	23	jsonb	integer	-	-	f	f	3303	0	0
+3287	#-	3802	1009	jsonb	text[]	-	-	f	f	3304	0	0
+3289	<->	604	600	polygon	point	-	-	f	f	3292	0	3276
+3291	<->	718	600	circle	point	-	-	f	f	3290	0	1522
+3315	<>	28	28	xid	xid	neqsel	neqjoinsel	f	f	3308	352	3315
+3316	<>	28	23	xid	integer	neqsel	neqjoinsel	f	f	3309	353	0
+3346	*	790	20	money	bigint	-	-	f	f	3344	0	3349
+3347	/	790	20	money	bigint	-	-	f	f	3345	0	0
+3349	*	20	790	bigint	money	-	-	f	f	3399	0	3346
+3362	=	774	774	macaddr8	macaddr8	eqsel	eqjoinsel	t	t	4113	3363	3362
+3363	<>	774	774	macaddr8	macaddr8	neqsel	neqjoinsel	f	f	4118	3362	3363
+3364	<	774	774	macaddr8	macaddr8	scalarltsel	scalarltjoinsel	f	f	4114	3367	3366
+3365	<=	774	774	macaddr8	macaddr8	scalarlesel	scalarlejoinsel	f	f	4115	3366	3367
+3366	>	774	774	macaddr8	macaddr8	scalargtsel	scalargtjoinsel	f	f	4116	3365	3364
+3367	>=	774	774	macaddr8	macaddr8	scalargesel	scalargejoinsel	f	f	4117	3364	3365
+3368	~	0	774	NONE	macaddr8	-	-	f	f	4120	0	0
+3369	&	774	774	macaddr8	macaddr8	-	-	f	f	4121	0	0
+3370	|	774	774	macaddr8	macaddr8	-	-	f	f	4122	0	0
+3398	-	3802	1009	jsonb	text[]	-	-	f	f	3343	0	0
+3477	->>	3802	25	jsonb	text	-	-	f	f	3214	0	0
+3481	->>	3802	23	jsonb	integer	-	-	f	f	3216	0	0
+3516	=	3500	3500	anyenum	anyenum	eqsel	eqjoinsel	t	t	3508	3517	3516
+3517	<>	3500	3500	anyenum	anyenum	neqsel	neqjoinsel	f	f	3509	3516	3517
+3518	<	3500	3500	anyenum	anyenum	scalarltsel	scalarltjoinsel	f	f	3510	3521	3519
+3519	>	3500	3500	anyenum	anyenum	scalargtsel	scalargtjoinsel	f	f	3511	3520	3518
+3520	<=	3500	3500	anyenum	anyenum	scalarlesel	scalarlejoinsel	f	f	3512	3519	3521
+3521	>=	3500	3500	anyenum	anyenum	scalargesel	scalargejoinsel	f	f	3513	3518	3520
+3552	&&	869	869	inet	inet	networksel	networkjoinsel	f	f	3551	0	3552
+3585	&>	3831	4537	anyrange	anymultirange	multirangesel	scalargtjoinsel	f	f	4267	0	0
+3627	<	3614	3614	tsvector	tsvector	scalarltsel	scalarltjoinsel	f	f	3616	3631	3632
+3628	<=	3614	3614	tsvector	tsvector	scalarlesel	scalarlejoinsel	f	f	3617	3632	3631
+3629	=	3614	3614	tsvector	tsvector	eqsel	eqjoinsel	f	t	3618	3630	3629
+3630	<>	3614	3614	tsvector	tsvector	neqsel	neqjoinsel	f	f	3619	3629	3630
+3631	>=	3614	3614	tsvector	tsvector	scalargesel	scalargejoinsel	f	f	3620	3627	3628
+3632	>	3614	3614	tsvector	tsvector	scalargtsel	scalargtjoinsel	f	f	3621	3628	3627
+3633	||	3614	3614	tsvector	tsvector	-	-	f	f	3625	0	0
+3636	@@	3614	3615	tsvector	tsquery	tsmatchsel	tsmatchjoinsel	f	f	3634	0	3637
+3637	@@	3615	3614	tsquery	tsvector	tsmatchsel	tsmatchjoinsel	f	f	3635	0	3636
+3660	@@@	3614	3615	tsvector	tsquery	tsmatchsel	tsmatchjoinsel	f	f	3634	0	3661
+3661	@@@	3615	3614	tsquery	tsvector	tsmatchsel	tsmatchjoinsel	f	f	3635	0	3660
+3674	<	3615	3615	tsquery	tsquery	scalarltsel	scalarltjoinsel	f	f	3662	3678	3679
+3675	<=	3615	3615	tsquery	tsquery	scalarlesel	scalarlejoinsel	f	f	3663	3679	3678
+3676	=	3615	3615	tsquery	tsquery	eqsel	eqjoinsel	f	t	3664	3677	3676
+3677	<>	3615	3615	tsquery	tsquery	neqsel	neqjoinsel	f	f	3665	3676	3677
+3678	>=	3615	3615	tsquery	tsquery	scalargesel	scalargejoinsel	f	f	3666	3674	3675
+3679	>	3615	3615	tsquery	tsquery	scalargtsel	scalargtjoinsel	f	f	3667	3675	3674
+3680	&&	3615	3615	tsquery	tsquery	-	-	f	f	3669	0	0
+3681	||	3615	3615	tsquery	tsquery	-	-	f	f	3670	0	0
+3682	!!	0	3615	NONE	tsquery	-	-	f	f	3671	0	0
+3693	@>	3615	3615	tsquery	tsquery	matchingsel	matchingjoinsel	f	f	3691	0	3694
+3694	<@	3615	3615	tsquery	tsquery	matchingsel	matchingjoinsel	f	f	3692	0	3693
+3762	@@	25	25	text	text	matchingsel	matchingjoinsel	f	f	3760	0	0
+3763	@@	25	3615	text	tsquery	matchingsel	matchingjoinsel	f	f	3761	0	0
+3825	/	790	790	money	money	-	-	f	f	3822	0	0
+3877	^@	25	25	text	text	prefixsel	prefixjoinsel	f	f	3696	0	0
+3882	=	3831	3831	anyrange	anyrange	eqsel	eqjoinsel	t	t	3855	3883	3882
+3883	<>	3831	3831	anyrange	anyrange	neqsel	neqjoinsel	f	f	3856	3882	3883
+3884	<	3831	3831	anyrange	anyrange	rangesel	scalarltjoinsel	f	f	3871	3886	3887
+3885	<=	3831	3831	anyrange	anyrange	rangesel	scalarlejoinsel	f	f	3872	3887	3886
+3886	>=	3831	3831	anyrange	anyrange	rangesel	scalargejoinsel	f	f	3873	3884	3885
+3887	>	3831	3831	anyrange	anyrange	rangesel	scalargtjoinsel	f	f	3874	3885	3884
+3888	&&	3831	3831	anyrange	anyrange	rangesel	areajoinsel	f	f	3857	0	3888
+3889	@>	3831	2283	anyrange	anyelement	rangesel	contjoinsel	f	f	3858	0	3891
+3890	@>	3831	3831	anyrange	anyrange	rangesel	contjoinsel	f	f	3859	0	3892
+3891	<@	2283	3831	anyelement	anyrange	rangesel	contjoinsel	f	f	3860	0	3889
+3892	<@	3831	3831	anyrange	anyrange	rangesel	contjoinsel	f	f	3861	0	3890
+3893	<<	3831	3831	anyrange	anyrange	rangesel	scalarltjoinsel	f	f	3863	0	3894
+3894	>>	3831	3831	anyrange	anyrange	rangesel	scalargtjoinsel	f	f	3864	0	3893
+3895	&<	3831	3831	anyrange	anyrange	rangesel	scalarltjoinsel	f	f	3865	0	0
+3896	&>	3831	3831	anyrange	anyrange	rangesel	scalargtjoinsel	f	f	3866	0	0
+3897	-|-	3831	3831	anyrange	anyrange	matchingsel	matchingjoinsel	f	f	3862	0	3897
+3898	+	3831	3831	anyrange	anyrange	-	-	f	f	3867	0	3898
+3899	-	3831	3831	anyrange	anyrange	-	-	f	f	3869	0	0
+3900	*	3831	3831	anyrange	anyrange	-	-	f	f	3868	0	3900
+3962	->	114	25	json	text	-	-	f	f	3947	0	0
+3963	->>	114	25	json	text	-	-	f	f	3948	0	0
+3964	->	114	23	json	integer	-	-	f	f	3949	0	0
+3965	->>	114	23	json	integer	-	-	f	f	3950	0	0
+3966	#>	114	1009	json	text[]	-	-	f	f	3951	0	0
+3967	#>>	114	1009	json	text[]	-	-	f	f	3953	0	0
+4012	@?	3802	4072	jsonb	jsonpath	matchingsel	matchingjoinsel	f	f	4010	0	0
+4013	@@	3802	4072	jsonb	jsonpath	matchingsel	matchingjoinsel	f	f	4011	0	0
+4035	&>	4537	3831	anymultirange	anyrange	multirangesel	scalargtjoinsel	f	f	4268	0	0
+4142	&>	4537	4537	anymultirange	anymultirange	multirangesel	scalargtjoinsel	f	f	4269	0	0
+4161	|>>	600	600	point	point	positionsel	positionjoinsel	f	f	131	0	0
+4162	<<|	600	600	point	point	positionsel	positionjoinsel	f	f	134	0	0
+4179	-|-	3831	4537	anyrange	anymultirange	matchingsel	matchingjoinsel	f	f	4255	0	4180
+4180	-|-	4537	3831	anymultirange	anyrange	matchingsel	matchingjoinsel	f	f	4257	0	4179
+4198	-|-	4537	4537	anymultirange	anymultirange	matchingsel	matchingjoinsel	f	f	4256	0	4198
+4392	+	4537	4537	anymultirange	anymultirange	-	-	f	f	4270	0	4392
+4393	-	4537	4537	anymultirange	anymultirange	-	-	f	f	4271	0	0
+4394	*	4537	4537	anymultirange	anymultirange	-	-	f	f	4272	0	4394
+4395	<<	3831	4537	anyrange	anymultirange	multirangesel	scalarltjoinsel	f	f	4258	0	4399
+4396	<<	4537	3831	anymultirange	anyrange	multirangesel	scalarltjoinsel	f	f	4259	0	4398
+4397	<<	4537	4537	anymultirange	anymultirange	multirangesel	scalarltjoinsel	f	f	4260	0	4400
+4398	>>	3831	4537	anyrange	anymultirange	multirangesel	scalargtjoinsel	f	f	4261	0	4396
+4399	>>	4537	3831	anymultirange	anyrange	multirangesel	scalargtjoinsel	f	f	4262	0	4395
+4400	>>	4537	4537	anymultirange	anymultirange	multirangesel	scalargtjoinsel	f	f	4263	0	4397
+4539	@>	3831	4537	anyrange	anymultirange	multirangesel	contjoinsel	f	f	4541	0	4540
+4540	<@	4537	3831	anymultirange	anyrange	multirangesel	contjoinsel	f	f	4542	0	4539
+5005	<->	3615	3615	tsquery	tsquery	-	-	f	f	5003	0	0
+5025	+	3220	1700	pg_lsn	numeric	-	-	f	f	5022	0	5026
+5026	+	1700	3220	numeric	pg_lsn	-	-	f	f	5023	0	5025
+5027	-	3220	1700	pg_lsn	numeric	-	-	f	f	5024	0	0
+5068	=	5069	5069	xid8	xid8	eqsel	eqjoinsel	t	t	5084	5072	5068
+5072	<>	5069	5069	xid8	xid8	neqsel	neqjoinsel	f	f	5085	5068	5072
+5073	<	5069	5069	xid8	xid8	scalarltsel	scalarltjoinsel	f	f	5034	5076	5074
+5074	>	5069	5069	xid8	xid8	scalargtsel	scalargtjoinsel	f	f	5035	5075	5073
+5075	<=	5069	5069	xid8	xid8	scalarlesel	scalarlejoinsel	f	f	5036	5074	5076
+5076	>=	5069	5069	xid8	xid8	scalargesel	scalargejoinsel	f	f	5037	5073	5075

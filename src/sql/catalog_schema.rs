@@ -55,7 +55,7 @@ fn column_value(ty: Type, text: &str) -> Option<Value> {
     Some(match ty {
         Type::Bool => Value::Bool(matches!(text, "t" | "true")),
         t if t.whole() => text.parse().map(Value::Int).ok()?,
-        Type::Float => text.parse().map(Value::Float).ok()?,
+        Type::Float | Type::Float4 => text.parse().map(Value::Float).ok()?,
         Type::TimestampTz => return None,
         Type::Numeric => coerce(Value::Text(text.to_string()), Type::Numeric).ok()?,
         Type::Reg(Reg::Proc | Reg::Procedure) => proc_value(text, ty),
@@ -74,7 +74,9 @@ fn column_type(ty: &str, sample: &str) -> (Type, Option<Value>) {
         "int4" => Type::Int,
         "oid" => Type::Oid,
         "int8" | "xid" | "cid" => Type::BigInt,
-        "float4" | "float8" => Type::Float,
+        // (a float4's values are doubles held to 32 bits, written as float4out writes them: reltuples 1e+06)
+        "float4" => Type::Float4,
+        "float8" => Type::Float,
         "numeric" => Type::Numeric,
         "int2vector" => Type::Array(22),
         "oidvector" => Type::Array(30),
@@ -296,6 +298,13 @@ impl Builtin<'static> {
     }
 }
 
+/// pg_proc.procost of built-in function `oid` (its 15th field; see `builtin_procs.tsv`): what the planner charges
+/// a call, in cpu_operator_costs (a real, widened as Postgres widens it). add_function_cost asks a prosupport
+/// function first, but no built-in one answers SupportRequestCost (only the regression suite's test function does).
+pub(super) fn builtin_proc_cost(oid: i64) -> Option<f64> {
+    Builtin::of(oid)?.f.get(14)?.parse::<f32>().ok().map(f64::from)
+}
+
 impl Builtin<'_> {
     /// Field `i`, as COPY's text format writes it: None for `\N`, with `\t`, `\n` and `\\` read back.
     fn text(&self, i: usize) -> Option<String> {
@@ -495,17 +504,14 @@ impl Builtin<'_> {
     }
 }
 
-/// `pg_proc`'s rows for the built-in functions, in oid order, each with its `tableoid` (1255) last: made the first time
-/// a query reads `pg_proc`, and kept (about 2 MB).
+/// `pg_proc`'s rows for the built-in functions, in oid order, each with its system columns last (its place among them,
+/// and the `tableoid` 1255: see `catalog_system`): made the first time a query reads `pg_proc`, and kept (about 2 MB).
 pub(super) fn builtin_proc_rows() -> &'static [Vec<Value>] {
     static ROWS: LazyLock<Vec<Vec<Value>>> = LazyLock::new(|| {
         let Some(cols) = SCHEMA.get("pg_proc") else { return vec![] };
-        let rows = PROCS.iter().filter_map(|p| Builtin::of(p.0)).map(|f| f.row(cols));
-        rows.map(|mut r| {
-            r.push(Value::Int(1255));
-            r
-        })
-        .collect()
+        let mut rows: Vec<Vec<Value>> = PROCS.iter().filter_map(|p| Builtin::of(p.0)).map(|f| f.row(cols)).collect();
+        catalog_system("pg_proc", &mut rows, 0);
+        rows
     });
     &ROWS
 }

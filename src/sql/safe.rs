@@ -253,14 +253,25 @@ fn access(s: &Stmt) -> Reach {
         Stmt::Select(_) if side_effects(s) => Reach::Write,
         // EXPLAIN without ANALYZE runs nothing that changes anything (see `effects`), but EXPLAIN EXECUTE works out its
         // arguments, as Postgres's does
-        Stmt::Explain { analyze: false, stmt, .. } if matches!(**stmt, Stmt::Execute { .. }) && side_effects(s) => {
+        Stmt::Explain { opts: super::explain::ExplainOpts { analyze: false, .. }, stmt, .. }
+            if matches!(**stmt, Stmt::Execute { .. }) && side_effects(s) =>
+        {
             Reach::Write
         }
         Stmt::Locking(..) => Reach::Write, // it locks rows it may then change
         // REINDEX writes what it rebuilds and moves (see `maintain::rebuild`): the world it runs on, a row of its own
         // per table (`tablespace::FILENODES`) that pg_class.relfilenode and pg_relation_filenode show, which a merge
-        // carries. (A READ ONLY transaction still runs it, as Postgres's does: see `sql::read_only_refusal`.)
-        Stmt::Maintain(m) if m.verb == super::maintain::Verb::Reindex => Reach::Write,
+        // carries; VACUUM and ANALYZE write the tables' statistics (`opt::stats`, `sql::RELSTATS`), which pg_class
+        // shows. (A READ ONLY transaction still runs them, as Postgres's does, whose are COMMAND_OK_IN_READ_ONLY_TXN:
+        // see `sql::read_only_refusal`.)
+        Stmt::Maintain(m)
+            if matches!(
+                m.verb,
+                super::maintain::Verb::Reindex | super::maintain::Verb::Vacuum | super::maintain::Verb::Analyze
+            ) =>
+        {
+            Reach::Write
+        }
         Stmt::Select(_)
         | Stmt::Set
         | Stmt::SetReadOnly { .. }
@@ -300,7 +311,7 @@ fn access(s: &Stmt) -> Reach {
         | Stmt::Readers(..)
         | Stmt::ShowReaders
         | Stmt::MergeBranch { dry: true, .. }
-        | Stmt::Explain { analyze: false, .. }
+        | Stmt::Explain { opts: super::explain::ExplainOpts { analyze: false, .. }, .. }
         | Stmt::Deallocate(_)
         | Stmt::Listen(_)
         | Stmt::Unlisten(_)
@@ -412,8 +423,6 @@ mod tests {
             "show disk",
             "show world_idle_ttl",
             "set statement_timeout = '1h'",
-            "vacuum",
-            "analyze t",
             "cluster t using t_pkey",
             "discard all",
             "lock table t in share mode",
@@ -427,8 +436,10 @@ mod tests {
         }
         for sql in [
             "insert into t values (1)",
-            "comment on table t is 'x'",               // a row of the world
-            "reindex table t",                         // so is its new relfilenode (Postgres's changes pg_class too)
+            "comment on table t is 'x'", // a row of the world
+            "reindex table t",           // so is its new relfilenode (Postgres's changes pg_class too)
+            "vacuum",                    // and the tables' statistics (pg_class.reltuples)
+            "analyze t",
             "create extension if not exists pgcrypto", // so is pgcrypto's record, for pg_extension
             "drop extension if exists pgcrypto",
             "update t set a = 1",

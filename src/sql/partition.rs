@@ -51,6 +51,16 @@ pub(super) enum KeyPart {
 pub(super) struct PartKey {
     pub(super) strategy: Strategy,
     pub(super) parts: Vec<KeyPart>,
+    /// what each part was written with beyond itself (as many as `parts`; a key kept before these were has none)
+    pub(super) extras: Vec<PartExtra>,
+}
+
+/// A key part's COLLATE and operator class, where they were written (pg_partitioned_table's partcollation and
+/// partclass): the collation's name, and the class's.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct PartExtra {
+    pub(super) coll: Option<String>,
+    pub(super) ops: Option<String>,
 }
 
 /// A key part ready to read from the rows of one table.
@@ -64,9 +74,22 @@ impl PartKey {
         let parts: Vec<Json> = self
             .parts
             .iter()
-            .map(|p| match p {
-                KeyPart::Col(id) => serde_json::json!({ "col": id }),
-                KeyPart::Expr(e) => serde_json::json!({ "expr": e }),
+            .enumerate()
+            .map(|(i, p)| {
+                let mut j = match p {
+                    KeyPart::Col(id) => serde_json::json!({ "col": id }),
+                    KeyPart::Expr(e) => serde_json::json!({ "expr": e }),
+                };
+                // (a collation and an operator class only where written: a key without them is kept as before)
+                if let Some(x) = self.extras.get(i) {
+                    if let Some(c) = &x.coll {
+                        j["coll"] = Json::String(c.clone());
+                    }
+                    if let Some(o) = &x.ops {
+                        j["ops"] = Json::String(o.clone());
+                    }
+                }
+                j
             })
             .collect();
         serde_json::json!({ "strategy": self.strategy.name(), "parts": parts })
@@ -74,8 +97,8 @@ impl PartKey {
 
     pub(super) fn from_json(j: &Json) -> Option<PartKey> {
         let strategy = Strategy::from_name(j["strategy"].as_str()?)?;
-        let parts = j["parts"]
-            .as_array()?
+        let arr = j["parts"].as_array()?;
+        let parts = arr
             .iter()
             .map(|p| match (p["col"].as_u64(), p["expr"].as_str()) {
                 (Some(id), _) => Some(KeyPart::Col(id as u32)),
@@ -83,7 +106,21 @@ impl PartKey {
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()?;
-        Some(PartKey { strategy, parts })
+        let extras = arr
+            .iter()
+            .map(|p| PartExtra { coll: p["coll"].as_str().map(String::from), ops: p["ops"].as_str().map(String::from) })
+            .collect();
+        Some(PartKey { strategy, parts, extras })
+    }
+
+    /// The operator class part `i` names, where it was written.
+    pub(super) fn ops(&self, i: usize) -> Option<&str> {
+        self.extras.get(i).and_then(|x| x.ops.as_deref())
+    }
+
+    /// The collation part `i` was written with.
+    pub(super) fn coll(&self, i: usize) -> Option<&str> {
+        self.extras.get(i).and_then(|x| x.coll.as_deref())
     }
 
     /// The key's parts bound to `t`'s columns.
@@ -152,19 +189,59 @@ impl PartKey {
 
     /// `RANGE (a, (b + 1), lower(c))`, as pg_get_partkeydef writes it.
     pub(super) fn def(&self, t: &Table) -> String {
+        let types = self.types(t).unwrap_or_default();
         let parts: Vec<String> = self
             .parts
             .iter()
-            .map(|p| match p {
-                KeyPart::Col(id) => t.cols.iter().find(|c| c.id == *id).map_or_else(String::new, |c| ident(&c.name)),
-                KeyPart::Expr(text) => match check_expr(text).ok().and_then(|e| catalog::deparse_expr(&e, &t.cols)) {
-                    Some((d, call)) if call => d,
-                    Some((d, _)) => format!("({d})"),
-                    None => format!("({text})"),
-                },
+            .enumerate()
+            .map(|(i, p)| {
+                let col = match p {
+                    KeyPart::Col(id) => t.cols.iter().find(|c| c.id == *id),
+                    KeyPart::Expr(_) => None,
+                };
+                let mut s = match p {
+                    KeyPart::Col(_) => col.map_or_else(String::new, |c| ident(&c.name)),
+                    KeyPart::Expr(text) => match check_expr(text).ok().and_then(|e| catalog::deparse_expr(&e, &t.cols))
+                    {
+                        Some((d, call)) if call => d,
+                        Some((d, _)) => format!("({d})"),
+                        None => format!("({text})"),
+                    },
+                };
+                // (pg_get_partkeydef_worker, ruleutils.c:1928: the collation where it isn't the column's, the
+                // operator class where it isn't the type's default)
+                if let Some(c) = self.coll(i)
+                    && col.is_none_or(|col| !col.coll.name().0.eq_ignore_ascii_case(c))
+                {
+                    s.push_str(&format!(" COLLATE {}", ident(c)));
+                }
+                if let Some(o) = self.ops(i)
+                    && types.get(i).is_none_or(|ty| default_opclass(*ty, col) != o)
+                {
+                    s.push_str(&format!(" {}", ident(o)));
+                }
+                s
             })
             .collect();
         format!("{} ({})", self.strategy.name().to_uppercase(), parts.join(", "))
+    }
+}
+
+/// The name of the default B-tree (and hash) operator class of a key part's type: `<type>_ops` (int4_ops,
+/// text_ops, timestamptz_ops; a varchar's is text's).
+fn default_opclass(ty: Type, col: Option<&Col>) -> String {
+    match ty {
+        Type::Int if col.is_some_and(|c| c.small) => "int2_ops".into(),
+        Type::SmallInt => "int2_ops".into(),
+        Type::Text if col.is_some_and(|c| matches!(c.chars, Some((_, true)))) => "bpchar_ops".into(),
+        Type::Text => "text_ops".into(),
+        Type::Float => "float8_ops".into(),
+        Type::Float4 => "float4_ops".into(),
+        Type::Bool => "bool_ops".into(),
+        Type::Json => "jsonb_ops".into(),
+        Type::Int => "int4_ops".into(),
+        Type::BigInt => "int8_ops".into(),
+        ty => format!("{}_ops", ty.name()),
     }
 }
 
@@ -301,6 +378,11 @@ impl PartBound {
     /// Whether the key belongs to the partition: for a DEFAULT one, nothing is known here (it is
     /// what no other takes).
     pub(super) fn holds(&self, key: &[Value], types: &[Type]) -> Result<bool> {
+        self.holds_with(key, types, &|_, _| None)
+    }
+
+    /// `holds`, a hash partition's key hashed with `part` (see `hash_key_with`).
+    pub(super) fn holds_with(&self, key: &[Value], types: &[Type], part: PartHash) -> Result<bool> {
         Ok(match self {
             PartBound::Range(f, t) => {
                 !key.contains(&Value::Null) && cmp_row(key, f)? != Ordering::Less && cmp_row(key, t)? == Ordering::Less
@@ -317,7 +399,7 @@ impl PartBound {
                 }
                 found
             }
-            PartBound::Hash(m, r) => hash_key(key, types)? % u64::from(*m) == u64::from(*r),
+            PartBound::Hash(m, r) => hash_key_with(key, types, part)? % u64::from(*m) == u64::from(*r),
             PartBound::Default => false,
         })
     }
@@ -595,16 +677,28 @@ fn hash_value(v: &Value, ty: Type, seed: u64) -> Result<u64> {
     })
 }
 
-/// A row's hash for HASH partitioning: its key values' hashes, nulls left out, combined as
-/// Postgres combines them, so a row lands in the partition Postgres's would take it to.
-pub(super) fn hash_key(key: &[Value], types: &[Type]) -> Result<u64> {
+/// A key part's hash by the support function of an operator class made with CREATE OPERATOR CLASS, where the part
+/// names one (its place, its value): None for a part hashed by its type's own function.
+pub(super) type PartHash<'a> = &'a dyn Fn(usize, &Value) -> Option<Result<u64>>;
+
+/// A row's hash for HASH partitioning: its key values' hashes, nulls left out, combined as Postgres combines them
+/// (compute_partition_hash_value, partbounds.c:4729: each value's hash, seeded with HASH_PARTITION_SEED, combined by
+/// hash_combine64), so a row lands in the partition Postgres's would take it to; the parts `part` hashes by their
+/// operator class's support function.
+pub(super) fn hash_key_with(key: &[Value], types: &[Type], part: PartHash) -> Result<u64> {
     let mut row = 0u64;
     for (i, v) in key.iter().enumerate().filter(|(_, v)| **v != Value::Null) {
-        let h = hash_value(v, types.get(i).copied().unwrap_or(Type::Text), HASH_SEED)?;
+        let h = match part(i, v) {
+            Some(h) => h?,
+            None => hash_value(v, types.get(i).copied().unwrap_or(Type::Text), HASH_SEED)?,
+        };
         row ^= h.wrapping_add(0x49a0_f4dd_15e5_a8e3).wrapping_add(row << 54).wrapping_add(row >> 7);
     }
     Ok(row)
 }
+
+/// HASH_PARTITION_SEED, as the int8 an operator class's support function is given.
+pub(super) const SEED: i64 = HASH_SEED as i64;
 
 // ---------------------------------------------------------------- where a row goes
 
@@ -669,8 +763,8 @@ impl Router {
     }
 
     /// The index (in `kids`) of the partition the key goes to: the one whose bound takes it, else
-    /// the default one; None when there is none.
-    pub(super) fn find(&self, key: &[Value]) -> Result<Option<usize>> {
+    /// the default one; None when there is none. A hash key is hashed with `part` (see `hash_key_with`).
+    pub(super) fn find_with(&self, key: &[Value], part: PartHash) -> Result<Option<usize>> {
         let found = match self.strategy {
             Strategy::Range => {
                 if key.contains(&Value::Null) {
@@ -699,7 +793,7 @@ impl Router {
                 None => None,
             },
             Strategy::Hash => {
-                let h = hash_key(key, &self.types)?;
+                let h = hash_key_with(key, &self.types, part)?;
                 self.kids
                     .iter()
                     .position(|k| matches!(k.bound, PartBound::Hash(m, r) if h % u64::from(m) == u64::from(r)))

@@ -14,7 +14,7 @@ pub(super) const IDX: &str = "_sonos_idx";
 /// Above every character a key holds: `x` then END sorts after every key that starts with `x`.
 const END: char = '\u{10ffff}';
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct Index {
     pub name: String,
     pub cols: Vec<u32>,         // column ids, in index order; EXPR for the next of `exprs`
@@ -29,12 +29,73 @@ pub(super) struct Index {
     /// each part's collation, in order (none: every part's is the default); a part of text in an ICU collation
     /// holds its key in that collation (see `collation::key`), so entries are in the collation's order
     pub colls: Vec<Coll>,
+    // What CREATE INDEX said that changes no entry: kept for the catalog (pg_class.relam, pg_index, pg_get_indexdef)
+    // and the index property functions. Each is absent from an index kept before they were, which reads as it did.
+    /// the access method as written (btree, hash, gist, spgist, gin, brin); None: btree, or for an index kept
+    /// before this was, what `catalog::describe` works out from `gin` and `trgm`
+    pub am: Option<String>,
+    /// each part's pg_index.indoption: `DESC` (1) and `NULLS FIRST` (2); none: every part's is 0, ascending with
+    /// nulls last. Entries are kept ascending whatever this says: a scan reads them backward for a DESC
+    pub opts: Vec<i16>,
+    /// INCLUDE's columns (ids), after the key parts in pg_index.indkey; no entry holds their values
+    pub include: Vec<u32>,
+    /// each part's operator class as written (`text_pattern_ops`), without a schema; none: no part names one
+    pub classes: Vec<Option<String>>,
+    /// for an index of an access method CREATE ACCESS METHOD made (`am`), the built-in one its handler is, which it
+    /// is kept as and does as (gist for gist2 over gisthandler: see `accessmethod`)
+    pub builtin: Option<String>,
 }
+
+/// pg_index.indoption's bits (Postgres's pg_index.h).
+pub(super) const INDOPTION_DESC: i16 = 1;
+pub(super) const INDOPTION_NULLS_FIRST: i16 = 2;
 
 impl Index {
     /// Part `k`'s collation.
     pub(super) fn coll(&self, k: usize) -> Coll {
         self.colls.get(k).copied().unwrap_or(Coll::DEFAULT)
+    }
+
+    /// Its access method: as written, or for an index kept before that was, what its entries say.
+    pub(super) fn method(&self) -> &str {
+        match (&self.am, &self.trgm) {
+            (Some(am), _) => am,
+            (None, Some(class)) if class.starts_with("gist") => "gist",
+            _ if self.gin => "gin",
+            _ => "btree",
+        }
+    }
+
+    /// The built-in access method it does as: its own, or for one CREATE ACCESS METHOD made, its handler's.
+    pub(super) fn kind(&self) -> &str {
+        self.builtin.as_deref().unwrap_or_else(|| self.method())
+    }
+
+    /// Part `k`'s indoption.
+    pub(super) fn opt(&self, k: usize) -> i16 {
+        self.opts.get(k).copied().unwrap_or(0)
+    }
+
+    /// Part `k`'s operator class as written, if it names one.
+    pub(super) fn class(&self, k: usize) -> Option<&str> {
+        self.classes.get(k).and_then(Option::as_deref)
+    }
+
+    /// Part `k`'s operator class as written, or for a trigram index kept before classes were, its one part's.
+    pub(super) fn said_class(&self, k: usize) -> Option<&str> {
+        self.class(k).or(self.trgm.as_deref().filter(|_| k == 0 && self.classes.is_empty()))
+    }
+
+    /// An index like `self` with what CREATE INDEX said beyond its entries (its access method, ordering, INCLUDE
+    /// columns and operator classes) as `from` has them: a partition's copy of its parent's index, whose INCLUDE
+    /// columns are its own ids (`include`).
+    pub(super) fn said_as(mut self, from: &Index, include: Vec<u32>) -> Index {
+        self.am = from.am.clone();
+        self.builtin = from.builtin.clone();
+        self.opts = from.opts.clone();
+        self.include = include;
+        self.classes = from.classes.clone();
+        self
     }
 }
 
