@@ -3902,6 +3902,100 @@ impl Core {
         Ok(Undone { parent, at: when, rows, skipped })
     }
 
+    /// In world `b`, puts back each row of `rows` (its key: its value before, after, and whether anyone else changed
+    /// it since) as it was before, as an ordinary write: index entries rebuilt and constraints checked as in a merge.
+    /// A row no longer as it was after (or changed by others) is named in a 40001, `whose` changes `stmt` undoes, and
+    /// nothing changes; with `skip_changed` it's left alone. Returns the rows put back and the rows left.
+    fn put_back(
+        &self,
+        b: &str,
+        rows: &std::collections::BTreeMap<String, (Option<Val>, Option<Val>, bool)>,
+        skip_changed: bool,
+        whose: &str,
+        stmt: &str,
+    ) -> Result<(usize, usize)> {
+        let (_, done) = self.batch_with(b, |v| {
+            // rows first; index entries are rebuilt below for the rows put back, as merges do
+            let (mut put, mut changed) = (std::collections::BTreeMap::new(), vec![]);
+            let mut owned = vec![]; // unique and reference rows: back only with their rows
+            for (k, (before, after, others)) in rows {
+                if k.starts_with("_sonos_seq/") || sql::btree_entry(k) || agents::agent_row(k) {
+                    continue;
+                }
+                let now = self.val(&v.s, k)?;
+                if sql::internal(k) {
+                    if !others && now == *after {
+                        owned.push((k, before));
+                    }
+                } else if !others && now == *after {
+                    if now != *before {
+                        put.insert(k.clone(), before.clone());
+                    }
+                } else {
+                    changed.push(k.as_str());
+                }
+            }
+            if !changed.is_empty() && !skip_changed {
+                return Err(Error::Constraint {
+                    code: "40001",
+                    message: format!(
+                        "{} rows {whose} changed have changed again since ({}); {stmt} ... SKIP CHANGED undoes the rest; nothing was undone",
+                        changed.len(),
+                        changed[..changed.len().min(10)].iter().map(|k| sql::show_key(k)).collect::<Vec<_>>().join(", ")
+                    ),
+                });
+            }
+            let n = put.len();
+            for (k, before) in owned {
+                let after = rows[k].1.as_deref();
+                if sql::owners(k, [before.as_deref(), after]).iter().all(|o| put.contains_key(o)) {
+                    put.insert(k.clone(), before.clone());
+                }
+            }
+            let keys: Vec<String> = put.keys().cloned().collect();
+            let mut next = v.s.clone();
+            for (k, val) in &put {
+                next.set(k, val.clone());
+            }
+            let undone = |e: sql::SqlError| Error::Constraint { code: e.code, message: format!("{}; nothing was undone", e.message) };
+            for (k, val) in sql::reindex(&View { s: next.clone(), ..v.clone() }, v, &keys).map_err(undone)? {
+                next.set(&k, val.clone());
+                put.insert(k, val);
+            }
+            sql::check_merge(&View { s: next, ..v.clone() }, v, &keys).map_err(undone)?;
+            let out = put.into_iter().map(|(k, v)| (k, v.as_deref().map(String::from))).collect();
+            Ok((out, (n, changed.len())))
+        })?;
+        Ok(done)
+    }
+
+    /// Undoes in world `b` what turned `from` into `to` (worlds, or worlds as they were: `'w@when'`), as `DIFF WORLD
+    /// from TO to` lists it: each row goes back to how `from` has it, as an ordinary write, constraints checked as in
+    /// a merge. A row `b` no longer has as `to` does was changed since: named in a 40001 with nothing undone, or with
+    /// `skip_changed` left alone. Tables in `except` (their rows, schema and indexes) are left as they are. A commit
+    /// reverted as the server sees it: `from` the moment before, `to` the moment after. Returns the rows put back and
+    /// the rows left.
+    pub fn undo_diff(
+        &self,
+        b: &str,
+        from: &str,
+        to: &str,
+        skip_changed: bool,
+        except: &[String],
+    ) -> Result<(usize, usize)> {
+        if b == MAIN {
+            attach::refuse_main(self, "UNDO DIFF")?;
+        }
+        let _back = Recovering::enter(); // a way back: main's protection lets it through
+        self.may_undo_into(b)?;
+        let (x, y) = self.diff_ends(from, Some(to))?;
+        let rows = (self.state_diff(&x, &y)?.into_iter())
+            .filter(|c| !except.iter().any(|t| t == table_of(&c.key)))
+            .map(|c| (c.key, (c.before, c.after, false)))
+            .collect();
+        self.put_back(b, &rows, skip_changed, &format!("the diff from {from} to {to}"), "UNDO DIFF")
+    }
+
     /// Undoes what agent `agent` changed in world `b` since `since` (ms since 1970, within the
     /// history window): its own writes, its commits and the merges it ran into `b`. Each row it
     /// changed goes back to how it was before the agent first changed it, as an ordinary write,
@@ -4024,58 +4118,8 @@ impl Core {
         if let Some(e) = failed {
             return Err(e);
         }
-        let (_, (n, skipped)) = self.batch_with(b, |v| {
-            // rows first; index entries are rebuilt below for the rows put back, as merges do
-            let (mut put, mut changed) = (std::collections::BTreeMap::new(), vec![]);
-            let mut owned = vec![]; // unique and reference rows: back only with their rows
-            for (k, (before, after, others)) in &rows {
-                if k.starts_with("_sonos_seq/") || sql::btree_entry(k) || agents::agent_row(k) {
-                    continue;
-                }
-                let now = self.val(&v.s, k)?;
-                if sql::internal(k) {
-                    if !others && now == *after {
-                        owned.push((k, before));
-                    }
-                } else if !others && now == *after {
-                    if now != *before {
-                        put.insert(k.clone(), before.clone());
-                    }
-                } else {
-                    changed.push(k.as_str());
-                }
-            }
-            if !changed.is_empty() && !skip_changed {
-                return Err(Error::Constraint {
-                    code: "40001",
-                    message: format!(
-                        "{} rows agent {agent} changed have changed again since ({}); UNDO AGENT ... SKIP CHANGED undoes the rest; nothing was undone",
-                        changed.len(),
-                        changed[..changed.len().min(10)].iter().map(|k| sql::show_key(k)).collect::<Vec<_>>().join(", ")
-                    ),
-                });
-            }
-            let n = put.len();
-            for (k, before) in owned {
-                let after = rows[k].1.as_deref();
-                if sql::owners(k, [before.as_deref(), after]).iter().all(|o| put.contains_key(o)) {
-                    put.insert(k.clone(), before.clone());
-                }
-            }
-            let keys: Vec<String> = put.keys().cloned().collect();
-            let mut next = v.s.clone();
-            for (k, val) in &put {
-                next.set(k, val.clone());
-            }
-            let undone = |e: sql::SqlError| Error::Constraint { code: e.code, message: format!("{}; nothing was undone", e.message) };
-            for (k, val) in sql::reindex(&View { s: next.clone(), ..v.clone() }, v, &keys).map_err(undone)? {
-                next.set(&k, val.clone());
-                put.insert(k, val);
-            }
-            sql::check_merge(&View { s: next, ..v.clone() }, v, &keys).map_err(undone)?;
-            let out = put.into_iter().map(|(k, v)| (k, v.as_deref().map(String::from))).collect();
-            Ok((out, (n, changed.len())))
-        })?;
+        let whose = format!("agent {agent}");
+        let (n, skipped) = self.put_back(b, &rows, skip_changed, &whose, "UNDO AGENT")?;
         Ok(Undone { parent: b.into(), at: since, rows: n, skipped })
     }
 
@@ -4678,6 +4722,31 @@ impl Core {
         Ok(tables)
     }
 
+    /// `diff` (or `diff_between` with `to`) counted rather than listed: per table, the rows deleted, updated and
+    /// inserted, without reading any of them; and the changes to tables and the other objects, as `diff` gives them.
+    pub fn diff_summary(
+        &self,
+        b: &str,
+        to: Option<&str>,
+    ) -> Result<(std::collections::BTreeMap<String, sql::Counts>, Vec<Change>)> {
+        let _t = self.metrics.time(metrics::Op::Diff);
+        let (x, y) = self.diff_ends(b, to)?;
+        let (mut tables, mut objects) = (std::collections::BTreeMap::<String, sql::Counts>::new(), vec![]);
+        for c in self.state_diff_iter(&x, &y, None)? {
+            let c = c?;
+            if !shown(&c.key) || sql::internal(&c.key) {
+                continue;
+            }
+            if reserved_table(&c.key) {
+                objects.push(self.show_change(&x, &y, c)?); // a table's schema, a view, a function...
+                continue;
+            }
+            let t = c.key.split_once('/').map_or(c.key.as_str(), |t| t.0);
+            tables.entry(t.to_string()).or_default().add(c.before.is_some(), c.after.is_some());
+        }
+        Ok((tables, objects))
+    }
+
     /// One page of `diff` (or `diff_between` with `to`): up to `limit` changes with key > `after`,
     /// in key order, and the key to pass as `after` for the next page (None on the last). Reads
     /// only as far as the page, so memory follows the page, not the diff.
@@ -4978,6 +5047,7 @@ impl Core {
     fn merge_locked(&self, b: &str, o: &MergeOptions, picks: &HashMap<String, Settle>, mode: Mode) -> Result<Merged> {
         let (how, expected, columns) = (o.how, o.expected, o.columns);
         let (dry, rebase) = (mode == Mode::Dry, mode == Mode::Rebase);
+        SETTLED.set(Settled::NONE);
         // `parent` is the world merged into: the branch's parent, or `into`
         let (child, parent, name, into) = {
             let m = self.branches.read().unwrap();
@@ -5145,7 +5215,12 @@ impl Core {
             false => child.info.read().unwrap().meta.get(scope::SCOPE).cloned(),
         };
         let columns_reviewed = policy.as_ref().is_some_and(|p| !p.review_columns.is_empty());
-        for ch in diff {
+        let mut counts = Settled::NONE;
+        // tables' definitions first: a table both sides changed is known before its rows come (a row of it can't be
+        // combined by columns, the merged table's columns being undecided)
+        let (defs, rows): (Vec<Change>, Vec<Change>) =
+            diff.into_iter().partition(|c| c.key.starts_with("_sonos_tables/"));
+        for ch in defs.into_iter().chain(rows) {
             let theirs = self.val(&next, &ch.key)?;
             // Apply only where the parent still holds the value this branch forked from. If the
             // parent changed the row too, that's a conflict even when both sides wrote the same
@@ -5180,11 +5255,13 @@ impl Core {
             }
             // BY COLUMNS for this merge, or for this table (ALTER TABLE ... SET (merge_by_columns)),
             // as the world merged into has it
-            let combine = columns || {
-                let t = ch.key.split_once('/').map_or("", |(t, _)| t);
-                !reserved_table(t)
-                    && *by_table.entry(t.to_string()).or_insert_with(|| sql::merges_by_columns(&parent_view, t))
-            };
+            let t = ch.key.split_once('/').map_or("", |(t, _)| t);
+            let clashed = schema_clash.iter().any(|k| k.strip_prefix("_sonos_tables/") == Some(t));
+            let combine = !clashed
+                && (columns || {
+                    !reserved_table(t)
+                        && *by_table.entry(t.to_string()).or_insert_with(|| sql::merges_by_columns(&parent_view, t))
+                });
             let mut by_cols_overwrites = None; // a row settled by columns: whether it overwrites the parent's change
             let settled = if sql::internal(&ch.key) {
                 None // rows behind constraints follow the rows they index
@@ -5235,6 +5312,14 @@ impl Core {
                         Settle::Stored(v) => v,
                         Settle::Json(_) => unreachable!(),
                     };
+                    if shown(&ch.key) && !sql::internal(&ch.key) {
+                        match what {
+                            "by columns" => counts.combined += 1,
+                            "kept ours" | "picked ours" | "by columns ours" => counts.ours += 1,
+                            "kept theirs" | "picked theirs" | "by columns theirs" => counts.theirs += 1,
+                            _ => counts.given += 1,
+                        }
+                    }
                     outcomes.insert(ch.key.clone(), (what, result.clone()));
                     let overwrites = by_cols_overwrites.unwrap_or(result != theirs);
                     overwrote += (overwrites && shown(&ch.key)) as usize;
@@ -5244,6 +5329,9 @@ impl Core {
                 }
                 None => conflicts.push(Conflict { key: ch.key, base: ch.before, ours: ch.after, theirs }),
             }
+        }
+        if !dry {
+            SETTLED.set(counts); // (read only once the merge went through: see `Settled::last`)
         }
         // what the merge does to the parent, as JSON, for the scope and the policy's columns: each
         // row it applies, from the parent's value now to what it gets (a row combined by columns
@@ -6798,6 +6886,36 @@ fn stamp() -> u64 {
     static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     START.get_or_init(|| disk::now_ms().saturating_mul(1_000_000))
         + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    /// The rows both sides changed that this thread's last merge or rebase settled (see `Settled`).
+    static SETTLED: std::cell::Cell<Settled> = const { std::cell::Cell::new(Settled::NONE) };
+}
+
+/// How a merge or rebase settled the rows both sides changed: combined by columns (the two changed
+/// different columns), taken as the merged world has them (OURS, picked ours, or by columns with
+/// OURS for the columns both changed), as the world merged into has them (THEIRS likewise), or as
+/// a RESOLVE gave them. Rows behind constraints and the catalog's own aren't counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Settled {
+    pub combined: usize,
+    pub ours: usize,
+    pub theirs: usize,
+    pub given: usize,
+}
+
+impl Settled {
+    const NONE: Settled = Settled { combined: 0, ours: 0, theirs: 0, given: 0 };
+
+    pub fn total(&self) -> usize {
+        self.combined + self.ours + self.theirs + self.given
+    }
+
+    /// What this thread's last merge or rebase settled (none after a dry run), read once it went through.
+    pub fn last() -> Settled {
+        SETTLED.get()
+    }
 }
 
 thread_local! {

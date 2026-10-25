@@ -4010,6 +4010,28 @@ fn notice(level: &'static str, message: String) {
     NOTICES.with_borrow_mut(|n| n.push(Notice { level, code: "00000", message, detail: None, hint: None }));
 }
 
+/// After a MERGE or REBASE of world `b` with `into` (the world merged into, or rebased onto) that settles rows both
+/// sides changed (`USING`, `BY COLUMNS`, `RESOLVE`): how many there were and how each was settled, none included,
+/// so a client counts them without a DRY RUN first.
+fn settled_notice(o: &crate::MergeOptions, b: &str, into: &str) {
+    if o.how == crate::Resolve::Fail && !o.columns && o.picks.is_empty() {
+        return; // nothing settles: a row both changed fails the merge
+    }
+    let s = crate::Settled::last();
+    notice(
+        "NOTICE",
+        format!(
+            "{} rows both sides changed: {} combined by columns, {} settled as {b} has them, {} as {into} has them, \
+             {} as RESOLVE gave them",
+            s.total(),
+            s.combined,
+            s.ours,
+            s.theirs,
+            s.given
+        ),
+    );
+}
+
 /// `notice`, with a DETAIL line.
 fn notice_detail(level: &'static str, message: String, detail: String) {
     unkept();
@@ -8398,6 +8420,13 @@ enum Stmt {
         verdict: crate::agents::Verdict,
         reason: String,
     },
+    /// UNDO DIFF [WORLD] a TO b [EXCEPT TABLES (t, ...)] [SKIP CHANGED]: in the session's world, what turned a into b
+    UndoDiff {
+        from: String,
+        to: String,
+        except: Vec<String>,
+        skip_changed: bool,
+    },
     /// UNDO AGENT name SINCE <time> [SKIP CHANGED] [WHERE run_id = '...']: in the session's world
     UndoAgent {
         agent: String,
@@ -8432,9 +8461,10 @@ enum Stmt {
         ttl: Option<Option<u64>>,
         pin: Option<bool>,
     },
-    /// DIFF [WORLD a [TO b]] [AS SQL]: a since its fork, or from a to b (either may be
-    /// `name@when`); as rows, or as the SQL statements that make the change
-    Diff(Option<String>, Option<String>, bool, Option<usize>),
+    /// DIFF [WORLD a [TO b]] [AS SQL | SUMMARY]: a since its fork, or from a to b (either may be
+    /// `name@when`); as rows, as the SQL statements that make the change, or (the last field) as
+    /// counts of rows per table
+    Diff(Option<String>, Option<String>, bool, Option<usize>, bool),
     /// DIFF [WORLD a [TO b]] READERS: what in the database reads the columns the diff changes
     /// (see `impact`), then what wasn't traced
     Readers(Option<String>, Option<String>),
@@ -11889,11 +11919,15 @@ impl Parser {
                 let named = self.peek().is_some_and(|t| *t != Tok::Sym(";"))
                     && !self.is_kw("as")
                     && !self.is_kw("limit")
-                    && !self.is_kw("readers");
+                    && !self.is_kw("readers")
+                    && !self.is_kw("summary");
                 let a = if named { Some(self.branch_name()?) } else { None };
                 let b = if a.is_some() && self.kw("to") { Some(self.branch_name()?) } else { None };
                 if self.kw("readers") {
                     return Ok(Stmt::Readers(a, b));
+                }
+                if self.kw("summary") {
+                    return Ok(Stmt::Diff(a, b, false, None, true));
                 }
                 let sql = if self.kw("as") {
                     self.expect_kw("sql")?;
@@ -11917,7 +11951,7 @@ impl Parser {
                 } else {
                     None
                 };
-                Ok(Stmt::Diff(a, b, sql, limit))
+                Ok(Stmt::Diff(a, b, sql, limit, false))
             }
             "show" if self.kw("history") => {
                 let world = if self.kw("for") {
@@ -12292,6 +12326,29 @@ impl Parser {
                     false => String::new(),
                 };
                 Ok(Stmt::ReviewWorld { world, verdict, reason })
+            }
+            "undo" if self.kw("diff") => {
+                let _ = self.kw("world") || self.kw("branch");
+                let from = self.branch_name()?;
+                self.expect_kw("to")?;
+                let to = self.branch_name()?;
+                let mut except = vec![];
+                if self.kw("except") {
+                    self.expect_kw("tables")?;
+                    self.expect_sym("(")?;
+                    loop {
+                        except.push(self.name()?);
+                        if !self.sym(",") {
+                            break;
+                        }
+                    }
+                    self.expect_sym(")")?;
+                }
+                let skip_changed = self.kw("skip");
+                if skip_changed {
+                    self.expect_kw("changed")?;
+                }
+                Ok(Stmt::UndoDiff { from, to, except, skip_changed })
             }
             "undo" if self.kw("agent") => {
                 let agent = self.branch_name()?;
@@ -36842,7 +36899,7 @@ impl Session {
             Stmt::Checkpoint { world, .. } if world.is_empty() => me.may_admin()?,
             Stmt::Checkpoint { world, .. } => me.may_manage(world)?,
             Stmt::Restore { world, .. } => me.may_restore(world)?,
-            Stmt::UndoMerge { .. } | Stmt::UndoAgent { .. } => me.may_undo()?,
+            Stmt::UndoMerge { .. } | Stmt::UndoAgent { .. } | Stmt::UndoDiff { .. } => me.may_undo()?,
             Stmt::ReviewWorld { .. } => {} // checked as it runs: the policy's reviewer, or an admin
             // checked as they run: 'outbox' or 'admin', policy or not
             Stmt::AckOutbox(_) | Stmt::RetryOutbox(_) | Stmt::ClaimOutbox { .. } => {}
@@ -39476,6 +39533,7 @@ impl Session {
             | Stmt::Restore { .. }
             | Stmt::UndoMerge { .. }
             | Stmt::UndoAgent { .. }
+            | Stmt::UndoDiff { .. }
             | Stmt::ReviewWorld { .. }
             | Stmt::SetRetention(_)
             | Stmt::SetSync(_)
@@ -40877,7 +40935,17 @@ impl Statement {
                     ("columns", Type::Json),
                 ]);
             }
-            Stmt::Diff(_, _, true, _) => return fixed(&[("sql", Type::Text)]),
+            Stmt::Diff(_, _, true, _, _) => return fixed(&[("sql", Type::Text)]),
+            Stmt::Diff(.., true) => {
+                return fixed(&[
+                    ("table", Type::Text),
+                    ("change", Type::Text),
+                    ("rows", Type::BigInt),
+                    ("before", Type::Json),
+                    ("after", Type::Json),
+                    ("columns", Type::Json),
+                ]);
+            }
             Stmt::ShowReaders => {
                 return fixed(&[
                     ("reader", Type::Text),
@@ -41541,7 +41609,10 @@ impl Statement {
                     columns: *columns,
                     ..Default::default()
                 };
-                Ok(Output::tag(format!("REBASE {}", db.rebase(b, &o)?)))
+                let parent = db.world(b)?.parent.unwrap_or_default();
+                let n = db.rebase(b, &o)?;
+                settled_notice(&o, b, &parent);
+                Ok(Output::tag(format!("REBASE {n}")))
             }
             Stmt::MergeBranch {
                 name,
@@ -41575,7 +41646,13 @@ impl Statement {
                     confirm_deletes: *confirm_deletes,
                 };
                 if !*dry {
-                    return Ok(Output::tag(format!("MERGE {}", db.merge_with(b, &o)?)));
+                    let into = match &o.into {
+                        Some(y) => y.clone(),
+                        None => db.world(b)?.parent.unwrap_or_default(),
+                    };
+                    let n = db.merge_with(b, &o)?;
+                    settled_notice(&o, b, &into);
+                    return Ok(Output::tag(format!("MERGE {n}")));
                 }
                 let plan = db.merge_preview(b, &o)?;
                 notice(
@@ -41716,6 +41793,14 @@ impl Statement {
             Stmt::UndoMerge { world, skip_changed } => {
                 let u = db.undo_merge(world, *skip_changed)?;
                 Ok(Output::tag(format!("UNDO MERGE {}", u.rows)))
+            }
+            Stmt::UndoDiff { from, to, except, skip_changed } => {
+                let w = db.world(branch)?.name;
+                let (n, skipped) = db.undo_diff(&w, from, to, *skip_changed, except)?;
+                if skipped > 0 {
+                    notice("NOTICE", format!("{skipped} rows changed since were left as they are"));
+                }
+                Ok(Output::tag(format!("UNDO DIFF {n}")))
             }
             Stmt::UndoAgent { agent, since, skip_changed, run } => {
                 let w = db.world(branch)?.name;
@@ -42286,7 +42371,43 @@ impl Statement {
                 let columns = self.columns(db, branch, &[])?;
                 Ok(Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows })
             }
-            Stmt::Diff(name, to, as_sql, limit) => {
+            Stmt::Diff(name, to, _, _, true) => {
+                // counts of rows per table, and the changes to tables and other objects as DIFF lists them: no row read
+                let a = name.as_deref().unwrap_or(branch);
+                let (counts, objects) = db.diff_summary(a, to.as_deref())?;
+                let json = |j: Option<Json>| j.map_or(Value::Null, Value::Json);
+                let mut rows: Vec<Vec<Value>> = describe(&objects)
+                    .into_iter()
+                    .map(|d| {
+                        let cols = Json::Array(d.columns.into_iter().map(Json::String).collect());
+                        vec![
+                            Value::Text(d.table),
+                            Value::Text(d.change.into()),
+                            Value::Null,
+                            json(d.before),
+                            json(d.after),
+                            Value::Json(cols),
+                        ]
+                    })
+                    .collect();
+                for (t, c) in by_deletes(counts) {
+                    for (change, n) in [("delete", c.deleted), ("update", c.updated), ("insert", c.inserted)] {
+                        if n > 0 {
+                            rows.push(vec![
+                                Value::Text(t.clone()),
+                                Value::Text(change.into()),
+                                Value::Int(n as i64),
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                            ]);
+                        }
+                    }
+                }
+                let columns = self.columns(db, branch, &[])?;
+                Ok(Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows })
+            }
+            Stmt::Diff(name, to, as_sql, limit, _) => {
                 let a = name.as_deref().unwrap_or(branch);
                 let changes = match (to, limit) {
                     (_, Some(n)) => db.diff_page(a, to.as_deref(), None, *n)?.0,

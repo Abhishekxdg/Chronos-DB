@@ -1,7 +1,7 @@
 //! A diff can be counted, or read a page at a time by key cursor, without building every change:
 //! a 200k-row update's full diff took 8.8 s and 350 MB just to show its size and first rows.
 
-use chronos::sql::Session;
+use chronos::sql::{Session, Value};
 use chronos::{Change, Db, MAIN};
 
 fn run(db: &Db, b: &str, q: &str) {
@@ -114,4 +114,47 @@ fn sql_diff_limit() {
     let all = Session::new(MAIN).run(&db, "diff world w", &[]).unwrap().pop().unwrap();
     assert_eq!(all.rows.len(), 50);
     assert_eq!(out.rows[..], all.rows[..7], "the first rows of the full diff");
+}
+
+/// `DIFF ... SUMMARY` counts what `DIFF` lists, per table and kind of change, and keeps a change to a table's schema
+/// as `DIFF` shows it; across trees, and between two worlds too.
+#[test]
+fn sql_diff_summary_counts_the_diff() {
+    let dir = std::env::temp_dir().join(format!("chronos-diffsummary-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = Db::open(&dir).unwrap();
+    tables(&db, 3000);
+    db.checkpoint().unwrap();
+    db.fork(MAIN, "w").unwrap();
+    change(&db, "w", 3000);
+    run(&db, "w", "alter table deals add column note text");
+    let q = |sql: &str| chronos::sql::run(&db, MAIN, sql, &[]).unwrap().pop().unwrap();
+    for (diff, summary) in
+        [("diff world w", "diff world w summary"), ("diff world main to w", "diff world main to w summary")]
+    {
+        let mut listed = std::collections::BTreeMap::<(String, String), i64>::new();
+        let full = q(diff);
+        for r in full.rows.iter().filter(|r| r[1] != Value::Null) {
+            *listed.entry((r[0].to_text(), r[2].to_text())).or_default() += 1;
+        }
+        let out = q(summary);
+        let names: Vec<&str> = out.columns.as_ref().unwrap().iter().map(|c| c.0.as_str()).collect();
+        assert_eq!(names, ["table", "change", "rows", "before", "after", "columns"]);
+        let counted: std::collections::BTreeMap<(String, String), i64> = out
+            .rows
+            .iter()
+            .filter(|r| r[2] != Value::Null)
+            .map(|r| ((r[0].to_text(), r[1].to_text()), r[2].to_text().parse().unwrap()))
+            .collect();
+        assert_eq!(counted, listed, "{summary}");
+        // the schema change, first and as DIFF has it
+        let schema = full.rows.iter().find(|r| r[1] == Value::Null).expect("alter table in the diff");
+        assert_eq!((out.rows[0][0].to_text(), out.rows[0][1].to_text()), ("deals".into(), "alter table".into()));
+        assert_eq!((&out.rows[0][3], &out.rows[0][4], &out.rows[0][5]), (&schema[3], &schema[4], &schema[5]));
+        // leads deletes the most: its counts come before deals'
+        assert_eq!((out.rows[1][0].to_text(), out.rows[1][1].to_text()), ("leads".into(), "delete".into()));
+    }
+    assert_eq!(q("diff world main to main summary").rows.len(), 0);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }

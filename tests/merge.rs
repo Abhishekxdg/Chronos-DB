@@ -95,6 +95,55 @@ fn settle_row_by_row_and_by_columns() {
     assert!(q(&db, MAIN, "select at from t where id = 'd'").rows[0][0] != Value::Null);
 }
 
+/// A merge or rebase that settles rows both sides changed says how many, and how, in one NOTICE: what a client
+/// counts as conflicts without a DRY RUN first.
+#[test]
+fn settled_rows_are_counted_in_a_notice() {
+    let said = || -> Vec<String> {
+        chronos::sql::take_notices()
+            .into_iter()
+            .filter(|n| n.message.contains("both sides"))
+            .map(|n| n.message)
+            .collect()
+    };
+    let db = Db::new();
+    setup(&db);
+    chronos::sql::take_notices();
+    q(
+        &db,
+        MAIN,
+        "merge world x by columns resolve ('t/b' = theirs, 't/d' = '{\"id\": \"d\", \"name\": \"Dee\", \"email\": \"d@z\", \"age\": 41}')",
+    );
+    assert_eq!(
+        said(),
+        ["3 rows both sides changed: 1 combined by columns, 0 settled as x has them, 1 as main has them, \
+          1 as RESOLVE gave them"]
+    );
+
+    // a rebase: a combined, b's age and d's delete as the world has them
+    let db = Db::new();
+    setup(&db);
+    chronos::sql::take_notices();
+    q(&db, "x", "rebase world x by columns using ours");
+    assert_eq!(
+        said(),
+        ["3 rows both sides changed: 1 combined by columns, 2 settled as x has them, 0 as main has them, \
+          0 as RESOLVE gave them"]
+    );
+    // a dry run, or a merge that settles nothing, says nothing; one that would settle says it had none
+    q(&db, MAIN, "merge world x dry run");
+    db.fork(MAIN, "y").unwrap();
+    q(&db, "y", "insert into t (id, name) values ('e', 'Eve')");
+    q(&db, MAIN, "merge world y");
+    assert_eq!(said(), Vec::<String>::new());
+    q(&db, MAIN, "merge world x by columns");
+    assert_eq!(
+        said(),
+        ["0 rows both sides changed: 0 combined by columns, 0 settled as x has them, 0 as main has them, \
+          0 as RESOLVE gave them"]
+    );
+}
+
 /// BY COLUMNS with a side: in a row both changed, the side named wins only the columns both changed, and each
 /// column only one side changed keeps that side's value. A whole side (USING OURS alone) still takes the whole row.
 /// A dry run says, per row, the columns each side changed and what each choice discards.
@@ -277,6 +326,22 @@ fn both_changing_a_table_cannot_be_settled_by_picking_a_side() {
         "{:?}",
         rows(&plan)
     );
+    // a row both changed, in a table both changed: the clash is what's said, not the row (a column of one name and two
+    // types: x's 'gold' can't be stored in main's integer)
+    let db2 = Db::new();
+    q(&db2, MAIN, "create table t (id int primary key, a text)");
+    q(&db2, MAIN, "insert into t values (1, 'one')");
+    db2.fork(MAIN, "x").unwrap();
+    q(&db2, "x", "alter table t add column c text");
+    q(&db2, "x", "update t set c = 'gold' where id = 1");
+    q(&db2, MAIN, "alter table t add column c int");
+    q(&db2, MAIN, "update t set a = 'uno' where id = 1");
+    for how in [" by columns", " by columns using ours", " by columns using theirs"] {
+        let e = chronos::sql::run(&db2, MAIN, &format!("merge world x{how}"), &[]).unwrap_err();
+        assert!(e.code == "40001" && e.message.contains("both sides changed table t itself"), "{how}: {}", e.message);
+        let e = chronos::sql::run(&db2, "x", &format!("rebase world x{how}"), &[]).unwrap_err();
+        assert!(e.code == "40001" && e.message.contains("both sides changed table t itself"), "{how}: {}", e.message);
+    }
     // the same change on both sides is no conflict
     let mut s = Session::new(MAIN);
     s.run(&db, "drop world x; create world y", &[]).unwrap();

@@ -199,6 +199,7 @@ DIFF
 DIFF [WORLD | BRANCH] a
 DIFF [WORLD | BRANCH] a TO b
 ... [AS SQL]
+... SUMMARY
 ... READERS
 ```
 
@@ -223,9 +224,12 @@ Destructive first: a NOTICE leads with what each table loses, the tables that de
 
 With `AS SQL`: one column, `sql` (text), one statement per row (`INSERT`, `UPDATE`, `DELETE`, `CREATE`/`ALTER TABLE`, ...). Run them on the other side to make the same change.
 
+With `SUMMARY`: the rows counted rather than listed, without reading them, so it takes a fraction of the time on a big diff. One row per table and kind of change, `table`, `change` (`delete`, `update`, `insert`), `rows` (bigint), the tables that delete most first; before them, the changes to tables and other objects as `DIFF` lists them (`alter table` with `before`, `after` and `columns`; `rows` null).
+
 ```sql
 diff world agent_7;
 diff world 'main@-1 hour' to main as sql;
+diff world agent_7 summary;
 ```
 
 ### DIFF ... READERS
@@ -294,6 +298,7 @@ MERGE BRANCH [name] [clause ...]
 
 - **Default:** a row both sides changed fails the merge with 40001, naming up to 10 rows; nothing is merged.
 - **Order of settling:** `RESOLVE` for its rows, then `BY COLUMNS`, then `USING`.
+- **Counted:** a merge that settled rows both sides changed says how many in a NOTICE: `3 rows both sides changed: 1 combined by columns, 0 settled as x has them, 1 as main has them, 1 as RESOLVE gave them`. The rows combined by columns are the ones whose sides changed different columns; the rest had a column both changed, or one side deleted the row. A merge with `USING`, `BY COLUMNS` or `RESOLVE` sends it even when no row needed settling (`0 rows both sides changed: ...`); one without them sends none. `REBASE` sends the same NOTICE.
 - **Afterwards:** a whole merge into the parent drops the world. If it was the session's, the session moves to the parent.
 - **Keys** of several columns are written `'t/(1,abc)'`.
 
@@ -437,6 +442,24 @@ Returns tag `UNDO MERGE n`.
 
 ```sql
 undo merge of world agent_7 skip changed;
+```
+
+## UNDO DIFF
+
+```
+UNDO DIFF [WORLD | BRANCH] a TO b [EXCEPT TABLES (t, ...)] [SKIP CHANGED]
+```
+
+In the session's world, puts back what turned `a` into `b`, as [`DIFF WORLD a TO b`](#diff) lists it: each row goes back to how `a` has it, as an ordinary write, indexes and constraints as in a merge. `a` and `b` are any two worlds or moments: a commit is reverted with `undo diff 'w@<before>' to 'w@<after>'`, changes made since staying.
+
+- **Rows changed since** (the world no longer has them as `b` does): 40001, naming up to 10; nothing is undone. `SKIP CHANGED` leaves those, says how many in a NOTICE, and undoes the rest.
+- **`EXCEPT TABLES`:** those tables (their rows, schema and indexes) are left as they are, say a log the undo shouldn't rewind.
+- **History** must reach back to the moments named (22023).
+
+Returns tag `UNDO DIFF n`.
+
+```sql
+undo diff world 'agent_7@2026-10-24 10:00:00' to 'agent_7@2026-10-24 10:05:00' except tables (audit);
 ```
 
 ## AS OF
