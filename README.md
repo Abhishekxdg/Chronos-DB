@@ -10,7 +10,7 @@ What keeps to the rules is written back to your Postgres in one checked transact
 
 <br>
 
-![status](https://img.shields.io/badge/status-v0.4.1%20beta-f59e0b?style=flat-square)
+![status](https://img.shields.io/badge/status-v0.4.2%20beta-f59e0b?style=flat-square)
 ![rust](https://img.shields.io/badge/rust-1.90%2B-b7410e?style=flat-square&logo=rust&logoColor=white)
 ![postgres wire](https://img.shields.io/badge/postgres-wire%20protocol-336791?style=flat-square&logo=postgresql&logoColor=white)
 ![mcp](https://img.shields.io/badge/MCP-ready-7c3aed?style=flat-square)
@@ -488,7 +488,7 @@ The Jepsen-style test found two real bugs before this release (money created by 
 
 ## Status and roadmap
 
-Chronos DB is a **public beta** (0.4.1), and not yet used in production. The previous release was [v0.4.0](https://github.com/Abhishekxdg/chronosdb/releases/tag/v0.4.0), on 2026-10-22.
+Chronos DB is a **public beta** (0.4.2), and not yet used in production. The previous release was [v0.4.1](https://github.com/Abhishekxdg/chronosdb/releases/tag/v0.4.1), on 2026-10-23.
 
 - [x] Worlds: fork, diff, three-way merge, partial merges, time travel, undo
 - [x] Postgres wire protocol and a broad SQL surface, checked against Postgres 17

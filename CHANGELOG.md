@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.4.2 (beta), 2026-10-25
+
+**Joins, merges and memory, from running BranchBench (Columbia's benchmark of agent workflows on branching databases): joins on several columns and joins too big for memory, merges where both sides changed a table's columns, a merge that counts its conflicts, `DIFF ... SUMMARY` and `UNDO DIFF`, and a memory limit for every query.**
+
+**Changed from 0.4.1: every statement has a memory limit.** A statement past `CHRONOS_QUERY_MEM` (default a quarter of the machine's memory; `0` for none, as before) fails alone with 53200, and statements together are held to twice that, where a runaway join used to take the server down. See the entry below.
+
 - **Joins on several columns too big for memory hash on all of them too.** A hash join whose other side outgrows `CHRONOS_WORK_MEM` goes to disk, split into files by the join key; that split, and each file's hash table, used the first equality alone. On TPC-C's `(w_id, d_id, ...)` keys that put a warehouse's rows in one file and paired each with all the others there: CH Q3 and Q18 took 17 minutes at five warehouses (16 MB of work memory: at one), where they now take 0.6 s. Found by BranchBench.
 - **Joins take the equalities their ON clauses imply.** `customer c JOIN new_order n ON n.w = c.w AND n.d = c.d JOIN orders o ON o.w = n.w AND o.d = n.d AND o.id = n.o AND o.c = c.id` (TPC-C's CH Q3) joined customer to new_order first, as written: every new order of a district met every customer of it, and the rows held grew past 12 GB at one warehouse (at five, the server was killed for memory). Equal columns now carry across (`o.w = n.w` and `n.w = c.w` give `o.w = c.w`, between columns of one type and collation), and the next table joined is the one linked by its whole key, then by the most columns: orders comes second. Q3 at one warehouse: 0.35 s and 850 MB. Found by BranchBench.
 - **Joins on several columns hash on all of them.** A join on `(w_id, d_id, o_id)` built its hash table on the first equality alone and checked the others row by row, so where that column has few values (one warehouse) every row probed the whole warehouse: TPC-C's `order_line JOIN orders` at one warehouse took over two minutes, `orders LEFT JOIN new_order` 4 s, `customer JOIN orders` 27 s (Postgres: 74 ms, 3 ms, 11 ms). An in-memory hash join now keys on every `a.x = b.y` of the same kind; the same three take 56 ms, 14 ms and 15 ms. A join bigger than `CHRONOS_WORK_MEM` (on disk) still hashes on one column. Found by BranchBench, whose TPC-C consistency checks are such joins.
@@ -27,6 +33,8 @@
 - **A merge says how many rows both sides changed, and how it settled them.** `MERGE WORLD` and `REBASE WORLD` that settle rows both sides changed (`USING`, `BY COLUMNS`, `RESOLVE`) send one NOTICE with the counts: `3 rows both sides changed: 1 combined by columns, 0 settled as x has them, 1 as main has them, 1 as RESOLVE gave them`. A client that counts conflicts used to run a `DRY RUN` first and then merge again; the count now comes with the merge. Found by BranchBench, whose merges count conflicts.
 - **`DIFF ... SUMMARY` counts a diff without reading it.** `DIFF WORLD a [TO b] SUMMARY` gives one row per table and kind of change (`table`, `change`, `rows`), and the changes to tables and other objects as `DIFF` lists them, without turning any row into JSON. A client that wanted only the counts of a 10,000-row diff used to read every row (0.5 s). Found by BranchBench, whose `diff` counts rows.
 - **`UNDO DIFF a TO b` reverts a change in one statement.** In the session's world it puts back what turned `a` into `b` (two worlds, or one world at two moments, as `DIFF WORLD a TO b` lists it), indexes rebuilt and constraints checked as in a merge. A row changed since is named in a 40001 and nothing is undone, as for `UNDO AGENT`; `SKIP CHANGED` leaves those, and `EXCEPT TABLES (log)` leaves tables alone. A revert used to be `DIFF ... AS SQL`, its statements then run one by one: 2 s for 10,000 rows, and a row changed since was overwritten without a word. Found by BranchBench, whose `revert` undoes a commit.
+
+The macOS builds need **macOS 13 or later**, as for 0.2.0.
 
 ## 0.4.1 (beta), 2026-10-23
 
