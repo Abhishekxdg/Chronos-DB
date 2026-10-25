@@ -1132,10 +1132,18 @@ impl Db {
                     let _ = core.expire_worlds();
                     let _ = core.announce_ambiguous(); // an effect whose lease ran out: said on its channel
                     if let Err(e) = core.save_reads() {
-                        eprintln!("chronos: could not save the reads recorded: {e}");
+                        obs::log_line(
+                            "WARN",
+                            "persist_failed",
+                            &[("what", "recorded reads".into()), ("error", format!("{e}"))],
+                        );
                     }
                     if let Err(e) = core.save_tallies() {
-                        eprintln!("chronos: could not save agents' hourly merge counts: {e}");
+                        obs::log_line(
+                            "WARN",
+                            "persist_failed",
+                            &[("what", "hourly merge counts".into()), ("error", format!("{e}"))],
+                        );
                     }
                     if let (Some(log), Some(pages)) = (&core.log, &core.pages) {
                         let reclaim = core.reclaim_due();
@@ -1170,10 +1178,14 @@ impl Drop for Db {
         let _ = w.kick.send(()); // waits out a pending wake-up, then this one stops the loop
         let _ = w.thread.join();
         if let Err(e) = self.save_reads() {
-            eprintln!("chronos: could not save the reads recorded: {e}");
+            obs::log_line("WARN", "persist_failed", &[("what", "recorded reads".into()), ("error", format!("{e}"))]);
         }
         if let Err(e) = self.save_tallies() {
-            eprintln!("chronos: could not save agents' hourly merge counts: {e}");
+            obs::log_line(
+                "WARN",
+                "persist_failed",
+                &[("what", "hourly merge counts".into()), ("error", format!("{e}"))],
+            );
         }
         let mut shipper = w.shipper;
         // the shipper stops after the closing checkpoint (which ships the log up to it) and before
@@ -1189,10 +1201,18 @@ impl Drop for Db {
                 Ok(()) => {
                     stop_shipping();
                     if let Err(e) = remote::release(r, owner) {
-                        eprintln!("chronos: could not release the lease on {}: {e}", r.url());
+                        obs::log_line(
+                            "WARN",
+                            "lease_release_failed",
+                            &[("remote", r.url().to_string()), ("error", format!("{e}"))],
+                        );
                     }
                 }
-                Err(e) => eprintln!("chronos: final checkpoint to {} failed: {e}", r.url()),
+                Err(e) => obs::log_line(
+                    "ERROR",
+                    "checkpoint_failed",
+                    &[("which", "final".into()), ("remote", r.url().to_string()), ("error", format!("{e}"))],
+                ),
             }
         }
         stop_shipping();
@@ -1206,7 +1226,15 @@ impl Drop for Core {
         sql::forget_world_types(self.uid, None); // (and the composite types its worlds were read with)
         // what worlds read, kept for the next open: last, as nothing reads any more (see `stale`)
         if let Err(e) = self.save_read_sets() {
-            eprintln!("chronos: could not keep what worlds read; their merges will be held after the restart: {e}");
+            obs::log_line(
+                "WARN",
+                "persist_failed",
+                &[
+                    ("what", "worlds' read sets".into()),
+                    ("error", format!("{e}")),
+                    ("detail", "merges held after the restart".into()),
+                ],
+            );
         }
         let (Some(log), Ok(m)) = (&self.log, self.branches.get_mut()) else { return };
         for e in m.values() {
@@ -1368,6 +1396,11 @@ impl Core {
         db.empty = Some(empty);
         db.owner = owner;
         let mut old_counters = true; // no manifest: the log's rows, if any, are in memory
+        // A logged op that no longer applies (a bug, or an on-disk/format mismatch) used to abort
+        // the process with no way back. Record the divergence instead, stop replaying, and turn it
+        // into a clean error from `open` below: the folder is left as it was, so a backup can be
+        // restored rather than the database becoming unopenable with a panic.
+        let diverged = std::cell::Cell::new(false);
         let (mut log, clean) = disk::recover(
             dir,
             lock,
@@ -1378,8 +1411,21 @@ impl Core {
                 let mut all = db.counters.lock().unwrap();
                 all.extend(counters.into_iter().flatten().map(|(name, high, origin)| (name, (high, origin))));
             },
-            |op| assert!(db.replay(op), "chronos: log replay diverged; the log only holds ops that succeeded"),
+            |op| {
+                if !diverged.get() && !db.replay(op) {
+                    diverged.set(true);
+                }
+            },
         )?;
+        if diverged.get() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chronos: log replay diverged while recovering this database: an operation in its \
+                 write-ahead log no longer applies (a bug, or an on-disk or format mismatch). The \
+                 folder was not changed and is unchanged on disk; restore it from a backup rather \
+                 than retrying in place, and please report it with the version.",
+            ));
+        }
         if let Some(anchor) = &o.anchor {
             // a takeover that set this folder's own database aside serves the remote's, not
             // anything left here, so there's nothing local to have rolled back: anchor it anew.
@@ -1953,8 +1999,10 @@ impl Core {
             if let (Some(ship), Some(r)) = (&log.ship, pages.remote())
                 && let Err(e) = ship.collect(r, first_seg)
             {
-                eprintln!(
-                    "chronos: could not delete shipped log the remote no longer needs ({e}); the next checkpoint tries again"
+                obs::log_line(
+                    "WARN",
+                    "shipped_log_cleanup_failed",
+                    &[("error", format!("{e}")), ("detail", "the next checkpoint tries again".into())],
                 );
             }
         }
@@ -4055,13 +4103,25 @@ impl Core {
         // worlds that check their reads lost them (their merges held as after a crash) and agents' hourly counts
         // started again. Kept again by the drop, if one follows: the same files, written whole
         if let Err(e) = self.save_read_sets() {
-            eprintln!("chronos: could not keep what worlds read; their merges will be held after the restart: {e}");
+            obs::log_line(
+                "WARN",
+                "persist_failed",
+                &[
+                    ("what", "worlds' read sets".into()),
+                    ("error", format!("{e}")),
+                    ("detail", "merges held after the restart".into()),
+                ],
+            );
         }
         if let Err(e) = self.save_reads() {
-            eprintln!("chronos: could not save the reads recorded: {e}");
+            obs::log_line("WARN", "persist_failed", &[("what", "recorded reads".into()), ("error", format!("{e}"))]);
         }
         if let Err(e) = self.save_tallies() {
-            eprintln!("chronos: could not save agents' hourly merge counts: {e}");
+            obs::log_line(
+                "WARN",
+                "persist_failed",
+                &[("what", "hourly merge counts".into()), ("error", format!("{e}"))],
+            );
         }
         log.close()
     }

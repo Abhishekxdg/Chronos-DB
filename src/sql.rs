@@ -50528,6 +50528,29 @@ impl<'a> Exec<'a> {
                 let agent = crate::disk::actor();
                 if !agent.is_empty() {
                     definer_refused(self.db, &agent, ddl)?;
+                    // A statement reached through a dynamic EXECUTE, a function or trigger body, or a
+                    // DO block never passed `agent_check` (the front-door capability gate). The read
+                    // or write it does is already bounded by the world this runs in — the agent was
+                    // checked for that world when the outer statement (the function call, the DO) was,
+                    // so a policy agent can't be here on `main`. What must still be stopped is a
+                    // world- or system-level statement — fork, merge, restore, drop, switch worlds, or
+                    // changing agents, policies, merge checks or the system — which is never a
+                    // legitimate thing to do from inside a body. (Classifying with `self.branch`, the
+                    // world this runs in, is right for that: `Reach::World` doesn't depend on it, and
+                    // it may be a transaction's own `_tx_` world, which `may_write` would reject.)
+                    if Statement(ddl.clone(), PlanCache::default(), false).access_in(self.db, self.branch)
+                        == Reach::World
+                    {
+                        return Err(SqlError {
+                            code: "42501",
+                            message: format!(
+                                "agent {agent} may not run world- or system-level statements from \
+                                 inside a function, trigger or DO block; it changes main only by \
+                                 merging a world of its own"
+                            ),
+                            info: None,
+                        });
+                    }
                 }
                 let out = Statement(ddl.clone(), PlanCache::default(), false).run(self, self.branch, self.params)?;
                 let fresh = self.db.view_tx(self.branch)?;
