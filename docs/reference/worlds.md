@@ -301,7 +301,7 @@ Returns tag `MERGE n`, n the rows applied.
 
 | SQLSTATE | When |
 |---|---|
-| 40001 | rows changed on both sides; or both sides changed one table's columns or constraints |
+| 40001 | rows changed on both sides; or both sides changed one column of a table, added columns of one name, or changed its keys, indexes or checks where they can't be combined (columns added or dropped on different sides merge) |
 | 23505 | both sides added rows with the same unique values |
 | 23503 / 23514 | the merged result breaks a foreign key or `CHECK` |
 | 22023 | `INTO` itself; `ONLY KEYS` given something that isn't `'table/id'`; a row tied (unique value or reference) to one left out; a row of a table the world changed itself (use `ONLY TABLES`) |

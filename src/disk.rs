@@ -526,7 +526,11 @@ pub(crate) fn stall_for_tests(var: &str) {
 // panic would end one thread, poison its locks and leave the rest serving state that isn't durable
 // (and a later fsync can report success for pages the failed one dropped).
 pub(crate) fn fatal(e: io::Error) -> ! {
-    eprintln!("chronos: a write or fsync failed ({e}); stopping so the next open recovers from the log");
+    crate::obs::log_line(
+        "ERROR",
+        "fsync_failed",
+        &[("error", format!("{e}")), ("detail", "stopping so the next open recovers from the log".into())],
+    );
     std::process::abort()
 }
 
@@ -707,7 +711,11 @@ impl Log {
 
     /// A checkpoint failed: say so, and hold off the next try for a while.
     pub(crate) fn failed(&self, e: &dyn std::fmt::Display) {
-        eprintln!("chronos: checkpoint failed ({e}); the log grows until one succeeds; trying again in 10 s");
+        crate::obs::log_line(
+            "WARN",
+            "checkpoint_failed",
+            &[("error", format!("{e}")), ("detail", "the log grows until one succeeds; retrying in 10s".into())],
+        );
         *self.retry_at.lock().unwrap() = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
     }
 

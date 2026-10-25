@@ -27858,6 +27858,134 @@ fn packed_parts(raw: &str) -> Option<(usize, &str)> {
     None
 }
 
+/// Two worlds' changes to one table's definition (its stored JSON), from the one they share: the
+/// definition holding both, when they changed different columns. See `merge_table_def`.
+pub(crate) struct MergedTable {
+    pub def: String,
+    /// layouts `from..to` are the world's own (added since the fork); in the merged definition each
+    /// is `by` further on, after the parent's (see `shift_layout`)
+    pub from: usize,
+    pub to: usize,
+    pub by: usize,
+}
+
+/// A table's definition both sides of a merge changed (`base` is it at the fork, `ours` the
+/// world's, `theirs` the parent's), merged column by column: a column only one side added, dropped
+/// or changed takes that side's change, the world's new columns going after the parent's with ids
+/// past the parent's own. Any other part of the definition (keys, indexes, checks, ...) only one
+/// side may change, and when both added columns the world mustn't change any (its parts name its
+/// columns by id, which move). None where the two can't be combined: one column changed by both,
+/// two columns of one name, or layouts that aren't the fork's with more after them.
+pub(crate) fn merge_table_def(base: &str, ours: &str, theirs: &str) -> Option<MergedTable> {
+    let parse = |s: &str| serde_json::from_str::<Json>(s).ok().filter(Json::is_object);
+    let (b, o, t) = (parse(base)?, parse(ours)?, parse(theirs)?);
+    let layouts = |j: &Json| -> Option<Vec<Vec<u64>>> {
+        j["layouts"].as_array()?.iter().map(|l| l.as_array()?.iter().map(Json::as_u64).collect()).collect()
+    };
+    let (lb, lo, lt) = (layouts(&b)?, layouts(&o)?, layouts(&t)?);
+    if lb.is_empty() || !lo.starts_with(&lb) || !lt.starts_with(&lb) {
+        return None;
+    }
+    let (nb, no, nt) = (b["next_id"].as_u64()?, o["next_id"].as_u64()?, t["next_id"].as_u64()?);
+    if no < nb || nt < nb {
+        return None;
+    }
+    let renumbered = no > nb && nt > nb;
+    let id = |old: u64| if old >= nb { old - nb + nt } else { old };
+    let (bo, oo) = (b.as_object()?, o.as_object()?);
+    let mut m = t.as_object()?.clone();
+    // everything but the columns: the world's change, where the parent made none or the same
+    let parts: std::collections::BTreeSet<&String> = bo.keys().chain(oo.keys()).chain(m.keys()).collect();
+    let mut taken = vec![];
+    for k in parts {
+        if matches!(k.as_str(), "columns" | "layouts" | "next_id" | "dropped") || oo.get(k) == bo.get(k) {
+            continue;
+        }
+        if renumbered || (t.get(k) != bo.get(k) && t.get(k) != oo.get(k)) {
+            return None;
+        }
+        taken.push((k.clone(), oo.get(k).cloned()));
+    }
+    for (k, v) in taken {
+        match v {
+            Some(v) => m.insert(k, v),
+            None => m.remove(&k),
+        };
+    }
+    let cols = |j: &Json| j["columns"].as_array().cloned().unwrap_or_default();
+    let (cb, co, ct) = (cols(&b), cols(&o), cols(&t));
+    let col_id = |c: &Json| c["id"].as_u64();
+    let find = |cs: &[Json], i: u64| cs.iter().find(|c| col_id(c) == Some(i)).cloned();
+    let mut out = vec![];
+    // the parent's columns, with the world's changes to those it had at the fork
+    for c in &ct {
+        let i = col_id(c)?;
+        if i >= nb {
+            out.push(c.clone()); // the parent's own new column
+            continue;
+        }
+        let bc = find(&cb, i)?;
+        match find(&co, i) {
+            Some(oc) if oc == bc => out.push(c.clone()),
+            Some(oc) if *c == bc || *c == oc => out.push(oc),
+            None if *c == bc => {} // the world dropped it, the parent left it
+            _ => return None,      // both changed it, or one dropped what the other changed
+        }
+    }
+    // a column the parent dropped, which the world changed
+    for bc in &cb {
+        let i = col_id(bc)?;
+        if find(&ct, i).is_none() && find(&co, i).is_some_and(|oc| oc != *bc) {
+            return None;
+        }
+    }
+    // the world's own new columns, after the parent's
+    for c in co.iter().filter(|c| col_id(c).is_some_and(|i| i >= nb)) {
+        let mut c = c.clone();
+        c["id"] = Json::from(id(col_id(&c)?));
+        out.push(c);
+    }
+    let mut names = std::collections::HashSet::new();
+    if !out.iter().all(|c| names.insert(c["name"].as_str().unwrap_or_default().to_string())) {
+        return None; // two columns of one name
+    }
+    // the parent's layouts, the world's own after them, and the merged columns as rows are packed now
+    let mut all = lt.clone();
+    all.extend(lo[lb.len()..].iter().map(|l| l.iter().map(|&i| id(i)).collect::<Vec<_>>()));
+    let now = out.iter().map(col_id).collect::<Option<Vec<u64>>>()?;
+    if all.last() != Some(&now) {
+        all.push(now);
+    }
+    // dropped columns' attnums (see `Table::dropped`): the parent's, and the world's own drops; a
+    // column the world added and dropped numbers after the parent's columns, as its new ones do
+    let dropped = |j: &Json| -> Option<Vec<u64>> {
+        j.get("dropped").map_or(Some(vec![]), |a| a.as_array()?.iter().map(Json::as_u64).collect())
+    };
+    let (db, dw, mut dm) = (dropped(&b)?, dropped(&o)?, dropped(&t)?);
+    let (used_b, used_t) = ((cb.len() + db.len()) as u64, (ct.len() + dm.len()) as u64);
+    for &d in dw.iter().filter(|d| !db.contains(d)) {
+        dm.push(if d <= used_b { d } else { d - used_b + used_t });
+    }
+    dm.sort_unstable();
+    dm.dedup();
+    match dm.is_empty() {
+        true => m.remove("dropped"),
+        false => m.insert("dropped".into(), serde_json::json!(dm)),
+    };
+    m.insert("columns".into(), Json::Array(out));
+    m.insert("layouts".into(), serde_json::json!(all));
+    m.insert("next_id".into(), Json::from(nt + (no - nb)));
+    Some(MergedTable { def: Json::Object(m).to_string(), from: lb.len(), to: lo.len(), by: lt.len() - lb.len() })
+}
+
+/// A packed row of the world in a merge that combined its table's definition (see `MergedTable`):
+/// packed with one of the world's own layouts (`from..to`), it reads the same as the merged
+/// definition's copy of it, `by` further on. None for any other row, which reads as it is.
+pub(crate) fn shift_layout(raw: &str, from: usize, to: usize, by: usize) -> Option<String> {
+    let (layout, body) = packed_parts(raw)?;
+    (by > 0 && (from..to).contains(&layout)).then(|| format!("\u{1}2{};{body}", layout + by))
+}
+
 fn pack(vals: &[Value], layout: usize) -> String {
     use std::fmt::Write;
     let mut s = format!("\u{1}2{layout};");

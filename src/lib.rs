@@ -1132,10 +1132,18 @@ impl Db {
                     let _ = core.expire_worlds();
                     let _ = core.announce_ambiguous(); // an effect whose lease ran out: said on its channel
                     if let Err(e) = core.save_reads() {
-                        eprintln!("chronos: could not save the reads recorded: {e}");
+                        obs::log_line(
+                            "WARN",
+                            "persist_failed",
+                            &[("what", "recorded reads".into()), ("error", format!("{e}"))],
+                        );
                     }
                     if let Err(e) = core.save_tallies() {
-                        eprintln!("chronos: could not save agents' hourly merge counts: {e}");
+                        obs::log_line(
+                            "WARN",
+                            "persist_failed",
+                            &[("what", "hourly merge counts".into()), ("error", format!("{e}"))],
+                        );
                     }
                     if let (Some(log), Some(pages)) = (&core.log, &core.pages) {
                         let reclaim = core.reclaim_due();
@@ -1170,10 +1178,14 @@ impl Drop for Db {
         let _ = w.kick.send(()); // waits out a pending wake-up, then this one stops the loop
         let _ = w.thread.join();
         if let Err(e) = self.save_reads() {
-            eprintln!("chronos: could not save the reads recorded: {e}");
+            obs::log_line("WARN", "persist_failed", &[("what", "recorded reads".into()), ("error", format!("{e}"))]);
         }
         if let Err(e) = self.save_tallies() {
-            eprintln!("chronos: could not save agents' hourly merge counts: {e}");
+            obs::log_line(
+                "WARN",
+                "persist_failed",
+                &[("what", "hourly merge counts".into()), ("error", format!("{e}"))],
+            );
         }
         let mut shipper = w.shipper;
         // the shipper stops after the closing checkpoint (which ships the log up to it) and before
@@ -1189,10 +1201,18 @@ impl Drop for Db {
                 Ok(()) => {
                     stop_shipping();
                     if let Err(e) = remote::release(r, owner) {
-                        eprintln!("chronos: could not release the lease on {}: {e}", r.url());
+                        obs::log_line(
+                            "WARN",
+                            "lease_release_failed",
+                            &[("remote", r.url().to_string()), ("error", format!("{e}"))],
+                        );
                     }
                 }
-                Err(e) => eprintln!("chronos: final checkpoint to {} failed: {e}", r.url()),
+                Err(e) => obs::log_line(
+                    "ERROR",
+                    "checkpoint_failed",
+                    &[("which", "final".into()), ("remote", r.url().to_string()), ("error", format!("{e}"))],
+                ),
             }
         }
         stop_shipping();
@@ -1206,7 +1226,15 @@ impl Drop for Core {
         sql::forget_world_types(self.uid, None); // (and the composite types its worlds were read with)
         // what worlds read, kept for the next open: last, as nothing reads any more (see `stale`)
         if let Err(e) = self.save_read_sets() {
-            eprintln!("chronos: could not keep what worlds read; their merges will be held after the restart: {e}");
+            obs::log_line(
+                "WARN",
+                "persist_failed",
+                &[
+                    ("what", "worlds' read sets".into()),
+                    ("error", format!("{e}")),
+                    ("detail", "merges held after the restart".into()),
+                ],
+            );
         }
         let (Some(log), Ok(m)) = (&self.log, self.branches.get_mut()) else { return };
         for e in m.values() {
@@ -1971,8 +1999,10 @@ impl Core {
             if let (Some(ship), Some(r)) = (&log.ship, pages.remote())
                 && let Err(e) = ship.collect(r, first_seg)
             {
-                eprintln!(
-                    "chronos: could not delete shipped log the remote no longer needs ({e}); the next checkpoint tries again"
+                obs::log_line(
+                    "WARN",
+                    "shipped_log_cleanup_failed",
+                    &[("error", format!("{e}")), ("detail", "the next checkpoint tries again".into())],
                 );
             }
         }
@@ -4073,13 +4103,25 @@ impl Core {
         // worlds that check their reads lost them (their merges held as after a crash) and agents' hourly counts
         // started again. Kept again by the drop, if one follows: the same files, written whole
         if let Err(e) = self.save_read_sets() {
-            eprintln!("chronos: could not keep what worlds read; their merges will be held after the restart: {e}");
+            obs::log_line(
+                "WARN",
+                "persist_failed",
+                &[
+                    ("what", "worlds' read sets".into()),
+                    ("error", format!("{e}")),
+                    ("detail", "merges held after the restart".into()),
+                ],
+            );
         }
         if let Err(e) = self.save_reads() {
-            eprintln!("chronos: could not save the reads recorded: {e}");
+            obs::log_line("WARN", "persist_failed", &[("what", "recorded reads".into()), ("error", format!("{e}"))]);
         }
         if let Err(e) = self.save_tallies() {
-            eprintln!("chronos: could not save agents' hourly merge counts: {e}");
+            obs::log_line(
+                "WARN",
+                "persist_failed",
+                &[("what", "hourly merge counts".into()), ("error", format!("{e}"))],
+            );
         }
         log.close()
     }
@@ -5042,6 +5084,24 @@ impl Core {
         };
         let mut next = parent.snapshot();
         let theirs_state = next.clone();
+        // both sides changed a table's definition: where they changed different columns, one
+        // definition holds both (see `sql::merge_table_def`), applied as the world's change. The
+        // world's rows of it are packed with its own layouts, which the merged definition keeps
+        // after the parent's: they move there as they're written into the result (see `relayout`)
+        let mut relayouts: Vec<Relayout> = vec![];
+        for ch in diff.iter_mut().filter(|c| c.key.starts_with("_sonos_tables/")) {
+            let theirs = self.val(&theirs_state, &ch.key)?;
+            if theirs == ch.before || theirs == ch.after {
+                continue;
+            }
+            let (Some(b), Some(o), Some(t)) = (&ch.before, &ch.after, &theirs) else { continue };
+            if let Some(m) = sql::merge_table_def(b, o, t) {
+                let table = ch.key["_sonos_tables/".len()..].to_string();
+                relayouts.push(Relayout { prefix: format!("{table}/"), from: m.from, to: m.to, by: m.by });
+                ch.before = theirs;
+                ch.after = Some(Val::from(m.def));
+            }
+        }
         let parent_view =
             View { core: self, born: parent.born, s: theirs_state.clone(), branch: String::new(), reads: None };
         // the world merged into with the definitions this merge brings it (a column the world added): a row settled
@@ -5293,6 +5353,7 @@ impl Core {
         if dry {
             let (mut p, merged) = self.plan(
                 &apply,
+                &relayouts,
                 &conflicts,
                 &outcomes,
                 &schema_clash,
@@ -5400,7 +5461,8 @@ impl Core {
             (self.tally_of(&disk::actor()).0, rows, deletes, effects)
         });
         for ch in apply {
-            next.set(&ch.key, ch.after);
+            let v = relayout(&relayouts, &ch.key, ch.after);
+            next.set(&ch.key, v);
         }
         let before = View { core: self, born: parent.born, s: parent.snapshot(), branch: String::new(), reads: None };
         let after = View { core: self, born: parent.born, s: next.clone(), branch: String::new(), reads: None };
@@ -5726,6 +5788,7 @@ impl Core {
     fn plan(
         &self,
         apply: &[Change],
+        relayouts: &[Relayout],
         conflicts: &[Conflict],
         outcomes: &HashMap<String, (&'static str, Option<Val>)>,
         schema_clash: &[String],
@@ -5740,7 +5803,7 @@ impl Core {
         let keys: Vec<String> = apply.iter().map(|c| c.key.clone()).collect();
         let before = View { core: self, born, s: states[2].clone(), branch: String::new(), reads: None };
         for ch in apply {
-            next.set(&ch.key, ch.after.clone());
+            next.set(&ch.key, relayout(relayouts, &ch.key, ch.after.clone()));
         }
         let blocked = match sql::reindex(&View { s: next.clone(), ..before.clone() }, &before, &keys) {
             Err(e) => Some(e.message),
@@ -5768,7 +5831,7 @@ impl Core {
                 "apply" => (String::new(), None),
                 _ => settled(&base, &ours, &theirs),
             };
-            let result = show(3, &next, &ch.key, ch.after.clone())?;
+            let result = show(3, &next, &ch.key, relayout(relayouts, &ch.key, ch.after.clone()))?;
             rows.push(Planned { key: ch.key.clone(), outcome, detail, base, ours, theirs, result, columns });
         }
         // settled rows that end as the parent already has them (kept theirs, picked theirs)
@@ -6998,6 +7061,24 @@ fn max_worlds(most: u64) -> Error {
 /// one panic doesn't make every later caller panic too.
 fn lock<T>(m: &Mutex<T>) -> sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A table whose definition a merge combined (see `sql::MergedTable`): the world's rows of it
+/// (keys starting `prefix`) packed with layouts `from..to` move `by` on as they're written.
+struct Relayout {
+    prefix: String,
+    from: usize,
+    to: usize,
+    by: usize,
+}
+
+/// `v`, the world's value for `key`, as the merged world stores it (see `Relayout`).
+fn relayout(relayouts: &[Relayout], key: &str, v: Option<Val>) -> Option<Val> {
+    let v = v?;
+    match relayouts.iter().find(|r| key.starts_with(&r.prefix)) {
+        Some(r) => Some(sql::shift_layout(&v, r.from, r.to, r.by).map_or(v, Val::from)),
+        None => Some(v),
+    }
 }
 
 fn no_history(message: String) -> Error {
