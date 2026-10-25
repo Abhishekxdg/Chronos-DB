@@ -31,6 +31,7 @@ mod bit;
 mod datefmt;
 pub mod decimal;
 mod domain;
+mod encoding;
 mod explain;
 mod filerows;
 mod foreign;
@@ -43063,6 +43064,9 @@ impl Statement {
                 db.batch_with(branch, |v| {
                     if *tag == "CREATE EVENT TRIGGER" {
                         userdefs::event_function(v, json.as_deref())?;
+                    }
+                    if *tag == "CREATE CONVERSION" {
+                        userdefs::conversion_default(v, key, json.as_deref())?;
                     }
                     x.user_def(v, key, json, missing, exists, needs, tag).map(|w| (w, ()))
                 })?;

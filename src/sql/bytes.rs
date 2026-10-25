@@ -240,20 +240,6 @@ fn position(hay: &[u8], needle: &[u8]) -> i64 {
     hay.windows(needle.len()).position(|w| w == needle).map_or(0, |i| i as i64 + 1)
 }
 
-/// The encodings `convert_to` and `convert_from` know: UTF8, LATIN1 and ASCII.
-fn encoding(name: &Value) -> Result<&'static str> {
-    let name = name.to_text();
-    match name.to_uppercase().replace(['-', '_'], "").as_str() {
-        "UTF8" | "UNICODE" => Ok("UTF8"),
-        "LATIN1" | "ISO88591" => Ok("LATIN1"),
-        "SQLASCII" | "ASCII" => Ok("ASCII"),
-        n if funcs::ENCODINGS.iter().any(|e| e.replace(['_', '-'], "") == n) => {
-            err("0A000", format!("converting to or from {name} isn't supported: UTF8, LATIN1 and SQL_ASCII are"))
-        }
-        _ => Err(invalid(format!("invalid encoding name \"{name}\""))),
-    }
-}
-
 /// SHA-224: SHA-256 from another starting state, cut to 28 bytes (`ring` has no SHA-224).
 pub(super) fn sha224(data: &[u8]) -> Vec<u8> {
     const K: [u32; 64] = [
@@ -339,50 +325,23 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Option<Value>> {
             Bytea(b)
         }
         BitLength => Int(if any { of(&a[0])?.len() as i64 * 8 } else { a[0].to_text().len() as i64 * 8 }),
-        ConvertTo => {
-            let s = a[0].to_text();
-            Bytea(match encoding(&a[1])? {
-                "UTF8" => s.into_bytes(),
-                "LATIN1" => {
-                    let mut out = vec![];
-                    for c in s.chars() {
-                        match u8::try_from(u32::from(c)) {
-                            Ok(x) => out.push(x),
-                            Err(_) => {
-                                return err(
-                                    "22021",
-                                    format!(
-                                        "character with byte sequence {} in encoding \"UTF8\" has no equivalent in encoding \"LATIN1\"",
-                                        text(c.to_string().as_bytes())
-                                    ),
-                                );
-                            }
-                        }
-                    }
-                    out
-                }
-                _ => match s.is_ascii() {
-                    true => s.into_bytes(),
-                    false => return err("22021", "invalid byte sequence for encoding \"SQL_ASCII\""),
-                },
-            })
-        }
+        // convert_to(text, to) and convert_from(bytes, from): from and to the database's encoding, UTF8; convert(bytes,
+        // from, to) between any two. Postgres's pg_convert (see `encoding`).
+        ConvertTo => Bytea(encoding::pg_convert(a[0].to_text().as_bytes(), "UTF8", &a[1].to_text())?),
         ConvertFrom => {
-            let b = of(&a[0])?;
-            Text(match encoding(&a[1])? {
-                "UTF8" => String::from_utf8(b).map_err(|e| SqlError {
-                    code: "22021",
-                    message: format!(
-                        "invalid byte sequence for encoding \"UTF8\": 0x{:02x}",
-                        e.as_bytes().get(e.utf8_error().valid_up_to()).copied().unwrap_or(0)
-                    ),
-                    info: None,
-                })?,
-                "LATIN1" => b.iter().map(|&x| char::from(x)).collect(),
-                _ if b.is_ascii() => String::from_utf8_lossy(&b).into_owned(),
-                _ => return err("22021", "invalid byte sequence for encoding \"SQL_ASCII\""),
-            })
+            let b = encoding::pg_convert(&of(&a[0])?, &a[1].to_text(), "UTF8")?;
+            // (valid UTF8: the conversion checked it)
+            Text(String::from_utf8(b).map_err(|e| {
+                encoding::report_invalid_encoding(encoding::PG_UTF8, &e.as_bytes()[e.utf8_error().valid_up_to()..])
+            })?)
         }
+        Convert => Bytea(encoding::pg_convert(&of(&a[0])?, &a[1].to_text(), &a[2].to_text())?),
+        TestEncValidlen | TestEncResult => {
+            let no_error = matches!(a[3], Value::Bool(true));
+            let (valid, out) = encoding::test_enc_conversion(&of(&a[0])?, &a[1].to_text(), &a[2].to_text(), no_error)?;
+            if f == TestEncValidlen { Int(valid.into()) } else { Bytea(out) }
+        }
+        TestEncSetup => Text(encoding::test_enc_setup().join("\n")),
         // from here on, only for a bytea
         _ if !any => return Ok(None),
         OctetLength => Int(of(&a[0])?.len() as i64),

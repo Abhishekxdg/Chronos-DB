@@ -379,6 +379,12 @@ pub(super) enum Scalar {
     BitLength,
     ConvertTo,
     ConvertFrom,
+    Convert,
+    /// regress.c's test_enc_conversion, its two OUT columns (see `encoding::test_enc_conversion`)
+    TestEncValidlen,
+    TestEncResult,
+    /// regress.c's test_enc_setup: its warnings, one text (see `encoding::test_enc_setup`)
+    TestEncSetup,
     Overlay,
     // the network address types' (see `net`)
     NetHost,
@@ -736,6 +742,10 @@ pub(super) fn lookup(name: &str) -> Option<(Scalar, std::ops::RangeInclusive<usi
         "bit_length" => (BitLength, 1..=1),
         "convert_to" => (ConvertTo, 2..=2),
         "convert_from" => (ConvertFrom, 2..=2),
+        "convert" => (Convert, 3..=3),
+        "__test_enc_validlen" => (TestEncValidlen, 4..=4),
+        "__test_enc_result" => (TestEncResult, 4..=4),
+        "__test_enc_setup" => (TestEncSetup, 0..=0),
         "overlay" => (Overlay, 3..=4),
         "host" => (NetHost, 1..=1),
         "abbrev" => (NetAbbrev, 1..=1),
@@ -913,8 +923,10 @@ pub(super) fn result_type(f: Scalar, first: Option<Type>) -> Type {
         JsonOpFn(5 | 6) => Type::Json,
         JsonOpFn(_) => Type::Bool,
         f if super::pgcrypto::ours(f) => super::pgcrypto::result_type(f),
-        Strpos | Position | OctetLength | Ascii | Grouping | GetByte | BitLength | CharToEncoding => Type::Int,
-        Decode | Sha224 | Sha256 | Sha384 | Sha512 | SetByte | ConvertTo => Type::Bytea,
+        Strpos | Position | OctetLength | Ascii | Grouping | GetByte | BitLength | CharToEncoding | TestEncValidlen => {
+            Type::Int
+        }
+        Decode | Sha224 | Sha256 | Sha384 | Sha512 | SetByte | ConvertTo | Convert | TestEncResult => Type::Bytea,
         // a bytea's part, or its bytea with another in the middle, is a bytea
         Substr | Overlay if first == Some(Type::Bytea) => Type::Bytea,
         StartsWith | BoolCmp(_) | IsNormalized | IsJson => Type::Bool,
@@ -1698,51 +1710,8 @@ fn geo(f: Scalar, a: &[Value]) -> Result<Value> {
     })
 }
 
-/// The encodings Postgres numbers, in order (`pg_encoding_to_char`).
-pub(super) const ENCODINGS: [&str; 42] = [
-    "SQL_ASCII",
-    "EUC_JP",
-    "EUC_CN",
-    "EUC_KR",
-    "EUC_TW",
-    "EUC_JIS_2004",
-    "UTF8",
-    "MULE_INTERNAL",
-    "LATIN1",
-    "LATIN2",
-    "LATIN3",
-    "LATIN4",
-    "LATIN5",
-    "LATIN6",
-    "LATIN7",
-    "LATIN8",
-    "LATIN9",
-    "LATIN10",
-    "WIN1256",
-    "WIN1258",
-    "WIN866",
-    "WIN874",
-    "KOI8R",
-    "WIN1251",
-    "WIN1252",
-    "ISO_8859_5",
-    "ISO_8859_6",
-    "ISO_8859_7",
-    "ISO_8859_8",
-    "WIN1250",
-    "WIN1253",
-    "WIN1254",
-    "WIN1255",
-    "WIN1257",
-    "KOI8U",
-    "SJIS",
-    "BIG5",
-    "GBK",
-    "UHC",
-    "GB18030",
-    "JOHAB",
-    "SHIFT_JIS_2004",
-];
+/// The encodings Postgres numbers, in order (`pg_encoding_to_char`; see `encoding::NAMES`).
+pub(super) const ENCODINGS: [&str; 42] = super::encoding::NAMES;
 
 /// Text read as a "char" and written back (see `Scalar::Char`).
 pub(super) fn one_byte(s: &str) -> String {
@@ -2437,7 +2406,7 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
         | NetSetMasklen | NetSameFamily | NetMerge | NetSet7bit | NetInet | NetCidr | NetMacaddr | NetMacaddr8 => Null,
         // (bytea's, and the text ones that need no bytea: answered by `bytes::call`)
         Encode | Decode | Sha224 | Sha256 | Sha384 | Sha512 | GetByte | SetByte | BitLength | ConvertTo
-        | ConvertFrom => Null,
+        | ConvertFrom | Convert | TestEncValidlen | TestEncResult | TestEncSetup => Null,
         // (pgcrypto's: answered by `pgcrypto::call`)
         Digest | Hmac | Crypt | GenSalt | GenRandomBytes | Encrypt | Decrypt | EncryptIv | DecryptIv
         | PgpSymEncrypt | PgpSymEncryptBytea | PgpSymDecrypt | PgpSymDecryptBytea | PgpKeyId | Armor | Dearmor => Null,
@@ -3388,13 +3357,8 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
         EncodingToChar => {
             Text(usize::try_from(int(&a[0])?).ok().and_then(|i| ENCODINGS.get(i)).map_or("", |e| e).into())
         }
-        // (its name compared as Postgres's clean_encoding_name leaves it: letters and digits only, in lower case, so
-        // `utf-8` is UTF8)
-        CharToEncoding => {
-            let clean = |s: &str| s.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_lowercase();
-            let name = clean(&s());
-            Int(ENCODINGS.iter().position(|e| clean(e) == name).map_or(-1, |i| i as i64))
-        }
+        // (by its name or any alias, as Postgres's pg_char_to_encoding: see `encoding::char_to_encoding`)
+        CharToEncoding => Int(super::encoding::char_to_encoding(&s()).map_or(-1, |i| i as i64)),
         // cardinality: all the elements; the others of dimension d, null for one the array doesn't have
         Cardinality | ArrayLength | ArrayLower | ArrayUpper => {
             let x = super::mdarray::read(&a[0])?.unwrap_or_else(super::mdarray::Arr::empty);

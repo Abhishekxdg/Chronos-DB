@@ -5986,6 +5986,15 @@ fn regress_c(file: &str, symbol: &str, args: &[Type]) -> Option<(Lang, String)> 
         }
         // a path as Postgres's canonicalize_path writes it (src/port/path.c: see `funcs::canonicalize_path`)
         ("regress", "test_canonicalize_path", [Type::Text]) => sql("select __canonicalize_path($1)"),
+        // regress.c's encoding tests: its verification of each encoding's invalid string (a warning for each that
+        // fails, none here), and a conversion and how many bytes of it were good (see `encoding`)
+        ("regress", "test_enc_setup", []) => Some((
+            Lang::PlPgSql,
+            "declare w text := __test_enc_setup(); begin if w <> '' then raise warning '%', w; end if; end".into(),
+        )),
+        ("regress", "test_enc_conversion", [Type::Bytea, _, _, Type::Bool]) => {
+            sql("select __test_enc_validlen($1, $2::text, $3::text, $4), __test_enc_result($1, $2::text, $3::text, $4)")
+        }
         // whether a value of one type reads as another's with no conversion (IsBinaryCoercible: see
         // `catalog::binary_coercible`)
         ("regress", "binary_coercible", [Type::Oid, Type::Oid]) => sql("select __binary_coercible($1, $2)"),

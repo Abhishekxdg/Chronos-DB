@@ -2143,10 +2143,12 @@ impl Parser {
         })
     }
 
-    /// After CREATE, ALTER or DROP: `[DEFAULT] CONVERSION ...`. A conversion is kept as its name only: text here
-    /// is UTF8, which nothing converts (CREATE CONVERSION name FOR 'from' TO 'to' FROM function).
+    /// After CREATE, ALTER or DROP: `[DEFAULT] CONVERSION ...`. A conversion's row is its schema, its encodings,
+    /// its function and whether it is its pair's default (CREATE [DEFAULT] CONVERSION name FOR 'from' TO 'to' FROM
+    /// function); text here is UTF8, so nothing converts by it, but `convert` and the like use the built-in ones (see
+    /// `encoding`).
     pub(super) fn conversion_stmt(&mut self, verb: &str) -> Result<Stmt> {
-        self.kw("default");
+        let default = self.kw("default");
         self.expect_kw("conversion")?;
         let tag: &'static str = match verb {
             "create" => "CREATE CONVERSION",
@@ -2154,22 +2156,65 @@ impl Parser {
             _ => "DROP CONVERSION",
         };
         let if_exists = verb == "drop" && self.guard(false)?;
+        let mut schema = None;
         let mut name = self.name()?;
         while self.sym(".") {
+            schema = Some(name);
             name = self.name()?;
         }
+        let def = match verb {
+            "create" => Some(self.conversion_def(schema.as_deref().unwrap_or("public"), default)?.to_string()),
+            _ => None,
+        };
         self.skip_rest();
         let key = format!("{PREFIX}conversion/{name}");
         let missing = format!("conversion \"{name}\" does not exist");
         Ok(Stmt::UserDef {
             needs: None,
             key,
-            json: (verb == "create").then(|| "{}".to_string()),
+            json: def,
             tag,
             missing: Some(if if_exists { format!("{SKIP}{missing}, skipping") } else { missing }),
             exists: Some(format!("conversion \"{name}\" already exists")),
             cascade: false,
         })
+    }
+
+    /// CREATE CONVERSION's `FOR 'from' TO 'to' FROM function`, checked as Postgres's CreateConversionCommand checks
+    /// it: two encodings, neither SQL_ASCII, and a conversion function that accepts them (called, as Postgres calls
+    /// it, on an empty string). The conversion's row.
+    fn conversion_def(&mut self, schema: &str, default: bool) -> Result<Json> {
+        self.expect_kw("for")?;
+        let Some(Tok::Str(from)) = self.next() else {
+            return self.fail("expected a source encoding name");
+        };
+        self.expect_kw("to")?;
+        let Some(Tok::Str(to)) = self.next() else {
+            return self.fail("expected a destination encoding name");
+        };
+        self.expect_kw("from")?;
+        let mut func = self.name()?;
+        while self.sym(".") {
+            func = self.name()?;
+        }
+        let Some(from_enc) = encoding::char_to_encoding(&from) else {
+            return err("42704", format!("source encoding \"{from}\" does not exist"));
+        };
+        let Some(to_enc) = encoding::char_to_encoding(&to) else {
+            return err("42704", format!("destination encoding \"{to}\" does not exist"));
+        };
+        if from_enc == encoding::PG_SQL_ASCII || to_enc == encoding::PG_SQL_ASCII {
+            return err("42P17", "encoding conversion to or from \"SQL_ASCII\" is not supported");
+        }
+        if !encoding::proc_exists(&func) {
+            return err(
+                NO_FUNCTION,
+                format!("function {func}(integer, integer, cstring, internal, integer, boolean) does not exist"),
+            );
+        }
+        // the function refuses encodings it doesn't convert
+        encoding::convert_with(&func, from_enc, to_enc, b"", false)?;
+        Ok(serde_json::json!({ "schema": schema, "for": from_enc, "to": to_enc, "proc": func, "default": default }))
     }
 
     /// `[IF [NOT] EXISTS]`, as (taken, whether it was there).
@@ -2236,6 +2281,30 @@ pub(super) fn event_function(v: &View, json: Option<&str>) -> Result<()> {
         }
         Some(_) => Ok(()),
     }
+}
+
+/// CREATE DEFAULT CONVERSION, from the conversion's row: no other default for its two encodings in its schema
+/// (Postgres's ConversionCreate). A name already taken is `user_def`'s error, which Postgres reports first.
+pub(super) fn conversion_default(v: &View, key: &str, json: Option<&str>) -> Result<()> {
+    let j: Json = json.and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+    if j["default"] != true || v.get(key)?.is_some() {
+        return Ok(());
+    }
+    let at = format!("{PREFIX}conversion/");
+    for r in v.prefix(&at)? {
+        let (_, raw) = r?;
+        let other: Json = serde_json::from_str(&raw).unwrap_or_default();
+        if other["default"] == true
+            && [&other["schema"], &other["for"], &other["to"]] == [&j["schema"], &j["for"], &j["to"]]
+        {
+            let name = |e: &Json| encoding::encoding_to_char(e.as_u64().unwrap_or(u64::MAX) as usize);
+            return err(
+                "42710",
+                format!("default conversion for {} to {} already exists", name(&j["for"]), name(&j["to"])),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The event triggers made here, by name, with their rows (what `pg_event_trigger` lists).
