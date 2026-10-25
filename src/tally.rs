@@ -47,15 +47,7 @@ pub(crate) fn load(dir: &Path, crypt: Option<&crate::crypt::Crypt>) -> Tallies {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Tallies::default(),
         Err(e) => {
-            crate::obs::log_line(
-                "WARN",
-                "tally_load_failed",
-                &[
-                    ("path", path.display().to_string()),
-                    ("error", format!("{e}")),
-                    ("detail", "hourly merge counts start over".into()),
-                ],
-            );
+            eprintln!("chronos: could not read {}: {e}; agents' hourly merge counts start over", path.display());
             return Tallies::default();
         }
     };
@@ -64,15 +56,7 @@ pub(crate) fn load(dir: &Path, crypt: Option<&crate::crypt::Crypt>) -> Tallies {
     let j = match parsed {
         Ok(j) => j,
         Err(e) => {
-            crate::obs::log_line(
-                "WARN",
-                "tally_damaged",
-                &[
-                    ("path", path.display().to_string()),
-                    ("error", format!("{e}")),
-                    ("detail", "hourly merge counts start over".into()),
-                ],
-            );
+            eprintln!("chronos: {} is damaged ({e}); agents' hourly merge counts start over", path.display());
             return Tallies::default();
         }
     };

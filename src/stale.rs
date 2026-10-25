@@ -345,14 +345,9 @@ pub(crate) fn load(db: &mut Core, dir: &Path, crypt: Option<&crate::crypt::Crypt
     {
         Ok(j) => j,
         Err(e) => {
-            crate::obs::log_line(
-                "WARN",
-                "reads_damaged",
-                &[
-                    ("path", path.display().to_string()),
-                    ("error", format!("{e}")),
-                    ("detail", "worlds that check their reads will have their merges held".into()),
-                ],
+            eprintln!(
+                "chronos: {} is damaged ({e}); worlds that check their reads will have their merges held",
+                path.display()
             );
             return Ok(());
         }

@@ -50,15 +50,7 @@ pub(crate) fn load(dir: &Path, crypt: Option<&crate::crypt::Crypt>) -> Log {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Log::new(),
         Err(e) => {
-            crate::obs::log_line(
-                "WARN",
-                "reads_load_failed",
-                &[
-                    ("path", path.display().to_string()),
-                    ("error", format!("{e}")),
-                    ("detail", "recording reads from now".into()),
-                ],
-            );
+            eprintln!("chronos: could not read {}: {e}; recording reads from now", path.display());
             return Log::new();
         }
     };
@@ -67,15 +59,7 @@ pub(crate) fn load(dir: &Path, crypt: Option<&crate::crypt::Crypt>) -> Log {
     let j = match parsed {
         Ok(j) => j,
         Err(e) => {
-            crate::obs::log_line(
-                "WARN",
-                "reads_damaged",
-                &[
-                    ("path", path.display().to_string()),
-                    ("error", format!("{e}")),
-                    ("detail", "recording reads from now".into()),
-                ],
-            );
+            eprintln!("chronos: {} is damaged ({e}); recording reads from now", path.display());
             return Log::new();
         }
     };
