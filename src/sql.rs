@@ -3709,6 +3709,18 @@ fn drop_schemas(db: &Db, branch: &str, names: &[String], if_exists: bool, cascad
         let exts: Vec<String> = pgcrypto::extensions(&v)?.into_iter().filter(|e| e.1 == *n).map(|e| e.0).collect();
         in_it.extend(types.iter().map(|t| Dep::Type(t.clone())));
         in_it.extend(exts.iter().map(|e| Dep::Ext(e.clone())));
+        // its aggregates and text search objects (rows of `userdefs`'), each dropped as what it is, first
+        let defs = userdefs::schema_defs(&v, n)?;
+        in_it.extend(defs.iter().map(|(key, _, shown)| Dep::Def(key.clone(), shown.clone())));
+        drops.extend(defs.into_iter().map(|(key, tag, _)| Stmt::UserDef {
+            needs: None,
+            key,
+            json: None,
+            tag,
+            missing: None,
+            exists: None,
+            cascade: false,
+        }));
         // the typed tables of other schemas made of its types (`CREATE TABLE o.t OF s.tt`): they go with them
         let mut typed_out: Vec<String> = vec![];
         for t in &types {
@@ -43071,6 +43083,10 @@ impl Statement {
             Stmt::Locking(s, clauses) => x.locking(s, clauses),
             Stmt::CreateFunction(f, replace, procedure) => x.create_function(f, *replace, *procedure),
             Stmt::UserDef { key, json, tag, missing, exists, needs, cascade } => {
+                // a text search object is in the schema named, else the search_path's first, as it runs
+                let made = tag.starts_with("CREATE TEXT SEARCH") || *tag == "CREATE AGGREGATE";
+                let filled = if made { Some(userdefs::with_schema(json.as_deref())?) } else { None };
+                let json = filled.as_ref().unwrap_or(json);
                 // a hash operator class a partition key hashes with: what depends on it stops the drop, or goes
                 // first with CASCADE (findDependentObjects: the table depends on its key's class)
                 if *tag == "DROP OPERATOR CLASS" {
@@ -43134,6 +43150,21 @@ impl Statement {
                     }
                     x.user_def(v, key, json, missing, exists, needs, tag).map(|w| (w, ()))
                 })?;
+                // (a subscription made WITH (connect = false): Postgres's warning that nothing replicates yet)
+                if *tag == "CREATE SUBSCRIPTION" && json.as_deref().is_some_and(|j| j.contains("\"unconnected\":true"))
+                {
+                    notice_raised(
+                        "WARNING",
+                        "01000",
+                        "subscription was created, but is not connected".into(),
+                        None,
+                        Some(
+                            "To initiate replication, you must manually create the replication slot, enable the \
+                             subscription, and refresh the subscription."
+                                .into(),
+                        ),
+                    );
+                }
                 Ok(Output::tag(*tag))
             }
             Stmt::DropFunction { names, if_exists, cascade, procedure, routine } => {
@@ -46442,6 +46473,9 @@ enum Dep {
     Policy(String, String),
     /// a foreign key: its table, and its name
     Fk(String, String),
+    /// an object kept as a row of `userdefs` (an aggregate, a text search object): its row's key, and how Postgres
+    /// names it ("function f(integer)", "text search dictionary d")
+    Def(String, String),
 }
 
 /// What dropping `roots` reaches, in the order Postgres's "drop cascades to" lists it, each with the object it was
@@ -46603,6 +46637,7 @@ fn schema_cascade(
             Dep::Policy(t, n) => policy_order(v, t, n, policy_made),
             Dep::Fk(t, n) => (acl::made_at(v, &format!("rel/{t}")), String::new(), format!("{t}/{n}")),
             Dep::Schema(n) => (String::new(), String::new(), n.clone()),
+            Dep::Def(key, _) => (acl::made_at(v, &userdefs::def_stamp(key)), String::new(), key.clone()),
         };
         keys.insert(d.clone(), k.clone());
         k
@@ -46683,6 +46718,7 @@ fn schema_cascade(
         Dep::Ext(n) => format!("extension {n}"),
         Dep::Policy(t, n) => format!("policy {n} on table {}", shown_name(t)),
         Dep::Fk(t, n) => format!("constraint {n} on table {}", shown_name(t)),
+        Dep::Def(_, shown) => shown.clone(),
     };
     // (what a function of another schema is reached from: the row type of the relation)
     let shown_on = |d: &Dep, on: &Dep| match (d, on) {
@@ -48853,6 +48889,7 @@ impl Exec<'_> {
                     None => format!("function {k}"),
                 },
                 Dep::Fk(t, n) => format!("constraint {n} on table {}", shown_name(&t)),
+                Dep::Def(_, shown) => shown,
                 Dep::Schema(_) | Dep::Type(_) | Dep::Ext(_) => continue,
             });
         }

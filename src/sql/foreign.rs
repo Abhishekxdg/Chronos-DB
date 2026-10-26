@@ -197,7 +197,8 @@ fn oids(kind: i64, keys: &[String]) -> Vec<i64> {
 }
 
 /// `oids`, for the other objects numbered this way (publications are kinds 8 to 10, statistics objects 11,
-/// subscriptions 12, event triggers 13): kinds 0 to 2 are this module's.
+/// subscriptions 12, event triggers 13, aggregates 14, text search objects 15 to 18, transforms 19: see
+/// `objaddr::SUB_KIND`): kinds 0 to 2 are this module's.
 pub(super) fn name_oids(kind: i64, keys: &[String]) -> Vec<i64> {
     oids(kind, keys)
 }

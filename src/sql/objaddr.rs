@@ -2,9 +2,11 @@
 //! an object's type and names give, as get_object_address finds them), pg_identify_object and
 //! pg_identify_object_as_address (an address's type, schema, name and identity, and the names and arguments that give
 //! it back, as getObjectIdentityParts writes them) and pg_describe_object (getObjectDescription's text). They read the
-//! oids Chronos's catalog serves, so they agree with pg_class, pg_proc, pg_type and the others: an oid of a catalog
-//! Chronos has no rows of (pg_cast, pg_amop, pg_event_trigger, ...) names nothing, and an object found by its names
-//! that has no oid here (an aggregate made with CREATE AGGREGATE, a domain's constraint) is 0A000.
+//! oids Chronos's catalog serves, so they agree with pg_class, pg_proc, pg_type and the others; the objects kept by
+//! name only (aggregates, text search objects, subscriptions, transforms) are numbered here (see `numbered`), and
+//! Postgres's own casts and operator family members have the oids its catalog gives them. An oid of a catalog Chronos
+//! has no rows of (pg_event_trigger, pg_parameter_acl) names nothing, and an object found by its names that has no oid
+//! here (a cast made with CREATE CAST) is 0A000.
 
 use super::catalog::{self, Catalog, Obj};
 use super::*;
@@ -295,6 +297,87 @@ fn op_data() -> &'static OpData {
         d
     });
     &DATA
+}
+
+// ---------------------------------------------------------------- objects kept by name, numbered here
+
+/// The kinds of `foreign::name_oids` the objects kept by name only are numbered as: subscriptions 12, the aggregates
+/// CREATE AGGREGATE makes 14, the text search objects CREATE TEXT SEARCH makes 15 to 18 (parsers, dictionaries,
+/// templates, configurations), transforms 19. Each keeps its oid whatever else is made or dropped.
+const SUB_KIND: i64 = 12;
+const AGG_KIND: i64 = 14;
+const TS_KIND: i64 = 15;
+const TRANSFORM_KIND: i64 = 19;
+
+/// Postgres's own rows of catalog `table`, each value an integer (its oid columns' oids; 0 for another), in column
+/// order: what pg_cast's, pg_amop's and pg_amproc's oids and keys are read from.
+fn builtin_rows(table: &str) -> Vec<Vec<i64>> {
+    let int = |v: &Value| if let Value::Int(n) = v { *n } else { 0 };
+    catalog_schema::builtin_rows(table).iter().map(|r| r.iter().map(int).collect()).collect()
+}
+
+/// The world's rows `_sonos_defs/<kind>/...`: each one's oid (of `oid_kind`: see `SUB_KIND`), its key after the
+/// prefix, and its value.
+fn numbered(kind: &str, oid_kind: i64) -> Result<Vec<(i64, String, Json)>> {
+    let at = format!("_sonos_defs/{kind}/");
+    let rows: Vec<(String, Json)> = catalog::with_world_view(|v| {
+        let mut out = vec![];
+        for r in v.prefix(&at)? {
+            let (k, raw) = r?;
+            out.push((k[at.len()..].to_string(), serde_json::from_str(&raw).unwrap_or(Json::Null)));
+        }
+        Ok(out)
+    })?;
+    let oids = super::foreign::name_oids(oid_kind, &rows.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>());
+    Ok(oids.into_iter().zip(rows).map(|(o, (k, j))| (o, k, j)).collect())
+}
+
+/// An aggregate CREATE AGGREGATE made: its oid, its name qualified by its schema as `qualify` does (bare in public's)
+/// and its arguments' type oids.
+struct MadeAgg {
+    oid: i64,
+    stored: String,
+    args: Vec<i64>,
+}
+
+/// The aggregates CREATE AGGREGATE made, numbered by their signatures (see `AGG_KIND`).
+fn aggregates(cat: &Catalog) -> Result<Vec<MadeAgg>> {
+    let mut out = vec![];
+    for (oid, sig, j) in numbered("agg", AGG_KIND)? {
+        let (name, rest) = sig.split_once('(').unwrap_or((&sig, ")"));
+        let rest = rest.strip_suffix(')').unwrap_or(rest);
+        let args = rest.split(',').filter(|t| !t.is_empty()).map(|t| type_oid(cat, t).unwrap_or(0)).collect();
+        // (in the schema it was made in: public for one made before that was kept)
+        let stored = super::userdefs::agg_stored(name, &j);
+        out.push(MadeAgg { oid, stored, args });
+    }
+    Ok(out)
+}
+
+/// A text search object CREATE TEXT SEARCH made: its oid, its schema and its name.
+struct MadeTs {
+    oid: i64,
+    schema: String,
+    name: String,
+}
+
+/// The text search objects of catalog `class` (pg_ts_parser, ...) CREATE TEXT SEARCH made, numbered by their names
+/// (see `TS_KIND`); each in the schema it was made in (public for one made before that was kept).
+fn ts_objects(class: i64) -> Result<Vec<MadeTs>> {
+    let (kind, at) = match class {
+        PG_TS_PARSER => ("parser", 0),
+        PG_TS_DICT => ("dictionary", 1),
+        PG_TS_TEMPLATE => ("template", 2),
+        _ => ("configuration", 3),
+    };
+    let made = numbered(&format!("ts{kind}"), TS_KIND + at)?;
+    Ok(made
+        .into_iter()
+        .map(|(oid, name, j)| {
+            let schema = j["schema"].as_str().unwrap_or("public").to_string();
+            MadeTs { oid, schema, name }
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------- the four functions
@@ -700,23 +783,50 @@ fn resolve(cat: &Catalog, ot: Ot, names: &[String], args: &[String]) -> Result<(
                     format!("constraint \"{con}\" for domain {} does not exist", cat.format_type(domain, -1)),
                 );
             }
-            return no_oid(&format!("constraint \"{con}\" of domain {}", cat.format_type(domain, -1)));
+            let k = cat.enum_at(domain, false);
+            match cat.domain_checks().into_iter().find(|(_, d, n, _)| Some(*d) == k && *n == con) {
+                Some((o, ..)) => (PG_CONSTRAINT, o, 0),
+                None => return no_oid(&format!("constraint \"{con}\" of domain {}", cat.format_type(domain, -1))),
+            }
         }
         Ot::Aggregate | Ot::Function | Ot::Procedure => (PG_PROC, routine(cat, ot, names, args)?, 0),
         Ot::Operator => (PG_OPERATOR, operator(cat, names, args)?, 0),
         Ot::Type => (PG_TYPE, type_oid(cat, only)?, 0),
         Ot::Cast => {
             let (from, to) = (type_oid(cat, only)?, type_oid(cat, &args[0])?);
-            return no_oid(&format!("the cast from {} to {}", cat.format_type(from, -1), cat.format_type(to, -1)));
+            let found = builtin_rows("pg_cast").into_iter().find(|r| r.get(1) == Some(&from) && r.get(2) == Some(&to));
+            match found {
+                Some(r) => (PG_CAST, r[0], 0),
+                // (one made with CREATE CAST: Chronos's catalog has no row of it)
+                None => {
+                    return no_oid(&format!(
+                        "the cast from {} to {}",
+                        cat.format_type(from, -1),
+                        cat.format_type(to, -1)
+                    ));
+                }
+            }
         }
         Ot::Transform => {
             let ty = type_oid(cat, only)?;
             language(&args[0])?;
-            // (Chronos has no transforms: CREATE TRANSFORM isn't taken)
-            return missing(
-                "42704",
-                format!("transform for type {} language \"{}\" does not exist", cat.format_type(ty, -1), args[0]),
-            );
+            let lang = args[0].to_lowercase();
+            // (kept by its type's name: see `userdefs`'s `transform`)
+            let of =
+                |k: &str| k.rsplit_once('/').is_some_and(|(t, l)| l == lang && type_oid(cat, t).is_ok_and(|o| o == ty));
+            match numbered("transform", TRANSFORM_KIND)?.into_iter().find(|(_, k, _)| of(k)) {
+                Some((o, ..)) => (PG_TRANSFORM, o, 0),
+                None => {
+                    return missing(
+                        "42704",
+                        format!(
+                            "transform for type {} language \"{}\" does not exist",
+                            cat.format_type(ty, -1),
+                            args[0]
+                        ),
+                    );
+                }
+            }
         }
         Ot::Collation => {
             qualified(names)?;
@@ -755,17 +865,11 @@ fn resolve(cat: &Catalog, ot: Ot, names: &[String], args: &[String]) -> Result<(
             let num: i64 =
                 last.trim().chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap_or(0);
             let am = index_am(only)?;
-            let (_, fam) = opfamily(cat, am, &names[1..names.len() - 1])?;
+            let (fam_oid, fam) = opfamily(cat, am, &names[1..names.len() - 1])?;
             let (l, r) = (type_oid(cat, &args[0])?, type_oid(cat, &args[1])?);
-            let kind = if ot == Ot::AmOp { 'o' } else { 'p' };
-            let key = format!("{am}/{fam}");
-            let there = op_data().members.iter().any(|(k, f, lt, rt, n)| {
-                *k == kind
-                    && *f == key
-                    && *n == num
-                    && type_oid(cat, lt).is_ok_and(|o| o == l)
-                    && type_oid(cat, rt).is_ok_and(|o| o == r)
-            });
+            let table = if ot == Ot::AmOp { "pg_amop" } else { "pg_amproc" };
+            // (oid, family, left and right types, strategy or number: the first five columns of either)
+            let row = builtin_rows(table).into_iter().find(|m| m[1..5] == [fam_oid, l, r, num]);
             let what = if ot == Ot::AmOp { "operator" } else { "function" };
             let member = format!(
                 "{what} {num} ({}, {}) of operator family {} for access method {am}",
@@ -773,10 +877,10 @@ fn resolve(cat: &Catalog, ot: Ot, names: &[String], args: &[String]) -> Result<(
                 args[1],
                 quoted(&fam)
             );
-            if !there {
-                return missing("42704", format!("{member} does not exist"));
+            match row {
+                Some(m) => (if ot == Ot::AmOp { PG_AMOP } else { PG_AMPROC }, m[0], 0),
+                None => return missing("42704", format!("{member} does not exist")),
             }
-            return no_oid(&member);
         }
         // (Postgres's own, or one CREATE ACCESS METHOD made)
         Ot::AccessMethod => match cat.am_oid(only) {
@@ -876,12 +980,10 @@ fn resolve(cat: &Catalog, ot: Ot, names: &[String], args: &[String]) -> Result<(
                 }
             }
         }
-        Ot::Subscription => {
-            if catalog::with_world_view(|v| Ok(v.get(&format!("_sonos_defs/sub/{only}/"))?.is_some()))? {
-                return no_oid(&format!("subscription \"{only}\""));
-            }
-            return missing("42704", format!("subscription \"{only}\" does not exist"));
-        }
+        Ot::Subscription => match numbered("sub", SUB_KIND)?.into_iter().find(|(_, k, _)| *k == format!("{only}/")) {
+            Some((o, ..)) => (PG_SUBSCRIPTION, o, 0),
+            None => return missing("42704", format!("subscription \"{only}\" does not exist")),
+        },
         Ot::Statistics => {
             let (schema, name) = qualified(names)?;
             if let Some(s) = schema {
@@ -1009,6 +1111,7 @@ fn routine(cat: &Catalog, ot: Ot, names: &[String], args: &[String]) -> Result<i
         Some(s) => vec![s.to_string()],
         None => func_path(),
     };
+    let made = aggregates(cat)?;
     let mut found: Option<(i64, char)> = None;
     for s in &schemas {
         if s == "pg_catalog" {
@@ -1025,7 +1128,9 @@ fn routine(cat: &Catalog, ot: Ot, names: &[String], args: &[String]) -> Result<i
                 .find(|(_, f)| {
                     f.name == stored && f.args.iter().map(|(_, t)| cat.type_oid(*t)).eq(types.iter().copied())
                 })
-                .map(|(k, f)| (cat.func_oid(k), if f.procedure { 'p' } else { 'f' }));
+                .map(|(k, f)| (cat.func_oid(k), if f.procedure { 'p' } else { 'f' }))
+                // (or an aggregate CREATE AGGREGATE made: see `aggregates`)
+                .or_else(|| made.iter().find(|a| a.stored == stored && a.args == types).map(|a| (a.oid, 'a')));
         }
         if found.is_some() {
             break;
@@ -1038,24 +1143,14 @@ fn routine(cat: &Catalog, ot: Ot, names: &[String], args: &[String]) -> Result<i
         (Ot::Procedure, Some((_, k))) if k != 'p' => err("42809", format!("{sig} is not a procedure")),
         (Ot::Aggregate, Some((_, k))) if k != 'a' => err("42809", format!("function {sig} is not an aggregate")),
         (_, Some((o, _))) => Ok(o),
-        (_, None) => {
-            // an aggregate made with CREATE AGGREGATE has no pg_proc row here
-            let (wcore, wname) = catalog::world_owner()?;
-            let v = wcore.view_tx(&wname)?;
-            for s in &schemas {
-                if v.prefix(&format!("_sonos_defs/agg/{}(", qualify(s, name)))?.next().is_some() {
-                    return no_oid(&format!("aggregate {}", joined(names)));
-                }
+        (_, None) => match ot {
+            Ot::Procedure => missing("42883", format!("procedure {sig} does not exist")),
+            Ot::Aggregate if types.is_empty() => {
+                missing("42883", format!("aggregate {}(*) does not exist", joined(names)))
             }
-            match ot {
-                Ot::Procedure => missing("42883", format!("procedure {sig} does not exist")),
-                Ot::Aggregate if types.is_empty() => {
-                    missing("42883", format!("aggregate {}(*) does not exist", joined(names)))
-                }
-                Ot::Aggregate => missing("42883", format!("aggregate {sig} does not exist")),
-                _ => missing("42883", format!("function {sig} does not exist")),
-            }
-        }
+            Ot::Aggregate => missing("42883", format!("aggregate {sig} does not exist")),
+            _ => missing("42883", format!("function {sig} does not exist")),
+        },
     }
 }
 
@@ -1149,8 +1244,15 @@ fn text_search(cat: &Catalog, ot: Ot, names: &[String]) -> Result<(i64, i64, i64
     if let Some((o, _)) = all.iter().find(|(_, n)| *n == name).filter(|_| in_catalog(schema)) {
         return Ok((class, *o, 0));
     }
-    if catalog::with_world_view(|v| Ok(v.get(&format!("_sonos_defs/ts{kind}/{name}"))?.is_some()))? {
-        return no_oid(&format!("text search {kind} \"{}\"", joined(names)));
+    // one made with CREATE TEXT SEARCH, in its schema (see `ts_objects`)
+    let made = ts_objects(class)?;
+    let on_path = || path_schemas().unwrap_or_else(|| vec!["public".into()]);
+    let found = match schema {
+        Some(s) => made.iter().find(|t| t.name == name && t.schema == s),
+        None => on_path().iter().find_map(|s| made.iter().find(|t| t.name == name && t.schema == *s)),
+    };
+    if let Some(t) = found {
+        return Ok((class, t.oid, 0));
     }
     missing("42704", format!("text search {kind} \"{}\" does not exist", joined(names)))
 }
@@ -1260,6 +1362,20 @@ fn identify(cat: &Catalog, class: i64, oid: i64, sub: i64) -> Result<(String, Op
             some(&ty, found.at(&f.schema).named(&f.name))
         }
         PG_PROC => {
+            if let Some(a) = aggregates(cat)?.into_iter().find(|a| a.oid == oid) {
+                let (schema, name) = (schema_part(&a.stored).to_string(), rel_part(&a.stored).to_string());
+                let types: Vec<String> = a.args.iter().map(|o| type_identity(cat, *o)).collect();
+                let shown: Vec<String> = a.args.iter().map(|o| cat.format_type(*o, -1)).collect();
+                // (as regprocedure shows it: bare where the search_path finds its schema)
+                let visible = path_schemas().unwrap_or_else(|| vec!["public".into()]).contains(&schema);
+                let called = if visible { quoted(&name) } else { format!("{}.{}", quoted(&schema), quoted(&name)) };
+                let found = Found::new(
+                    format!("{}.{}({})", quoted(&schema), quoted(&name), types.join(",")),
+                    vec![schema.clone(), name],
+                    format!("function {called}({})", shown.join(",")),
+                );
+                return some("aggregate", found.at(&schema).with_args(types));
+            }
             let routine = match (catalog_schema::builtin_proc_facts(oid), cat.find(oid)) {
                 (Some((name, kind, args)), _) => Some(("pg_catalog".to_string(), name, kind, args)),
                 (None, Some(Obj::Func(k))) => {
@@ -1312,6 +1428,18 @@ fn identify(cat: &Catalog, class: i64, oid: i64, sub: i64) -> Result<(String, Op
             some(&ty, found.at(&schema).named(&name))
         }
         PG_CONSTRAINT => {
+            // a domain's CHECK: `con on domain`, named by the domain's type and its own name
+            if let Some((_, k, con, _)) = cat.domain_checks().into_iter().find(|(o, ..)| *o == oid) {
+                let domain = cat.enum_oid(k);
+                let schema = schema_part(&cat.enums[k].0).to_string();
+                let identity = type_identity(cat, domain);
+                let found = Found::new(
+                    format!("{} on {identity}", quoted(con)),
+                    vec![identity.clone()],
+                    format!("constraint {con} on type {}", cat.format_type(domain, -1)),
+                );
+                return some("domain constraint", found.at(&schema).with_args(vec![con.clone()]));
+            }
             let Some(k) = (0..cat.cons.len()).find(|&k| cat.con_oid(k) == oid) else { return none(ty) };
             let (i, c) = &cat.cons[k];
             let f = facts(cat, Rel::Made(*i));
@@ -1428,6 +1556,18 @@ fn identify(cat: &Catalog, class: i64, oid: i64, sub: i64) -> Result<(String, Op
             let found =
                 Found::new(identity, vec![schema.to_string(), name.to_string()], format!("statistics object {shown}"));
             some(&ty, found.at(schema).named(name))
+        }
+        PG_TS_PARSER | PG_TS_DICT | PG_TS_TEMPLATE | PG_TS_CONFIG
+            if ts_objects(class)?.iter().any(|t| t.oid == oid) =>
+        {
+            let made = ts_objects(class)?;
+            let Some(t) = made.iter().find(|t| t.oid == oid) else { return none(ty) };
+            let found = Found::new(
+                format!("{}.{}", quoted(&t.schema), quoted(&t.name)),
+                vec![t.schema.clone(), t.name.clone()],
+                format!("{ty} {}", t.name),
+            );
+            some(&ty, found.at(&t.schema).named(&t.name))
         }
         PG_TS_PARSER | PG_TS_DICT | PG_TS_TEMPLATE | PG_TS_CONFIG => {
             let all: &[(i64, &str)] = match class {
@@ -1568,8 +1708,55 @@ fn identify(cat: &Catalog, class: i64, oid: i64, sub: i64) -> Result<(String, Op
             );
             some(&ty, found.with_args(vec![pubname.clone()]))
         }
-        // pg_cast, pg_amop, pg_amproc, pg_event_trigger, pg_parameter_acl, pg_subscription and pg_transform: Chronos's
-        // catalog has no rows of them, so no oid names one
+        PG_CAST => {
+            let Some(r) = builtin_rows("pg_cast").into_iter().find(|r| r[0] == oid) else { return none(ty) };
+            let (from, to) = (type_identity(cat, r[1]), type_identity(cat, r[2]));
+            let found = Found::new(
+                format!("({from} AS {to})"),
+                vec![from.clone()],
+                format!("cast from {} to {}", cat.format_type(r[1], -1), cat.format_type(r[2], -1)),
+            );
+            some(&ty, found.with_args(vec![to]))
+        }
+        PG_AMOP | PG_AMPROC => {
+            let table = if class == PG_AMOP { "pg_amop" } else { "pg_amproc" };
+            let Some(m) = builtin_rows(table).into_iter().find(|m| m[0] == oid) else { return none(ty) };
+            let (fam, l, r, num) = (m[1], m[2], m[3], m[4]);
+            let Some((_, am, family)) = op_data().families.iter().find(|(o, ..)| *o == fam) else { return none(ty) };
+            let what = if class == PG_AMOP { "operator" } else { "function" };
+            let (lt, rt) = (type_identity(cat, l), type_identity(cat, r));
+            let found = Found::new(
+                format!("{what} {num} ({lt}, {rt}) of pg_catalog.{} USING {am}", quoted(family)),
+                vec![am.clone(), "pg_catalog".into(), family.clone(), num.to_string()],
+                format!(
+                    "{what} {num} ({}, {}) of operator family {family} for access method {am}",
+                    cat.format_type(l, -1),
+                    cat.format_type(r, -1)
+                ),
+            );
+            some(&ty, found.with_args(vec![lt, rt]))
+        }
+        PG_SUBSCRIPTION => {
+            let Some((_, key, _)) = numbered("sub", SUB_KIND)?.into_iter().find(|(o, ..)| *o == oid) else {
+                return none(ty);
+            };
+            let name = key.trim_end_matches('/').to_string();
+            some(&ty, Found::new(quoted(&name), vec![name.clone()], format!("subscription {name}")).named(&name))
+        }
+        PG_TRANSFORM => {
+            let Some((_, key, _)) = numbered("transform", TRANSFORM_KIND)?.into_iter().find(|(o, ..)| *o == oid) else {
+                return none(ty);
+            };
+            let (name, lang) = key.rsplit_once('/').unwrap_or((&key, ""));
+            let t = type_oid(cat, name).unwrap_or(0);
+            let found = Found::new(
+                format!("for {} language {lang}", type_identity(cat, t)),
+                vec![type_identity(cat, t)],
+                format!("transform for {} language {lang}", cat.format_type(t, -1)),
+            );
+            some(&ty, found.with_args(vec![lang.to_string()]))
+        }
+        // pg_event_trigger and pg_parameter_acl: Chronos's catalog has no rows of them, so no oid names one
         _ => none(ty),
     }
 }

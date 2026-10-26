@@ -1434,7 +1434,7 @@ impl Parser {
     /// `create_agg`); SSPACE, SORTOP, PARALLEL and the *_MODIFY settings only tune how Postgres runs it, and are read
     /// and not kept.
     pub(super) fn create_aggregate(&mut self, replace: bool) -> Result<Stmt> {
-        let name = self.aggregate_name()?;
+        let (schema, name) = self.ts_qualified()?;
         let old = self.peek() == Some(&Tok::Sym("("))
             && matches!(self.t.get(self.i + 1), Some(Tok::Word(_) | Tok::Ident(_)))
             && self.t.get(self.i + 2) == Some(&Tok::Sym("="));
@@ -1588,6 +1588,8 @@ impl Parser {
             "deserialfunc": funcs.get("deserialfunc"), "mstype": mstype.map(|t| t.name().to_string()),
             "msfunc": funcs.get("msfunc"), "minvfunc": funcs.get("minvfunc"), "mfinalfunc": funcs.get("mfinalfunc"),
             "initcond": initcond, "minitcond": minitcond, "kind": kind, "shown": shown, "replace": replace,
+            // its schema: the one named, else the search_path's first when it runs (see `with_schema`)
+            "schema": schema,
         });
         Ok(Stmt::UserDef {
             needs: None,
@@ -1936,6 +1938,8 @@ impl Parser {
             || (at(0, "text") && at(1, "search"))
             || at(0, "publication")
             || at(0, "subscription")
+            || at(0, "transform")
+            || (at(0, "or") && at(1, "replace") && at(2, "transform"))
             || at(0, "statistics")
             || at(0, "tablespace")
             || (at(0, "operator") && (at(1, "class") || at(1, "family")))
@@ -1953,6 +1957,11 @@ impl Parser {
         }
         if self.kw("tablespace") {
             return self.tablespace(verb);
+        }
+        let word = |n: usize, x: &str| matches!(self.t.get(self.i + n), Some(Tok::Word(w)) if w == x);
+        if word(0, "transform") || (word(0, "or") && word(1, "replace") && word(2, "transform")) {
+            self.kw("transform");
+            return self.transform(verb);
         }
         let (what, kind, tag): (&str, &str, &str) = if self.kw("publication") {
             ("publication", "pub", "PUBLICATION")
@@ -2114,6 +2123,18 @@ impl Parser {
                 .iter()
                 .take_while(|t| **t != Tok::Sym(";"))
                 .any(|t| matches!(t, Tok::Word(w) if w == "cascade"));
+        // a subscription made WITH (connect = false): Postgres's warning that it isn't connected (see `user_def_done`)
+        if kind == "sub" && verb == "create" {
+            let rest: Vec<&Tok> = self.t[self.i..].iter().take_while(|t| **t != Tok::Sym(";")).collect();
+            let off = rest.windows(3).any(|w| {
+                matches!(w[0], Tok::Word(c) if c == "connect")
+                    && *w[1] == Tok::Sym("=")
+                    && matches!(w[2], Tok::Word(f) | Tok::Str(f) if f.eq_ignore_ascii_case("false") || f == "off")
+            });
+            if off {
+                facts["unconnected"] = Json::Bool(true);
+            }
+        }
         self.skip_rest();
         let key = format!("{PREFIX}{kind}/{name}/{using}");
         let on = if using.is_empty() { String::new() } else { format!(" for access method \"{using}\"") };
@@ -2139,6 +2160,53 @@ impl Parser {
                 }),
                 exists: None,
                 cascade,
+            },
+        })
+    }
+
+    /// After CREATE [OR REPLACE] or DROP: `TRANSFORM FOR type LANGUAGE lang ...`. A transform is kept as its type and
+    /// language only, which its address names (see `objaddr`): no language here calls its functions.
+    fn transform(&mut self, verb: &str) -> Result<Stmt> {
+        let replace = self.kw("or");
+        if replace {
+            self.expect_kw("replace")?;
+            self.expect_kw("transform")?;
+        }
+        let if_exists = verb == "drop" && self.guard(false)?;
+        self.expect_kw("for")?;
+        let ty = self.ty()?;
+        self.expect_kw("language")?;
+        let lang = self.name()?.to_lowercase();
+        if !["sql", "plpgsql", "c", "internal"].contains(&lang.as_str()) {
+            return err("42704", format!("language \"{lang}\" does not exist"));
+        }
+        // (a type not looked up yet has to be there when it runs: 42704, as Postgres looks it up first)
+        let needs = unresolved_needs(ty, if_exists);
+        self.skip_rest();
+        // (by its type's name: a type made here has no oid of its own on the wire, `ty.oid()`)
+        let key = format!("{PREFIX}transform/{}/{lang}", ty.name());
+        let what = format!("transform for type {} language \"{lang}\"", ty.pg_name());
+        Ok(match verb {
+            "create" => Stmt::UserDef {
+                needs,
+                key,
+                json: Some(serde_json::json!({ "type": ty.name(), "language": lang }).to_string()),
+                tag: "CREATE TRANSFORM",
+                missing: None,
+                exists: (!replace).then(|| format!("{what} already exists")),
+                cascade: false,
+            },
+            _ => Stmt::UserDef {
+                needs,
+                key,
+                json: None,
+                tag: "DROP TRANSFORM",
+                missing: Some(match if_exists {
+                    true => format!("{SKIP}{what} does not exist, skipping"),
+                    false => format!("{what} does not exist"),
+                }),
+                exists: None,
+                cascade: false,
             },
         })
     }
@@ -2305,6 +2373,80 @@ pub(super) fn conversion_default(v: &View, key: &str, json: Option<&str>) -> Res
         }
     }
     Ok(())
+}
+
+/// The aggregates and text search objects of schema `schema`, as DROP SCHEMA drops them: each one's row key, its DROP's
+/// tag and how Postgres names it in "drop cascades to" (bare where the search_path finds the schema). The aggregates
+/// first, then the configurations, dictionaries, templates and parsers, so each goes before what it uses.
+pub(super) fn schema_defs(v: &View, schema: &str) -> Result<Vec<(String, &'static str, String)>> {
+    let mut out = vec![];
+    for r in v.prefix(&format!("{PREFIX}agg/"))? {
+        let (k, raw) = r?;
+        let (name, types) = key_parts(&k);
+        let stored = agg_stored(&name, &serde_json::from_str(&raw).unwrap_or_default());
+        if schema_part(&stored) != schema {
+            continue;
+        }
+        out.push((
+            k.clone(),
+            "DROP AGGREGATE",
+            format!("function {}({})", in_schema(schema, rel_part(&stored)), pg_types(&types, ",")),
+        ));
+    }
+    let kinds = [
+        ("configuration", "DROP TEXT SEARCH CONFIGURATION"),
+        ("dictionary", "DROP TEXT SEARCH DICTIONARY"),
+        ("template", "DROP TEXT SEARCH TEMPLATE"),
+        ("parser", "DROP TEXT SEARCH PARSER"),
+    ];
+    for (kind, tag) in kinds {
+        let at = format!("{PREFIX}ts{kind}/");
+        for r in v.prefix(&at)? {
+            let (k, raw) = r?;
+            let j: Json = serde_json::from_str(&raw).unwrap_or_default();
+            if j["schema"].as_str() == Some(schema) {
+                out.push((k.clone(), tag, format!("text search {kind} {}", in_schema(schema, &k[at.len()..]))));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Object `name` of schema `schema` as getObjectDescription names it: bare where the search_path has the schema, else
+/// qualified.
+fn in_schema(schema: &str, name: &str) -> String {
+    let path = super::path_schemas().unwrap_or_else(|| vec!["public".into()]);
+    match path.iter().any(|s| s == schema) {
+        true => name.to_string(),
+        false => format!("{schema}.{name}"),
+    }
+}
+
+/// The key of the stamp (see `acl::MADE`) of the object row `key` of `userdefs` keeps: `def/` and the key past
+/// `_sonos_defs/`.
+pub(super) fn def_stamp(key: &str) -> String {
+    format!("def/{}", key.strip_prefix(PREFIX).unwrap_or(key))
+}
+
+/// A CREATE TEXT SEARCH's or CREATE AGGREGATE's row with its schema: the one it named, else the one Postgres puts a
+/// new object in (`create_in`: the search_path's first that exists; 3F000 where none does).
+pub(super) fn with_schema(json: Option<&str>) -> Result<Option<String>> {
+    let mut j: Json = json.and_then(|j| serde_json::from_str(j).ok()).unwrap_or_default();
+    if !j["schema"].is_string() {
+        let made = super::create_in("x")?;
+        j["schema"] = Json::from(schema_part(&made));
+    }
+    Ok(Some(j.to_string()))
+}
+
+/// An aggregate's name with its schema, as `qualify` writes it (bare in public), from its row key's name and its row:
+/// the key's name is qualified once ALTER AGGREGATE ... SET SCHEMA moved it; else its row's schema (public for one
+/// made before that was kept).
+pub(super) fn agg_stored(name: &str, row: &Json) -> String {
+    if name.contains('.') {
+        return name.to_string();
+    }
+    super::qualify(row["schema"].as_str().unwrap_or("public"), name)
 }
 
 /// The event triggers made here, by name, with their rows (what `pg_event_trigger` lists).
@@ -2549,7 +2691,14 @@ impl Parser {
         self.expect_sym("(")?;
         let mut out = vec![];
         loop {
-            let key = self.name()?.to_lowercase();
+            // (a parser's `end`, a reserved word, is a name here)
+            let key = match self.peek() {
+                Some(Tok::Word(w)) if w == "end" => {
+                    self.next();
+                    "end".to_string()
+                }
+                _ => self.name()?.to_lowercase(),
+            };
             let value = if self.sym("=") {
                 match self.next() {
                     Some(Tok::Str(v) | Tok::Num(v) | Tok::Word(v) | Tok::Ident(v)) => {
@@ -2576,11 +2725,16 @@ impl Parser {
     }
 
     fn ts_name(&mut self) -> Result<String> {
-        let mut n = self.name()?;
+        Ok(self.ts_qualified()?.1)
+    }
+
+    /// A text search object's or an aggregate's name, with the schema before it if it has one.
+    fn ts_qualified(&mut self) -> Result<(Option<String>, String)> {
+        let (mut schema, mut n) = (None, self.name()?);
         while self.sym(".") {
-            n = self.name()?;
+            schema = Some(std::mem::replace(&mut n, self.name()?));
         }
-        Ok(n)
+        Ok((schema, n))
     }
 
     /// CREATE, ALTER and DROP TEXT SEARCH DICTIONARY | CONFIGURATION | PARSER | TEMPLATE.
@@ -2593,7 +2747,7 @@ impl Parser {
         let tag: &'static str =
             Box::leak(format!("{} TEXT SEARCH {}", verb.to_uppercase(), kind.to_uppercase()).into_boxed_str());
         let if_exists = verb == "drop" && self.guard(false)?;
-        let name = self.ts_name()?;
+        let (schema, name) = self.ts_qualified()?;
         let key = format!("{PREFIX}ts{kind}/{name}");
         let what = format!("text search {kind} \"{name}\"");
         let missing = Some(match if_exists {
@@ -2608,7 +2762,7 @@ impl Parser {
             let opts = self.ts_options()?;
             let get = |k: &str| opts.iter().find(|(o, _)| o == k).map(|(_, v)| v.to_lowercase());
             let mut needs = None;
-            let json = match *kind {
+            let mut json = match *kind {
                 "dictionary" => {
                     let Some(template) = get("template") else {
                         return err("42P17", "text search template is required");
@@ -2646,6 +2800,10 @@ impl Parser {
                 }
                 _ => serde_json::json!({ "options": opts }),
             };
+            // its schema: the one named, else the first of the search_path's when it runs (see `with_schema`)
+            if let Some(s) = schema {
+                json["schema"] = Json::from(s);
+            }
             return Ok(Stmt::UserDef {
                 needs,
                 key,
@@ -3342,6 +3500,10 @@ fn agg_stmt(
             }
             let mut row: Json = serde_json::from_str(&v.get(key)?.unwrap_or_default()).unwrap_or_default();
             row["name"] = Json::from(to);
+            // (SET SCHEMA: the schema it is in now, which DROP SCHEMA and its address read)
+            if j["rename"].is_null() {
+                row["schema"] = Json::from(schema.as_str());
+            }
             forget(key);
             Ok(vec![(key.to_string(), None), (new, Some(row.to_string()))])
         }
@@ -3366,8 +3528,10 @@ fn owns_agg(v: &View, key: &str, name: &str, alter: bool) -> Result<bool> {
     if !v.core.has_privileges() {
         return Ok(true);
     }
-    // (ALTER is its owner's alone; DROP its schema's owner's too)
-    Ok(who.has_privs_of(agg_owner(v, key)?) || (!alter && who.has_privs_of(acl::schema(v, schema_part(name))?.owner)))
+    // (ALTER is its owner's alone; DROP its schema's owner's too: the schema it is in, see `agg_stored`)
+    let stored = agg_stored(name, &agg_row(v, key)?);
+    Ok(who.has_privs_of(agg_owner(v, key)?)
+        || (!alter && who.has_privs_of(acl::schema(v, schema_part(&stored))?.owner)))
 }
 
 /// What a support function is given: the state's type, then these.

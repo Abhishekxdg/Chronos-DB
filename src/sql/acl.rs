@@ -3298,8 +3298,18 @@ fn making(v: &View, st: &Stmt) -> Result<Option<(String, Option<char>)>> {
         Stmt::CreateExtension { name, .. } => {
             v.get(&pgcrypto::key(name))?.is_none().then(|| (key_of(Kind::Extension, name), None))
         }
+        // an aggregate or a text search object: a row of `userdefs`' (see `userdefs::def_stamp`)
+        Stmt::UserDef { key, tag, .. } if stamped_def(tag) => {
+            v.get(key)?.is_none().then(|| (userdefs::def_stamp(key), None))
+        }
         _ => None,
     })
+}
+
+/// Whether a `Stmt::UserDef` of this tag makes an object whose making is kept (see `MADE`): what DROP SCHEMA ...
+/// CASCADE lists in the order they were made.
+fn stamped_def(tag: &str) -> bool {
+    tag == "CREATE AGGREGATE" || tag.starts_with("CREATE TEXT SEARCH")
 }
 
 // ---------------------------------------------------------------- the order objects are made in
@@ -3324,6 +3334,7 @@ pub(crate) fn may_stamp(st: &Stmt) -> bool {
             | Stmt::CreateFunction(..)
             | Stmt::CreateExtension { .. }
     ) || matches!(st, Stmt::Policy(p) if matches!(**p, rls::PolicyStmt::Create { .. }))
+        || matches!(st, Stmt::UserDef { tag, .. } if stamped_def(tag))
 }
 
 /// The key (see `MADE`) of what statement `st` is about to make, when it isn't there yet: stamped once it is made.
@@ -3504,15 +3515,25 @@ fn alive(key: &str, has: &dyn Fn(&str) -> crate::Result<bool>) -> crate::Result<
         "func" => has(&format!("{}/{name}", functions::FUNCTIONS))?,
         "ext" => has(&pgcrypto::key(name))?,
         "policy" => has(&format!("{}/{name}", rls::POLICIES))?,
+        "def" => has(&format!("_sonos_defs/{name}"))?,
         _ => return Ok(None),
     }))
 }
 
 /// Whether row `key` is one `alive` looks for.
 fn defines(key: &str) -> bool {
-    [SCHEMAS, VIEWS, SEQUENCES, "_sonos_types", functions::FUNCTIONS, pgcrypto::EXTENSIONS, rls::POLICIES]
-        .iter()
-        .any(|p| key.strip_prefix(p).is_some_and(|rest| rest.starts_with('/')))
+    [
+        SCHEMAS,
+        VIEWS,
+        SEQUENCES,
+        "_sonos_types",
+        functions::FUNCTIONS,
+        pgcrypto::EXTENSIONS,
+        rls::POLICIES,
+        "_sonos_defs",
+    ]
+    .iter()
+    .any(|p| key.strip_prefix(p).is_some_and(|rest| rest.starts_with('/')))
 }
 
 /// Where object `key` (see `MADE`) comes in the order objects were made, as a key that sorts in that order: empty
@@ -3576,6 +3597,7 @@ pub(crate) fn may_unstamp(st: &Stmt) -> bool {
         Stmt::DropCollation { cascade, .. } => *cascade,
         Stmt::Foreign(f) => matches!(**f, foreign::ForeignStmt::Drop { cascade: true, .. }),
         Stmt::Policy(p) => matches!(**p, rls::PolicyStmt::Drop { .. }),
+        Stmt::UserDef { tag, .. } => *tag == "DROP AGGREGATE" || tag.starts_with("DROP TEXT SEARCH"),
         _ => false,
     }
 }
