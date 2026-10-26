@@ -3823,8 +3823,14 @@ pub(super) fn visit_expr(
             Ok(())
         }
         Expr::Window(w) => {
-            let Win { args, partition, order, .. } = &mut **w;
-            for y in args.iter_mut().chain(partition.iter_mut()).chain(order.iter_mut().map(|(y, _)| y)) {
+            let Win { args, partition, order, frame, .. } = &mut **w;
+            // (and a frame's offsets that read parameters: a function's argument by name is made one here)
+            let offsets = frame.as_mut().map(|(_, a, b)| [a, b]).into_iter().flatten().filter_map(|b| match b {
+                Bound::Param(x, _) => Some(&mut **x),
+                _ => None,
+            });
+            for y in args.iter_mut().chain(partition.iter_mut()).chain(order.iter_mut().map(|(y, _)| y)).chain(offsets)
+            {
                 visit_expr(y, e, q)?;
             }
             Ok(())

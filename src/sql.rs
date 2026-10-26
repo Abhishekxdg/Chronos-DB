@@ -7779,13 +7779,24 @@ enum WinFn {
 }
 
 /// A frame's edge; an offset is a row count for ROWS, a distance in the ORDER BY value for RANGE.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 enum Bound {
     UnboundedPreceding,
     Preceding(Value),
     Current,
     Following(Value),
     UnboundedFollowing,
+    /// A ROWS or GROUPS offset that reads the query's parameters (`$1`, or in a function's body its argument by
+    /// name, which is a column to the parser until the call names it: see `functions::named_args`), PRECEDING if
+    /// true: worked out when the window runs, made one of the others then (see `Exec::frame_of`)
+    Param(Box<Expr>, bool),
+}
+
+impl PartialEq for Bound {
+    fn eq(&self, other: &Bound) -> bool {
+        // (an expression is compared by its shape, as expressions are elsewhere)
+        format!("{self:?}") == format!("{other:?}")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -16657,8 +16668,20 @@ impl Parser {
             return Ok(Bound::Current);
         }
         let e = self.concat()?;
-        let mut columns = false;
-        walk(&e, &mut |x| columns |= matches!(x, Expr::Col(..)));
+        let (mut columns, mut params) = (false, false);
+        walk(&e, &mut |x| {
+            columns |= matches!(x, Expr::Col(..));
+            params |= matches!(x, Expr::Param(_));
+        });
+        // (a ROWS or GROUPS offset of the query's parameters, or of names that may be a function's arguments: worked
+        // out when it runs, where a name still a column is refused)
+        if rows && (columns || params) {
+            let preceding = self.kw("preceding");
+            if !preceding {
+                self.expect_kw("following")?;
+            }
+            return Ok(Bound::Param(Box::new(e), preceding));
+        }
         if columns {
             return err("42P10", format!("argument of {unit} must not contain variables"));
         }
@@ -34206,6 +34229,10 @@ fn hint(e: &Expr, cols: &[Col], want: Option<Type>, out: &mut [Option<Type>]) {
             for x in w.args.iter().chain(&w.partition).chain(w.order.iter().map(|(x, _)| x)) {
                 hint(x, cols, None, out);
             }
+            // (a ROWS or GROUPS offset left to run time, `ROWS $1 PRECEDING`: a bigint, as Postgres's is)
+            for x in frame_exprs(w) {
+                hint(x, cols, Some(Type::BigInt), out);
+            }
         }
         Expr::Lit(_) | Expr::Col(..) | Expr::Idx(_) | Expr::AggRef(_) | Expr::Agg(_, None, _) | Expr::Default => {}
     }
@@ -46778,7 +46805,18 @@ fn map_subqueries(e: &mut Expr, f: &mut dyn FnMut(&mut Select) -> Result<bool>) 
         )?,
         Expr::Window(w) => {
             let w = &mut **w;
-            each(&mut w.args.iter_mut().chain(w.partition.iter_mut()).chain(w.order.iter_mut().map(|(x, _)| x)))?
+            let frame = w.frame.as_mut().map(|(_, a, b)| [a, b]).into_iter().flatten().filter_map(|b| match b {
+                Bound::Param(e, _) => Some(&mut **e),
+                _ => None,
+            });
+            each(
+                &mut w
+                    .args
+                    .iter_mut()
+                    .chain(w.partition.iter_mut())
+                    .chain(w.order.iter_mut().map(|(x, _)| x))
+                    .chain(frame),
+            )?
         }
         _ => {}
     }
@@ -55275,6 +55313,37 @@ impl Exec<'_> {
         Ok(rows)
     }
 
+    /// A window whose frame has an offset of the query's parameters (`Bound::Param`) with it worked out: the
+    /// offset's value, checked as a constant one is when it is parsed; None where the frame has none.
+    fn frame_of(&self, w: &Win) -> Result<Option<Win>> {
+        let Some((unit, start, end)) = &w.frame else { return Ok(None) };
+        if !matches!(start, Bound::Param(..)) && !matches!(end, Bound::Param(..)) {
+            return Ok(None);
+        }
+        let name = match unit {
+            FrameUnit::Rows => "ROWS",
+            FrameUnit::Groups => "GROUPS",
+            FrameUnit::Range => "RANGE",
+        };
+        let value = |b: &Bound| -> Result<Bound> {
+            let Bound::Param(e, preceding) = b else { return Ok(b.clone()) };
+            let mut columns = false;
+            walk(e, &mut |x| columns |= matches!(x, Expr::Col(..)));
+            if columns {
+                return err("42P10", format!("argument of {name} must not contain variables"));
+            }
+            let env = Env { cols: &[], row: &[], params: self.params, aggs: &[], sub: Some(self) };
+            let n = coerce(eval(e, &env)?, Type::BigInt)?;
+            if n == Value::Null || compare(&n, &Value::Int(0)).is_ok_and(|o| o == Ordering::Less) {
+                return err("22013", "invalid preceding or following size in window function");
+            }
+            Ok(if *preceding { Bound::Preceding(n) } else { Bound::Following(n) })
+        };
+        let mut out = w.clone();
+        out.frame = Some((*unit, value(start)?, value(end)?));
+        Ok(Some(out))
+    }
+
     /// Every window function's value for every row (or group) in `units`; and the order Postgres hands the units
     /// out in after its last window, with the sort keys that order is by (see `pg_resort`).
     #[allow(clippy::type_complexity)]
@@ -55292,7 +55361,8 @@ impl Exec<'_> {
         let mut cur: Vec<usize> = (0..n).collect();
         let mut have: Vec<(String, Dir)> = vec![];
         for k in window_order(p) {
-            let w = &p.wins[k];
+            let resolved = self.frame_of(&p.wins[k])?;
+            let w = resolved.as_ref().unwrap_or(&p.wins[k]);
             // each unit's PARTITION BY and ORDER BY values, evaluated once (random() sorts as it reads)
             let (mut pv, mut ov) = (Vec::with_capacity(n), Vec::with_capacity(n));
             for i in 0..n {
@@ -55435,6 +55505,8 @@ impl Exec<'_> {
                                     }
                                     Bound::Preceding(n) => within(pos, n, true, start)?,
                                     Bound::Following(n) => within(pos, n, false, start)?,
+                                    // (made a value before the window runs: see `Exec::frame_of`)
+                                    Bound::Param(..) => return err("XX000", "a frame offset wasn't worked out"),
                                 })
                             };
                             (at(a, true)?.max(0), at(b, false)?.min(len - 1))
@@ -63545,6 +63617,14 @@ fn shift(e: &Expr, at: usize) -> Expr {
     rewrite(e, &|x| if let Expr::Idx(i) = x { Some(Expr::Idx(i - at)) } else { None })
 }
 
+/// The expressions of a window's frame offsets that read the query's parameters (see `Bound::Param`)
+fn frame_exprs(w: &Win) -> impl Iterator<Item = &Expr> {
+    w.frame.iter().flat_map(|(_, a, b)| [a, b]).filter_map(|b| match b {
+        Bound::Param(e, _) => Some(&**e),
+        _ => None,
+    })
+}
+
 /// A copy of `e` with every part `f` answers for replaced by its answer.
 fn rewrite(e: &Expr, f: &dyn Fn(&Expr) -> Option<Expr>) -> Expr {
     if let Some(x) = f(e) {
@@ -63579,6 +63659,13 @@ fn rewrite(e: &Expr, f: &dyn Fn(&Expr) -> Option<Expr>) -> Expr {
             args: all(&w.args),
             partition: all(&w.partition),
             order: w.order.iter().map(|(x, d)| (rewrite(x, f), *d)).collect(),
+            frame: w.frame.as_ref().map(|(u, a, b)| {
+                let edge = |b: &Bound| match b {
+                    Bound::Param(e, p) => Bound::Param(r(e), *p),
+                    b => b.clone(),
+                };
+                (*u, edge(a), edge(b))
+            }),
             ..(**w).clone()
         })),
         Expr::Sub(sq) => Expr::Sub(Box::new(renumber(sq, f))),
@@ -63862,7 +63949,7 @@ fn walk(e: &Expr, f: &mut impl FnMut(&Expr)) {
         Expr::InSub(x, ..) => walk(x, f),
         Expr::Sub(_) | Expr::Exists(..) => {} // a scope of its own
         Expr::Window(w) => {
-            for x in w.args.iter().chain(&w.partition).chain(w.order.iter().map(|(x, _)| x)) {
+            for x in w.args.iter().chain(&w.partition).chain(w.order.iter().map(|(x, _)| x)).chain(frame_exprs(w)) {
                 walk(x, f);
             }
         }
