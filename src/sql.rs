@@ -19,6 +19,7 @@ mod btree;
 mod bulk;
 mod bytes;
 mod catalog;
+mod catalog_fks;
 pub use catalog::{Con, Idx, pretty_default};
 mod catalog_objects;
 mod catalog_schema;
@@ -8855,6 +8856,7 @@ const SRFS: &[&str] = &[
     "string_to_table",
     "__file_rows",
     "pg_options_to_table",
+    "pg_get_catalog_foreign_keys",
     "pg_get_keywords",
     "pg_event_trigger_ddl_commands",
     "pg_event_trigger_dropped_objects",
@@ -9320,6 +9322,21 @@ fn srf_columns(full: &str, tys: &[Type], alias: &str) -> Result<Vec<(String, Typ
         "pg_options_to_table" => {
             need(1..=1)?;
             vec![("option_name".into(), Type::Text), ("option_value".into(), Type::Text)]
+        }
+        // the system catalogs' foreign keys (see `catalog_fks`)
+        "pg_get_catalog_foreign_keys" => {
+            need(0..=0)?;
+            [
+                ("fktable", Type::Reg(Reg::Class)),
+                ("fkcols", Type::Array(25)),
+                ("pktable", Type::Reg(Reg::Class)),
+                ("pkcols", Type::Array(25)),
+                ("is_array", Type::Bool),
+                ("is_opt", Type::Bool),
+            ]
+            .into_iter()
+            .map(|(n, t)| (n.to_string(), t))
+            .collect()
         }
         // aclexplode(acl): each privilege of each item (see `acl::explode`)
         "aclexplode" => {
@@ -9971,6 +9988,26 @@ fn srf_rows(full: &str, a: &[Value]) -> Result<Vec<Vec<Value>>> {
             rows
         }
         "aclexplode" => acl::explode(&a[0])?,
+        // pg_get_catalog_foreign_keys: genbki.pl's sys_fk_relationships, each column list read as array_in reads it
+        // (`{adrelid, adnum}` is {adrelid,adnum})
+        "pg_get_catalog_foreign_keys" => {
+            let cols = |s: &str| {
+                Text(format!("{{{}}}", s[1..s.len() - 1].split(',').map(str::trim).collect::<Vec<_>>().join(",")))
+            };
+            catalog_fks::SYS_FK_RELATIONSHIPS
+                .iter()
+                .map(|f| {
+                    vec![
+                        Int(f.fk_table),
+                        cols(f.fk_columns),
+                        Int(f.pk_table),
+                        cols(f.pk_columns),
+                        Bool(f.is_array),
+                        Bool(f.is_opt),
+                    ]
+                })
+                .collect()
+        }
         // reloptions and the like: `{fillfactor=70,autovacuum_enabled=off}` as (name, value) rows
         "pg_options_to_table" => array_values(a[0].clone())?
             .unwrap_or_default()
@@ -34238,15 +34275,7 @@ fn func_name(f: &Func) -> String {
         Func::Scalar(funcs::Scalar::GeoOp | funcs::Scalar::GeoOpF | funcs::Scalar::GeoOpV) => return "?column?".into(),
         Func::Scalar(funcs::Scalar::HashFn(k, e)) => {
             let name = hashfn::NAMES[*k as usize % hashfn::NAMES.len()];
-            // (interval_hash's extended form is interval_hash_extended)
-            let ext = if !*e {
-                ""
-            } else if name == "interval_hash" {
-                "_extended"
-            } else {
-                "extended"
-            };
-            return format!("{name}{ext}");
+            return if *e { hashfn::extended_name(name) } else { name.to_string() };
         }
         Func::Scalar(funcs::Scalar::Position) => return "position".into(),
         Func::Scalar(funcs::Scalar::FloatAccum(k)) => {
@@ -65024,6 +65053,11 @@ impl<'a> Binder<'a> {
                 | Func::Record(_) => true,
                 Func::Ctx(c) => matches!(c, CtxFn::TypeOf),
                 Func::Enum(..) | Func::EnumPos(_) | Func::EnumLabel(_) | Func::WithTies => true,
+                // (the hash functions of the network types: hashinet, hashmacaddr, hashmacaddr8 and their extended forms)
+                Func::Scalar(funcs::Scalar::HashFn(k, _)) => matches!(
+                    hashfn::NAMES[*k as usize % hashfn::NAMES.len()],
+                    "hashinet" | "hashmacaddr" | "hashmacaddr8"
+                ),
                 Func::Scalar(sf) => matches!(
                     sf,
                     Concat
