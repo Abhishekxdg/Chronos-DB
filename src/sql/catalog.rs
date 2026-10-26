@@ -1474,6 +1474,7 @@ impl Catalog {
             "public" => 2200,
             "pg_catalog" => 11,
             "information_schema" => 13000,
+            "pg_toast" => super::catalog_objects::TOAST_SCHEMA_OID,
             TEMP_SCHEMA => TEMP_SCHEMA_OID,
             s => self.schemas.iter().position(|x| x == s).map_or(0, |k| self.named.schemas[k]),
         }
@@ -1613,7 +1614,13 @@ impl Catalog {
     /// index made here, else a catalog table of the name, as Postgres numbers them.
     pub(super) fn rel_named(&self, schema: Option<&str>, name: &str) -> Option<i64> {
         match schema {
-            Some("pg_catalog") => return table_oid(name).or_else(|| self.oid_of(name)),
+            Some("pg_catalog") => {
+                return table_oid(name)
+                    .or_else(|| self.oid_of(name))
+                    .or_else(|| super::catalog_objects::kept_nowhere_named(self, "pg_catalog", name));
+            }
+            // (a TOAST table: see `catalog_objects::toast_class_rows`)
+            Some("pg_toast") => return super::catalog_objects::kept_nowhere_named(self, "pg_toast", name),
             Some(TEMP_SCHEMA) => return self.oid_of(&format!("{TEMP_SCHEMA}.{name}")),
             Some(s) => return self.oid_of(&qualify(s, name)),
             None => {}
@@ -1639,8 +1646,8 @@ impl Catalog {
                 return Some(o);
             }
         }
-        // the catalog's own tables, as Postgres numbers them
-        table_oid(name)
+        // the catalog's own tables, as Postgres numbers them, and their primary keys' indexes
+        table_oid(name).or_else(|| super::catalog_objects::kept_nowhere_named(self, "pg_catalog", name))
     }
 
     /// A relation's (or index's) name as a regclass shows it: bare where the search_path finds it by that name, else
@@ -1648,6 +1655,12 @@ impl Catalog {
     fn shown(&self, oid: i64) -> Option<String> {
         if let Some((name, _)) = CATALOG_OIDS.iter().find(|(_, o)| *o == oid).filter(|_| self.find(oid).is_none()) {
             return Some((*name).to_string());
+        }
+        // a catalog's primary key index (pg_catalog's, on every path) or a TOAST table (pg_toast's, on none)
+        if self.find(oid).is_none()
+            && let Some((schema, name)) = super::catalog_objects::kept_nowhere_name(self, oid)
+        {
+            return Some(if schema == "pg_toast" { format!("pg_toast.{name}") } else { name });
         }
         let stored = match self.find(oid)? {
             Obj::Rel(i) => self.rels[i].name.clone(),
@@ -2381,6 +2394,8 @@ pub(super) fn call(f: CtxFn, a: &[Value]) -> Result<Value> {
                     let k = cat.idx.iter().position(|(q, y)| *q == r && y.name == x.name);
                     k.map_or(Null, |k| Int(super::tablespace::filenode(cat.idx_oid(k), x.filenode)))
                 }
+                // (a TOAST table, a catalog table or its key's index: its oid, see `kept_nowhere`)
+                _ if super::catalog_objects::kept_nowhere(&cat, o) => Int(o),
                 _ => Null,
             }
         }
@@ -2415,7 +2430,11 @@ pub(super) fn call(f: CtxFn, a: &[Value]) -> Result<Value> {
                     && x.tablespace == space
                     && super::tablespace::filenode(cat.idx_oid(*k), x.filenode) == node
             });
-            index.map_or(Null, |(k, _)| Reg(cat.idx_oid(k), super::Reg::Class))
+            match index {
+                Some((k, _)) => Reg(cat.idx_oid(k), super::Reg::Class),
+                None if space == 0 && super::catalog_objects::kept_nowhere(&cat, node) => Reg(node, super::Reg::Class),
+                None => Null,
+            }
         }
         // (a built-in function's from its line in builtin_procs.tsv)
         CtxFn::FunctionArgs(identity) => {
@@ -3420,6 +3439,7 @@ pub(super) fn reg_shown(cat: &Catalog, kind: Reg, oid: i64) -> String {
             11 => Some("pg_catalog".into()),
             2200 => Some("public".into()),
             13000 => Some("information_schema".into()),
+            super::catalog_objects::TOAST_SCHEMA_OID => Some("pg_toast".into()),
             TEMP_SCHEMA_OID => Some("pg_temp_3".into()),
             o => cat.schemas.iter().find(|s| cat.schema_oid(s) == o).map(|s| super::collation::quoted(s)),
         },
@@ -3694,6 +3714,34 @@ pub(super) fn rows(branch: &str, name: &str, cat: &Catalog) -> Option<Rows> {
                         x.pred.as_deref().map_or(Null, t),
                     ]
                 })
+                // the system catalogs' primary keys (see `catalog_objects::catalog_pkeys`)
+                .chain(super::catalog_objects::catalog_pkeys().into_iter().map(|k| {
+                    let n = k.attnums.len() as i64;
+                    vec![
+                        int(k.oid),
+                        int(k.table_oid),
+                        int(n),
+                        int(n),
+                        b(true),
+                        b(false),
+                        b(true),
+                        b(false),
+                        b(true),
+                        b(false),
+                        b(true),
+                        b(false),
+                        b(true),
+                        b(true),
+                        b(false),
+                        // (0s: the key columns aren't served in pg_attribute, which a key column has to be)
+                        vector(&vec![0; k.attnums.len()]),
+                        vector(&k.colls),
+                        vector(&k.classes),
+                        vector(&vec![0; k.attnums.len()]),
+                        Null,
+                        Null,
+                    ]
+                }))
                 .collect(),
         ),
         "pg_constraint" => (
@@ -3765,6 +3813,33 @@ pub(super) fn rows(branch: &str, name: &str, cat: &Catalog) -> Option<Rows> {
                         c.bin.as_deref().map_or(Null, t),
                     ]
                 })
+                // the system catalogs' primary keys (see `catalog_objects::catalog_pkeys`), named as their indexes
+                .chain(super::catalog_objects::catalog_pkeys().into_iter().map(|k| {
+                    vec![
+                        int(k.con_oid),
+                        t(k.name),
+                        int(11),
+                        t("p"),
+                        b(false),
+                        b(false),
+                        b(true),
+                        int(k.table_oid),
+                        int(0),
+                        int(k.oid),
+                        int(0),
+                        int(0),
+                        t(" "),
+                        t(" "),
+                        t(" "),
+                        b(true),
+                        int(0),
+                        b(true),
+                        // (none: the key columns aren't served in pg_attribute; see pg_index's)
+                        Null,
+                        Null,
+                        Null,
+                    ]
+                }))
                 // a domain's CHECKs: constraints of the type, not of a table (contypid, no conrelid)
                 .chain({
                     cat.domain_checks().into_iter().map(|(oid, k, n, text)| {

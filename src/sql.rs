@@ -50405,6 +50405,13 @@ fn catalog_query(branch: &str, name: &str, cat: &catalog::Catalog) -> Select {
                     let (owner, acl) = acl::schema_shown(&cat.reg, cat.acls.get(&format!("schema/{s}")), s);
                     vec![int(cat.schema_oid(s)), t(s), int(owner), acl]
                 })
+                // pg_toast, where the TOAST tables pg_class lists are (see `catalog_objects::toast_class_rows`)
+                .chain(std::iter::once(vec![
+                    int(catalog_objects::TOAST_SCHEMA_OID),
+                    t("pg_toast"),
+                    int(10),
+                    Value::Null,
+                ]))
                 // the session's temporary schema, once it has a temporary table (Postgres names it after the backend:
                 // `pg_temp_3`)
                 .chain(

@@ -65,21 +65,26 @@ fn alter_table_holds_the_lock_its_changes_need() {
     setup(&db, &mut s);
     let sue = "ShareUpdateExclusiveLock";
     let ael = "AccessExclusiveLock";
-    for (alter, mode) in [
-        ("alter table alterlock alter column f2 set statistics 150", sue),
-        ("alter table alterlock set without cluster", sue),
-        // (the TOAST table is locked too, but isn't in pg_class to be shown)
-        ("alter table alterlock set (fillfactor = 100)", sue),
-        ("alter table alterlock reset (fillfactor)", sue),
-        ("alter table alterlock set (toast.autovacuum_enabled = off)", sue),
-        ("alter table alterlock alter column f2 set (n_distinct = 1)", sue),
-        ("alter table alterlock set (autovacuum_enabled = off, fillfactor = 80)", sue),
-        ("alter table alterlock alter column f2 set storage extended", ael),
-        ("alter table alterlock alter column f2 set default 'x'", ael),
-        ("alter table alterlock add column f3 int", ael),
-        ("alter table alterlock alter column f2 set statistics 150, alter column f2 drop default", ael),
+    // (a table's storage parameters, SET or RESET, lock its TOAST table too, which pg_locks shows as alter_table.sql's
+    // my_locks names it, `pg_toast`; a column's options don't)
+    for (alter, mode, toast) in [
+        ("alter table alterlock alter column f2 set statistics 150", sue, false),
+        ("alter table alterlock set without cluster", sue, false),
+        ("alter table alterlock set (fillfactor = 100)", sue, true),
+        ("alter table alterlock reset (fillfactor)", sue, true),
+        ("alter table alterlock set (toast.autovacuum_enabled = off)", sue, true),
+        ("alter table alterlock alter column f2 set (n_distinct = 1)", sue, false),
+        ("alter table alterlock set (autovacuum_enabled = off, fillfactor = 80)", sue, true),
+        ("alter table alterlock alter column f2 set storage extended", ael, false),
+        ("alter table alterlock alter column f2 set default 'x'", ael, false),
+        ("alter table alterlock add column f3 int", ael, false),
+        ("alter table alterlock alter column f2 set statistics 150, alter column f2 drop default", ael, false),
     ] {
-        assert_eq!(held(&db, &mut s, alter), [format!("alterlock:{mode}")], "{alter}");
+        let mut want = vec![format!("alterlock:{mode}")];
+        if toast {
+            want.push(format!("pg_toast:{mode}"));
+        }
+        assert_eq!(held(&db, &mut s, alter), want, "{alter}");
     }
     // CLUSTER ON locks the index too
     assert_eq!(

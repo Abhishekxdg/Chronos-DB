@@ -280,6 +280,70 @@ const EXTENSION_PROCS: [(i64, &str, &str, &str); 13] = [
     (16331, "lquery_send", "(lquery)", ""),
 ];
 
+/// The `pg_proc` row of one of `EXTENSION_PROCS`: a C function of one argument, as the extension's script makes it
+/// (hstore_in(cstring) RETURNS hstore, hstore_out(hstore) RETURNS cstring, hstore_recv(internal), hstore_send(hstore)
+/// RETURNS bytea, hnswhandler(internal) RETURNS index_am_handler), strict and immutable.
+fn extension_proc_row(oid: i64, name: &str, args: &str) -> Vec<Value> {
+    let type_oid = |t: &str| -> i64 {
+        match t {
+            "cstring" => 2275,
+            "internal" => 2281,
+            "hstore" => i64::from(super::hstore::OID),
+            "ltree" => i64::from(super::ltree::OID),
+            "lquery" => i64::from(super::ltree::LQUERY_OID),
+            _ => 0,
+        }
+    };
+    let arg = type_oid(args.trim_matches(|c| c == '(' || c == ')'));
+    let (of, what) = name.rsplit_once('_').unwrap_or((name, ""));
+    let ret = match what {
+        "out" => 2275,
+        "send" => 17,
+        "in" | "recv" => type_oid(of),
+        _ => 325,
+    };
+    let t = |s: &str| Value::Text(s.into());
+    named_row(
+        "pg_proc",
+        vec![
+            ("oid", Value::Int(oid)),
+            ("proname", t(name)),
+            ("pronamespace", Value::Int(11)),
+            ("proowner", Value::Int(10)),
+            ("prolang", Value::Int(13)),
+            ("procost", Value::Float(1.0)),
+            ("prorows", Value::Float(0.0)),
+            ("provariadic", Value::Int(0)),
+            ("prosupport", Value::Reg(0, Reg::Proc)),
+            ("prokind", t("f")),
+            ("prosecdef", Value::Bool(false)),
+            ("proleakproof", Value::Bool(false)),
+            ("proisstrict", Value::Bool(true)),
+            ("proretset", Value::Bool(false)),
+            ("provolatile", t("i")),
+            ("proparallel", t("s")),
+            ("pronargs", Value::Int(1)),
+            ("pronargdefaults", Value::Int(0)),
+            ("prorettype", Value::Int(ret)),
+            ("proargtypes", t(&arg.to_string())),
+            ("prosrc", t(name)),
+            (
+                "probin",
+                t(&format!(
+                    "$libdir/{}",
+                    if of.starts_with('l') {
+                        "ltree"
+                    } else if name.starts_with("hnsw") {
+                        "vector"
+                    } else {
+                        "hstore"
+                    }
+                )),
+            ),
+        ],
+    )
+}
+
 /// A built-in function's fields, from its line in `builtin_procs.tsv` (see its header): `pg_proc`'s columns and
 /// what `pg_get_function_arguments`, `_result` and `pg_get_functiondef` give.
 struct Builtin<'a> {
@@ -510,6 +574,9 @@ pub(super) fn builtin_proc_rows() -> &'static [Vec<Value>] {
     static ROWS: LazyLock<Vec<Vec<Value>>> = LazyLock::new(|| {
         let Some(cols) = SCHEMA.get("pg_proc") else { return vec![] };
         let mut rows: Vec<Vec<Value>> = PROCS.iter().filter_map(|p| Builtin::of(p.0)).map(|f| f.row(cols)).collect();
+        // (and the built-in extensions' functions the catalog names, which have no line of their own)
+        rows.extend(EXTENSION_PROCS.iter().map(|&(oid, name, args, _)| extension_proc_row(oid, name, args)));
+        rows.sort_by_key(|r| if let Value::Int(o) = r[0] { o } else { 0 });
         catalog_system("pg_proc", &mut rows, 0);
         rows
     });

@@ -662,7 +662,12 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
     let t = |s: &str| Value::Text(s.into());
     let row = |fields: Vec<(&str, Value)>| catalog_schema::named_row(name, fields);
     let rows: Vec<Vec<Value>> = match name {
-        "pg_class" => class_rows(cat).into_iter().chain(composite_class_rows(cat)).collect(),
+        "pg_class" => class_rows(cat)
+            .into_iter()
+            .chain(composite_class_rows(cat))
+            .chain(toast_class_rows(cat))
+            .chain(system_class_rows())
+            .collect(),
         "pg_attribute" => attribute_rows(cat).into_iter().chain(composite_attribute_rows(cat)).collect(),
         // the built-in functions whose privileges initdb set (pg_proc's built-in rows are added by `catalog_query`)
         "pg_init_privs" => catalog_schema::builtin_init_privs(),
@@ -1599,6 +1604,368 @@ fn toasted(cat: &Catalog, r: &TableInfo) -> bool {
             let storage = r.attopts.get(j).map_or(storage, |o| o.0.to_string());
             len == -1 && storage != "p"
         })
+}
+
+/// The oid of the `pg_toast` schema, where Postgres keeps the TOAST tables.
+pub(super) const TOAST_SCHEMA_OID: i64 = 99;
+
+/// pg_class's rows of the TOAST tables of the tables that have one in Postgres (see `toasted`): `pg_toast_<oid>` in
+/// schema pg_toast, numbered as `reltoastrelid` names them (the table's oid with the top bit set). Chronos keeps no
+/// TOAST; they are there so that `reltoastrelid` names a relation, as it does in Postgres.
+fn toast_class_rows(cat: &Catalog) -> Vec<Vec<Value>> {
+    use Value::{Bool as b, Int as int};
+    let t = |s: &str| Value::Text(s.into());
+    cat.rels
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| toasted(cat, r))
+        .map(|(i, r)| {
+            let (owner, _) = cat.rel_acl(r);
+            let oid = cat.rel_oid(i);
+            catalog_schema::named_row(
+                "pg_class",
+                vec![
+                    ("oid", int(oid | (1 << 31))),
+                    ("relname", t(&format!("pg_toast_{oid}"))),
+                    ("relnamespace", int(TOAST_SCHEMA_OID)),
+                    ("reltype", int(0)),
+                    ("reloftype", int(0)),
+                    ("relowner", int(owner)),
+                    ("relam", int(cat.am_oid("heap"))),
+                    ("relfilenode", int(oid | (1 << 31))),
+                    ("reltablespace", int(0)),
+                    ("relpages", int(0)),
+                    ("reltuples", Value::Float(-1.0)),
+                    ("relallvisible", int(0)),
+                    ("reltoastrelid", int(0)),
+                    ("relhasindex", b(true)),
+                    ("relisshared", b(false)),
+                    ("relpersistence", t(if r.unlogged { "u" } else { "p" })),
+                    ("relkind", t("t")),
+                    // (its columns aren't served, so none are counted: pg_attribute has no rows of them)
+                    ("relnatts", int(0)),
+                    ("relchecks", int(0)),
+                    ("relhasrules", b(false)),
+                    ("relhastriggers", b(false)),
+                    ("relhassubclass", b(false)),
+                    ("relrowsecurity", b(false)),
+                    ("relforcerowsecurity", b(false)),
+                    ("relispopulated", b(true)),
+                    ("relreplident", t("n")),
+                    ("relispartition", b(false)),
+                    ("relrewrite", int(0)),
+                    ("relfrozenxid", int(0)),
+                    ("relminmxid", int(0)),
+                ],
+            )
+        })
+        .collect()
+}
+
+/// Postgres's catalogs that are shared by every database (`relisshared`).
+const SHARED_CATALOGS: [&str; 11] = [
+    "pg_authid",
+    "pg_auth_members",
+    "pg_database",
+    "pg_db_role_setting",
+    "pg_tablespace",
+    "pg_shdepend",
+    "pg_shdescription",
+    "pg_shseclabel",
+    "pg_replication_origin",
+    "pg_subscription",
+    "pg_parameter_acl",
+];
+
+/// pg_class's rows of Postgres's own catalog tables and system views that Chronos serves (`catalog::CATALOG_OIDS`), at
+/// the oids Postgres gives them, in pg_catalog and owned by the bootstrap superuser: what the catalog's other rows name
+/// (pg_description's and pg_depend's `classoid`, pg_init_privs'), as in Postgres. Their row types and indexes aren't
+/// served (`reltype` 0).
+fn system_class_rows() -> Vec<Vec<Value>> {
+    use Value::{Bool as b, Int as int};
+    let t = |s: &str| Value::Text(s.into());
+    // (and each one's primary key index: see `catalog_pkeys`)
+    let indexes = catalog_pkeys().into_iter().map(move |k| {
+        catalog_schema::named_row(
+            "pg_class",
+            vec![
+                ("oid", int(k.oid)),
+                ("relname", t(k.name)),
+                ("relnamespace", int(11)),
+                ("reltype", int(0)),
+                ("reloftype", int(0)),
+                ("relowner", int(super::roles::BOOTSTRAP)),
+                ("relam", int(BTREE_AM)),
+                ("relfilenode", int(k.oid)),
+                ("reltablespace", int(0)),
+                ("relpages", int(0)),
+                ("reltuples", Value::Float(-1.0)),
+                ("relallvisible", int(0)),
+                ("reltoastrelid", int(0)),
+                ("relhasindex", b(false)),
+                ("relisshared", b(SHARED_CATALOGS.contains(&k.table))),
+                ("relpersistence", t("p")),
+                ("relkind", t("i")),
+                ("relnatts", int(0)),
+                ("relchecks", int(0)),
+                ("relhasrules", b(false)),
+                ("relhastriggers", b(false)),
+                ("relhassubclass", b(false)),
+                ("relrowsecurity", b(false)),
+                ("relforcerowsecurity", b(false)),
+                ("relispopulated", b(true)),
+                ("relreplident", t("n")),
+                ("relispartition", b(false)),
+                ("relrewrite", int(0)),
+                ("relfrozenxid", int(0)),
+                ("relminmxid", int(0)),
+            ],
+        )
+    });
+    super::catalog::CATALOG_OIDS
+        .iter()
+        .map(|&(name, oid)| {
+            let view = super::catalog_view(name);
+            catalog_schema::named_row(
+                "pg_class",
+                vec![
+                    ("oid", int(oid)),
+                    ("relname", t(name)),
+                    ("relnamespace", int(11)),
+                    ("reltype", int(0)),
+                    ("reloftype", int(0)),
+                    ("relowner", int(super::roles::BOOTSTRAP)),
+                    ("relam", int(if view { 0 } else { 2 })),
+                    ("relfilenode", int(if view { 0 } else { oid })),
+                    ("reltablespace", int(0)),
+                    ("relpages", int(0)),
+                    ("reltuples", Value::Float(if view { 0.0 } else { -1.0 })),
+                    ("relallvisible", int(0)),
+                    ("reltoastrelid", int(0)),
+                    ("relhasindex", b(!view)),
+                    ("relisshared", b(SHARED_CATALOGS.contains(&name))),
+                    ("relpersistence", t("p")),
+                    ("relkind", t(if view { "v" } else { "r" })),
+                    // (its columns aren't served in pg_attribute, so none are counted)
+                    ("relnatts", int(0)),
+                    ("relchecks", int(0)),
+                    ("relhasrules", b(view)),
+                    ("relhastriggers", b(false)),
+                    ("relhassubclass", b(false)),
+                    ("relrowsecurity", b(false)),
+                    ("relforcerowsecurity", b(false)),
+                    ("relispopulated", b(true)),
+                    ("relreplident", t("n")),
+                    ("relispartition", b(false)),
+                    ("relrewrite", int(0)),
+                    ("relfrozenxid", int(0)),
+                    ("relminmxid", int(0)),
+                ],
+            )
+        })
+        .chain(indexes)
+        .collect()
+}
+
+/// Whether `oid` is a relation pg_class lists that Chronos keeps nothing of: a TOAST table (see `toast_class_rows`),
+/// a catalog table (`system_class_rows`) or a catalog's primary key index (`catalog_pkeys`). Each one's relfilenode is
+/// its oid, as pg_relation_filenode and pg_filenode_relation give it.
+pub(super) fn kept_nowhere(cat: &Catalog, oid: i64) -> bool {
+    let toast = oid & (1 << 31) != 0
+        && cat.rels.iter().enumerate().any(|(i, r)| cat.rel_oid(i) == oid & !(1 << 31) && toasted(cat, r));
+    toast
+        || super::catalog::CATALOG_OIDS.iter().any(|&(n, o)| o == oid && !super::catalog_view(n))
+        || CATALOG_PKEYS.iter().any(|k| k.1 == oid)
+}
+
+/// The oid of the relation `kept_nowhere` names `name` in `schema` (a catalog's primary key index in pg_catalog, a
+/// TOAST table `pg_toast_<oid>` in pg_toast), as regclass reads it.
+pub(super) fn kept_nowhere_named(cat: &Catalog, schema: &str, name: &str) -> Option<i64> {
+    match schema {
+        "pg_catalog" => CATALOG_PKEYS.iter().find(|k| k.0 == name).map(|k| k.1),
+        "pg_toast" => {
+            let of: i64 = name.strip_prefix("pg_toast_")?.parse().ok()?;
+            let toast = of | (1 << 31);
+            kept_nowhere(cat, toast).then_some(toast)
+        }
+        _ => None,
+    }
+}
+
+/// The schema and name of the relation `kept_nowhere` numbers `oid` (see `kept_nowhere_named`).
+pub(super) fn kept_nowhere_name(cat: &Catalog, oid: i64) -> Option<(&'static str, String)> {
+    if let Some(k) = CATALOG_PKEYS.iter().find(|k| k.1 == oid) {
+        return Some(("pg_catalog", k.0.to_string()));
+    }
+    (oid & (1 << 31) != 0 && kept_nowhere(cat, oid)).then(|| ("pg_toast", format!("pg_toast_{}", oid & !(1 << 31))))
+}
+
+/// btree's oid in pg_am.
+const BTREE_AM: i64 = 403;
+
+/// Postgres 16's catalogs' primary keys, as their headers declare them (DECLARE_UNIQUE_INDEX_PKEY in
+/// src/include/catalog/*.h): the index's name and oid, the catalog, and its key columns with their operator classes.
+/// pg_depend and pg_shdepend have none.
+const CATALOG_PKEYS: &[PkeyDecl] = &[
+    ("pg_aggregate_fnoid_index", 2650, "pg_aggregate", &[("aggfnoid", "oid_ops")]),
+    ("pg_am_oid_index", 2652, "pg_am", &[("oid", "oid_ops")]),
+    ("pg_amop_oid_index", 2756, "pg_amop", &[("oid", "oid_ops")]),
+    ("pg_amproc_oid_index", 2757, "pg_amproc", &[("oid", "oid_ops")]),
+    ("pg_attrdef_oid_index", 2657, "pg_attrdef", &[("oid", "oid_ops")]),
+    ("pg_attribute_relid_attnum_index", 2659, "pg_attribute", &[("attrelid", "oid_ops"), ("attnum", "int2_ops")]),
+    ("pg_auth_members_oid_index", 6303, "pg_auth_members", &[("oid", "oid_ops")]),
+    ("pg_authid_oid_index", 2677, "pg_authid", &[("oid", "oid_ops")]),
+    ("pg_cast_oid_index", 2660, "pg_cast", &[("oid", "oid_ops")]),
+    ("pg_class_oid_index", 2662, "pg_class", &[("oid", "oid_ops")]),
+    ("pg_collation_oid_index", 3085, "pg_collation", &[("oid", "oid_ops")]),
+    ("pg_constraint_oid_index", 2667, "pg_constraint", &[("oid", "oid_ops")]),
+    ("pg_conversion_oid_index", 2670, "pg_conversion", &[("oid", "oid_ops")]),
+    ("pg_database_oid_index", 2672, "pg_database", &[("oid", "oid_ops")]),
+    (
+        "pg_db_role_setting_databaseid_rol_index",
+        2965,
+        "pg_db_role_setting",
+        &[("setdatabase", "oid_ops"), ("setrole", "oid_ops")],
+    ),
+    ("pg_default_acl_oid_index", 828, "pg_default_acl", &[("oid", "oid_ops")]),
+    (
+        "pg_description_o_c_o_index",
+        2675,
+        "pg_description",
+        &[("objoid", "oid_ops"), ("classoid", "oid_ops"), ("objsubid", "int4_ops")],
+    ),
+    ("pg_enum_oid_index", 3502, "pg_enum", &[("oid", "oid_ops")]),
+    ("pg_event_trigger_oid_index", 3468, "pg_event_trigger", &[("oid", "oid_ops")]),
+    ("pg_extension_oid_index", 3080, "pg_extension", &[("oid", "oid_ops")]),
+    ("pg_foreign_data_wrapper_oid_index", 112, "pg_foreign_data_wrapper", &[("oid", "oid_ops")]),
+    ("pg_foreign_server_oid_index", 113, "pg_foreign_server", &[("oid", "oid_ops")]),
+    ("pg_foreign_table_relid_index", 3119, "pg_foreign_table", &[("ftrelid", "oid_ops")]),
+    ("pg_index_indexrelid_index", 2679, "pg_index", &[("indexrelid", "oid_ops")]),
+    ("pg_inherits_relid_seqno_index", 2680, "pg_inherits", &[("inhrelid", "oid_ops"), ("inhseqno", "int4_ops")]),
+    (
+        "pg_init_privs_o_c_o_index",
+        3395,
+        "pg_init_privs",
+        &[("objoid", "oid_ops"), ("classoid", "oid_ops"), ("objsubid", "int4_ops")],
+    ),
+    ("pg_language_oid_index", 2682, "pg_language", &[("oid", "oid_ops")]),
+    ("pg_largeobject_loid_pn_index", 2683, "pg_largeobject", &[("loid", "oid_ops"), ("pageno", "int4_ops")]),
+    ("pg_largeobject_metadata_oid_index", 2996, "pg_largeobject_metadata", &[("oid", "oid_ops")]),
+    ("pg_namespace_oid_index", 2685, "pg_namespace", &[("oid", "oid_ops")]),
+    ("pg_opclass_oid_index", 2687, "pg_opclass", &[("oid", "oid_ops")]),
+    ("pg_operator_oid_index", 2688, "pg_operator", &[("oid", "oid_ops")]),
+    ("pg_opfamily_oid_index", 2755, "pg_opfamily", &[("oid", "oid_ops")]),
+    ("pg_parameter_acl_oid_index", 6247, "pg_parameter_acl", &[("oid", "oid_ops")]),
+    ("pg_partitioned_table_partrelid_index", 3351, "pg_partitioned_table", &[("partrelid", "oid_ops")]),
+    ("pg_policy_oid_index", 3257, "pg_policy", &[("oid", "oid_ops")]),
+    ("pg_proc_oid_index", 2690, "pg_proc", &[("oid", "oid_ops")]),
+    ("pg_publication_oid_index", 6110, "pg_publication", &[("oid", "oid_ops")]),
+    ("pg_publication_namespace_oid_index", 6238, "pg_publication_namespace", &[("oid", "oid_ops")]),
+    ("pg_publication_rel_oid_index", 6112, "pg_publication_rel", &[("oid", "oid_ops")]),
+    ("pg_range_rngtypid_index", 3542, "pg_range", &[("rngtypid", "oid_ops")]),
+    ("pg_replication_origin_roiident_index", 6001, "pg_replication_origin", &[("roident", "oid_ops")]),
+    ("pg_rewrite_oid_index", 2692, "pg_rewrite", &[("oid", "oid_ops")]),
+    (
+        "pg_seclabel_object_index",
+        3597,
+        "pg_seclabel",
+        &[("objoid", "oid_ops"), ("classoid", "oid_ops"), ("objsubid", "int4_ops"), ("provider", "text_ops")],
+    ),
+    ("pg_sequence_seqrelid_index", 5002, "pg_sequence", &[("seqrelid", "oid_ops")]),
+    ("pg_shdescription_o_c_index", 2397, "pg_shdescription", &[("objoid", "oid_ops"), ("classoid", "oid_ops")]),
+    (
+        "pg_shseclabel_object_index",
+        3593,
+        "pg_shseclabel",
+        &[("objoid", "oid_ops"), ("classoid", "oid_ops"), ("provider", "text_ops")],
+    ),
+    (
+        "pg_statistic_relid_att_inh_index",
+        2696,
+        "pg_statistic",
+        &[("starelid", "oid_ops"), ("staattnum", "int2_ops"), ("stainherit", "bool_ops")],
+    ),
+    ("pg_statistic_ext_oid_index", 3380, "pg_statistic_ext", &[("oid", "oid_ops")]),
+    (
+        "pg_statistic_ext_data_stxoid_inh_index",
+        3433,
+        "pg_statistic_ext_data",
+        &[("stxoid", "oid_ops"), ("stxdinherit", "bool_ops")],
+    ),
+    ("pg_subscription_oid_index", 6114, "pg_subscription", &[("oid", "oid_ops")]),
+    (
+        "pg_subscription_rel_srrelid_srsubid_index",
+        6117,
+        "pg_subscription_rel",
+        &[("srrelid", "oid_ops"), ("srsubid", "oid_ops")],
+    ),
+    ("pg_tablespace_oid_index", 2697, "pg_tablespace", &[("oid", "oid_ops")]),
+    ("pg_transform_oid_index", 3574, "pg_transform", &[("oid", "oid_ops")]),
+    ("pg_trigger_oid_index", 2702, "pg_trigger", &[("oid", "oid_ops")]),
+    ("pg_ts_config_oid_index", 3712, "pg_ts_config", &[("oid", "oid_ops")]),
+    (
+        "pg_ts_config_map_index",
+        3609,
+        "pg_ts_config_map",
+        &[("mapcfg", "oid_ops"), ("maptokentype", "int4_ops"), ("mapseqno", "int4_ops")],
+    ),
+    ("pg_ts_dict_oid_index", 3605, "pg_ts_dict", &[("oid", "oid_ops")]),
+    ("pg_ts_parser_oid_index", 3607, "pg_ts_parser", &[("oid", "oid_ops")]),
+    ("pg_ts_template_oid_index", 3767, "pg_ts_template", &[("oid", "oid_ops")]),
+    ("pg_type_oid_index", 2703, "pg_type", &[("oid", "oid_ops")]),
+    ("pg_user_mapping_oid_index", 174, "pg_user_mapping", &[("oid", "oid_ops")]),
+];
+
+/// A catalog's primary key as its header declares it: the index's name and oid, the catalog, and its key columns with
+/// their operator classes.
+type PkeyDecl = (&'static str, i64, &'static str, &'static [(&'static str, &'static str)]);
+
+/// A served catalog's primary key (see `CATALOG_PKEYS`), as pg_class, pg_index and pg_constraint have it.
+pub(super) struct CatalogPkey {
+    pub(super) name: &'static str,
+    pub(super) oid: i64,
+    pub(super) table: &'static str,
+    pub(super) table_oid: i64,
+    /// the key columns' attnums, operator classes' oids and collations' oids (C's for a name, else none)
+    pub(super) attnums: Vec<i64>,
+    pub(super) classes: Vec<i64>,
+    pub(super) colls: Vec<i64>,
+    /// the constraint's oid
+    pub(super) con_oid: i64,
+}
+
+/// The primary keys of the catalog tables Chronos serves (`catalog::CATALOG_OIDS`), in `CATALOG_PKEYS`' order: their
+/// constraints numbered by their names (`foreign::name_oids` kind 20).
+pub(super) fn catalog_pkeys() -> Vec<CatalogPkey> {
+    let opclasses = catalog_schema::builtin_rows("pg_opclass");
+    let ocols = catalog_schema::columns("pg_opclass");
+    let at = |n: &str| ocols.iter().position(|(c, _)| c == n).unwrap_or(0);
+    let (o_oid, o_name, o_method) = (at("oid"), at("opcname"), at("opcmethod"));
+    let class_oid = |name: &str| {
+        opclasses
+            .iter()
+            .find(|r| r[o_name].to_text() == name && r[o_method] == Value::Int(BTREE_AM))
+            .map_or(0, |r| if let Value::Int(o) = r[o_oid] { o } else { 0 })
+    };
+    let served: Vec<(PkeyDecl, i64)> = CATALOG_PKEYS
+        .iter()
+        .filter_map(|&decl| Some((decl, super::catalog::CATALOG_OIDS.iter().find(|(n, _)| *n == decl.2)?.1)))
+        .collect();
+    let con_oids = super::foreign::name_oids(20, &served.iter().map(|s| s.0.0.to_string()).collect::<Vec<_>>());
+    served
+        .into_iter()
+        .zip(con_oids)
+        .map(|(((name, oid, table, cols), table_oid), con_oid)| {
+            let columns = catalog_schema::columns(table);
+            let attnums = cols
+                .iter()
+                .map(|(c, _)| columns.iter().position(|(n, _)| n == c).map_or(0, |p| p as i64 + 1))
+                .collect();
+            let classes = cols.iter().map(|(_, o)| class_oid(o)).collect();
+            let colls = cols.iter().map(|(_, o)| if *o == "name_ops" { 950 } else { 0 }).collect();
+            CatalogPkey { name, oid, table, table_oid, attnums, classes, colls, con_oid }
+        })
+        .collect()
 }
 
 /// pg_class: tables, views, materialized views, sequences and indexes.
