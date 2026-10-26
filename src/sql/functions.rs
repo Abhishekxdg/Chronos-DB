@@ -202,6 +202,9 @@ pub(super) struct Function {
     pub(super) name: String,
     /// name (if it has one) and type, in order
     pub(super) args: Vec<(Option<String>, Type)>,
+    /// a polymorphic function's instance (see `instance`): the types its parameters were declared with, which its
+    /// CONTEXT lines name (`foreach_test(anyarray)`); empty for the function itself
+    pub(super) declared: Vec<Type>,
     /// each parameter's DEFAULT, as SQL (only the last ones have any)
     pub(super) defaults: Vec<Option<String>>,
     pub(super) ret: Ret,
@@ -420,6 +423,7 @@ impl Function {
         let mut f = Function {
             name: j["name"].as_str().ok_or_else(bad)?.into(),
             args: list(&j["args"])?,
+            declared: vec![],
             defaults: j["defaults"]
                 .as_array()
                 .map(|d| d.iter().map(|x| x.as_str().map(String::from)).collect())
@@ -1608,6 +1612,7 @@ impl Parser {
         let mut f = Function {
             name,
             args,
+            declared: vec![],
             defaults,
             ret,
             lang,
@@ -1689,6 +1694,7 @@ impl Parser {
         let mut f = Function {
             name: "inline_code_block".into(),
             args: vec![],
+            declared: vec![],
             defaults: vec![],
             ret: Ret::Void,
             lang,
@@ -5601,6 +5607,7 @@ pub(super) fn instance(f: &Arc<Function>, given: &[Option<Type>], sure: bool) ->
     let mut g = Function {
         name: f.name.clone(),
         args: f.args.iter().map(|(n, t)| (n.clone(), sub(*t))).collect(),
+        declared: f.args.iter().map(|a| a.1).collect(),
         defaults: f.defaults.clone(),
         ret,
         lang: f.lang,

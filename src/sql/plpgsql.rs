@@ -433,7 +433,10 @@ fn signature(f: &Function) -> String {
     if f.name == "inline_code_block" {
         return f.name.clone();
     }
-    let types: Vec<String> = f.args.iter().map(|(_, t)| t.pg_name().into_owned()).collect();
+    let types: Vec<String> = match &f.declared[..] {
+        [] => f.args.iter().map(|(_, t)| t.pg_name().into_owned()).collect(),
+        declared => declared.iter().map(|t| t.pg_name().into_owned()).collect(),
+    };
     format!("{}({})", f.name, types.join(","))
 }
 
@@ -1176,6 +1179,13 @@ impl P<'_> {
             offset: None,
             locking: vec![],
         })));
+        // a subquery of a catalog table (`RETURN (SELECT ... FROM pg_class)`) runs as a statement, which has the
+        // catalog's rows put in as it runs (see `inline_catalog`)
+        if query && !bound {
+            let mut names = vec![];
+            super::reads_of(&sel, &mut names);
+            bound = names.iter().any(|n| super::catalog_table(n.strip_prefix("pg_catalog.").unwrap_or(n)));
+        }
         E { e, query, bound, sel }
     }
 
