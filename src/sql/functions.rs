@@ -3378,9 +3378,142 @@ pub(super) fn resolve_calls(s: &Stmt, v: &View) -> Result<Stmt> {
 
 /// A set-returning function made with CREATE FUNCTION in a select list (`SELECT f(x) FROM t`), as Postgres runs it
 /// since version 10: for each row, a row for each of the function's (none: the row is gone). Made a LATERAL source of
-/// the call, its column (a record of its columns, for several) where the call was, named as the function. One such
-/// call, with no aggregate, window function, grouping or other set-returning function beside it (those are left).
+/// the call, its column (a record of its columns, for several) where the call was, named as the function. A call
+/// nested in another's arguments (`g(f(x))`) is made one first, and then the outer, each a level as Postgres's
+/// ProjectSet nodes run them. First, attribute notation is made the calls it means (see `attribute_calls`).
 fn select_list_srfs(v: &View, q: &mut Select) {
+    attribute_calls(v, q);
+    for level in 0..8 {
+        let at = if level == 0 { SRF_SOURCE.to_string() } else { format!("{SRF_SOURCE}{level}") };
+        if !srf_round(v, q, &at) {
+            break;
+        }
+    }
+}
+
+/// The name of the LATERAL source a select list's set-returning call is made (with its level after it, past the first):
+/// a name SQL can't write (\u{1} starts it, as `GROUP`'s), so no alias of the user's is taken for one
+pub(super) const SRF_SOURCE: &str = "\u{1}usrf";
+
+/// Whether a function made with CREATE FUNCTION named `name` takes one argument (so `name(x)` calls it, and is not
+/// the field `name` of x)
+fn takes_one(v: &View, name: &str) -> bool {
+    named(v, name).is_ok_and(|fs| fs.iter().any(|f| f.takes(1)))
+}
+
+/// Attribute notation, as Postgres's ParseFuncOrColumn reads it: `t.f`, where FROM item `t` is a table or view
+/// with no column `f` but a function `f` takes one argument, is `f(t)` (the call with t's whole row); and so is
+/// `(x).f` where x is such a call whose rows have no field `f`. A column of the name is always the column.
+fn attribute_calls(v: &View, q: &mut Select) {
+    // the FROM items that are tables or views here, by the name they go by, with their columns
+    let mut rels: Vec<(String, Vec<String>)> = vec![];
+    for src in q.from.iter().chain(q.joins.iter().map(|j| &j.src)) {
+        if src.srf.is_some() {
+            continue;
+        }
+        // (a subquery's columns are its select list's names: an inherited table's rows, `person*`, are one over it
+        // and its children, its own columns)
+        let cols = match &src.sub {
+            Some(sub) => match sub_columns(sub) {
+                Some(c) => c,
+                None => continue,
+            },
+            None => match super::view_def(v, &src.table) {
+                Ok(Some(d)) => d.cols.clone(),
+                _ => match super::load(v, &src.table) {
+                    Ok(Some(t)) => t.cols.iter().map(|c| c.name.clone()).collect(),
+                    _ => continue,
+                },
+            },
+        };
+        // (a column alias list, `t AS p(a, b)`, names the first columns as `sources` renames them)
+        let cols = src.names.iter().cloned().chain(cols.into_iter().skip(src.names.len())).collect();
+        rels.push((src.alias.clone(), cols));
+    }
+    if rels.is_empty() {
+        return;
+    }
+    let fix = |e: &Expr| attr_fix(v, &rels, e);
+    for it in &mut q.items {
+        if let Item::Expr(e, _) = it {
+            *e = fix(e);
+        }
+    }
+    for (e, _) in &mut q.order {
+        *e = fix(e);
+    }
+    if let Some(w) = &mut q.filter {
+        *w = fix(w);
+    }
+}
+
+/// A subquery's column names, where its select list says them all (an alias, or a column's own name); None where
+/// one can't be told (a `*`, an expression with no alias)
+fn sub_columns(q: &Select) -> Option<Vec<String>> {
+    q.items
+        .iter()
+        .map(|it| match it {
+            Item::Expr(_, Some(alias)) => Some(alias.clone()),
+            Item::Expr(Expr::Col(_, n), None) => Some(n.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `e` with its attribute notation made calls (see `attribute_calls`; `rels` the FROM items' columns by name)
+fn attr_fix(v: &View, rels: &[(String, Vec<String>)], e: &Expr) -> Expr {
+    let call = |name: &str, arg: Expr| {
+        Expr::Call(Box::new(Call {
+            name: name.into(),
+            args: vec![arg],
+            names: vec![],
+            def: None,
+            via_call: false,
+            builtin: false,
+        }))
+    };
+    rewrite(e, &|x| match x {
+        Expr::Col(Some(t), f) => {
+            let (_, cols) = rels.iter().find(|(a, _)| a == t)?;
+            (!cols.iter().any(|c| c == f) && !SYSTEM_COLUMNS.contains(&f.as_str()) && takes_one(v, f))
+                // (`t.*`, the row: a bare `t` would be t's column of that name, where it has one)
+                .then(|| call(f, Expr::Col(Some(t.clone()), "*".into())))
+        }
+        // `(x).f`: x made a call first where it is attribute notation itself (`(t.g).f`); then, if x is a call whose
+        // rows have no field f, f's call of it
+        Expr::Func(Func::FieldOf, a) if a.len() == 2 => {
+            let inner = attr_fix(v, rels, &a[0]);
+            let Expr::Lit(Value::Text(f)) = &a[1] else { return None };
+            let fields = match &inner {
+                // (only where the call can be only one function: its rows' fields are then that function's, whatever
+                // its arguments' types, which aren't known yet)
+                Expr::Call(c)
+                    if named(v, &c.name).is_ok_and(|fs| fs.iter().filter(|g| g.takes(c.args.len())).count() == 1) =>
+                {
+                    let tys: Vec<Option<Type>> = c.args.iter().map(|_| None).collect();
+                    srf_columns(v, &c.name, &tys, "?v")
+                        .ok()
+                        .map(|cs| cs.into_iter().map(|(n, _)| n).collect::<Vec<_>>())
+                }
+                _ => None,
+            };
+            match fields {
+                Some(fs) if !fs.iter().any(|n| n == f) && takes_one(v, f) => Some(call(f, inner)),
+                _ => Some(Expr::Func(Func::FieldOf, vec![inner, a[1].clone()])),
+            }
+        }
+        _ => None,
+    })
+}
+
+/// The system columns every table has, which attribute notation never takes for a function
+const SYSTEM_COLUMNS: [&str; 7] = ["ctid", "oid", "tableoid", "xmin", "xmax", "cmin", "cmax"];
+
+/// One level of `select_list_srfs`: the innermost set-returning call in the select list (one whose arguments hold
+/// none) made a LATERAL source named `at`, its column where the call was. False where there was none, or one this
+/// leaves: beside an aggregate, a window function or a grouping, or another at its level (Postgres runs those in
+/// step, which this doesn't).
+fn srf_round(v: &View, q: &mut Select, at: &str) -> bool {
     // (a call whose functions of its name, taking that many arguments, all return sets, not one row)
     let sets = |c: &Call| -> bool {
         if !c.names.is_empty() || c.builtin {
@@ -3408,27 +3541,37 @@ fn select_list_srfs(v: &View, q: &mut Select) {
             _ => {}
         });
     }
-    let [call] = &calls[..] else { return };
+    // (the innermost: a call whose arguments hold no other, as Postgres's ProjectSet runs a nested one first)
+    let innermost: Vec<&Call> = calls
+        .iter()
+        .filter(|c| {
+            let mut inner = false;
+            for a in &c.args {
+                walk(a, &mut |x| inner |= matches!(x, Expr::Call(d) if sets(d)));
+            }
+            !inner
+        })
+        .collect();
+    let [call] = &innermost[..] else { return false };
     if other || !q.group.is_empty() || q.having.is_some() {
-        return;
+        return false;
     }
     // its columns, from its arguments' types where they can be told unbound (unknown otherwise)
     let tys: Vec<Option<Type>> = call.args.iter().map(|a| unbound_type(a, &[], None).flatten()).collect();
-    let Ok(cols) = srf_columns(v, &call.name, &tys, "?v") else { return };
+    let Ok(cols) = srf_columns(v, &call.name, &tys, "?v") else { return false };
     if cols.is_empty() {
-        return;
+        return false;
     }
-    const AT: &str = "?usrf";
     let names: Vec<String> = cols.iter().map(|(n, _)| n.clone()).collect();
     let column = match &names[..] {
-        [one] => Expr::Col(Some(AT.into()), one.clone()),
-        all => Expr::Func(Func::RowValue, all.iter().map(|n| Expr::Col(Some(AT.into()), n.clone())).collect()),
+        [one] => Expr::Col(Some(at.into()), one.clone()),
+        all => Expr::Func(Func::RowValue, all.iter().map(|n| Expr::Col(Some(at.into()), n.clone())).collect()),
     };
     let src = Source {
-        table: AT.into(),
-        alias: AT.into(),
+        table: at.into(),
+        alias: at.into(),
         sub: None,
-        names,
+        names: names.clone(),
         rec: None,
         working: false,
         at: None,
@@ -3441,9 +3584,23 @@ fn select_list_srfs(v: &View, q: &mut Select) {
         bound: false,
     };
     let key = format!("{call:?}");
+    let is_call = |x: &Expr| matches!(x, Expr::Call(c) if format!("{c:?}") == key);
+    // a field of the call's rows, `(f(x)).name` or `name(f(x))` (functional notation, where no function `name` takes
+    // the row: Postgres's ParseFuncOrColumn), is that column of the source
+    let field =
+        |f: &str| (names.len() > 1 && names.iter().any(|n| n == f)).then(|| Expr::Col(Some(at.into()), f.into()));
     let swap = |e: &Expr| {
         rewrite(e, &|x| match x {
             Expr::Call(c) if format!("{c:?}") == key => Some(column.clone()),
+            Expr::Func(Func::FieldOf, a) if a.len() == 2 && is_call(&a[0]) => match &a[1] {
+                Expr::Lit(Value::Text(f)) => field(f),
+                _ => None,
+            },
+            Expr::Call(c)
+                if c.args.len() == 1 && c.names.is_empty() && is_call(&c.args[0]) && !takes_one(v, &c.name) =>
+            {
+                field(rel_part(written(&c.name)))
+            }
             _ => None,
         })
     };
@@ -3472,6 +3629,7 @@ fn select_list_srfs(v: &View, q: &mut Select) {
             comma: true,
         }),
     }
+    true
 }
 
 /// The table whose rows a call in FROM of `name` with `n` arguments gives, when it calls a function made with

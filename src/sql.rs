@@ -20902,6 +20902,10 @@ impl Parser {
                 }
                 self.deeper(1)?;
                 let field = self.name()?;
+                // (`(t.f).g` may be attribute notation, a call of f: see `functions::attribute_calls`)
+                if matches!(e, Expr::Col(Some(_), _)) {
+                    self.calls = true;
+                }
                 e = Expr::Func(Func::FieldOf, vec![e, Expr::Lit(Value::Text(field))]);
             } else if self.sym("[") {
                 // a[i], a[lo:hi] with either bound left out (everything from or up to there), and several in a row,
@@ -34376,9 +34380,13 @@ fn projection(items: &[Item], cols: &[Col], pad: bool) -> Result<Vec<(String, Ex
     for it in items {
         match it {
             Item::Star if cols.is_empty() => return err(SYNTAX, "SELECT * needs a FROM table"),
-            Item::Star => {
-                out.extend(cols.iter().enumerate().filter(|(_, c)| !c.hidden).map(|(i, c)| (c.name.clone(), shown(i))))
-            }
+            // (not a select list's set-returning call's own source: see `functions::select_list_srfs`)
+            Item::Star => out.extend(
+                cols.iter()
+                    .enumerate()
+                    .filter(|(_, c)| !c.hidden && !c.table.starts_with(functions::SRF_SOURCE))
+                    .map(|(i, c)| (c.name.clone(), shown(i))),
+            ),
             Item::TableStar(t) => {
                 let before = out.len();
                 out.extend(
