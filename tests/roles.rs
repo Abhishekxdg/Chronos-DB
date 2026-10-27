@@ -117,6 +117,11 @@ fn a_created_role_logs_in_with_its_rights() {
     assert_eq!(message(&e), "permission denied for database \"main\"");
     admin.batch_execute("grant connect on database main to r1_user").unwrap();
     connect(port, "r1_user").unwrap();
+    // `postgres` is main too, as connecting to it is (Supabase's init scripts grant on it)
+    admin.batch_execute("revoke connect on database postgres from r1_user").unwrap();
+    assert!(connect(port, "r1_user").is_err());
+    admin.batch_execute("grant connect on database postgres to r1_user").unwrap();
+    connect(port, "r1_user").unwrap();
     // CONNECTION LIMIT: the one it has open counts
     admin.batch_execute("alter role r1_reader connection limit 1").unwrap();
     admin.batch_execute("grant connect on database main to r1_reader").unwrap();

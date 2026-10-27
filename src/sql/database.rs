@@ -23,7 +23,7 @@ pub(super) struct Create {
 
 /// The maintenance databases every Postgres has: `postgres` is where tools connect to create the
 /// others, and here it is `main` unless a world is named so.
-const MAINTENANCE: [&str; 2] = ["postgres", "template1"];
+pub(super) const MAINTENANCE: [&str; 2] = ["postgres", "template1"];
 
 /// The world a database name means: the world of that name, or `main` for the maintenance databases.
 pub fn world_of(db: &Db, name: &str) -> Option<String> {

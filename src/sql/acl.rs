@@ -2557,6 +2557,13 @@ fn targets(v: &View, on: &On) -> Result<Vec<Obj>> {
         }
         On::Databases(names) => {
             for n in names {
+                // (`postgres` and `template1`, the maintenance databases tools connect to, are main where no world is
+                // named so, as a connection to them is: see `database::world_of`)
+                let here = database_name(v);
+                let main = here == crate::MAIN
+                    && super::database::MAINTENANCE.contains(&n.as_str())
+                    && v.core.world(n).is_err();
+                let n = if main { &here } else { n };
                 // (under CHRONOS_PG_EXACT the regression suite's database is the one the session is in)
                 if *n != database_name(v) && !(pg_exact() && n == "regression") {
                     return err(
