@@ -1437,12 +1437,13 @@ impl Catalog {
         super::acl::shown(&self.reg, e, owner)
     }
 
-    /// The access methods as pg_am lists them: Postgres's own (pgvector's hnsw once an index uses it, as Postgres has
-    /// it only where the extension is), then those CREATE ACCESS METHOD made: oid, name, handler, kind (`i`, `t`).
+    /// The access methods as pg_am lists them: Postgres's own (pgvector's hnsw and contrib/bloom's bloom once an index
+    /// uses it, as Postgres has it only where the extension is), then those CREATE ACCESS METHOD made: oid, name,
+    /// handler, kind (`i`, `t`).
     pub(super) fn access_methods(&self) -> Vec<(i64, String, String, char)> {
         let own = AMS
             .iter()
-            .filter(|(_, n, ..)| *n != "hnsw" || self.idx.iter().any(|(_, x)| x.method == "hnsw"))
+            .filter(|(_, n, ..)| !["hnsw", "bloom"].contains(n) || self.idx.iter().any(|(_, x)| x.method == *n))
             .map(|(o, n, h, k)| (*o, n.to_string(), h.to_string(), k.chars().next().unwrap_or('i')));
         own.chain(self.ams.iter().map(|a| (a.oid, a.name.clone(), a.handler.clone(), a.kind))).collect()
     }
@@ -3572,8 +3573,8 @@ pub(super) fn table_oid(name: &str) -> Option<i64> {
     CATALOG_OIDS.iter().find(|(n, _)| *n == name).map(|(_, o)| *o)
 }
 
-/// pg_am: oid, name, handler function, and kind (t table, i index); hnsw is pgvector's.
-pub(super) const AMS: [(i64, &str, &str, &str); 8] = [
+/// pg_am: oid, name, handler function, and kind (t table, i index); hnsw is pgvector's, bloom contrib/bloom's.
+pub(super) const AMS: [(i64, &str, &str, &str); 9] = [
     (2, "heap", "heap_tableam_handler", "t"),
     (403, "btree", "bthandler", "i"),
     (405, "hash", "hashhandler", "i"),
@@ -3582,6 +3583,7 @@ pub(super) const AMS: [(i64, &str, &str, &str); 8] = [
     (3580, "brin", "brinhandler", "i"),
     (4000, "spgist", "spghandler", "i"),
     (16300, "hnsw", "hnswhandler", "i"),
+    (16303, "bloom", "blhandler", "i"),
 ];
 
 /// The catalog tables made here, by name (see `CATALOG`).

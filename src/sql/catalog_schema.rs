@@ -261,11 +261,12 @@ pub(super) fn builtin_description(oid: i64, class: i64) -> Option<&'static str> 
     all.binary_search_by_key(&(class, oid), |(o, c, _)| (*c, *o)).ok().map(|i| all[i].2)
 }
 
-/// The functions of the extensions built in that the catalog names: pgvector's index handler (`pg_am`'s
-/// `amhandler` for hnsw), and the input and output functions of hstore's and ltree's types (their `pg_type` rows'
+/// The functions of the extensions built in that the catalog names: pgvector's and contrib/bloom's index handlers
+/// (`pg_am`'s `amhandler` for hnsw and bloom), and the input and output functions of hstore's and ltree's types (their `pg_type` rows'
 /// `typinput` and the rest), each at an oid of Chronos's own, as hnsw's is. They have no `pg_proc` rows.
-const EXTENSION_PROCS: [(i64, &str, &str, &str); 13] = [
+const EXTENSION_PROCS: [(i64, &str, &str, &str); 14] = [
     (16301, "hnswhandler", "(internal)", ""),
+    (16302, "blhandler", "(internal)", ""),
     (16320, "hstore_in", "(cstring)", ""),
     (16321, "hstore_out", "(hstore)", ""),
     (16322, "hstore_recv", "(internal)", ""),

@@ -18,6 +18,8 @@ pub(super) enum Kind {
     Gin,
     Brin,
     Spgist,
+    /// contrib/bloom's: a signature `length` and the bits each key column sets (`col1` ... `col32`)
+    Bloom,
     Tablespace,
 }
 
@@ -31,6 +33,7 @@ impl Kind {
             "gin" => Kind::Gin,
             "brin" => Kind::Brin,
             "spgist" => Kind::Spgist,
+            "bloom" => Kind::Bloom,
             _ => return None,
         })
     }
@@ -189,21 +192,37 @@ pub(super) fn transform(
     Ok(out)
 }
 
+/// Parameter `name` of `kind`: its name as Postgres has it, and its type. bloom's are its own (bloom.c's
+/// `_PG_init`): `length` of 1 to 4096 bits, and `col1` to `col32` (INDEX_MAX_KEYS) of 1 to 4095.
+fn param(kind: Kind, name: &str) -> Option<(String, Ty)> {
+    if kind == Kind::Bloom {
+        let name = name.to_ascii_lowercase();
+        let col = name.strip_prefix("col").and_then(|n| n.parse::<u32>().ok()).filter(|n| (1..=32).contains(n));
+        return match (name.as_str(), col) {
+            ("length", _) => Some((name, Ty::Int(1, 4096))),
+            (_, Some(n)) if name == format!("col{n}") => Some((name, Ty::Int(1, 4095))),
+            _ => None,
+        };
+    }
+    PARAMS
+        .iter()
+        .find(|(n, _, kinds)| n.eq_ignore_ascii_case(name) && kinds.contains(&kind))
+        .map(|(n, ty, _)| (n.to_string(), *ty))
+}
+
 /// Postgres's `parseRelOptions` with validation: each of `options` (`name=value`) has to be a parameter of `kind`,
 /// given once, with a value of its type within its bounds.
 pub(super) fn check(kind: Kind, options: &[String]) -> Result<()> {
-    let mut seen: Vec<&str> = vec![];
+    let mut seen: Vec<String> = vec![];
     for o in options {
         let (name, value) = o.split_once('=').unwrap_or((o, "true"));
-        let Some((name, ty, _)) =
-            PARAMS.iter().find(|(n, _, kinds)| n.eq_ignore_ascii_case(name) && kinds.contains(&kind))
-        else {
+        let Some((name, ty)) = param(kind, name) else {
             return Err(bad(format!("unrecognized parameter \"{name}\"")));
         };
-        if seen.contains(name) {
+        if seen.contains(&name) {
             return Err(bad(format!("parameter \"{name}\" specified more than once")));
         }
-        seen.push(name);
+        seen.push(name.clone());
         let bounds = |lo: String, hi: String| SqlError {
             code: "22023",
             message: format!("value {value} out of bounds for option \"{name}\""),
@@ -212,7 +231,7 @@ pub(super) fn check(kind: Kind, options: &[String]) -> Result<()> {
                 ..Violation::default()
             })),
         };
-        match *ty {
+        match ty {
             Ty::Bool => {
                 if settings::parse_bool(value.trim()).is_none() {
                     return Err(bad(format!("invalid value for boolean option \"{name}\": {value}")));

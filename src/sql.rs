@@ -2436,7 +2436,7 @@ thread_local! {
 /// The extensions CREATE EXTENSION takes whose functions are built in, so DROP EXTENSION of one has nothing to do
 /// (pgcrypto is recorded besides: see `Stmt::CreateExtension`).
 const BUILT_IN_EXTENSIONS: &[&str] =
-    &["vector", "postgis", "plpgsql", "uuid-ossp", "pgcrypto", "pg_trgm", "fuzzystrmatch", "unaccent"];
+    &["vector", "postgis", "plpgsql", "uuid-ossp", "pgcrypto", "pg_trgm", "fuzzystrmatch", "unaccent", "bloom"];
 
 // ---------------------------------------------------------------- schemas
 
@@ -17216,7 +17216,7 @@ impl Parser {
         };
         // an access method CREATE ACCESS METHOD made: made as the built-in one its handler is, under its own name
         // (read here as that one's word; `method` keeps its own)
-        const OWN: [&str; 9] = ["btree", "hash", "gist", "gin", "spgist", "brin", "rtree", "hnsw", "ivfflat"];
+        const OWN: [&str; 10] = ["btree", "hash", "gist", "gin", "spgist", "brin", "rtree", "hnsw", "ivfflat", "bloom"];
         let mut builtin = None;
         if self.is_kw("using") && !OWN.contains(&method.as_str()) {
             match accessmethod::index_at_parse(&method)? {
@@ -17269,8 +17269,9 @@ impl Parser {
             } else if class.is_some() && (self.kw("gin") || self.kw("gist")) {
                 trgm = class;
                 Using::Gin
-            // a hash or block-range index finds no more than a btree does: it's a btree here
-            } else if self.kw("hash") || self.kw("brin") {
+            // a hash, block-range or bloom (contrib/bloom's signature) index finds no more than a btree does: it's a
+            // btree here
+            } else if self.kw("hash") || self.kw("brin") || self.kw("bloom") {
                 Using::Btree
             } else if self.kw("gin") {
                 Using::Gin
@@ -17582,6 +17583,8 @@ impl Parser {
                 // operator classes for GIN and GiST indexes on plain values: an index on one is kept as a
                 // btree here whatever its method, so there is nothing for them to add
                 "btree_gin" | "btree_gist" => Ok(Stmt::Noop("CREATE EXTENSION")),
+                // its access method is built in: a bloom index is kept as a btree on its columns (see `create_index`)
+                "bloom" => Ok(Stmt::Noop("CREATE EXTENSION")),
                 // its type is built in: `citext` is text in the collation "citext"
                 "citext" => Ok(Stmt::Noop("CREATE EXTENSION")),
                 // their types, operators and functions are built in (see `hstore` and `ltree`)
@@ -61933,12 +61936,26 @@ impl Exec<'_> {
                     IndexPart::Col(n) => t.cols.iter().find(|x| x.name == *n).map_or(i64::from(ty.oid()), col_oid),
                     IndexPart::Expr(_) => i64::from(ty.oid()),
                 };
+                // (one named for bloom is one of its own, int4_ops or text_ops, of the column's type: see `indexam`)
+                if let Some(n) = class.filter(|_| am == "bloom") {
+                    match indexam::accepts(am, n, ty, oid) {
+                        None => {
+                            return err("42704", format!("operator class \"{n}\" does not exist for access method \"bloom\""));
+                        }
+                        Some(false) => {
+                            return err("42804", format!("operator class \"{n}\" does not accept data type {}", ty.pg_name()));
+                        }
+                        Some(true) => {}
+                    }
+                }
                 // (an access method made here has the classes made for it alone: a column naming none needs one made
                 // the default for its type, as ResolveOpClass finds it, indexcmds.c:2216)
-                if said.builtin.is_some()
+                if (said.builtin.is_some()
                     && class.is_none()
                     && accessmethod::made_default_class(v, am, ty, oid)?.is_none()
-                    && with_path_view(|w| accessmethod::made_default_class(w, am, ty, oid)).transpose()?.flatten().is_none()
+                    && with_path_view(|w| accessmethod::made_default_class(w, am, ty, oid)).transpose()?.flatten().is_none())
+                    // (contrib/bloom's default classes, int4_ops and text_ops, varchar read as text: see `indexam`)
+                    || (am == "bloom" && class.is_none() && indexam::class_of(am, None, ty, oid).is_none())
                 {
                     return Err(SqlError {
                         code: "42704",

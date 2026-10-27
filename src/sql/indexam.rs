@@ -58,7 +58,7 @@ const fn am(
 /// The index access methods (pg_am's of kind `i`): [amcanorder, amcanorderbyop, amcanbackward, amcanunique,
 /// amcanmulticol], [amsearcharray, amsearchnulls, amclusterable, amcaninclude], [amgettuple, amgetbitmap,
 /// amcanreturn], each set or not as its handler sets it.
-const AMS: [Am; 7] = [
+const AMS: [Am; 8] = [
     am("btree", [true, false, true, true, true], [true, true, true, true], [true, true, true]),
     am("hash", [false, false, true, false, false], [false, false, false, false], [true, true, false]),
     am("gist", [false, true, false, false, true], [false, true, true, true], [true, true, true]),
@@ -66,6 +66,7 @@ const AMS: [Am; 7] = [
     am("gin", [false, false, false, false, true], [false, false, false, false], [false, true, false]),
     am("brin", [false, false, false, false, true], [false, true, false, false], [false, true, false]),
     am("hnsw", [false, true, false, false, false], [false, false, false, false], [true, false, false]),
+    am("bloom", [false, false, false, false, true], [false, false, false, false], [false, true, false]),
 ];
 
 /// Index access method `name`'s capabilities: None for one that isn't an index access method (heap).
@@ -158,9 +159,9 @@ pub(super) fn class_named(am: &str, name: &str) -> Option<&'static OpClass> {
     classes().iter().find(|c| c.am == am && c.name == name)
 }
 
-/// The extensions' operator classes Chronos has (pg_trgm's, hstore's, ltree's): access method, name, the type it
-/// indexes, and whether it is that type's default for the method. They have no row in pg_opclass here.
-const EXTENSION_CLASSES: [(&str, &str, u32, bool); 10] = [
+/// The extensions' operator classes Chronos has (pg_trgm's, hstore's, ltree's, bloom's): access method, name, the type
+/// it indexes, and whether it is that type's default for the method. They have no row in pg_opclass here.
+const EXTENSION_CLASSES: [(&str, &str, u32, bool); 12] = [
     ("gin", "gin_trgm_ops", 25, false),
     ("gist", "gist_trgm_ops", 25, false),
     ("gin", "gin_hstore_ops", hstore::OID, true),
@@ -171,6 +172,8 @@ const EXTENSION_CLASSES: [(&str, &str, u32, bool); 10] = [
     ("gist", "gist__ltree_ops", ltree::ARRAY_OID, true),
     ("btree", "ltree_ops", ltree::OID, true),
     ("hash", "hash_ltree_ops", ltree::OID, true),
+    ("bloom", "int4_ops", 23, true),
+    ("bloom", "text_ops", 25, true),
 ];
 
 /// Whether operator class `name` is one access method `am` has: Postgres's own, or an extension's Chronos has.
