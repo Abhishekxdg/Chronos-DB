@@ -2305,6 +2305,8 @@ pub struct Refreshed {
     pub tables: Vec<(String, usize, usize, usize)>,
     /// columns Postgres added that main took (`table.column type`), before its rows (see `widen`)
     pub added: Vec<String>,
+    /// enum labels Postgres added that main's types took (`type 'label'`), before the rows (see `take_labels`)
+    pub labels: Vec<String>,
     /// tables left as they were, and why (their shape changed in Postgres)
     pub skipped: Vec<String>,
     /// when Postgres was read (ms since 1970)
@@ -2323,6 +2325,7 @@ impl Refreshed {
             "tables": self.tables.iter().map(|(t, i, u, d)| json!({"table": t, "inserted": i, "updated": u, "deleted": d}))
                 .collect::<Vec<_>>(),
             "added": self.added,
+            "labels": self.labels,
             "skipped": self.skipped,
         })
     }
@@ -2391,6 +2394,7 @@ fn refresh_read(
         )));
     }
     let mut out = Refreshed { at: crate::now_ms(), ..Default::default() };
+    take_labels(core, pg, &mut out)?;
     let mut rows = vec![];
     for ti in 0..att.tables().len() {
         if only.is_some_and(|o| !o.contains(&ti)) {
@@ -2486,6 +2490,67 @@ fn refresh_read(
         out.tables.push((t.name.clone(), ins, upd, del));
     }
     Ok((out, rows))
+}
+
+/// Labels Postgres added to an enum type main has (`ALTER TYPE ... ADD VALUE` there since the attach or the last
+/// refresh), added to main's type in Postgres's order, before the rows that may hold them are read (see `refresh`):
+/// as `widen` adds columns, as the database's own change. Without them a world can't write the label, and a row
+/// holding it can't come into main. A label main has that Postgres hasn't (renamed there) is left, and said; a type
+/// only main has is no business of Postgres's.
+fn take_labels(core: &Core, pg: &mut Client, out: &mut Refreshed) -> Result<()> {
+    let Some(db) = core.db() else { return Ok(()) };
+    let sql = "select n.nspname, t.typname, e.enumlabel from pg_enum e join pg_type t on t.oid = e.enumtypid \
+               join pg_namespace n on n.oid = t.typnamespace order by 1, 2, e.enumsortorder";
+    let mut ours: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    let read = match crate::sql::run(&db, MAIN, sql, &[]) {
+        Ok(r) => r,
+        Err(e) => {
+            out.skipped.push(format!("enum types: main's couldn't be read: {}", e.message));
+            return Ok(());
+        }
+    };
+    for r in read.into_iter().last().map(|r| r.rows).unwrap_or_default() {
+        ours.entry((r[0].to_text(), r[1].to_text())).or_default().push(r[2].to_text());
+    }
+    if ours.is_empty() {
+        return Ok(());
+    }
+    let mut theirs: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for r in pg.query(sql).map_err(|e| failed("reading enum types", &e))? {
+        let [Some(n), Some(t), Some(l)] = [&r[0], &r[1], &r[2]] else { continue };
+        theirs.entry((n.clone(), t.clone())).or_default().push(l.clone());
+    }
+    for ((schema, ty), mut have) in ours {
+        let Some(want) = theirs.get(&(schema.clone(), ty.clone())) else { continue };
+        let name = if schema == "public" { q(&ty) } else { format!("{}.{}", q(&schema), q(&ty)) };
+        for (i, l) in want.iter().enumerate() {
+            if have.contains(l) {
+                continue;
+            }
+            let place = match want[..i].iter().rev().find(|p| have.contains(p)) {
+                Some(p) => format!(" after {}", lit(p)),
+                None => match want[i + 1..].iter().find(|n| have.contains(n)) {
+                    Some(n) => format!(" before {}", lit(n)),
+                    None => String::new(),
+                },
+            };
+            let _r = crate::Recovering::enter();
+            let skip = SKIP.replace(true);
+            let done = crate::sql::run(&db, MAIN, &format!("alter type {name} add value {}{place}", lit(l)), &[]);
+            SKIP.set(skip);
+            match done {
+                Ok(_) => {
+                    out.labels.push(format!("{ty} {}", lit(l)));
+                    have.push(l.clone());
+                }
+                Err(e) => out.skipped.push(format!("type {ty}: label {} added in Postgres: {}", lit(l), e.message)),
+            }
+        }
+        for l in have.iter().filter(|l| !want.contains(l)) {
+            out.skipped.push(format!("type {ty}: label {} isn't in Postgres's type (renamed there?)", lit(l)));
+        }
+    }
+    Ok(())
 }
 
 /// Adds `added`, columns Postgres added to attached table `ti`, to main's table and then to the folder's record in

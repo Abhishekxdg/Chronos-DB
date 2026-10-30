@@ -3,7 +3,7 @@ title: Chronos DB documentation
 slug: /
 ---
 
-> **Beta.** Chronos 0.2 is a public beta for developers; see [where it stands](postgres-compatibility.md#where-it-stands-beta).
+> **Beta.** Chronos 0.4 is a public beta for developers; see [where it stands](postgres-compatibility.md#where-it-stands-beta).
 
 Chronos DB gives every AI agent its own **world**: a copy-on-write branch of the whole database, made in about 2 microseconds. Agents change their world freely; you look at what changed and keep what works.
 

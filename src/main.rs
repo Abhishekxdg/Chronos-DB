@@ -299,6 +299,9 @@ fn main() {
                 for c in &r.added {
                     println!("column added in Postgres, taken: {c}");
                 }
+                for l in &r.labels {
+                    println!("enum label added in Postgres, taken: {l}");
+                }
                 for (t, i, u, d) in &r.tables {
                     println!("{t}: {i} inserted, {u} updated, {d} deleted");
                 }
@@ -658,9 +661,17 @@ fn main() {
                 loop {
                     std::thread::sleep(every);
                     match chronos::attach::refresh(&db) {
-                        Ok(r) if r.changed() > 0 || !r.skipped.is_empty() || !r.added.is_empty() => {
+                        Ok(r)
+                            if r.changed() > 0
+                                || !r.skipped.is_empty()
+                                || !r.added.is_empty()
+                                || !r.labels.is_empty() =>
+                        {
                             for c in &r.added {
                                 eprintln!("chronos: column added in Postgres, taken: {c}");
+                            }
+                            for l in &r.labels {
+                                eprintln!("chronos: enum label added in Postgres, taken: {l}");
                             }
                             let tables: Vec<String> = r
                                 .tables

@@ -4,7 +4,7 @@ module.exports = {
   tagline: 'Fork the world, try everything, merge what works.',
   // GitHub Pages (.github/workflows/docs.yml); a custom domain later changes these two lines
   url: 'https://abhishekxdg.github.io',
-  baseUrl: '/chronosdb/',
+  baseUrl: '/Chronos-DB/',
   onBrokenLinks: 'throw',
   markdown: { format: 'detect', hooks: { onBrokenMarkdownLinks: 'warn' } },
   presets: [
@@ -29,7 +29,7 @@ module.exports = {
         { to: '/quickstart', label: 'Quickstart', position: 'left' },
         { to: '/guides/agent-sandbox', label: 'Guides', position: 'left' },
         { to: '/sql', label: 'Reference', position: 'left' },
-        { href: 'https://github.com/Abhishekxdg/chronosdb', label: 'GitHub', position: 'right' },
+        { href: 'https://github.com/Abhishekxdg/Chronos-DB', label: 'GitHub', position: 'right' },
       ],
     },
     prism: { additionalLanguages: ['rust', 'bash', 'sql', 'toml', 'json'] },

@@ -33,7 +33,17 @@ fn throwaway(tag: &str) -> Option<(postgres::Client, String, String, std::sync::
 fn drop_db(name: &str) {
     let admin_url = std::env::var("CHRONOS_TEST_PG").unwrap();
     let mut admin = postgres::Client::connect(&admin_url, postgres::NoTls).unwrap();
-    admin.batch_execute(&format!("drop database if exists {name} with (force)")).unwrap();
+    force_drop(&mut admin, name);
+}
+
+/// `drop database ... with (force)`, which Postgres 12 hasn't: its sessions ended first.
+fn force_drop(admin: &mut postgres::Client, name: &str) {
+    admin
+        .batch_execute(&format!(
+            "select pg_terminate_backend(pid) from pg_stat_activity where datname = '{name}' and pid <> pg_backend_pid()"
+        ))
+        .unwrap();
+    admin.batch_execute(&format!("drop database if exists {name}")).unwrap();
 }
 
 fn folder(tag: &str) -> std::path::PathBuf {
@@ -361,7 +371,7 @@ fn merges_are_written_to_postgres_first() {
     assert!(e.message.contains("isn't the one this folder was attached to"), "{}", e.message);
     unsafe { std::env::set_var("CHRONOS_SOURCE_URL", &url) };
     run(&db, MAIN, "drop world w13", &[]).unwrap();
-    admin.batch_execute(&format!("drop database {other} with (force)")).unwrap();
+    force_drop(&mut admin, &other);
 
     // more rows in one merge than CHRONOS_ATTACH_MAX_ROWS: refused, said how
     unsafe { std::env::set_var("CHRONOS_ATTACH_MAX_ROWS", "10000") };
@@ -1027,6 +1037,58 @@ fn columns_added_in_postgres_come_over_at_refresh() {
 }
 
 #[test]
+fn enum_labels_added_in_postgres_come_over_at_refresh() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("labels") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create type mood as enum ('sad', 'happy');
+         create table leads (id int primary key, m mood);
+         insert into leads values (1, 'sad'), (2, 'happy');",
+    )
+    .unwrap();
+    let dir = folder("labels");
+    let (ok, out) = attach(&dir, &["--tables", "leads"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    // the app's migration: a label between two, one at the end, and a row holding it
+    pg.batch_execute("alter type mood add value 'ok' before 'happy'").unwrap();
+    pg.batch_execute("alter type mood add value 'meh'").unwrap();
+    pg.batch_execute("update leads set m = 'meh' where id = 1").unwrap();
+    // until a refresh, main's type hasn't the labels: a world can't write them
+    run(&db, MAIN, "create world early", &[]).unwrap();
+    let e = run(&db, "early", "update leads set m = 'ok' where id = 2", &[]).unwrap_err();
+    assert!(e.message.contains("invalid input value for enum"), "{}", e.message);
+    run(&db, MAIN, "drop world early", &[]).unwrap();
+
+    let r = chronos::attach::refresh(&db).unwrap();
+    assert!(r.skipped.is_empty(), "{:?}", r);
+    assert_eq!(r.labels, vec!["mood 'ok'".to_string(), "mood 'meh'".to_string()]);
+    // in Postgres's order, and the row holding one came in after them
+    assert_eq!(cell(&db, MAIN, "select 'sad'::mood < 'ok'::mood and 'ok'::mood < 'happy'::mood"), "true");
+    assert_eq!(cell(&db, MAIN, "select 'happy'::mood < 'meh'::mood"), "true");
+    assert_eq!(cell(&db, MAIN, "select m::text from leads where id = 1"), "meh");
+    // taken once: kept when reopened, nothing to take again
+    drop(db);
+    let db = Db::open(&dir).unwrap();
+    let r = chronos::attach::refresh(&db).unwrap();
+    assert!(r.labels.is_empty() && r.skipped.is_empty(), "{:?}", r);
+
+    // a world forked now writes them, and the merge reaches Postgres
+    if let Some(e) = change(&db, "fresh", "update leads set m = 'ok' where id = 2; insert into leads values (3, 'meh')")
+    {
+        panic!("{}", e.message);
+    }
+    assert_eq!(pg_cell(&mut pg, "select string_agg(m::text, ',' order by id) from leads"), "meh,ok,meh");
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+#[test]
 fn widening_keeps_not_null_and_survives_a_stop_before_its_record_is_saved() {
     let Some((mut pg, name, _url, _turn)) = throwaway("widen_nn") else {
         eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
@@ -1095,6 +1157,8 @@ fn a_column_added_with_a_default_worked_out_per_row_comes_over() {
     assert!(ok, "{out}");
     let db = Db::open(&dir).unwrap();
     // Postgres gives every row its own value; Chronos won't fill rows it has with such a default
+    // (gen_random_uuid is pgcrypto's before Postgres 13)
+    pg.batch_execute("create extension if not exists pgcrypto").unwrap();
     pg.batch_execute("alter table leads add column ref uuid not null default gen_random_uuid()").unwrap();
     let r = chronos::attach::refresh(&db).unwrap();
     assert!(r.skipped.is_empty(), "{:?}", r);

@@ -1,4 +1,4 @@
-# The docs site (site/, Docusaurus over docs/) on GitHub Pages: https://abhishekxdg.github.io/chronosdb/
+# The docs site (site/, Docusaurus over docs/) on GitHub Pages: https://abhishekxdg.github.io/Chronos-DB/
 # Rebuilt when the docs or the site change on main. Broken links fail the build (onBrokenLinks: throw).
 name: docs
 on:

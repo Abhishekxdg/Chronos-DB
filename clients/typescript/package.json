@@ -4,7 +4,7 @@
   "description": "TypeScript/JavaScript client for Chronos DB's HTTP API: worlds (copy-on-write branches of the whole database), rows, search, diff and merge. One file, no dependencies.",
   "license": "MIT",
   "author": "Abhishek DG",
-  "homepage": "https://abhishekxdg.github.io/chronosdb/reference/clients",
+  "homepage": "https://abhishekxdg.github.io/Chronos-DB/reference/clients",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Abhishekxdg/chronosdb.git",

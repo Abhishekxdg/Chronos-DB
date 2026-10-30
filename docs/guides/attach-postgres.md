@@ -151,18 +151,23 @@ create merge check one_lead_per_email on tables (leads) as
 
 Main's rows change only this way: writes to main and `RESTORE` on main are refused (an `UNDO` goes back through
 Postgres, as a merge: see [below](#undoing-a-merge-that-reached-postgres)), and no statement may
-change a table's shape here. Change it in Postgres: a refresh takes added columns (below); any other change needs a
-new attach into a new folder.
+change a table's shape here. Change it in Postgres: a refresh takes added columns and enum labels (below); any other
+change needs a new attach into a new folder.
 
 An agent's merge into main needs a person unless the agent has a [merge policy](merge-policies.md) of its own; a
 person approves by merging the queued world.
 
 ## Limits in Stage 1
 
-- Postgres 12 or later: attach reads catalog columns 12 added (`attgenerated`, `relispartition`). Tested on 16 and
-  17 (and Neon's 17); 12 to 15 and 18 aren't tested yet. On 11 or older the check and attach fail with Postgres's own
-  error ("column attgenerated does not exist") rather than saying the version is too old; a clear refusal and a run
-  across versions come after the 10 Nov launch.
+- Postgres 12 or later: attach reads catalog columns 12 added (`attgenerated`, `relispartition`). Tested on 12 to
+  18 (and Neon's 17), with TLS `verify-full` and through PgBouncer in transaction mode (`tests/attach_compat.rs`:
+  column types with the citext, hstore, pgvector and PostGIS ones, key shapes, constraints, foreign keys, settings,
+  LATIN1 and SQL_ASCII databases). On 11 or older the check and attach fail with Postgres's own error ("column
+  attgenerated does not exist") rather than saying the version is too old.
+- A timestamp written without an offset (`'2026-03-01'` into a `timestamptz` or `tstzrange`) is read in UTC, as
+  Chronos's sessions are, not in the database's own `timezone` setting; write the offset if they differ.
+- Main sorts text by its bytes (`C`), so `ORDER BY` a text column can list rows in another order than a database with
+  a language collation (`en_US.UTF-8`) does.
 - Each table needs a primary key, and no generated column or row-level security. Partitioned and inheriting tables
   aren't attached.
 - Serial and identity columns take their new values from Postgres's own sequence, reserved 1,000 at a time, so an
@@ -209,6 +214,9 @@ move: a row a world changed that Postgres changed too is a conflict at its merge
   fill rows it has with, is set once they have Postgres's values. The refresh lists the columns (`added`). One
   stopped halfway is redone at the next. Until a refresh has taken them, a merge writing to the table is refused and
   says to refresh. A column added with a sequence or identity default, or a generated one, isn't taken.
+- **Enum labels added in Postgres** (`ALTER TYPE ... ADD VALUE`) are added to main's type, in Postgres's order,
+  before the rows are read; the refresh lists them (`labels`). Until then a world can't write a new label. A label
+  main has that Postgres hasn't (renamed there) is left, and said.
 - Worlds forked before a column was added keep the table as they had it. When one merges, a row it changed keeps the
   values Postgres holds in the columns it never had, settled `USING OURS` too: it can't have meant to change them.
   A row it inserts leaves those columns out, so Postgres fills them as it fills its own rows (`now()` is the

@@ -561,7 +561,14 @@ impl Client {
             broken: false,
         };
         let mut body = vec![0, 3, 0, 0]; // protocol 3.0
-        for (k, v) in [("user", url.user.as_str()), ("database", &url.database), ("application_name", app)] {
+        // client_encoding: rows come as UTF-8 whatever the database's encoding is (LATIN1, WIN1252, ...), converted
+        // by Postgres, as libpq's clients ask too
+        for (k, v) in [
+            ("user", url.user.as_str()),
+            ("database", &url.database),
+            ("application_name", app),
+            ("client_encoding", "UTF8"),
+        ] {
             body.extend(k.as_bytes());
             body.push(0);
             body.extend(v.as_bytes());

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Attach: tested on Postgres 12 to 18, and two fixes it found.** A database whose encoding isn't UTF8 (LATIN1, WIN1252, ...) with any non-ASCII text couldn't be attached ("invalid byte sequence for encoding UTF8"): Chronos's connections now ask Postgres for UTF8, as libpq's clients do. A refresh now takes enum labels added in Postgres (`ALTER TYPE ... ADD VALUE`), in Postgres's order, before the rows that may hold them; until then no world could write a new label, even after a refresh (`chronos refresh` prints them, HTTP `refresh` lists them as `labels`). `tests/attach_compat.rs` runs about 80 cases (column types, key shapes, constraints, foreign keys, quoted names, a minimal role) under four database setups against whichever Postgres `CHRONOS_TEST_PG` names; `tests/attach.rs` runs on Postgres 12 too.
+
 ## 0.4.3 (beta), 2026-10-30
 
 **Postgres compatibility from running real apps (PostgREST and Supabase's setup, psycopg's server-side cursors, Django's `explain()`, deferred UNIQUE constraints, a third batch of PostgreSQL 16's regression suite), and agents on production data held tighter: masked columns that triggers can't leak, tenants that must name a real column, low-priority scans, and an attached Postgres's write-back you can rehearse and undo.**

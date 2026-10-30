@@ -4,7 +4,7 @@ title: Postgres compatibility
 
 ## Where it stands (beta)
 
-Chronos 0.2 is a **beta**. It aims to run what an application written for Postgres 16 sends, and to give the same answers; it isn't there yet, and this page says how far it is, as measured. Numbers are from October 2026, on the release this page ships with.
+Chronos 0.4 is a **beta**. It aims to run what an application written for Postgres 16 sends, and to give the same answers; it isn't there yet, and this page says how far it is, as measured. Numbers are from October 2026, on the release this page ships with.
 
 | Measure | Result |
 |---|---|

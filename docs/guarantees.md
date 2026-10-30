@@ -11,7 +11,7 @@ on one machine, not a published result; the losses are listed beside the wins.
 
 - **Beta.** Try it on a staging copy, not production. The on-disk format is versioned and read
   across releases, but a release has changed authentication semantics before, so read the
-  [CHANGELOG](../CHANGELOG.md) when you upgrade.
+  [CHANGELOG](https://github.com/Abhishekxdg/chronosdb/blob/main/CHANGELOG.md) when you upgrade.
 - **One maintainer.** The storage engine has not had an outside review. Treat it accordingly.
 - **Platforms:** macOS 13+ and Linux (x86-64-v2 and aarch64). No Windows.
 
@@ -81,7 +81,7 @@ audit trail records privileged and agent actions but not logins.
 ## Performance — measured, with the losses
 
 The benchmarks are engineering numbers on one machine, with every rival run on the same machine and
-the losses listed ([BENCHMARKS](../BENCHMARKS.md)). Fork is O(1) and microsecond-scale; durable
+the losses listed ([BENCHMARKS](https://github.com/Abhishekxdg/chronosdb/blob/main/BENCHMARKS.md)). Fork is O(1) and microsecond-scale; durable
 single-row commit is at parity with Postgres for a single client; vector search beats pgvector at
 matched recall over SQL. Chronos is slower than DuckDB on in-process analytics, merges are slower
 than Postgres under a thousand concurrent agents, and several "versus" rows compare an in-process
