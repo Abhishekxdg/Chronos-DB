@@ -1075,6 +1075,10 @@ impl Conn<'_> {
         if let Err(e) = self.session.may_connect(self.db) {
             return self.refuse(&e);
         }
+        // the database's ALTER DATABASE ... SET settings, now that it is known (under the role's, which `log_in` took)
+        if !is_agent && let Err(e) = self.session.take_database_settings(self.db) {
+            return self.refuse(&e);
+        }
         // TimeZone, as a startup parameter or in options (`-c TimeZone=Asia/Kolkata`), as Postgres
         // takes it: a zone this can't honour refuses the connection rather than serve it in UTC
         let options = opts.get("options").map_or(vec![], |o| {
@@ -2301,6 +2305,14 @@ impl Conn<'_> {
             }
             _ => {
                 let portal = self.portals.get(&name).cloned();
+                // a cursor DECLAREd in SQL is a portal of its name, as in Postgres: psycopg's server-side cursors
+                // describe theirs so (DECLARE "c" CURSOR FOR ..., then Describe portal "c", then FETCH)
+                if portal.is_none()
+                    && let Some((cols, typmods)) = self.session.cursor_columns(&name)
+                {
+                    self.row_description(&cols, &typmods, &[])?;
+                    return Ok(());
+                }
                 let p = portal.ok_or_else(|| SqlError {
                     code: "34000",
                     message: format!("portal \"{name}\" does not exist"),

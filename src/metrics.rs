@@ -129,6 +129,8 @@ pub struct Metrics {
     pub(crate) rows_written: AtomicU64,
     pub(crate) errors: AtomicU64,
     pub(crate) conflicts: AtomicU64,
+    /// µs low-priority agents' statements yielded to the database's own users (see `sql`'s `Stop::yields`)
+    pub(crate) agent_yield_us: AtomicU64,
     /// when an operation a client asked for last started or ended (ms since 1970; 0: none yet)
     last: AtomicU64,
     started: Instant,
@@ -141,6 +143,7 @@ impl Default for Metrics {
             rows_written: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             conflicts: AtomicU64::new(0),
+            agent_yield_us: AtomicU64::new(0),
             last: AtomicU64::new(0),
             started: Instant::now(),
         }
@@ -238,7 +241,7 @@ impl Metrics {
         }
         for (name, n) in counters {
             let (kind, name) = match *name {
-                "rows_written" | "errors" | "conflicts" | "cache_hits" | "cache_misses" => {
+                "rows_written" | "errors" | "conflicts" | "cache_hits" | "cache_misses" | "agent_yield_ms" => {
                     ("counter", format!("{name}_total"))
                 }
                 _ => ("gauge", name.to_string()),

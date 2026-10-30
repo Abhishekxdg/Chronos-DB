@@ -125,6 +125,35 @@ impl Can {
     }
 }
 
+/// How an agent's statements share the CPU with the statements of the database's own users (sessions no agent
+/// runs): a world isolates data, not CPU, so an agent's heavy scan in its world competes with main's traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Priority {
+    /// as anyone's
+    #[default]
+    Normal,
+    /// while any statement of the database's own users runs, its statements yield: each of its threads runs at most
+    /// a quarter of the time, and its parallel scans borrow no helper threads (see `sql`'s `Stop::check`)
+    Low,
+}
+
+impl Priority {
+    pub fn name(self) -> &'static str {
+        match self {
+            Priority::Normal => "normal",
+            Priority::Low => "low",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Priority> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "normal" => Some(Priority::Normal),
+            "low" => Some(Priority::Low),
+            _ => None,
+        }
+    }
+}
+
 /// An agent (see the module docs).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Agent {
@@ -152,6 +181,8 @@ pub struct Agent {
     /// the most threads one of its statements may run on (a parallel scan's parts), its own included, so a heavy
     /// scan leaves the other cores to everyone else (0: as many as the server's pool lends)
     pub max_threads: u64,
+    /// how its statements share the CPU with the database's own users (see `Priority`)
+    pub priority: Priority,
     pub created: u64,
     pub disabled: bool,
     /// the merge policy its merges keep to (see `MergePolicy`); None: its rights alone decide
@@ -183,6 +214,7 @@ pub struct AgentSpec {
     pub max_memory_mb: Option<u64>,
     pub max_idle_ms: Option<u64>,
     pub max_threads: Option<u64>,
+    pub priority: Option<Priority>,
     pub disabled: Option<bool>,
     /// a merge policy's name; "" takes the agent's away
     pub policy: Option<String>,
@@ -216,6 +248,7 @@ impl Agent {
             "max_worlds": self.max_worlds, "writes_per_minute": self.writes_per_minute,
             "max_changes": self.max_changes, "world_ttl": self.world_ttl, "max_query_ms": self.max_query_ms,
             "max_concurrent": self.max_concurrent, "max_memory_mb": self.max_memory_mb, "max_idle_ms": self.max_idle_ms, "max_threads": self.max_threads,
+            "priority": self.priority.name(),
             "created": self.created,
             "disabled": self.disabled, "policy": self.policy, "token_hash": self.token_hash, "scram": self.scram,
             "tenant": self.tenant, "expires": self.expires, "rotated": self.rotated,
@@ -239,6 +272,8 @@ impl Agent {
             max_memory_mb: n("max_memory_mb"),
             max_idle_ms: n("max_idle_ms"),
             max_threads: n("max_threads"),
+            // (kept by an older version: none, normal)
+            priority: j["priority"].as_str().and_then(Priority::parse).unwrap_or_default(),
             created: n("created"),
             disabled: j["disabled"].as_bool().unwrap_or(false),
             policy: j["policy"].as_str().map(String::from),
@@ -265,6 +300,7 @@ impl Agent {
             max_memory_mb: 0,
             max_idle_ms: 0,
             max_threads: 0,
+            priority: Priority::Normal,
             created: 0,
             disabled: false,
             policy: None,
@@ -300,6 +336,7 @@ impl Agent {
         self.max_memory_mb = spec.max_memory_mb.unwrap_or(self.max_memory_mb);
         self.max_idle_ms = spec.max_idle_ms.unwrap_or(self.max_idle_ms);
         self.max_threads = spec.max_threads.unwrap_or(self.max_threads);
+        self.priority = spec.priority.unwrap_or(self.priority);
         self.disabled = spec.disabled.unwrap_or(self.disabled);
         if let Some(p) = &spec.policy {
             self.policy = (!p.is_empty()).then(|| p.clone());
@@ -567,6 +604,7 @@ impl Core {
             max_memory_mb: 0,
             max_idle_ms: 0,
             max_threads: 0,
+            priority: Priority::Normal,
             created: disk::now_ms(),
             disabled: false,
             policy: None,
@@ -577,9 +615,30 @@ impl Core {
             scram: Some(scram),
         };
         a.apply(spec)?;
+        self.tenant_held(&a)?;
         self.put_agent(&a)?;
         self.record_security("create agent", name);
         Ok((a, token))
+    }
+
+    /// Refuses agent `a`'s tenant when no table on main has its column: it is held to its tenant only in tables with
+    /// the column, so one no table has (a typo, `{"nosuch": 1}`) would hold it nowhere and let it see every tenant's
+    /// rows. Tables without the column are shared lookup tables, read whole, as long as some table has it. Nothing to
+    /// check on a database with no tables yet.
+    fn tenant_held(&self, a: &Agent) -> Result<()> {
+        let Some(col) = a.tenant.as_ref().and_then(|t| t["column"].as_str()) else { return Ok(()) };
+        let tables = crate::sql::tables_and_columns(self, MAIN)?;
+        if tables.is_empty() || tables.iter().any(|(_, cs)| cs.iter().any(|c| c == col)) {
+            return Ok(());
+        }
+        let seen: Vec<String> = tables.iter().map(|(t, cs)| format!("{t} ({})", cs.join(", "))).collect();
+        Err(bad(format!(
+            "tenant {}: no table has a column \"{col}\", so agent {} would be held to no tenant and see every row; \
+             the tables are {}",
+            a.tenant_sql().unwrap_or_default(),
+            a.name,
+            seen.join("; ")
+        )))
     }
 
     /// Gives agent `name` a SCRAM verifier of `token`, once a login has shown `token` is its: an agent
@@ -607,6 +666,9 @@ impl Core {
     pub fn alter_agent(&self, name: &str, spec: &AgentSpec) -> Result<Agent> {
         let mut a = self.agent(name)?;
         a.apply(spec)?;
+        if spec.tenant.as_ref().is_some_and(|t| !t.is_null()) {
+            self.tenant_held(&a)?;
+        }
         self.put_agent(&a)?;
         self.record_security("alter agent", name);
         Ok(a)
@@ -1166,6 +1228,9 @@ pub struct MergePolicy {
     /// whether its agents' worlds keep what they read, and a merge whose reads changed since the
     /// fork waits for a person (see `stale`)
     pub check_reads: bool,
+    /// whether its agents' worlds keep the SELECTs they read through, and a merge their reads would hold runs them
+    /// again: held only if one gives something else now (see `stale`). It checks their reads too
+    pub rerun_reads: bool,
     /// whether its agents must declare what a world may change when forking it (`may_change` or
     /// `tenant`: see `scope`)
     pub require_scope: bool,
@@ -1297,6 +1362,7 @@ impl MergePolicy {
                 "overwrite" => self.overwrite = flag()?,
                 "critical" => self.critical = flag()?,
                 "check_reads" => self.check_reads = flag()?,
+                "rerun_reads" => self.rerun_reads = flag()?,
                 "require_scope" => self.require_scope = flag()?,
                 "reviewer" => {
                     self.reviewer = match v {
@@ -1307,7 +1373,7 @@ impl MergePolicy {
                 }
                 k => {
                     return Err(bad(format!(
-                        "merge policies have no setting {k} (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, require_scope, reviewer)"
+                        "merge policies have no setting {k} (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, rerun_reads, require_scope, reviewer)"
                     )));
                 }
             }
@@ -1323,7 +1389,7 @@ impl MergePolicy {
             "max_effects": self.max_effects, "effects_per_hour": self.effects_per_hour,
             "review_channels": self.review_channels,
             "review_tables": self.review_tables, "review_columns": self.review_columns, "schema": self.schema, "overwrite": self.overwrite,
-            "critical": self.critical, "check_reads": self.check_reads,
+            "critical": self.critical, "check_reads": self.check_reads, "rerun_reads": self.rerun_reads,
             "require_scope": self.require_scope, "reviewer": self.reviewer, "created": self.created,
         })
         .to_string()
@@ -1356,6 +1422,7 @@ impl MergePolicy {
             overwrite: j["overwrite"].as_bool().unwrap_or(false),
             critical: j["critical"].as_bool().unwrap_or(false),
             check_reads: j["check_reads"].as_bool().unwrap_or(false),
+            rerun_reads: j["rerun_reads"].as_bool().unwrap_or(false),
             require_scope: j["require_scope"].as_bool().unwrap_or(false),
             reviewer: j["reviewer"].as_str().map(String::from),
             created: j["created"].as_u64().unwrap_or(0),
@@ -2131,8 +2198,11 @@ impl Acting<'_> {
         }
         crate::scope::from_meta(self.core, from, &mut meta)?;
         let policy = self.core.policy_of(&self.agent)?;
-        if policy.as_ref().is_some_and(|p| p.check_reads) {
+        if policy.as_ref().is_some_and(|p| p.check_reads || p.rerun_reads) {
             meta.insert(crate::stale::CHECK_READS.into(), Json::Bool(true)); // its policy checks what it reads
+        }
+        if policy.as_ref().is_some_and(|p| p.rerun_reads) {
+            meta.insert(crate::stale::RERUN_READS.into(), Json::Bool(true)); // and runs its SELECTs again
         }
         // a run may declare tighter limits than its policy, never looser
         if let (Some(p), Some(s)) = (&policy, meta.get(crate::scope::SCOPE)) {

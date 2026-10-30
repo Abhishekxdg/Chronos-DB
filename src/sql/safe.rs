@@ -426,9 +426,6 @@ mod tests {
             "cluster t using t_pkey",
             "discard all",
             "lock table t in share mode",
-            "create extension if not exists \"uuid-ossp\"",
-            "create extension if not exists vector",
-            "drop extension if exists pg_trgm",
             "copy t to stdout",
             "copy (select * from t) to stdout",
         ] {
@@ -440,8 +437,11 @@ mod tests {
             "reindex table t",           // so is its new relfilenode (Postgres's changes pg_class too)
             "vacuum",                    // and the tables' statistics (pg_class.reltuples)
             "analyze t",
-            "create extension if not exists pgcrypto", // so is pgcrypto's record, for pg_extension
+            "create extension if not exists pgcrypto", // so is an extension's record, for pg_extension
             "drop extension if exists pgcrypto",
+            "create extension if not exists \"uuid-ossp\"",
+            "create extension if not exists vector",
+            "drop extension if exists pg_trgm",
             "update t set a = 1",
             "delete from t",
             "copy (delete from t returning id) to stdout",

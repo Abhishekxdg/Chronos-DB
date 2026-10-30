@@ -1065,6 +1065,159 @@ fn dry_transaction(
     Ok(())
 }
 
+/// `MERGE WORLD x REHEARSE [FAIL AT n]` in an attached folder: the write-back a merge would run, run in Postgres as
+/// the merge runs it (rows locked and compared, each statement with RETURNING, so triggers, defaults and constraints
+/// act; deferred constraints made immediate; the merge checks), then ROLLBACK instead of COMMIT. `stop`: stop after
+/// that many write statements, to watch the rollback on real data. Then, in a read-only transaction of its own, each
+/// row is compared again, to show Postgres holds what it held before. Nothing changes in Chronos either (main doesn't
+/// take Postgres's rows, even on a conflict), and no effect is sent. Needs a role that may write the tables, as a
+/// merge does. Never fails: what went wrong is the check's `error`, or where the rehearsal stopped.
+pub(crate) fn rehearse(core: &Core, att: &Attached, dry: Dry, stop: Option<usize>) -> crate::LiveCheck {
+    let mut live = crate::LiveCheck { source: att.source(), ..Default::default() };
+    let rows = match dry.rows {
+        Ok(rows) => rows,
+        Err(e) => {
+            live.error = Some(e.to_string());
+            return live;
+        }
+    };
+    let mut done = crate::Rehearsal::default();
+    if rows.is_empty() {
+        live.rehearsal = Some(done);
+        return live; // writes nothing to Postgres: nothing there to rehearse
+    }
+    let mut pg = match att.lease() {
+        Ok(pg) => pg,
+        Err(e) => {
+            live.error = Some(e);
+            return live;
+        }
+    };
+    let reads = dry.reads.as_ref().map(|(set, base, wrote)| Reads { set, base, wrote });
+    let mut steps = Steps { stop, ..Steps::default() };
+    let out = rehearsal(core, &mut pg, att, &rows, reads.as_ref(), &mut steps, &mut live, &mut done);
+    rollback(&mut pg);
+    done.statements = steps.done;
+    match out {
+        Ok(()) => {}
+        Err(_) if steps.stopped => {
+            done.stopped =
+                Some(format!("stopped after statement {} as FAIL AT asked, and rolled back", stop.unwrap_or(0)))
+        }
+        Err(e) if live.at == 0 => {
+            live.error = Some(e.to_string()); // (it didn't start: another database, Postgres unreachable)
+            return live;
+        }
+        Err(e) if !steps.running.is_empty() => {
+            done.stopped = Some(format!("{} failed, and everything was rolled back: {e}", steps.running));
+        }
+        Err(e) => done.stopped = Some(format!("{e}; everything was rolled back")),
+    }
+    // Postgres as it was: each row compared again, read only, in a transaction of its own
+    let tables = att.tables();
+    let by = by_table(&rows);
+    let again = begin(&mut pg, att, true).and_then(|()| {
+        let mut differ = vec![];
+        for (&ti, rs) in &by {
+            for c in compare(&mut pg, &tables[ti], rs)? {
+                if c.changed && !live.rows.iter().any(|r| r.key == rs[c.at].key && r.changed) {
+                    differ.push(crate::sql::show_key(&rs[c.at].key).into_owned());
+                }
+            }
+        }
+        Ok(differ)
+    });
+    rollback(&mut pg);
+    done.afterwards = Some(match again {
+        Ok(differ) if differ.is_empty() => {
+            Ok(format!("Postgres holds each of the {} rows as it did before the rehearsal", rows.len()))
+        }
+        Ok(differ) => Err(format!(
+            "{} rows differ from main's copy after the rollback (changed in Postgres meanwhile?): {}",
+            differ.len(),
+            differ.into_iter().take(10).collect::<Vec<_>>().join(", ")
+        )),
+        Err(e) => Err(format!("couldn't be checked: {e}")),
+    });
+    live.rehearsal = Some(done);
+    live
+}
+
+/// The rehearsal's transaction (see `rehearse`): Err where it stopped, for the caller to say and roll back.
+#[allow(clippy::too_many_arguments)]
+fn rehearsal(
+    core: &Core,
+    pg: &mut Lease,
+    att: &Attached,
+    rows: &[Row],
+    reads: Option<&Reads>,
+    steps: &mut Steps,
+    live: &mut crate::LiveCheck,
+    done: &mut crate::Rehearsal,
+) -> Result<()> {
+    begin(pg, att, false)?;
+    live.at = crate::now_ms();
+    let tables = att.tables();
+    let by_table = by_table(rows);
+    for &ti in by_table.keys() {
+        same_shape(pg, &tables[ti])?;
+    }
+    if let Some(r) = reads {
+        live.stale_reads = live_reads(core, pg, att, r)?;
+        if !live.stale_reads.is_empty() {
+            return Err(refused(
+                "what the world read changed in Postgres since its fork: a merge would be held here, \
+               before any row is written",
+            ));
+        }
+    }
+    let (compared, _) = lock_and_compare(pg, &tables, &by_table)?;
+    let mut changed = 0;
+    for (ti, row, c) in compared {
+        changed += c.changed as usize;
+        live.rows.push(crate::LiveRow {
+            key: row.key.clone(),
+            changed: c.changed,
+            postgres: c.now.as_ref().map(|r| row_json(&tables[ti], r)),
+        });
+    }
+    if changed > 0 {
+        return Err(refused(format!(
+            "{changed} rows it would write changed in Postgres since main's copy: a merge would be refused here, \
+               before any row is written"
+        )));
+    }
+    let names = text_array(by_table.keys().map(|&ti| Some(tables[ti].pg.as_str())));
+    let sql = "select tgrelid::regclass::text, tgname from pg_trigger where tgrelid = any($1::text[]::regclass[]) \
+               and not tgisinternal and tgenabled <> 'D' order by 1, 2";
+    for r in run(pg, "reading the tables' triggers", sql, &[names])? {
+        live.triggers.push(format!("{}: {}", r[0].clone().unwrap_or_default(), r[1].clone().unwrap_or_default()));
+    }
+    for s in write_rows(pg, &tables, &by_table, steps)? {
+        let t = &tables[s.table];
+        let key: Vec<String> = t
+            .key
+            .iter()
+            .zip(&s.key)
+            .map(|(&i, v)| format!("{} = {}", t.cols[i].name, v.as_deref().unwrap_or("NULL")))
+            .collect();
+        let row = s.row.as_ref().map_or("no row".to_string(), |r| row_json(t, r));
+        done.returned.push(format!("{} ({}): {row}", t.name, key.join(", ")));
+    }
+    run(
+        pg,
+        "running deferred constraints and triggers (SET CONSTRAINTS ALL IMMEDIATE)",
+        "set constraints all immediate",
+        &[],
+    )?;
+    done.besides = others(pg, &tables, &by_table)?.into_iter().map(|ti| tables[ti].name.clone()).collect();
+    // the merge checks on the tables it writes, on Postgres as the writes leave it (see `transaction`)
+    let changed: HashSet<&str> = rows.iter().filter_map(|r| r.key.split_once('/').map(|(t, _)| t)).collect();
+    let checks = core.checks()?.into_iter().filter(|c| c.tables.iter().any(|t| changed.contains(t.as_str())));
+    done.checks = live_checks(pg, &checks_for(att, checks.collect()));
+    Ok(())
+}
+
 /// Why a merge the dry run checked against Postgres would be refused there now (rows changed since main's copy),
 /// or None.
 pub(crate) fn dry_blocked(live: &crate::LiveCheck) -> Option<String> {
@@ -1187,34 +1340,10 @@ fn transaction(
         }
     }
     // every row locked and compared before anything is written: any conflict, and nothing is
+    let (compared, canon) = lock_and_compare(pg, &tables, &by_table)?;
     // (table, the row, Postgres's row now, its key as Postgres writes it)
-    let mut conflicts: Vec<(usize, &Row, Option<Texts>, Texts)> = vec![];
-    // per table, the key text Postgres gives each row (by its place in the table's rows)
-    let mut canon: HashMap<usize, Vec<Vec<Option<String>>>> = HashMap::new();
-    for (&ti, rs) in &by_table {
-        let t = &tables[ti];
-        let tkeys: Vec<String> = t.key.iter().map(|&i| format!("t.{}", q(&t.cols[i].name))).collect();
-        let kcast: Vec<String> = t.key.iter().enumerate().map(|(n, &i)| format!("k.k{n}::{}", t.cols[i].ty)).collect();
-        let lock = format!(
-            "select 1 from {} t where ({}) in (select {} from {}) for update of t",
-            t.pg,
-            tkeys.join(", "),
-            kcast.join(", "),
-            unnest(t, false, &[], 1)
-        );
-        let mut keys_here = vec![vec![]; rs.len()];
-        for (part, chunk) in rs.chunks(CHUNK).enumerate() {
-            let from = part * CHUNK;
-            run(pg, &format!("locking rows of {}", t.pg), &lock, &arrays(chunk, t, false, &[], false))?;
-            for c in compare(pg, t, chunk)? {
-                keys_here[from + c.at] = c.key.clone();
-                if c.changed {
-                    conflicts.push((ti, rs[from + c.at], c.now, c.key));
-                }
-            }
-        }
-        canon.insert(ti, keys_here);
-    }
+    let conflicts: Vec<(usize, &Row, Option<Texts>, Texts)> =
+        compared.into_iter().filter(|(_, _, c)| c.changed).map(|(ti, row, c)| (ti, row, c.now, c.key)).collect();
     if !conflicts.is_empty() {
         rollback(pg);
         let mut lines = vec![];
@@ -1240,95 +1369,7 @@ fn transaction(
         return Err(conflict(conflicts.len(), world, &att.source(), &lines));
     }
     // writes: updates and inserts parents first, then deletes children first
-    let mut sent_back: Vec<Stored> = vec![];
-    for (&ti, rs) in &by_table {
-        let t = &tables[ti];
-        let all: Vec<usize> = (0..t.cols.len()).collect();
-        let back: Vec<String> = t.cols.iter().map(|c| format!("t.{}::text", q(&c.name))).collect();
-        let sent: Vec<String> = all.iter().map(|&i| format!("k.c{i}::{}::text", t.cols[i].ty)).collect();
-        let updates: Vec<&Row> = rs.iter().copied().filter(|r| r.before.is_some() && r.after.is_some()).collect();
-        let set: Vec<usize> = all.iter().copied().filter(|i| !t.key.contains(i) && !t.cols[*i].always).collect();
-        if !updates.is_empty() && !set.is_empty() {
-            let sets: Vec<String> =
-                set.iter().map(|&i| format!("{} = k.c{i}::{}", q(&t.cols[i].name), t.cols[i].ty)).collect();
-            let sql = format!(
-                "update {} t set {} from {} where {} returning ({}) is distinct from ({}), {}",
-                t.pg,
-                sets.join(", "),
-                unnest(t, false, &all, 1),
-                key_match(t, "t"),
-                back.join(", "),
-                sent.join(", "),
-                back.join(", ")
-            );
-            for chunk in updates.chunks(CHUNK) {
-                let got = run(pg, &format!("updating {}", t.pg), &sql, &arrays(chunk, t, false, &all, true))?;
-                count(t, "updated", chunk.len(), got.len())?;
-                // (first: a row Postgres then stored otherwise, as `keep_changed` finds, is taken as stored)
-                for r in chunk.iter().filter(|r| r.kept) {
-                    sent_back.push(Stored { table: ti, key: r.key_texts(t), row: r.after.clone() });
-                }
-                keep_changed(t, ti, got, &mut sent_back);
-            }
-        }
-        let inserts: Vec<&Row> = rs.iter().copied().filter(|r| r.before.is_none()).collect();
-        if !inserts.is_empty() {
-            // columns the world's table hadn't (one world's rows: the same for each) are Postgres's to fill, and
-            // compared as unknown, so main takes what Postgres put there
-            let unseen = &inserts[0].unseen;
-            let given_cols: Vec<usize> = all.iter().copied().filter(|i| !unseen.contains(i)).collect();
-            let cols: Vec<String> = given_cols.iter().map(|&i| q(&t.cols[i].name)).collect();
-            let given: Vec<String> = given_cols.iter().map(|&i| format!("k.c{i}::{}", t.cols[i].ty)).collect();
-            let sent: Vec<String> = all
-                .iter()
-                .map(|&i| match unseen.contains(&i) {
-                    true => "null::text".to_string(),
-                    false => format!("k.c{i}::{}::text", t.cols[i].ty),
-                })
-                .collect();
-            let back_ins: Vec<String> = t.cols.iter().map(|c| format!("ins.{}::text", q(&c.name))).collect();
-            let key_eq: Vec<String> = t
-                .key
-                .iter()
-                .map(|&i| format!("ins.{}::text = k.c{i}::{}::text", q(&t.cols[i].name), t.cols[i].ty))
-                .collect();
-            let sql = format!(
-                "with k as (select * from {}), ins as (insert into {} ({}){} select {} from k order by k.i returning *) \
-                 select ({}) is distinct from ({}), {} from ins join k on {}",
-                unnest(t, false, &all, 1),
-                t.pg,
-                cols.join(", "),
-                if t.cols.iter().any(|c| c.always) { " overriding system value" } else { "" },
-                given.join(", "),
-                back_ins.join(", "),
-                sent.join(", "),
-                back_ins.join(", "),
-                key_eq.join(" and ")
-            );
-            for chunk in inserts.chunks(CHUNK) {
-                let got = run(pg, &format!("inserting into {}", t.pg), &sql, &arrays(chunk, t, false, &all, true))?;
-                count(t, "inserted", chunk.len(), got.len())?;
-                keep_changed(t, ti, got, &mut sent_back);
-            }
-        }
-    }
-    for (&ti, rs) in by_table.iter().rev() {
-        let t = &tables[ti];
-        let deletes: Vec<&Row> = rs.iter().copied().filter(|r| r.after.is_none()).collect();
-        if deletes.is_empty() {
-            continue;
-        }
-        let sql = format!(
-            "delete from {} t using {} where {} returning 1",
-            t.pg,
-            unnest(t, false, &[], 1),
-            key_match(t, "t")
-        );
-        for chunk in deletes.chunks(CHUNK) {
-            let got = run(pg, &format!("deleting from {}", t.pg), &sql, &arrays(chunk, t, false, &[], false))?;
-            count(t, "deleted", chunk.len(), got.len())?;
-        }
-    }
+    let sent_back = write_rows(pg, &tables, &by_table, &mut Steps::default())?;
     // deferred constraint triggers (and foreign key checks) run now, not at COMMIT: what they write is counted below,
     // and the merge checks see it; one that fails rolls the write-back back here, as it would at COMMIT
     run(pg, "running deferred triggers", "set constraints all immediate", &[])?;
@@ -1395,6 +1436,168 @@ fn transaction(
     let refresh = others;
     AFTER.set(Some(After { rows: sent_back, committed: true, refresh }));
     Ok(None)
+}
+
+/// Each of `by_table`'s rows (of `tables`, by place) locked in Postgres and compared with main's value of it (see
+/// `compare`), in parts of `CHUNK`: each row with what was found, by table, and per table the key text Postgres gives
+/// each row (by its place in the table's rows).
+#[allow(clippy::type_complexity)]
+fn lock_and_compare<'r>(
+    pg: &mut Client,
+    tables: &[Table],
+    by_table: &BTreeMap<usize, Vec<&'r Row>>,
+) -> Result<(Vec<(usize, &'r Row, Compared)>, HashMap<usize, Vec<Texts>>)> {
+    let mut out = vec![];
+    let mut canon: HashMap<usize, Vec<Texts>> = HashMap::new();
+    for (&ti, rs) in by_table {
+        let t = &tables[ti];
+        let tkeys: Vec<String> = t.key.iter().map(|&i| format!("t.{}", q(&t.cols[i].name))).collect();
+        let kcast: Vec<String> = t.key.iter().enumerate().map(|(n, &i)| format!("k.k{n}::{}", t.cols[i].ty)).collect();
+        let lock = format!(
+            "select 1 from {} t where ({}) in (select {} from {}) for update of t",
+            t.pg,
+            tkeys.join(", "),
+            kcast.join(", "),
+            unnest(t, false, &[], 1)
+        );
+        let mut keys_here = vec![vec![]; rs.len()];
+        for (part, chunk) in rs.chunks(CHUNK).enumerate() {
+            let from = part * CHUNK;
+            run(pg, &format!("locking rows of {}", t.pg), &lock, &arrays(chunk, t, false, &[], false))?;
+            for c in compare(pg, t, chunk)? {
+                keys_here[from + c.at] = c.key.clone();
+                out.push((ti, rs[from + c.at], c));
+            }
+        }
+        canon.insert(ti, keys_here);
+    }
+    Ok((out, canon))
+}
+
+/// The write statements a write-back runs (see `write_rows`), counted: what each was, and how many rows Postgres
+/// returned. `stop`: a rehearsal's FAIL AT n, which stops it after the nth (see `rehearse`).
+#[derive(Default)]
+struct Steps {
+    done: Vec<String>,
+    /// the statement running now, for the error if it fails
+    running: String,
+    stop: Option<usize>,
+    stopped: bool,
+}
+
+impl Steps {
+    fn run(&mut self, pg: &mut Client, what: String, sql: &str, params: &[String]) -> Result<pgclient::Rows> {
+        self.running = format!("statement {} ({what})", self.done.len() + 1);
+        let got = run(pg, &what, sql, params)?;
+        self.running.clear();
+        self.done.push(format!("{what}: {} rows", got.len()));
+        if self.stop == Some(self.done.len()) {
+            self.stopped = true;
+            return Err(refused(format!("stopped after statement {} as FAIL AT asked", self.done.len())));
+        }
+        Ok(got)
+    }
+}
+
+/// The write-back's writes (see `transaction`), each with RETURNING: updates and inserts parents first, then deletes
+/// children first. Returns the rows Postgres stored otherwise than sent (see `keep_changed`), for main to take.
+fn write_rows(
+    pg: &mut Client,
+    tables: &[Table],
+    by_table: &BTreeMap<usize, Vec<&Row>>,
+    steps: &mut Steps,
+) -> Result<Vec<Stored>> {
+    let mut sent_back: Vec<Stored> = vec![];
+    for (&ti, rs) in by_table {
+        let t = &tables[ti];
+        let all: Vec<usize> = (0..t.cols.len()).collect();
+        let back: Vec<String> = t.cols.iter().map(|c| format!("t.{}::text", q(&c.name))).collect();
+        let sent: Vec<String> = all.iter().map(|&i| format!("k.c{i}::{}::text", t.cols[i].ty)).collect();
+        let updates: Vec<&Row> = rs.iter().copied().filter(|r| r.before.is_some() && r.after.is_some()).collect();
+        let set: Vec<usize> = all.iter().copied().filter(|i| !t.key.contains(i) && !t.cols[*i].always).collect();
+        if !updates.is_empty() && !set.is_empty() {
+            let sets: Vec<String> =
+                set.iter().map(|&i| format!("{} = k.c{i}::{}", q(&t.cols[i].name), t.cols[i].ty)).collect();
+            let sql = format!(
+                "update {} t set {} from {} where {} returning ({}) is distinct from ({}), {}",
+                t.pg,
+                sets.join(", "),
+                unnest(t, false, &all, 1),
+                key_match(t, "t"),
+                back.join(", "),
+                sent.join(", "),
+                back.join(", ")
+            );
+            for chunk in updates.chunks(CHUNK) {
+                let got = steps.run(pg, format!("update {}", t.name), &sql, &arrays(chunk, t, false, &all, true))?;
+                count(t, "updated", chunk.len(), got.len())?;
+                // (first: a row Postgres then stored otherwise, as `keep_changed` finds, is taken as stored)
+                for r in chunk.iter().filter(|r| r.kept) {
+                    sent_back.push(Stored { table: ti, key: r.key_texts(t), row: r.after.clone() });
+                }
+                keep_changed(t, ti, got, &mut sent_back);
+            }
+        }
+        let inserts: Vec<&Row> = rs.iter().copied().filter(|r| r.before.is_none()).collect();
+        if !inserts.is_empty() {
+            // columns the world's table hadn't (one world's rows: the same for each) are Postgres's to fill, and
+            // compared as unknown, so main takes what Postgres put there
+            let unseen = &inserts[0].unseen;
+            let given_cols: Vec<usize> = all.iter().copied().filter(|i| !unseen.contains(i)).collect();
+            let cols: Vec<String> = given_cols.iter().map(|&i| q(&t.cols[i].name)).collect();
+            let given: Vec<String> = given_cols.iter().map(|&i| format!("k.c{i}::{}", t.cols[i].ty)).collect();
+            let sent: Vec<String> = all
+                .iter()
+                .map(|&i| match unseen.contains(&i) {
+                    true => "null::text".to_string(),
+                    false => format!("k.c{i}::{}::text", t.cols[i].ty),
+                })
+                .collect();
+            let back_ins: Vec<String> = t.cols.iter().map(|c| format!("ins.{}::text", q(&c.name))).collect();
+            let key_eq: Vec<String> = t
+                .key
+                .iter()
+                .map(|&i| format!("ins.{}::text = k.c{i}::{}::text", q(&t.cols[i].name), t.cols[i].ty))
+                .collect();
+            let sql = format!(
+                "with k as (select * from {}), ins as (insert into {} ({}){} select {} from k order by k.i returning *) \
+                 select ({}) is distinct from ({}), {} from ins join k on {}",
+                unnest(t, false, &all, 1),
+                t.pg,
+                cols.join(", "),
+                if t.cols.iter().any(|c| c.always) { " overriding system value" } else { "" },
+                given.join(", "),
+                back_ins.join(", "),
+                sent.join(", "),
+                back_ins.join(", "),
+                key_eq.join(" and ")
+            );
+            for chunk in inserts.chunks(CHUNK) {
+                let got =
+                    steps.run(pg, format!("insert into {}", t.name), &sql, &arrays(chunk, t, false, &all, true))?;
+                count(t, "inserted", chunk.len(), got.len())?;
+                keep_changed(t, ti, got, &mut sent_back);
+            }
+        }
+    }
+    for (&ti, rs) in by_table.iter().rev() {
+        let t = &tables[ti];
+        let deletes: Vec<&Row> = rs.iter().copied().filter(|r| r.after.is_none()).collect();
+        if deletes.is_empty() {
+            continue;
+        }
+        let sql = format!(
+            "delete from {} t using {} where {} returning 1",
+            t.pg,
+            unnest(t, false, &[], 1),
+            key_match(t, "t")
+        );
+        for chunk in deletes.chunks(CHUNK) {
+            let got = steps.run(pg, format!("delete from {}", t.name), &sql, &arrays(chunk, t, false, &[], false))?;
+            count(t, "deleted", chunk.len(), got.len())?;
+        }
+    }
+    Ok(sent_back)
 }
 
 /// The attached tables the write-back's transaction wrote more rows of than the merge sent: a trigger, a rule or a
@@ -1701,14 +1904,16 @@ fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result
         }
         Err(e) => out.push(format!("read rows Postgres changed in a way that can't be checked here ({})", e.message)),
     }
-    let stale = core.stale_reasons(r.set, r.base, &live, r.wrote)?;
+    // (SELECTs kept to run again run on Postgres's rows: see `stale`)
+    let stale = core.stale_reasons(r.set, crate::MAIN, r.base, &live, r.wrote)?;
     // (reads lost in a restart are main's check's to report: it held the merge already)
-    out.extend(
-        stale
-            .into_iter()
-            .filter(|s| s.contains("changed since it forked"))
-            .map(|s| s.replace("changed since it forked", "changed in Postgres since it forked")),
-    );
+    out.extend(stale.into_iter().filter_map(|s| match s.strip_suffix(" now") {
+        Some(read) if s.starts_with("read `") => Some(format!("{read} in Postgres now")),
+        _ if s.contains("changed since it forked") => {
+            Some(s.replace("changed since it forked", "changed in Postgres since it forked"))
+        }
+        _ => None,
+    }));
     Ok(out)
 }
 

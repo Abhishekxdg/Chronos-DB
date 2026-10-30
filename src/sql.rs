@@ -2118,6 +2118,16 @@ thread_local! {
     static FLOAT_DIGITS: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
 }
 
+/// Runs `f` with floats printed with all the digits they need, whatever the session's extra_float_digits says: what
+/// a key is made of (`uniq_key`, `ref_prefix`) must be the same text for the same value in every session, and is the
+/// text the default setting gives, so keys written before are the same.
+fn exact_floats<T>(f: impl FnOnce() -> T) -> T {
+    let was = FLOAT_DIGITS.with(|d| d.replace(1));
+    let out = f();
+    FLOAT_DIGITS.with(|d| d.set(was));
+    out
+}
+
 /// `%.{p}g`, as C writes it, with the exponent as Postgres writes it (`1e+15`, `1.5e-05`).
 fn fmt_g(f: f64, p: usize) -> String {
     let p = p.max(1);
@@ -3831,7 +3841,46 @@ struct Stop {
     mem: Option<Arc<Mem>>,
     /// the most threads its parallel parts may run on, its own included (an agent's max_threads); 0: no cap
     threads: usize,
+    /// an agent's of `priority = 'low'`: it yields to the database's own users (see `Stop::yields`)
+    low: bool,
 }
+
+/// Statements of the database's own users (sessions no agent runs) running now: while any does, a low-priority
+/// agent's statements yield to them (see `Stop::yields`).
+static BUSY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// One of the database's own users' statements running, counted in `BUSY` until it drops.
+struct Busy;
+
+impl Busy {
+    fn new() -> Busy {
+        BUSY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Busy
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        BUSY.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether a statement of the database's own users is running.
+fn busy() -> bool {
+    BUSY.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+thread_local! {
+    /// When this thread last went on with a low-priority statement (see `Stop::yields`).
+    static RAN_FROM: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// The longest a low-priority statement's thread yields at once: a cancel or a timeout is never far off.
+const YIELD_MOST: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// What a low-priority statement's thread yields for each moment it runs while the database's own users run
+/// statements: three, so it takes at most a quarter of its core.
+const YIELD_FOR: u32 = 3;
 
 /// A message a statement sent besides its result: RAISE NOTICE, or DROP ... IF EXISTS
 /// skipping. The Postgres server sends them to the client (see `take_notices`).
@@ -3965,6 +4014,34 @@ fn dry_refusal(what: impl FnOnce() -> String) -> Result<()> {
             err(CANCELED, format!("EXPLAIN without ANALYZE doesn't run {}", what()))
         }
     })
+}
+
+/// What an undo (UNDO MERGE, UNDO AGENT) says besides its count: the rows it left, changed since, and each effect the
+/// undone change brought into main, which no undo takes back (an email sent stays sent): for a person to follow up.
+fn undone_notices(u: &crate::Undone) {
+    if u.skipped > 0 {
+        notice("NOTICE", format!("{} rows changed since were left as they are", u.skipped));
+    }
+    if u.effects.is_empty() {
+        return;
+    }
+    let each: Vec<String> = u
+        .effects
+        .iter()
+        .map(|e| match e.state {
+            "queued" => format!("{} {} (queued, not sent yet: ACK OUTBOX '{}' drops it)", e.channel, e.id, e.id),
+            "sent" => format!("{} {} (sent)", e.channel, e.id),
+            s => format!("{} {} ({s}: it may have been sent)", e.channel, e.id),
+        })
+        .collect();
+    notice(
+        "WARNING",
+        format!(
+            "{} effects of what was undone are not undone, and may need a follow-up: {}",
+            each.len(),
+            each.join("; ")
+        ),
+    );
 }
 
 /// An effect as SHOW OUTBOX and CLAIM OUTBOX show it.
@@ -4299,6 +4376,7 @@ fn stopped() -> Result<()> {
 
 impl Stop {
     fn check(&self) -> Result<()> {
+        self.yields();
         match self {
             s if s.cancel.load(std::sync::atomic::Ordering::Relaxed) => {
                 err(CANCELED, "canceling statement due to user request")
@@ -4311,6 +4389,36 @@ impl Stop {
             _ => Ok(()),
         }
     }
+
+    /// A low-priority agent's statement (`low`), while a statement of the database's own users runs: sleeps
+    /// `YIELD_FOR` times as long as it ran since this thread's last check (at most `YIELD_MOST`), so its heavy scan
+    /// leaves its cores to them. The time counts toward its statement_timeout, and the database's `agent_yield_ms`.
+    fn yields(&self) {
+        if !self.low {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let from = RAN_FROM.replace(Some(now));
+        if !busy() {
+            return;
+        }
+        let ran = from.map_or(std::time::Duration::ZERO, |f| now.saturating_duration_since(f));
+        let pause = (ran * YIELD_FOR).min(YIELD_MOST);
+        if pause.is_zero() {
+            return;
+        }
+        std::thread::sleep(pause);
+        RAN_FROM.set(Some(std::time::Instant::now())); // (sleeping isn't running)
+        YIELDED.set(YIELDED.get() + 1);
+        if let Some(c) = &self.ctx {
+            c.core.metrics().agent_yield_us.fetch_add(pause.as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+thread_local! {
+    /// How many times this thread yielded for a low-priority statement (see `Stop::yields`).
+    static YIELDED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Checks that `e`, if a string literal, reads as type `t` (a label of an enum whose labels are
@@ -4849,6 +4957,19 @@ pub fn coerce(v: Value, ty: Type) -> Result<Value> {
                     Text(array_text(items.iter()))
                 }
 
+                // an array cast to an int2vector or oidvector is one, written as one: `1 2` (Rails compares
+                // `ARRAY[t::regtype]::oidvector` with pg_proc.proargtypes)
+                Some(items) if matches!(e, 22 | 30) && !is_vector_text(s.trim()) => {
+                    let elem = if e == 30 { Type::Oid } else { Type::SmallInt };
+                    let mut out = vec![];
+                    for i in items {
+                        if i == Value::Null {
+                            return err("22004", "array must not contain nulls");
+                        }
+                        out.push(coerce(i, elem)?.to_text());
+                    }
+                    Text(out.join(" "))
+                }
                 // an int2vector's or oidvector's `1 2` cast to an array is the array, which still
                 // counts from 0: `[0:1]={1,2}` (one that stays a vector is as it was)
                 Some(items) if !matches!(e, 22 | 30) && is_vector_text(s.trim()) && !items.is_empty() => {
@@ -5768,6 +5889,9 @@ enum CtxFn {
     /// pg_export_snapshot(): an id another session's SET TRANSACTION SNAPSHOT reads this transaction's database by
     ExportSnapshot,
     InRecovery,
+    /// pg_is_other_temp_schema(oid): false, since no other session's temporary schema shows here (each session sees
+    /// its own as pg_temp_3)
+    OtherTempSchema,
     PostmasterStart,
     /// inet_server_addr(), inet_client_addr() (false) and their ports (true): null, as for a Unix socket
     InetNull(bool),
@@ -5911,6 +6035,7 @@ impl CtxFn {
         ("getdatabaseencoding", CtxFn::DbEncoding, 0..=0),
         ("pg_export_snapshot", CtxFn::ExportSnapshot, 0..=0),
         ("pg_is_in_recovery", CtxFn::InRecovery, 0..=0),
+        ("pg_is_other_temp_schema", CtxFn::OtherTempSchema, 1..=1),
         ("pg_postmaster_start_time", CtxFn::PostmasterStart, 0..=0),
         ("inet_server_addr", CtxFn::InetNull(false), 0..=0),
         ("inet_client_addr", CtxFn::InetNull(false), 0..=0),
@@ -6015,6 +6140,7 @@ impl CtxFn {
             | CtxFn::AdvisoryUnlock(_)
             | CtxFn::AdvisoryLock(_, true, _)
             | CtxFn::InRecovery
+            | CtxFn::OtherTempSchema
             | CtxFn::CancelBackend
             | CtxFn::TerminateBackend
             | CtxFn::HasPrivilege(_)
@@ -7269,6 +7395,8 @@ enum ConstraintDef {
         nnd: bool,
         /// USING INDEX TABLESPACE name: where its index is kept (see `tablespace`)
         space: Option<String>,
+        /// DEFERRABLE, and INITIALLY DEFERRED (see `Unique::deferred`)
+        defer: (bool, bool),
     },
     /// `not_valid`: NOT VALID (counted in ALTER TABLE ... ADD CONSTRAINT only), the rows there are aren't checked
     Check { name: Option<String>, text: String, no_inherit: bool, not_valid: bool },
@@ -7570,8 +7698,10 @@ enum Alter {
     AddPrimaryKey(Vec<String>, Option<String>, Option<String>),
     DropConstraint(String, bool, bool), // if exists, cascade
     /// ENABLE [ALWAYS | REPLICA] | DISABLE TRIGGER name | ALL | USER (None): the state pg_trigger.tgenabled
-    /// gets, `O`, `A`, `R` or `D` (see `functions::Trigger::mode`)
-    Trigger(Option<String>, char),
+    /// gets, `O`, `A`, `R` or `D` (see `functions::Trigger::mode`); ALL (`true`) the foreign keys' triggers too (see
+    /// `Table::ri_off`). With `true` and a name: the foreign keys' triggers alone (a partition's, which are copies of
+    /// its partitioned table's, see `hier::alter_hier`)
+    Trigger(Option<String>, char, bool),
     /// SET (merge_by_columns = true | false), RESET (merge_by_columns)
     MergeByColumns(bool),
     /// SET UNLOGGED (true) | LOGGED: whether Postgres would keep it out of its write-ahead log (pg_class's
@@ -8582,7 +8712,7 @@ enum Stmt {
     },
     /// MERGE WORLD [name] [INTO world] [ONLY TABLES (t, ...)] [ONLY KEYS ('t/1', ...)]
     /// [USING OURS|THEIRS] [BY COLUMNS] [RESOLVE ('t/1' = OURS, ...)] [CONFIRM | AT VERSION n]
-    /// [CONFIRM DELETES n] [DRY RUN]
+    /// [CONFIRM DELETES n] [DRY RUN | REHEARSE [FAIL AT n]]
     MergeBranch {
         name: Option<String>,
         how: crate::Resolve,
@@ -8596,6 +8726,9 @@ enum Stmt {
         columns: bool,
         picks: Vec<(String, crate::Pick)>,
         dry: bool,
+        /// REHEARSE (a dry run, `dry` set, whose write-back to an attached folder's Postgres runs and is rolled back),
+        /// with FAIL AT n: stopped after the nth write statement
+        rehearse: Option<Option<usize>>,
         into: Option<String>,
         only_tables: Vec<String>,
         only_keys: Vec<String>,
@@ -11946,10 +12079,11 @@ impl Parser {
             {
                 self.default_privileges()
             }
-            // ALTER EXTENSION pgcrypto: UPDATE [TO version] and SET SCHEMA (its record; see `Stmt::CreateExtension`)
+            // ALTER EXTENSION of one CREATE EXTENSION records: UPDATE [TO version] and SET SCHEMA (its record; see
+            // `Stmt::CreateExtension`)
             "alter"
                 if self.is_kw("extension")
-                    && matches!(self.t.get(self.i + 1), Some(Tok::Word(w) | Tok::Ident(w)) if w == "pgcrypto") =>
+                    && matches!(self.t.get(self.i + 1), Some(Tok::Word(w) | Tok::Ident(w)) if pgcrypto::version(w).is_some()) =>
             {
                 self.i += 1;
                 let name = self.name()?;
@@ -12651,6 +12785,7 @@ impl Parser {
                     columns: c.columns,
                     picks: c.picks,
                     dry: c.dry,
+                    rehearse: c.rehearse,
                     into: c.into,
                     only_tables: c.only_tables,
                     only_keys: c.only_keys,
@@ -12666,6 +12801,7 @@ impl Parser {
                 if c.confirm
                     || c.confirm_deletes.is_some()
                     || c.dry
+                    || c.rehearse.is_some()
                     || c.into.is_some()
                     || c.target.is_some()
                     || !c.only_tables.is_empty()
@@ -12743,8 +12879,8 @@ impl Parser {
                     names.push(self.name()?);
                 }
                 let _ = self.kw("cascade") || self.kw("restrict");
-                // pgcrypto is there if CREATE EXTENSION recorded it, which only the world knows
-                if names.iter().any(|n| n == "pgcrypto") {
+                // one CREATE EXTENSION records is there if it recorded it, which only the world knows
+                if names.iter().any(|n| pgcrypto::version(n).is_some()) {
                     return Ok(Stmt::DropExtension { names, if_exists });
                 }
                 // the others CREATE EXTENSION takes are always there (see `create`), so dropping one is
@@ -14535,6 +14671,17 @@ impl Parser {
             } else if self.kw("dry") {
                 self.expect_kw("run")?;
                 c.dry = true;
+            } else if self.kw("rehearse") {
+                // REHEARSE [FAIL AT n]: a dry run whose write-back runs in Postgres and is rolled back (attached folders)
+                c.dry = true;
+                c.rehearse = Some(None);
+                if self.kw("fail") {
+                    self.expect_kw("at")?;
+                    c.rehearse = match self.next() {
+                        Some(Tok::Num(n)) if n.parse::<usize>().is_ok_and(|n| n > 0) => Some(n.parse().ok()),
+                        _ => return self.fail("expected the statement to stop after (1, 2, ...) after FAIL AT"),
+                    };
+                }
             } else if self.kw("resolve") {
                 // RESOLVE ('table/id' = OURS | THEIRS | DELETE | '<json row>', ...)
                 self.expect_sym("(")?;
@@ -15922,9 +16069,16 @@ impl Parser {
 
     /// `ALTER SCHEMA | DATABASE name OWNER TO role`, after the kind: what pg_dump writes after every object it
     /// makes. A schema's owner changes (see `acl`); a database's isn't kept (its world's owner is the bootstrap
-    /// superuser), which the notice says.
+    /// superuser), which the notice says. And `ALTER DATABASE name SET x = v | RESET x | RESET ALL` (see
+    /// `roles::db_config`).
     fn alter_owner(&mut self, tag: &'static str) -> Result<Stmt> {
         self.if_exists()?;
+        if tag == "ALTER DATABASE" && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "set" || w == "reset")
+        {
+            let name = self.name()?;
+            let setting = self.role_setting()?;
+            return Ok(Stmt::Role(Box::new(roles::RoleStmt::DbConfig { name, setting })));
+        }
         if tag == "ALTER SCHEMA" {
             let name = self.name()?;
             if self.kw("rename") {
@@ -15937,7 +16091,13 @@ impl Parser {
         // the name: everything up to OWNER
         while !self.is_kw("owner") {
             if self.next().is_none() {
-                return err(UNSUPPORTED, format!("{tag} does OWNER TO only here"));
+                return err(
+                    UNSUPPORTED,
+                    match tag {
+                        "ALTER DATABASE" => "ALTER DATABASE does OWNER TO, SET and RESET only here".into(),
+                        _ => format!("{tag} does OWNER TO only here"),
+                    },
+                );
             }
         }
         self.expect_kw("owner")?;
@@ -16375,8 +16535,9 @@ impl Parser {
                 if !self.kw("trigger") {
                     return later("ENABLE / DISABLE other than TRIGGER and RULE");
                 }
-                let name = if self.kw("all") || self.kw("user") { None } else { Some(self.name()?) };
-                Alter::Trigger(name, mode)
+                let all = self.kw("all");
+                let name = if all || self.kw("user") { None } else { Some(self.name()?) };
+                Alter::Trigger(name, mode, all)
             } else if self.is_kw("alter") && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "constraint") {
                 self.i += 2;
                 let name = self.name()?;
@@ -17550,7 +17711,7 @@ impl Parser {
                 self.expect_kw("exists")?;
             }
             let name = self.name()?;
-            if name == "pgcrypto" {
+            if pgcrypto::version(&name).is_some() {
                 // [WITH] [SCHEMA s] [VERSION v] [CASCADE]
                 self.kw("with");
                 let (mut schema, mut version) = (None, None);
@@ -17572,31 +17733,11 @@ impl Parser {
             }
             self.skip_rest(); // [WITH] [SCHEMA s] [VERSION v] [CASCADE]
             return match name.as_str() {
-                // the functions and operators of these are built in (pg_trgm's operator classes are accepted
-                // on gin and gist indexes, as plain btrees)
-                "vector" | "postgis" | "pg_trgm" | "fuzzystrmatch" | "unaccent" => Ok(Stmt::Noop("CREATE EXTENSION")),
                 // in every database, as in Postgres
                 "plpgsql" if if_not_exists => {
                     Ok(Stmt::NoopNotice("CREATE EXTENSION", "extension \"plpgsql\" already exists, skipping"))
                 }
                 "plpgsql" => err("42710", "extension \"plpgsql\" already exists"),
-                // operator classes for GIN and GiST indexes on plain values: an index on one is kept as a
-                // btree here whatever its method, so there is nothing for them to add
-                "btree_gin" | "btree_gist" => Ok(Stmt::Noop("CREATE EXTENSION")),
-                // its access method is built in: a bloom index is kept as a btree on its columns (see `create_index`)
-                "bloom" => Ok(Stmt::Noop("CREATE EXTENSION")),
-                // its type is built in: `citext` is text in the collation "citext"
-                "citext" => Ok(Stmt::Noop("CREATE EXTENSION")),
-                // their types, operators and functions are built in (see `hstore` and `ltree`)
-                "hstore" | "ltree" => Ok(Stmt::Noop("CREATE EXTENSION")),
-                // statements' statistics are kept whether or not it is made (see `stmtstats`); intarray's functions
-                // and operators, and tablefunc's crosstab and normal_rand, are built in
-                "pg_stat_statements" | "intarray" | "tablefunc" => Ok(Stmt::Noop("CREATE EXTENSION")),
-                // what apps create them for is here: the functions they'd call are the built-in ones
-                "uuid-ossp" => Ok(Stmt::NoopNotice(
-                    "CREATE EXTENSION",
-                    "uuid-ossp: only uuid_generate_v4() is available, and it is built in",
-                )),
                 _ => err(
                     UNSUPPORTED,
                     format!("extension \"{name}\" isn't available (vector and PostGIS points are built in)"),
@@ -18256,25 +18397,32 @@ impl Parser {
     }
 
     /// `UNIQUE (a, b)` or `FOREIGN KEY (a) REFERENCES t [(id)] ...`, if that's what comes next.
-    /// `[NOT] DEFERRABLE` and `INITIALLY IMMEDIATE` after a UNIQUE constraint. One checked at once is what a unique
-    /// constraint is here, deferrable or not: it is checked as each statement writes, and a statement's rows are
-    /// checked together. INITIALLY DEFERRED, which would let a transaction hold duplicates until it commits, is
-    /// refused.
-    fn key_deferral(&mut self) -> Result<()> {
+    /// `[NOT] DEFERRABLE` and `INITIALLY IMMEDIATE | DEFERRED` after a UNIQUE constraint: whether it is DEFERRABLE,
+    /// and INITIALLY DEFERRED (which makes it DEFERRABLE, as in Postgres; NOT DEFERRABLE with it is 42601). A deferred
+    /// one lets a transaction hold duplicates until it commits (see `put_off_unique`).
+    fn key_deferral(&mut self) -> Result<(bool, bool)> {
+        let (mut deferrable, mut not, mut deferred) = (false, false, false);
         loop {
             let next = |p: &Self, w: &str| matches!(p.t.get(p.i + 1), Some(Tok::Word(x)) if x == w);
-            if (self.is_kw("not") && next(self, "deferrable")) || (self.is_kw("initially") && next(self, "immediate")) {
+            if self.is_kw("not") && next(self, "deferrable") {
                 self.i += 2;
+                not = true;
+            } else if self.is_kw("initially") && next(self, "immediate") {
+                self.i += 2;
+                deferred = false;
             } else if self.is_kw("initially") && next(self, "deferred") {
-                return err(
-                    UNSUPPORTED,
-                    "a UNIQUE constraint INITIALLY DEFERRED isn't supported: uniqueness is checked as each statement \
-                     writes (DEFERRABLE INITIALLY IMMEDIATE is)",
-                );
-            } else if !self.kw("deferrable") {
-                return Ok(());
+                self.i += 2;
+                deferred = true;
+            } else if self.kw("deferrable") {
+                deferrable = true;
+            } else {
+                break;
             }
         }
+        if not && deferred {
+            return err(SYNTAX, "constraint declared INITIALLY DEFERRED must be DEFERRABLE");
+        }
+        Ok((!not && (deferrable || deferred), deferred))
     }
 
     /// `[WITH (storage parameters)] [USING INDEX TABLESPACE name]` after a PRIMARY KEY or UNIQUE constraint: how
@@ -18303,8 +18451,8 @@ impl Parser {
                 self.names()?;
             }
             let space = self.constraint_space()?;
-            self.key_deferral()?;
-            return Ok(Some(ConstraintDef::Unique { name, cols, nnd, space }));
+            let defer = self.key_deferral()?;
+            return Ok(Some(ConstraintDef::Unique { name, cols, nnd, space, defer }));
         }
         if self.kw("foreign") {
             self.expect_kw("key")?;
@@ -18652,12 +18800,13 @@ impl Parser {
             } else if self.kw("unique") {
                 let nnd = self.nulls_not_distinct()?;
                 let space = self.constraint_space()?;
-                self.key_deferral()?;
+                let defer = self.key_deferral()?;
                 c.constraints.push(ConstraintDef::Unique {
                     name: named.take(),
                     cols: vec![c.name.clone()],
                     nnd,
                     space,
+                    defer,
                 });
             } else if self.kw("references") {
                 let col = vec![c.name.clone()];
@@ -20117,6 +20266,17 @@ impl Parser {
         }
     }
 
+    /// Whether a `(` here opens the statement, as in `EXPLAIN (SELECT ...) UNION (SELECT ...)` (Django's union),
+    /// not an option list: no option is named by a reserved word, nor opens with another `(`.
+    fn parenthesized_query(&self) -> bool {
+        matches!(self.peek(), Some(Tok::Sym("(")))
+            && match self.t.get(self.i + 1) {
+                Some(Tok::Sym("(")) => true,
+                Some(Tok::Word(w)) => matches!(w.as_str(), "select" | "values" | "with" | "table"),
+                _ => false,
+            }
+    }
+
     /// After EXPLAIN: `ANALYZE [VERBOSE]`, `VERBOSE`, or `(option [value], ...)`, as gram.y's ExplainStmt has them,
     /// each option read as ExplainQuery reads it (explain.c:176-251): a boolean one takes true, false, on, off, 1 or 0
     /// (none: true), FORMAT one of text, xml, json and yaml. TIMING and SUMMARY are what ANALYZE says where not given.
@@ -20130,7 +20290,7 @@ impl Parser {
             o.verbose = self.kw("verbose");
         } else if self.kw("verbose") {
             o.verbose = true;
-        } else if self.sym("(") {
+        } else if !self.parenthesized_query() && self.sym("(") {
             loop {
                 let at = self.i;
                 let name = match self.peek() {
@@ -21949,6 +22109,11 @@ impl Parser {
                 self.catalog_call = true;
                 return self.primary();
             }
+            if first == "information_schema"
+                && let Some(e) = self.info_schema_call(&name)?
+            {
+                return Ok(e);
+            }
             return self.call(qualify(&first, &name));
         }
         // `schema.table.column` (and `schema.table.*`), as an ORM writes every column it names: the table is what
@@ -21977,6 +22142,40 @@ impl Parser {
             });
         }
         Ok(Expr::Col(Some(first), name))
+    }
+
+    /// After `information_schema.name(`: its functions of a column's type, which PostgREST reads columns with, built
+    /// in. _pg_truetypid and _pg_truetypmod (a pg_attribute row, its pg_type row) are a domain's base type and typmod,
+    /// else the column's own, as Postgres's information_schema.sql writes them; the others are
+    /// `funcs::INFO_TYPE_FNS`. None, having read nothing, for another name.
+    fn info_schema_call(&mut self, name: &str) -> Result<Option<Expr>> {
+        let qualified = format!("information_schema.{name}");
+        let true_type = match name {
+            "_pg_truetypid" => Some(("typbasetype", "atttypid")),
+            "_pg_truetypmod" => Some(("typtypmod", "atttypmod")),
+            _ => None,
+        };
+        if let Some((of_domain, own)) = true_type {
+            let (args, _) = self.call_args()?;
+            let Ok([att, typ]) = <[Expr; 2]>::try_from(args) else {
+                return no_op(format!("function {qualified}() takes 2 arguments"));
+            };
+            // (`t.*`, as PostgREST writes them, is the table's own column; another record, its field)
+            let field = |e: &Expr, f: &str| match e {
+                Expr::Col(Some(t), c) if c == "*" => Expr::Col(Some(t.clone()), f.into()),
+                e => Expr::Func(Func::FieldOf, vec![e.clone(), Expr::Lit(Value::Text(f.into()))]),
+            };
+            let domain =
+                Expr::Bin(Box::new(field(&typ, "typtype")), Op::Eq, Box::new(Expr::Lit(Value::Text("d".into()))));
+            return Ok(Some(Expr::Case(
+                None,
+                vec![(domain, field(&typ, of_domain))],
+                Some(Box::new(field(&att, own))),
+            )));
+        }
+        let Some((f, arity)) = builtin_of(&qualified) else { return Ok(None) };
+        let (args, names) = self.call_args()?;
+        builtin_call(&qualified, f, arity, args, &names).map(Some)
     }
 
     /// A function's arguments and the names they were given (`name => value`, or `name := value`;
@@ -23694,6 +23893,12 @@ struct Table {
     by_columns: bool,
     /// CREATE UNLOGGED TABLE, ALTER TABLE ... SET UNLOGGED (see `Alter::Unlogged`)
     unlogged: bool,
+    /// ALTER TABLE ... DISABLE TRIGGER ALL: the foreign keys whose triggers on it are off, as Postgres's
+    /// RI_ConstraintTrigger ones are, until ENABLE TRIGGER ALL: its own (by name), a row it writes not checked against
+    /// the table each references, and those of the tables that reference it (`table/name`), a row of it deleted or
+    /// changed not touching their rows. Those it had then: one added later has its own, on. Nothing is checked again
+    /// when they're back on (Rails loads its test fixtures so)
+    ri_off: Vec<String>,
     /// partitioning and inheritance: what the table is partitioned by, what it is a partition or a
     /// child of (see `hier`)
     hier: hier::Hier,
@@ -23724,6 +23929,10 @@ struct Unique {
     /// the table's primary key, kept as a unique constraint (over NOT NULL columns): one on text in a nondeterministic
     /// collation (citext), whose equal strings differ in bytes, which name a row
     primary: bool,
+    /// DEFERRABLE: SET CONSTRAINTS may put its check off to COMMIT; `deferred`: INITIALLY DEFERRED, it is put off
+    /// unless SET CONSTRAINTS says otherwise (see `put_off_unique`)
+    deferrable: bool,
+    deferred: bool,
 }
 
 /// A foreign key: `cols` (by id), when none is null, are the primary key of a row of `table`, or
@@ -23837,7 +24046,28 @@ fn index_holds(t: &Table, text: &str, vals: &[Value]) -> bool {
 
 /// `t`'s CHECK conditions, bound to its columns (no subqueries, as in Postgres).
 fn bound_checks(t: &Table) -> Result<Vec<(&str, Expr)>> {
-    t.checks.iter().map(|c| Ok((c.name.as_str(), Binder::plain(&t.cols, None).bind(&check_expr(&c.text)?)?))).collect()
+    t.checks
+        .iter()
+        .map(|c| {
+            let e = with_calls_inlined(check_expr(&c.text)?, schema_part(&t.name))?;
+            Ok((c.name.as_str(), Binder::plain(&t.cols, None).bind(&e)?))
+        })
+        .collect()
+}
+
+/// `e` (a CHECK's or a generated column's expression, which runs where no query does) with the calls it makes of SQL
+/// functions made here put in their place where they can be (see `functions::inline_row_calls`), in the world the
+/// statement runs in.
+fn with_calls_inlined(e: Expr, schema: &str) -> Result<Expr> {
+    let mut calls = false;
+    walk(&e, &mut |x| calls |= matches!(x, Expr::Call(c) if !c.builtin));
+    if !calls {
+        return Ok(e);
+    }
+    match catalog::world_owner() {
+        Ok(_) => catalog::with_world_view(|v| functions::inline_row_calls(v, &e, schema)),
+        Err(_) => Ok(e),
+    }
 }
 
 /// A CHECK that a table changed whole (ALTER TABLE ... ADD CONSTRAINT) fails: no one row is "the new row".
@@ -23967,6 +24197,7 @@ impl Table {
             matview: None,
             by_columns: false,
             unlogged: false,
+            ri_off: vec![],
             hier: Default::default(),
             dropped: vec![],
         }
@@ -24068,7 +24299,8 @@ impl Table {
                     | Value::Timestamp(_)
                     | Value::TimestampTz(_)
                     | Value::Time(_)
-                    | Value::Float(_)),
+                    | Value::Float(_)
+                    | Value::Text(_)),
                 ],
             ) => coerce(v.clone(), self.cols[k].ty),
             _ => coerce(Value::Text(id.into()), self.cols[k].ty),
@@ -24780,6 +25012,13 @@ fn agent_spec(j: &Json) -> Result<crate::AgentSpec> {
                 })
             }
             "max_threads" => spec.max_threads = Some(num()?),
+            "priority" => {
+                let p = v.as_str().ok_or_else(|| bad("priority must be 'normal' or 'low'".into()))?;
+                spec.priority = Some(
+                    crate::Priority::parse(p)
+                        .ok_or_else(|| bad(format!("priority must be 'normal' or 'low', not '{p}'")))?,
+                );
+            }
             "max_query_ms" => {
                 spec.max_query_ms = Some(match v {
                     Json::String(s) => {
@@ -24954,6 +25193,7 @@ fn load_world(v: &View, name: &str) -> Result<Option<Table>> {
         matview: None,
         by_columns: false,
         unlogged: false,
+        ri_off: vec![],
         hier: Default::default(),
         dropped: vec![],
     }))
@@ -25130,6 +25370,8 @@ fn parse_schema(name: &str, s: &str) -> Result<Table> {
                 cols: ids(&u["cols"]).unwrap_or_default(),
                 nnd: u["nnd"].as_bool().unwrap_or(false),
                 primary: u["primary"].as_bool().unwrap_or(false),
+                deferrable: u["deferrable"].as_bool().unwrap_or(false),
+                deferred: u["deferred"].as_bool().unwrap_or(false),
             })
             .collect();
         let fks = j["foreign"]
@@ -25232,6 +25474,10 @@ fn parse_schema(name: &str, s: &str) -> Result<Table> {
             matview: j.get("matview").cloned(),
             by_columns: j["merge_by_columns"] == true,
             unlogged: j["unlogged"] == true,
+            ri_off: j["ri_off"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
             hier: hier::Hier::from_json(&j),
             dropped: j["dropped"]
                 .as_array()
@@ -25364,6 +25610,8 @@ fn fire_deferred(db: &Db, branch: &str, due: Vec<DeferredTrig>, state: &Mutex<Se
                     subs: Default::default(),
                     working: Default::default(),
                     trace: Default::default(),
+                    arm: Default::default(),
+                    arms: Default::default(),
                     given: Default::default(),
                     plans: None,
                     output: false,
@@ -25447,6 +25695,152 @@ fn put_off(f: &Fk, table: &str, id: &str) -> bool {
         }
     }
     true
+}
+
+/// A unique key a transaction let two rows hold until COMMIT (see `put_off_unique`).
+#[derive(Clone, Debug)]
+struct DeferredUnique {
+    table: String,
+    /// its table is a temporary one, in the session's own database (see `temp_table`)
+    temp: bool,
+    /// SET CONSTRAINTS ... IMMEDIATE checked it since it was last put off: kept, as a ROLLBACK TO a savepoint before
+    /// that may bring the duplicate back, but no longer pending (see `deferred_uniques_on`)
+    checked: bool,
+    constraint: String,
+    /// the key's entry (see `uniq_key`)
+    key: String,
+    /// the rows that held it or took it since (by id), in order
+    rows: Vec<String>,
+}
+
+/// Whether `v` is of the session's own database, where its temporary tables are (see `temp_table`).
+fn in_temp(v: &View) -> bool {
+    TEMP.with_borrow(|x| x.as_ref().is_some_and(|(db, _)| std::ptr::eq(v.core, &*db.core)))
+}
+
+/// Puts off the check of unique constraint `u` of `t` for `key`, which row `other` holds and row `id` takes too, when
+/// the running transaction defers `u` (DEFERRABLE INITIALLY DEFERRED, or SET CONSTRAINTS ... DEFERRED): noted for
+/// COMMIT, which takes the rows that hold it then (see `verify_deferred_uniques`). False when it doesn't defer it.
+fn put_off_unique(v: &View, t: &Table, u: &Unique, key: &str, other: &str, id: &str) -> bool {
+    if !defers(&u.name, u.deferrable, u.deferred) {
+        return false;
+    }
+    if let Some(ctx) = STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.clone())) {
+        let mut st = ctx.state.lock().unwrap();
+        let temp = in_temp(v);
+        let at = match st.deferred_uniques.iter().position(|d| d.key == key && d.temp == temp) {
+            Some(at) => at,
+            None => {
+                st.deferred_uniques.push(DeferredUnique {
+                    table: t.name.clone(),
+                    temp,
+                    checked: false,
+                    constraint: u.name.clone(),
+                    key: key.to_string(),
+                    rows: vec![],
+                });
+                st.deferred_uniques.len() - 1
+            }
+        };
+        st.deferred_uniques[at].checked = false;
+        let rows = &mut st.deferred_uniques[at].rows;
+        for r in [other, id] {
+            if !rows.iter().any(|x| x == r) {
+                rows.push(r.to_string());
+            }
+        }
+    }
+    true
+}
+
+/// Notes row `id` among those COMMIT looks at for `key`, when a deferred check of it is out (see `put_off_unique`):
+/// a row that takes a key whose entry a deferred duplicate moved or freed is one more holder.
+fn join_deferred_unique(v: &View, key: &str, id: &str) {
+    let temp = in_temp(v);
+    let Some(ctx) = STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.clone())) else { return };
+    let mut st = ctx.state.lock().unwrap();
+    if let Some(d) = st.deferred_uniques.iter_mut().find(|d| d.key == key && d.temp == temp)
+        && !d.rows.iter().any(|x| x == id)
+    {
+        d.rows.push(id.to_string());
+    }
+}
+
+/// Whether the running transaction put off checks of unique keys of `table` (see `put_off_unique`): they name it and
+/// its constraints, so renaming either waits for them, as Postgres's ALTER TABLE waits for pending trigger events.
+fn deferred_uniques_on(table: &str) -> bool {
+    let Some(ctx) = STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.clone())) else { return false };
+    ctx.state.lock().unwrap().deferred_uniques.iter().any(|d| d.table == table && !d.checked)
+}
+
+/// The unique keys a transaction put off (see `put_off_unique`), against `v` as things stand: 23505 for the first
+/// that two rows hold; else the writes that leave each key's entry naming the row that holds it (or none): the world's,
+/// and those of the session's own database, which a temporary table's rows are in (see `temp_table`).
+#[allow(clippy::type_complexity)]
+fn verify_deferred_uniques(
+    v: &View,
+    notes: &[DeferredUnique],
+) -> Result<(Vec<(String, Option<String>)>, Vec<(String, Option<String>)>)> {
+    let temp = TEMP.with_borrow(Clone::clone);
+    let tv = match &temp {
+        Some((db, branch)) if !std::ptr::eq(v.core, &*db.core) => Some(db.view_tx(branch)?),
+        _ => None,
+    };
+    let (mut world_fixes, mut temp_fixes) = (vec![], vec![]);
+    for d in notes {
+        // (in the database it was put off in, whatever a table of the name shadows it now)
+        let (v, fixes) = match &tv {
+            Some(tv) if d.temp => (tv, &mut temp_fixes),
+            _ if d.temp => continue, // (no temporary tables now: it went with them)
+            _ => (v, &mut world_fixes),
+        };
+        let Some(t) = load_world(v, &d.table)? else { continue };
+        let Some(u) = t.uniques.iter().find(|u| u.name == d.constraint) else { continue };
+        let mut holders = vec![];
+        for id in &d.rows {
+            let Some(raw) = v.get(&row_key(&t.name, id))? else { continue }; // deleted since
+            let vals = decode_raw(&t, id, &raw, None)?;
+            if uniq_key(&t, u, &vals).as_deref() == Some(d.key.as_str()) {
+                holders.push((id.clone(), vals));
+            }
+        }
+        if let [(_, vals), _, ..] = &holders[..] {
+            let names = uniq_names(&t, u);
+            let shown: Vec<String> = uniq_vals(&t, u, vals).unwrap_or_default().iter().map(key_value_shown).collect();
+            return Err(violation(
+                UNIQUE,
+                format!("duplicate key value violates unique constraint \"{}\"", u.name),
+                &t.name,
+                Some(&u.name),
+                None,
+                Some(key_detail(&names, &shown)),
+            ));
+        }
+        let want = holders.first().map(|(id, _)| id.clone());
+        if v.get(&d.key)?.map(|x| x.to_string()) != want {
+            fixes.push((d.key.clone(), want));
+        }
+    }
+    Ok((world_fixes, temp_fixes))
+}
+
+/// Writes the fix-ups `verify_deferred_uniques` gives: the world's on `branch`, the temporary tables' in the session's
+/// own database.
+#[allow(clippy::type_complexity)]
+fn write_unique_fixes(
+    db: &Db,
+    branch: &str,
+    (world, temp): (Vec<(String, Option<String>)>, Vec<(String, Option<String>)>),
+) -> Result<()> {
+    if !world.is_empty() {
+        db.batch_with::<(), SqlError>(branch, |_| Ok((world, ())))?;
+    }
+    if !temp.is_empty()
+        && let Some((tdb, tbranch)) = TEMP.with_borrow(Clone::clone)
+    {
+        tdb.batch_with::<(), SqlError>(&tbranch, |_| Ok((temp, ())))?;
+    }
+    Ok(())
 }
 
 /// Notes that a statement left a check of foreign key `f` on table `table` until COMMIT: a row
@@ -25567,15 +25961,19 @@ fn position(t: &Table, id: u32) -> Option<usize> {
 
 fn uniq_key(t: &Table, u: &Unique, vals: &[Value]) -> Option<String> {
     // as a JSON array, with numbers exact: numeric without trailing zeros (1 and 1.0 clash, and
-    // digits past a double's still count), a float's -0 as 0
-    let parts: Vec<String> = uniq_keys(t, u, vals)?
-        .iter()
-        .map(|v| match v {
-            Value::Numeric(d) => d.normal().to_string(),
-            Value::Float(f) => Value::Float(fcanon(*f)).to_json().to_string(),
-            v => v.kept_json().to_string(),
-        })
-        .collect();
+    // digits past a double's still count), a float's -0 as 0 and in all its digits (`exact_floats`: only as the
+    // values are written, after the index's expressions and WHERE are worked out under the session's settings)
+    let these = uniq_keys(t, u, vals)?;
+    let parts: Vec<String> = exact_floats(|| {
+        these
+            .iter()
+            .map(|v| match v {
+                Value::Numeric(d) => d.normal().to_string(),
+                Value::Float(f) => Value::Float(fcanon(*f)).to_json().to_string(),
+                v => v.kept_json().to_string(),
+            })
+            .collect()
+    });
     Some(format!("{UNIQ}/{}/{}/[{}]", t.name, u.name, parts.join(",")))
 }
 
@@ -25589,9 +25987,20 @@ const OLD_FORMS: usize = 64;
 /// `restore` brings back and data adopted from a remote, and two worlds rewriting the same entry
 /// would clash when merged. So checks look there too (`old_holder`).
 fn old_uniq_keys(t: &Table, u: &Unique, vals: &[Value]) -> Vec<String> {
+    // (the values worked out under the session's settings, written in all their digits: see `uniq_key`)
     let Some(these) = uniq_vals(t, u, vals) else { return vec![] };
+    let now = uniq_key(t, u, vals);
+    exact_floats(|| old_forms(&these))
+        .into_iter()
+        .map(|k| format!("{UNIQ}/{}/{}/[{k}]", t.name, u.name))
+        .filter(|k| now.as_ref() != Some(k))
+        .collect()
+}
+
+/// Each form an older Chronos could have written `these` in, as a key's JSON array's insides (see `old_uniq_keys`).
+fn old_forms(these: &[Value]) -> Vec<String> {
     let mut keys = vec![String::new()];
-    for v in &these {
+    for v in these {
         // every form an equal value could have had
         let forms: Vec<String> = match v {
             Value::Numeric(d) => {
@@ -25614,11 +26023,7 @@ fn old_uniq_keys(t: &Table, u: &Unique, vals: &[Value]) -> Vec<String> {
             .flat_map(|k| forms.iter().map(move |f| if k.is_empty() { f.clone() } else { format!("{k},{f}") }))
             .collect();
     }
-    let now = uniq_key(t, u, vals);
-    keys.into_iter()
-        .map(|k| format!("{UNIQ}/{}/{}/[{k}]", t.name, u.name))
-        .filter(|k| now.as_ref() != Some(k))
-        .collect()
+    keys
 }
 
 /// The row an older Chronos's entry (see `old_uniq_keys`) says holds `vals` in unique constraint
@@ -25812,10 +26217,10 @@ fn uniq_names(t: &Table, u: &Unique) -> Vec<String> {
 /// values) start: one value as JSON, several as a JSON array.
 fn ref_prefix(t: &Table, f: &Fk, parent: &[Value]) -> String {
     // (a regproc by its oid: its name changes with the search_path)
-    let p = match parent {
+    let p = exact_floats(|| match parent {
         [one] => one.kept_json(),
         many => Json::Array(many.iter().map(Value::kept_json).collect()),
-    };
+    });
     format!("{REFS}/{}/{}/{p}/", t.name, f.name)
 }
 
@@ -26066,6 +26471,23 @@ pub(crate) fn table_columns(v: &View, t: &str) -> crate::Result<Option<Vec<Strin
         return Ok(None);
     }
     Ok(load(v, t).map_err(sql_to_db)?.map(|t| t.cols.into_iter().map(|c| c.name).collect()))
+}
+
+/// The tables of `branch` made with CREATE TABLE (or attached), each with its columns: what an agent's tenant is held
+/// to (see `rls::tenant_policy`), so what `Core::create_agent` checks its column against.
+pub(crate) fn tables_and_columns(db: &crate::Core, branch: &str) -> crate::Result<Vec<(String, Vec<String>)>> {
+    let v = db.view_tx(branch)?;
+    let mut out = vec![];
+    for r in v.prefix(&format!("{SCHEMAS}/"))? {
+        let name = r?.0[SCHEMAS.len() + 1..].to_string();
+        if crate::reserved_table(&name) {
+            continue;
+        }
+        if let Some(t) = load_world(&v, &name).map_err(sql_to_db)? {
+            out.push((name, t.cols.into_iter().map(|c| c.name).collect()));
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn btree_entry(key: &str) -> bool {
@@ -26758,6 +27180,10 @@ fn enforce_in(
         let above = hier::partition_chain(&by_name, t);
         for child in &tables {
             for fk in child.fks.iter().filter(|f| f.table == t.name || above.contains(&f.table.as_str())) {
+                // (the actions are the referenced table's triggers: off, nothing that references it is touched)
+                if t.ri_off.iter().any(|k| k.split_once('/') == Some((child.name.as_str(), fk.name.as_str()))) {
+                    continue;
+                }
                 // the values the rows referencing this one name, and what they become: nothing
                 // to do unless they change (an update that leaves them as they were touches no child)
                 let cols = ref_cols(t, fk);
@@ -26983,6 +27409,8 @@ fn enforce_in(
             if let Some(m) = marks.as_deref_mut() {
                 m.push((key.clone(), bulk::CLAIM)); // and a second claim, from any part, clashes
             }
+            // (a key a deferred check is out on: this row is among those COMMIT looks at)
+            join_deferred_unique(v, &key, id);
             if holder.as_deref().is_none_or(|h| h == id) {
                 let get = |k: &str| -> Result<Option<String>> {
                     match claimed.get(k) {
@@ -26996,6 +27424,15 @@ fn enforce_in(
                     (Some((_, h)), None) if h != id => holder = Some(h),
                     _ => {}
                 }
+            }
+            // DEFERRABLE INITIALLY DEFERRED (or SET CONSTRAINTS ... DEFERRED): the rows may share it until COMMIT, which
+            // checks it again (a statement too big to hold, see `bulk`, checks it now)
+            if let Some(other) = holder.as_deref().filter(|o| *o != id)
+                && marks.is_none()
+                && put_off_unique(v, t, u, &key, other, id)
+            {
+                claimed.insert(key, Some(id.to_string()));
+                continue;
             }
             if let Some(other) = holder.filter(|o| o != id) {
                 let names = uniq_names(t, u);
@@ -27021,8 +27458,8 @@ fn enforce_in(
         }
         for f in &t.fks {
             // (a NOT VALID foreign key holds for the rows written from now on: one this statement doesn't
-            // write is left as it is)
-            let unchecked = !f.valid && !pending.contains_key(k);
+            // write is left as it is; one whose triggers are off checks nothing)
+            let unchecked = t.ri_off.contains(&f.name) || (!f.valid && !pending.contains_key(k));
             if mixes_nulls(t, f, &vals) && !unchecked {
                 if put_off(f, &t.name, id) {
                     continue;
@@ -27608,14 +28045,15 @@ fn add_constraint(v: &View, t: &mut Table, c: &ConstraintDef) -> Result<()> {
         return err("42710", format!("constraint \"{n}\" for relation \"{}\" already exists", rel_part(&t.name)));
     }
     match c {
-        ConstraintDef::Unique { name, cols, nnd, space } => {
+        ConstraintDef::Unique { name, cols, nnd, space, defer } => {
             let mut ids = vec![];
             for n in cols {
                 // (as Postgres's index build says it)
                 let Some(i) = t.cols.iter().position(|c| c.name == *n) else {
                     return err(NO_COLUMN, format!("column \"{n}\" named in key does not exist"));
                 };
-                if matches!(t.cols[i].ty, Type::Float | Type::Float4 | Type::Json) {
+                // (a float's key is its shortest exact text, -0 as 0 and every NaN one: see `uniq_key`)
+                if t.cols[i].ty == Type::Json {
                     return err(UNSUPPORTED, format!("UNIQUE on {} columns isn't supported", t.cols[i].ty.name()));
                 }
                 // (json has no equality)
@@ -27632,7 +28070,14 @@ fn add_constraint(v: &View, t: &mut Table, c: &ConstraintDef) -> Result<()> {
             // (where its index is kept: USING INDEX TABLESPACE's, else default_tablespace's)
             let at = tablespace::place(v, space.as_deref(), 0, t.hier.part.is_some(), true)?;
             t.hier.set_index_space(&name, at);
-            t.uniques.push(Unique { name, cols: ids, nnd: *nnd, primary: false });
+            t.uniques.push(Unique {
+                name,
+                cols: ids,
+                nnd: *nnd,
+                primary: false,
+                deferrable: defer.0,
+                deferred: defer.1,
+            });
         }
         ConstraintDef::Foreign {
             name, cols, table, refcols, on_delete, on_update, delete_cols, defer, full, ..
@@ -27708,7 +28153,16 @@ fn add_constraint(v: &View, t: &mut Table, c: &ConstraintDef) -> Result<()> {
                         .filter_map(|j| is.get(j).copied())
                         .collect();
                     pk.clone()
-                } else if parent.uniques.iter().any(|u| uniq_index(&parent, u).is_none() && same(&u.cols)) {
+                } else if let Some(u) =
+                    parent.uniques.iter().find(|u| uniq_index(&parent, u).is_none() && same(&u.cols))
+                {
+                    // (a deferrable one may hold a key twice until COMMIT: no foreign key's, as in Postgres)
+                    if u.deferrable {
+                        return err(
+                            "55000",
+                            format!("cannot use a deferrable unique constraint for referenced table \"{table}\""),
+                        );
+                    }
                     refs = named.iter().map(|&j| parent.cols[j].id).collect();
                     named
                 } else {
@@ -28060,6 +28514,12 @@ fn schema_json(t: &Table) -> String {
             if u.primary {
                 j["primary"] = Json::Bool(true);
             }
+            if u.deferrable {
+                j["deferrable"] = Json::Bool(true);
+            }
+            if u.deferred {
+                j["deferred"] = Json::Bool(true);
+            }
             j
         })
         .collect();
@@ -28189,6 +28649,9 @@ fn schema_json(t: &Table) -> String {
     }
     if t.by_columns {
         j["merge_by_columns"] = Json::Bool(true);
+    }
+    if !t.ri_off.is_empty() {
+        j["ri_off"] = Json::from(t.ri_off.clone());
     }
     if t.unlogged {
         j["unlogged"] = Json::Bool(true);
@@ -29411,10 +29874,12 @@ fn par_run_on<T: Send>(
 ) -> Result<Vec<T>> {
     use std::sync::atomic::{AtomicUsize, Ordering::*};
     let k = k.max(1);
-    // an agent's max_threads: its statement leaves the other cores to main's traffic
-    let threads = match STOP.with_borrow(|s| s.as_ref().map_or(0, |s| s.threads)) {
-        0 => threads,
-        cap => threads.min(cap),
+    // an agent's max_threads: its statement leaves the other cores to main's traffic; and a low-priority one's borrows
+    // no helpers while the database's own users run statements (see `Stop::yields`)
+    let threads = match STOP.with_borrow(|s| s.as_ref().map_or((0, false), |s| (s.threads, s.low))) {
+        (_, true) if busy() => 1,
+        (0, _) => threads,
+        (cap, _) => threads.min(cap),
     };
     // a seeded generator is one sequence: its numbers go to rows in the one order the data gives
     let extra = if funcs::SEEDED.get().is_some() { 0 } else { (k - 1).min(threads.max(1) - 1) };
@@ -29440,11 +29905,12 @@ fn par_run_on<T: Send>(
         (catalog::world_state(), PATH.with_borrow(Clone::clone), SESSION.with_borrow(Clone::clone));
     let who = roles::current();
     let ts_config = tsearch::default_config();
-    let using = crate::stale::USING.with_borrow(Clone::clone);
+    let (using, replay) = (crate::stale::USING.with_borrow(Clone::clone), crate::stale::REPLAY.get());
     let dry = DRY.with_borrow(Clone::clone);
     let work = || {
         STOP.set(stop.clone()); // helper threads stop with the statement too
         crate::stale::USING.set(using.clone()); // and keep what they read as its columns (see `stale`)
+        crate::stale::REPLAY.set(replay); // and as read by a SELECT kept to run again, if it is one
         DRY.set(dry.clone()); // and change nothing where it may not (see `dry_run`)
         tsearch::set_default(ts_config); // and search text as its session does
         roles::enter(who.clone()); // and run as its role
@@ -29511,6 +29977,9 @@ fn par_run_on<T: Send>(
                 SESSION.set(None);
                 STOP.set(None);
                 DRY.set(None);
+                // (nor whether what it reads is a kept SELECT's: the next statement it helps may not be)
+                crate::stale::USING.set(None);
+                crate::stale::REPLAY.set(false);
                 finished(&mine);
             };
             let job: Box<dyn FnOnce() + Send + '_> = Box::new(job);
@@ -30158,6 +30627,8 @@ struct MergeClauses {
     columns: bool,
     picks: Vec<(String, crate::Pick)>,
     dry: bool,
+    /// REHEARSE [FAIL AT n] (see `Stmt::MergeBranch`)
+    rehearse: Option<Option<usize>>,
     into: Option<String>,
     only_tables: Vec<String>,
     only_keys: Vec<String>,
@@ -30401,6 +30872,22 @@ pub fn live_summary(l: &crate::LiveCheck) -> String {
     if l.at == 0 {
         return format!("writes nothing to Postgres ({})", l.source);
     }
+    if let Some(r) = &l.rehearsal {
+        let changed = l.rows.iter().filter(|r| r.changed).count();
+        let at = time::format_timestamptz(l.at as i64 * 1000);
+        let how = match &r.stopped {
+            None => "ran to the end, then ROLLBACK instead of COMMIT",
+            Some(_) => "stopped (see below), then ROLLBACK",
+        };
+        return format!(
+            "rehearsed in Postgres ({}) at {at}: the write-back as a merge runs it (rows locked and compared, each \
+             statement with RETURNING, triggers and constraints, deferred ones made immediate, the merge checks), as \
+             the role CHRONOS_SOURCE_URL names, which must be able to write these tables; {} rows compared, {changed} \
+             changed in Postgres since main's copy; {how}. Nothing was merged, and no effect sent",
+            l.source,
+            l.rows.len()
+        );
+    }
     let changed = l.rows.iter().filter(|r| r.changed).count();
     let at = time::format_timestamptz(l.at as i64 * 1000);
     let mut out = format!(
@@ -30417,6 +30904,49 @@ pub fn live_summary(l: &crate::LiveCheck) -> String {
         out.push_str(&format!(
             "; triggers not run, so what they set isn't shown (main takes it after the merge): {}",
             l.triggers.join(", ")
+        ));
+    }
+    out
+}
+
+/// A rehearsal's lines for its plan (see `crate::attach::rehearse`), each an outcome and its detail: the statements
+/// it ran, what Postgres stored otherwise than sent, the tables written besides, merge checks that would hold it,
+/// where it stopped, the check that Postgres is as it was, and the effects the merge would send (none sent).
+fn rehearsal_lines(r: &crate::Rehearsal, plan: &[crate::Planned]) -> Vec<(&'static str, String)> {
+    let mut out = vec![];
+    for (n, s) in r.statements.iter().enumerate() {
+        out.push(("rehearsed", format!("statement {}: {s}", n + 1)));
+    }
+    for s in &r.returned {
+        out.push(("postgres set", format!("{s} (a trigger or default: main would take it)")));
+    }
+    if !r.besides.is_empty() {
+        out.push((
+            "postgres wrote",
+            format!("tables written besides (triggers, rules, foreign keys' actions): {}", r.besides.join(", ")),
+        ));
+    }
+    for c in &r.checks {
+        out.push(("held", format!("it {c}: a merge would be held")));
+    }
+    if let Some(s) = &r.stopped {
+        out.push(("stopped", s.clone()));
+    }
+    match &r.afterwards {
+        Some(Ok(s)) => out.push(("rolled back", s.clone())),
+        Some(Err(s)) => out.push(("check after", s.clone())),
+        None => {}
+    }
+    for p in plan.iter().filter(|p| crate::outbox::entry(&p.key) && p.theirs.is_none()) {
+        let Some(v) = p.result.as_deref() else { continue };
+        let j: Json = serde_json::from_str(v).unwrap_or(Json::Null);
+        out.push((
+            "effect",
+            format!(
+                "NOTIFY {}, '{}': the merge would send it once it lands; the rehearsal sent nothing",
+                j["channel"].as_str().unwrap_or_default(),
+                j["payload"].as_str().unwrap_or_default()
+            ),
         ));
     }
     out
@@ -30890,7 +31420,9 @@ fn key_text(v: &Value) -> Result<String> {
     match v {
         Value::Int(n) => Ok(n.to_string()),
         Value::Text(s) if !s.is_empty() => Ok(s.clone()),
-        Value::Text(_) => err(BAD_INPUT, "a key can't be empty"),
+        // (a row key can't be empty: the empty text's is a one-part composite one, which sorts before any other text,
+        // as '' does, and reads back as itself: see `show_id`)
+        Value::Text(_) => composite_id(&[v]),
         Value::Bytea(b) => Ok(bytes::text(b)), // (`\x`, then hex: it orders as the bytes do)
         Value::Null => err(NOT_NULL, "a key can't be null"),
         v => err(WRONG_TYPE, format!("a key must be an integer, text or bytea, not {}", v.kind())),
@@ -31063,6 +31595,9 @@ pub fn show_id(id: &str) -> Cow<'_, str> {
     }
     if let [Value::Bool(b)] = vals[..] {
         return Cow::Owned(b.to_string());
+    }
+    if let [Value::Text(s)] = &vals[..] {
+        return Cow::Owned(s.clone()); // the empty text's key (see `key_text`)
     }
     let field = |v: &Value| {
         let s = match v {
@@ -32258,6 +32793,45 @@ fn eval_node(e: &Expr, env: &Env) -> Result<Value> {
                 }
                 (Func::DateTrunc, Date(_) | Timestamp(_)) => {
                     Timestamp(time::trunc(&part, micros(&x)?).ok_or_else(cut_bad)?)
+                }
+                // an interval's parts (a time of day is cut as the interval it casts to, as Postgres finds
+                // date_trunc(text, interval) for one: Django truncates a TimeField so)
+                // (date_trunc(text, interval, text) is no function: the zone is a timestamptz's)
+                (Func::DateTrunc, Interval(_) | Time(_)) if zone.is_some() => {
+                    return err(
+                        NO_FUNCTION,
+                        format!(
+                            "function date_trunc(unknown, {}, unknown) does not exist",
+                            x.ty().map_or("unknown".into(), Type::pg_name)
+                        ),
+                    );
+                }
+                (Func::DateTrunc, Interval(_) | Time(_)) => {
+                    let i = match x {
+                        Time(t) => time::Interval { months: 0, days: 0, micros: t },
+                        Interval(i) => i,
+                        _ => unreachable!(),
+                    };
+                    match time::trunc_interval(&part, i) {
+                        Ok(i) => Interval(i),
+                        Err(true) => {
+                            return Err(SqlError {
+                                code: UNSUPPORTED,
+                                message: format!("unit \"{lower}\" not supported for type interval"),
+                                info: Some(Box::new(Violation {
+                                    detail: Some("Months usually have fractional weeks.".into()),
+                                    ..Violation::default()
+                                })),
+                            });
+                        }
+                        Err(false) => {
+                            let e = cut_bad();
+                            return Err(SqlError {
+                                message: e.message.replace("type time without time zone", "type interval"),
+                                ..e
+                            });
+                        }
+                    }
                 }
                 _ => return no_op(format!("{f:?} needs a date, timestamp or interval, not {}", x.kind())),
             }
@@ -33974,6 +34548,8 @@ fn ty_in(e: &Expr, cols: &[Col], params: &[Option<Type>], aggs: &[Expr]) -> Resu
             Func::CurrentDate => Type::Date,
             Func::DateTrunc => match args.get(1).map(ty).transpose()? {
                 _ if args.len() == 3 => Type::TimestampTz, // (with a zone, always a timestamptz)
+                // (an interval's, and a time's, which is cut as the interval it casts to)
+                Some(Type::Interval | Type::Time) => Type::Interval,
                 // (a date is cut as the timestamptz it is at its midnight)
                 Some(Type::TimestampTz | Type::Date) => Type::TimestampTz,
                 _ => Type::Timestamp,
@@ -34328,6 +34904,7 @@ fn func_name(f: &Func) -> String {
         Func::Scalar(funcs::Scalar::UuidV1(mc)) => {
             return if *mc { "uuid_generate_v1mc" } else { "uuid_generate_v1" }.into();
         }
+        Func::Scalar(funcs::Scalar::InfoTypeFn(k)) => return funcs::INFO_TYPE_FNS[*k as usize].into(),
         Func::Scalar(funcs::Scalar::NumNode) => return "numnode".into(),
         Func::Scalar(funcs::Scalar::SetSeed) => return "setseed".into(),
         Func::Scalar(funcs::Scalar::RegexpSplit) => return "regexp_split_to_array".into(),
@@ -35171,6 +35748,161 @@ pub(crate) fn merge_check(db: &Db, world: &str, query: &str, timeout: u64, limit
     session.close(db);
     NOTICES.set(notices);
     out
+}
+
+/// A plain SELECT a world that checks its reads ran (see `Session::replayable`), kept with what it gave, to run again
+/// at the world's merge as the session ran it: the same parameters, as the same agent and role, with the same
+/// search_path and time zone. Same answer from the world's fork point and from the world it merges into as it is now:
+/// the rows that changed since didn't change what the agent read (see `stale`).
+#[derive(Clone)]
+pub(crate) struct Replay {
+    stmt: Stmt,
+    calls: bool,
+    params: Vec<Value>,
+    types: Vec<Type>,
+    agent: Option<String>,
+    user: Option<String>,
+    masked: bool,
+    ident: roles::Ident,
+    search_path: Option<Vec<String>>,
+    zone: Option<time::Zone>,
+    /// it has an ORDER BY: its rows' order counts
+    ordered: bool,
+    /// the statement as the client sent it, on one line
+    pub(crate) text: String,
+}
+
+impl Replay {
+    /// Runs it again on world `world` (a name a merge reads a state by: see `Core::view_tx`), within `timeout` ms.
+    pub(crate) fn run(&self, db: &Db, world: &str, timeout: u64) -> Result<Output> {
+        let _as = crate::disk::acting_as(self.agent.as_deref().unwrap_or(""));
+        let notices = take_notices();
+        let mut session = Session::new(world);
+        session.agent.clone_from(&self.agent);
+        session.user.clone_from(&self.user);
+        session.masked = self.masked;
+        session.ident = self.ident.clone();
+        session.search_path.clone_from(&self.search_path);
+        session.zone.clone_from(&self.zone);
+        session.timeout = Some(timeout);
+        let out = session.execute(
+            db,
+            &Statement(self.stmt.clone(), PlanCache::default(), self.calls),
+            &self.params,
+            &self.types,
+        );
+        session.close(db);
+        NOTICES.set(notices);
+        out
+    }
+
+    /// Whether `o` is this statement run again as this one ran: the same text and parameters, by the same session.
+    pub(crate) fn same(&self, o: &Replay) -> bool {
+        self.text == o.text
+            && self.params == o.params
+            && self.agent == o.agent
+            && self.user == o.user
+            && self.masked == o.masked
+            && self.ident == o.ident
+            && self.search_path == o.search_path
+            && self.zone == o.zone
+    }
+
+    /// What `o`, a result of it, holds, as one hash: its columns and rows, the rows in any order unless it has an
+    /// ORDER BY.
+    pub(crate) fn digest(&self, o: &Output) -> [u8; 32] {
+        let row = |r: &Vec<Value>| -> String {
+            r.iter()
+                .map(|v| if matches!(v, Value::Null) { "\\N".to_string() } else { format!("{:?}", v.to_text()) })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let mut rows: Vec<String> = o.rows.iter().map(row).collect();
+        if !self.ordered {
+            rows.sort_unstable();
+        }
+        let mut h = blake3::Hasher::new();
+        for (c, _) in o.columns.as_deref().unwrap_or_default() {
+            h.update(c.as_bytes()).update(b"\0");
+        }
+        h.update(b"\n");
+        for r in &rows {
+            h.update(r.as_bytes()).update(b"\n");
+        }
+        *h.finalize().as_bytes()
+    }
+}
+
+/// A result as a held merge's reason shows it: one short row's values (`1204.00`, `(open, 12)`), else how many rows.
+pub(crate) fn result_summary(o: &Output) -> String {
+    let shown = |v: &Value| if matches!(v, Value::Null) { "null".to_string() } else { v.to_text() };
+    match o.rows.as_slice() {
+        [] => "no rows".into(),
+        [r] => {
+            let vals: Vec<String> = r.iter().map(shown).collect();
+            let one = match vals.as_slice() {
+                [v] => v.clone(),
+                vs => format!("({})", vs.join(", ")),
+            };
+            if one.chars().count() <= 80 { one } else { "1 row".into() }
+        }
+        rows => format!("{} rows", rows.len()),
+    }
+}
+
+/// Plain SELECT `s` with the views it reads inlined, when nothing in it may read more than the rows and columns it
+/// names (see `Session::read_columns` and `Session::replayable`): None for one calling a function made with CREATE
+/// FUNCTION, an aggregate made with CREATE AGGREGATE, or a function that reaches past the row (a table's size, the
+/// catalog, a sequence, the session's settings); one with a set-returning function in FROM, a NATURAL JOIN, or a
+/// DISTINCT ON with a subquery in it.
+fn plain_select(v: &View, db: &Db, s: &Statement) -> Option<Stmt> {
+    // with the views it reads inlined: a view may call a function, or read columns the statement doesn't name
+    let views = db.has_views();
+    let mut st = match views {
+        true => match expand_stmt(v, &s.0, None, true, true) {
+            Ok(Some((e, _))) => e,
+            Ok(None) => s.0.clone(),
+            Err(_) => return None,
+        },
+        false => s.0.clone(),
+    };
+    // what may read more than the columns it names: a function made with CREATE FUNCTION, an aggregate made with
+    // CREATE AGGREGATE (its state function's SQL) in place or as a window function, and a function that reaches
+    // past the row (a table's size, the catalog, a sequence)
+    fn opaque(e: &Expr) -> bool {
+        let user_agg = |a: &Agg| matches!(a, Agg::List(ListAgg::User(_), _));
+        match e {
+            Expr::Call(_) | Expr::Func(Func::Ctx(_), _) => true,
+            Expr::Agg(a, ..) => user_agg(a),
+            Expr::Window(w) => matches!(&w.func, WinFn::Agg(a) if user_agg(a)),
+            _ => false,
+        }
+    }
+    let (mut calls, mut srfs) = (false, false);
+    let _ = functions::visit(
+        &mut st,
+        &mut |e| {
+            calls |= opaque(e);
+            Ok(())
+        },
+        &mut |q| {
+            // a set-returning function in FROM; a NATURAL JOIN, whose join columns aren't named yet; and DISTINCT
+            // ON with a subquery in it: any column may count
+            srfs |= q.from.iter().chain(q.joins.iter().map(|j| &j.src)).any(|f| f.srf.is_some())
+                || q.joins.iter().any(|j| j.natural)
+                || q.distinct_on.iter().any(|e| {
+                    let mut found = false;
+                    walk(e, &mut |x| {
+                        found |= opaque(x) || matches!(x, Expr::Sub(_) | Expr::Exists(..) | Expr::InSub(..))
+                    });
+                    found
+                });
+        },
+    );
+    if calls || srfs {
+        return None;
+    }
+    Some(st)
 }
 
 const TX_PREFIX: &str = "_tx_";
@@ -37074,52 +37806,7 @@ impl Session {
         if !v.recording() {
             return None;
         }
-        // with the views it reads inlined: a view may call a function, or read columns the statement doesn't name
-        let views = db.has_views();
-        let mut st = match views {
-            true => match expand_stmt(&v, &s.0, None, true, true) {
-                Ok(Some((e, _))) => e,
-                Ok(None) => s.0.clone(),
-                Err(_) => return None,
-            },
-            false => s.0.clone(),
-        };
-        // what may read more than the columns it names: a function made with CREATE FUNCTION, an aggregate made with
-        // CREATE AGGREGATE (its state function's SQL) in place or as a window function, and a function that reaches
-        // past the row (a table's size, the catalog, a sequence)
-        fn opaque(e: &Expr) -> bool {
-            let user_agg = |a: &Agg| matches!(a, Agg::List(ListAgg::User(_), _));
-            match e {
-                Expr::Call(_) | Expr::Func(Func::Ctx(_), _) => true,
-                Expr::Agg(a, ..) => user_agg(a),
-                Expr::Window(w) => matches!(&w.func, WinFn::Agg(a) if user_agg(a)),
-                _ => false,
-            }
-        }
-        let (mut calls, mut srfs) = (false, false);
-        let _ = functions::visit(
-            &mut st,
-            &mut |e| {
-                calls |= opaque(e);
-                Ok(())
-            },
-            &mut |q| {
-                // a set-returning function in FROM; a NATURAL JOIN, whose join columns aren't named yet; and DISTINCT
-                // ON with a subquery in it: any column may count
-                srfs |= q.from.iter().chain(q.joins.iter().map(|j| &j.src)).any(|f| f.srf.is_some())
-                    || q.joins.iter().any(|j| j.natural)
-                    || q.distinct_on.iter().any(|e| {
-                        let mut found = false;
-                        walk(e, &mut |x| {
-                            found |= opaque(x) || matches!(x, Expr::Sub(_) | Expr::Exists(..) | Expr::InSub(..))
-                        });
-                        found
-                    });
-            },
-        );
-        if calls || srfs {
-            return None;
-        }
+        let st = plain_select(&v, db, s)?;
         let mut cols: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
         let mut whole = HashSet::new();
         let Stmt::Select(q) = &st else { return None };
@@ -37134,6 +37821,43 @@ impl Session {
         }
         cols.retain(|t, _| !whole.contains(t));
         Some(Arc::new(cols))
+    }
+
+    /// For a world that runs its reads again (see `stale`): whether `s`, about to run, can be run again at the world's
+    /// merge to see whether it still gives what it gives now (see `Replay`). A plain SELECT (run by the client, not
+    /// inside another statement: the caller knows) that changes nothing and reads only rows: no function made with
+    /// CREATE FUNCTION, no function of the session (`current_setting`, `current_user`), no row security (whose
+    /// policies may read the session's settings), none of which a statement run again would see as the session had
+    /// them.
+    fn replayable(&self, db: &Db, s: &Statement) -> bool {
+        if !matches!(s.0, Stmt::Select(_)) || self.declaring || db.has_row_security() {
+            return false;
+        }
+        if !db.core.recorder(&self.branch).is_some_and(|r| r.lock().unwrap().reruns()) {
+            return false;
+        }
+        let Ok(v) = db.view_tx(self.target()) else { return false };
+        v.recording() && s.access_in(db, self.target()) == Reach::Read && plain_select(&v, db, s).is_some()
+    }
+
+    /// Statement `s` (see `replayable`), as this session ran it with `params`, to run again (see `Replay`).
+    fn replay(&self, s: &Statement, params: &[Value], types: &[Type]) -> Replay {
+        let own = self.stmt_sql.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let text = own.unwrap_or_else(|| self.sql.lock().unwrap_or_else(|p| p.into_inner()).clone());
+        Replay {
+            stmt: s.0.clone(),
+            calls: s.2,
+            params: params.to_vec(),
+            types: types.to_vec(),
+            agent: self.agent.clone(),
+            user: self.user.clone(),
+            masked: self.masked,
+            ident: self.ident.clone(),
+            search_path: self.search_path.clone(),
+            zone: self.zone.clone(),
+            ordered: matches!(&s.0, Stmt::Select(q) if !q.order.is_empty()),
+            text: text.split_whitespace().collect::<Vec<_>>().join(" "),
+        }
     }
 
     /// The search_path names are looked up along, when it isn't just public (see `find_named`).
@@ -37332,6 +38056,8 @@ impl Session {
             Stmt::Execute { .. } => {}
             Stmt::CreateDatabase(_) | Stmt::DropDatabase { .. } => me.may_admin()?, // worlds with no owner
             Stmt::Simulate(_) | Stmt::Replay { .. } => {} // checked as it runs: its worlds are the agent's
+            // (a rehearsal writes to Postgres, locking the rows, if only to roll back: as a merge's)
+            Stmt::MergeBranch { name, rehearse: Some(_), .. } => me.may_merge(&world(name))?,
             Stmt::MergeBranch { name, dry: true, .. } => me.may_see_changes(&world(name))?,
             Stmt::MergeBranch { name, into: Some(into), .. } => me.may_merge_into(&world(name), into)?,
             Stmt::MergeBranch { name, .. } => me.may_merge(&world(name))?,
@@ -37593,16 +38319,51 @@ impl Session {
     pub fn log_in(&mut self, db: &Db, user: &str) -> Result<()> {
         self.ident = roles::Ident { login: roles::login(&db.core, user)?, auth: None, role: None };
         // its ALTER ROLE ... SET settings, as Postgres applies them at login (the client's own startup
-        // options come after them); one that no longer takes is a warning
-        let config = match self.ident.login {
-            Some(oid) => roles::registry(&db.core)?.by_oid(oid).map(|r| r.config).unwrap_or_default(),
-            None => vec![],
-        };
+        // options come after them); one that no longer takes is a warning. A login that is no role is the bootstrap
+        // superuser, and takes its settings.
+        let config = self.role_config(db)?;
         for c in config {
             let Some((name, value)) = c.split_once('=') else { continue };
             let sql = format!("set {} to '{}'", name.to_lowercase(), value.replace('\'', "''"));
-            if let Err(e) = self.run(db, &sql, &[]) {
-                notice("WARNING", format!("invalid value for parameter \"{name}\" of role \"{user}\": {e}"));
+            match self.run(db, &sql, &[]) {
+                // (what RESET puts back, as Postgres's reset value of a setting a role gives is the role's)
+                Ok(_) => self.keep_as_startup(name),
+                Err(e) => notice("WARNING", format!("invalid value for parameter \"{name}\" of role \"{user}\": {e}")),
+            }
+        }
+        Ok(())
+    }
+
+    /// The ALTER ROLE ... SET settings of the role the session logged in as (`name=value`).
+    fn role_config(&self, db: &Db) -> Result<Vec<String>> {
+        let reg = roles::registry(&db.core)?;
+        Ok(reg.by_oid(self.ident.login.unwrap_or(roles::BOOTSTRAP)).map(|r| r.config).unwrap_or_default())
+    }
+
+    /// Takes the ALTER DATABASE ... SET settings of the database the session connected to, once it knows which, as
+    /// Postgres applies them at login: under its role's (`log_in`), which a setting of both keeps, and before the
+    /// client's own startup options. One that no longer takes is a warning.
+    pub fn take_database_settings(&mut self, db: &Db) -> Result<()> {
+        let reg = roles::registry(&db.core)?;
+        let world = self.branch.split_once('@').map_or(self.branch.as_str(), |(w, _)| w).to_string();
+        let Ok(id) = db.world(&world).map(|w| w.id) else { return Ok(()) };
+        let config = reg.db_settings(&id);
+        if config.is_empty() {
+            return Ok(());
+        }
+        let own = if self.user.is_some() && self.agent.is_none() { self.role_config(db)? } else { vec![] };
+        let named = |c: &str| c.split_once('=').map(|(n, _)| n.to_lowercase());
+        for c in config {
+            let Some((name, value)) = c.split_once('=') else { continue };
+            if own.iter().any(|o| named(o).as_deref() == Some(&name.to_lowercase())) {
+                continue;
+            }
+            let sql = format!("set {} to '{}'", name.to_lowercase(), value.replace('\'', "''"));
+            match self.run(db, &sql, &[]) {
+                Ok(_) => self.keep_as_startup(name), // (what RESET puts back)
+                Err(e) => {
+                    notice("WARNING", format!("invalid value for parameter \"{name}\" of database \"{world}\": {e}"))
+                }
             }
         }
         Ok(())
@@ -37898,6 +38659,14 @@ impl Session {
     /// `Statement::columns` on the session's branch, its temporary tables included.
     pub fn columns(&self, db: &Db, s: &Statement, types: &[Type]) -> Result<Option<Columns>> {
         Ok(self.columns_typed(db, s, types)?.map(|(c, _)| c))
+    }
+
+    /// The columns of the cursor `name` this session DECLAREd (and their types where theirs don't say them), as the
+    /// extended protocol's Describe of a portal of that name gives them: in Postgres a SQL cursor is a portal.
+    #[allow(clippy::type_complexity)]
+    pub fn cursor_columns(&self, name: &str) -> Option<(Columns, Vec<Option<(u32, i32)>>)> {
+        let c = self.cursors.get(name)?;
+        Some((c.columns.clone(), c.typmods.clone()))
     }
 
     /// `Statement::columns_typed` on the session's branch, its temporary tables included: what a Describe's
@@ -38213,7 +38982,13 @@ impl Session {
 
     fn set_constraints(&mut self, db: &Db, names_given: &[String], deferred: bool) -> Result<Output> {
         let v = db.view_tx(self.target())?;
-        let tables = schemas(&v)?;
+        let mut tables = schemas(&v)?;
+        // (and the session's temporary tables', in its own database)
+        if let Some((tdb, tbranch)) = TEMP.with_borrow(Clone::clone)
+            && !std::ptr::eq(v.core, &*tdb.core)
+        {
+            tables.extend(schemas(&tdb.view_tx(&tbranch)?)?);
+        }
         // (`s.name`: only the constraints of tables in schema s; the name alone stands for them after)
         let split = |n: &String| -> (Option<String>, String) {
             match n.split_once('.') {
@@ -38235,18 +39010,21 @@ impl Session {
                 .filter(|x| x.name == *n)
                 .filter_map(|x| x.constraint.as_ref())
                 .collect();
-            let other = tables.iter().filter(here).any(|t| {
-                t.uniques.iter().any(|u| u.name == *n)
-                    || t.checks.iter().any(|c| c.name == *n)
-                    || (!t.key_cols().is_empty() && *n == t.pkey_name())
-            });
-            if (fks.is_empty() && trigs.is_empty() && other)
+            // (and unique constraints: see `put_off_unique`)
+            let uniques: Vec<&Unique> =
+                tables.iter().filter(here).flat_map(|t| &t.uniques).filter(|u| u.name == *n).collect();
+            let other = tables
+                .iter()
+                .filter(here)
+                .any(|t| t.checks.iter().any(|c| c.name == *n) || (!t.key_cols().is_empty() && *n == t.pkey_name()));
+            if (fks.is_empty() && trigs.is_empty() && uniques.is_empty() && other)
                 || fks.iter().any(|f| !f.deferrable)
                 || trigs.iter().any(|c| !c.deferrable)
+                || uniques.iter().any(|u| !u.deferrable)
             {
                 return err("42809", format!("constraint \"{n}\" is not deferrable"));
             }
-            if fks.is_empty() && trigs.is_empty() {
+            if fks.is_empty() && trigs.is_empty() && uniques.is_empty() {
                 return err("42704", format!("constraint \"{n}\" does not exist"));
             }
         }
@@ -38274,6 +39052,20 @@ impl Session {
             }
         };
         verify_deferred(&v, &now)?;
+        // the unique keys they put off are checked now too, and their entries set right
+        if !deferred {
+            // (kept for COMMIT all the same: a ROLLBACK TO a savepoint before it may bring a duplicate back)
+            let due: Vec<DeferredUnique> = {
+                let st = self.state.lock().unwrap();
+                let mine = |d: &&DeferredUnique| names.is_empty() || names.contains(&d.constraint);
+                st.deferred_uniques.iter().filter(mine).cloned().collect()
+            };
+            write_unique_fixes(db, self.target(), verify_deferred_uniques(&v, &due)?)?;
+            let mut st = self.state.lock().unwrap();
+            for d in st.deferred_uniques.iter_mut().filter(|d| names.is_empty() || names.contains(&d.constraint)) {
+                d.checked = true;
+            }
+        }
         // the constraint triggers they put off fire now
         if !deferred {
             let due: Vec<DeferredTrig> = {
@@ -38696,6 +39488,10 @@ impl Session {
             Some(a) if !IN_SLOT.get() => db.slot(a)?.map(|s| (s, InSlot::new())),
             _ => None,
         };
+        // the database's own users' statements, which low-priority agents' yield to (see `Stop::yields`): counted once,
+        // not again for what runs inside one (a function's statements, a parallel part's sessions), nor for what runs
+        // inside an agent's
+        let _busy = (agent.is_none() && STOP.with_borrow(Option::is_none)).then(Busy::new);
         NOTICES.with_borrow_mut(Vec::clear); // the last statement's, if nobody took them
         let ends = matches!(
             s.0,
@@ -38760,7 +39556,9 @@ impl Session {
             ctx: Some(ctx),
             mem,
             threads: agent.as_ref().map_or(0, |a| a.max_threads as usize),
+            low: agent.as_ref().is_some_and(|a| a.priority == crate::Priority::Low),
         }));
+        RAN_FROM.set(None); // (it starts running now: what ran before was another statement)
         let (seed, clock) = (funcs::SEEDED.replace(self.seed), time::FROZEN.replace(self.clock));
         let who_was = roles::enter(Some(current));
         // now() is the transaction's start, statement_timestamp() the statement's; a function's
@@ -38790,9 +39588,15 @@ impl Session {
         let stat_was = pgstat::before(&self.state, self.tx.is_some(), self.tx.as_ref().is_some_and(|t| t.failed));
         // a world that checks its reads keeps the columns a plain SELECT reads with what it reads (see `stale`)
         let using = crate::stale::USING.take();
+        // and a plain SELECT, to run again at its merge: what it reads meanwhile is read by it (see `stale`)
+        let (replaying, mut replay) = (crate::stale::REPLAY.get(), false);
         // (worked out on the snapshot the statement runs on: a view replaced since the last one reads other columns)
         let mut out = (if takes_no_snapshot(&s.0) { Ok(()) } else { self.fresh_snapshot(db) })
-            .map(|_| crate::stale::USING.set(self.read_columns(db, s)))
+            .map(|_| {
+                crate::stale::USING.set(self.read_columns(db, s));
+                replay = stmt_was.is_none() && self.replayable(db, s);
+                crate::stale::REPLAY.set(replay);
+            })
             .and_then(|_| match s.0 {
                 Stmt::Select(_) if !s.2 => Ok(()),
                 _ => self.reserve(db, s, None),
@@ -38870,6 +39674,15 @@ impl Session {
             temp_unwind(0, out.is_ok());
         }
         crate::stale::USING.set(using);
+        crate::stale::REPLAY.set(replaying && stmt_was.is_some()); // (a statement the client sent: none)
+        // kept with what it gave; one that failed, having read, can't be told from one that didn't run again
+        if replay && let Some(set) = db.core.recorder(&self.branch) {
+            let mut set = set.lock().unwrap();
+            match &out {
+                Ok(o) => set.keep(self.replay(s, params, types), o),
+                Err(_) => set.loosen(),
+            }
+        }
         {
             let mut st = self.state.lock().unwrap();
             st.used.clear();
@@ -38935,6 +39748,7 @@ impl Session {
             st.local.clear(); // SET LOCAL's end with the transaction
             st.los.clear(); // and its large objects' descriptors, as Postgres closes them
             st.deferred.clear(); // and SET CONSTRAINTS's
+            st.deferred_uniques.clear();
             st.pending_events.clear();
             st.fk_modes.clear();
             st.deferred_trigs.clear();
@@ -38997,6 +39811,21 @@ impl Session {
     }
 
     fn step(&mut self, db: &Db, s: &Statement, params: &[Value], types: &[Type]) -> Result<Output> {
+        let out = self.step_alone(db, s, params, types);
+        // set_config() of a setting the session keeps itself, as SET takes it (a failed statement's are no matter)
+        let own = std::mem::take(&mut self.state.lock().unwrap().own_set);
+        if out.is_ok() {
+            for (name, value, local) in own {
+                let Some(set) = own_setting_sql(&name, value.as_deref(), local) else { continue };
+                for st in parse(&set)? {
+                    self.step_alone(db, &st, &[], &[])?;
+                }
+            }
+        }
+        out
+    }
+
+    fn step_alone(&mut self, db: &Db, s: &Statement, params: &[Value], types: &[Type]) -> Result<Output> {
         // main's protection is what stands between a leaked token and main: a person turns it off, on the database's
         // own machine, not an agent or a client of the server
         if matches!(s.0, Stmt::SetSystem(crate::Setting::ProtectMain, 0)) && (self.agent.is_some() || self.remote) {
@@ -39644,6 +40473,11 @@ impl Session {
                         .and_then(|_| {
                             let notes = std::mem::take(&mut self.state.lock().unwrap().deferred);
                             verify_deferred(&db.view_tx(&t.branch)?, &notes)
+                        })
+                        .and_then(|_| {
+                            // the unique keys it let two rows share: one holds each now, and its entry says which
+                            let notes = std::mem::take(&mut self.state.lock().unwrap().deferred_uniques);
+                            write_unique_fixes(db, &t.branch, verify_deferred_uniques(&db.view_tx(&t.branch)?, &notes)?)
                         })
                         .and_then(|_| {
                             // a sequence it altered over another session's commit takes its definition
@@ -41250,6 +42084,7 @@ impl Statement {
                     ("max_threads", Type::BigInt),
                     ("tenant", Type::Text),
                     ("expires", Type::TimestampTz),
+                    ("priority", Type::Text),
                 ]);
             }
             Stmt::ShowPolicies | Stmt::CreatePolicy { .. } | Stmt::AlterPolicy { .. } => {
@@ -41274,6 +42109,7 @@ impl Statement {
                     ("review_channels", Type::Text),
                     ("confirm_deletes_over", Type::BigInt),
                     ("reviewer", Type::Text),
+                    ("rerun_reads", Type::Bool),
                 ]);
             }
             Stmt::ShowChecks | Stmt::CreateCheck { .. } => {
@@ -41561,6 +42397,8 @@ impl Statement {
             subs: Default::default(),
             working: Default::default(),
             trace: Default::default(),
+            arm: Default::default(),
+            arms: Default::default(),
             given: Default::default(),
             plans: None,
             output: false,
@@ -41759,7 +42597,8 @@ impl Statement {
                         }
                         return err("42710", format!("extension \"{name}\" already exists"));
                     }
-                    if let Some(ver) = version.as_deref().filter(|v| *v != pgcrypto::VERSION) {
+                    let installs = pgcrypto::version(name).unwrap_or(pgcrypto::VERSION);
+                    if let Some(ver) = version.as_deref().filter(|v| *v != installs) {
                         return err(
                             "22023",
                             format!(
@@ -41770,11 +42609,14 @@ impl Statement {
                     if schema != "public" && v.get(&namespace_key(&schema))?.is_none() {
                         return err("3F000", format!("schema \"{schema}\" does not exist"));
                     }
-                    let rec = serde_json::json!({"schema": schema, "version": pgcrypto::VERSION});
+                    let rec = serde_json::json!({"schema": schema, "version": installs});
                     Ok((vec![(pgcrypto::key(name), Some(rec.to_string()))], ()))
                 })?;
                 if skipped {
                     notice("NOTICE", format!("extension \"{name}\" already exists, skipping"));
+                } else if name == "uuid-ossp" {
+                    // (what apps create it for is here: the function they'd call is the built-in one)
+                    notice("NOTICE", "uuid-ossp: only uuid_generate_v4() is available, and it is built in".into());
                 }
                 Ok(Output::tag("CREATE EXTENSION"))
             }
@@ -41786,9 +42628,13 @@ impl Statement {
                         return err("42704", format!("extension \"{name}\" does not exist"));
                     }
                     if let Some(to) = update {
-                        let now = pgcrypto::VERSION;
+                        let now = pgcrypto::version(name).unwrap_or(pgcrypto::VERSION);
                         return match to.as_deref() {
-                            None | Some(pgcrypto::VERSION) => {
+                            None => {
+                                said = Some(format!("version \"{now}\" of extension \"{name}\" is already installed"));
+                                Ok((vec![], ()))
+                            }
+                            Some(to) if to == now => {
                                 said = Some(format!("version \"{now}\" of extension \"{name}\" is already installed"));
                                 Ok((vec![], ()))
                             }
@@ -41804,7 +42650,8 @@ impl Statement {
                     if schema != "public" && v.get(&namespace_key(&schema))?.is_none() {
                         return err("3F000", format!("schema \"{schema}\" does not exist"));
                     }
-                    let rec = serde_json::json!({"schema": schema, "version": pgcrypto::VERSION});
+                    let rec =
+                        serde_json::json!({"schema": schema, "version": pgcrypto::version(name).unwrap_or(pgcrypto::VERSION)});
                     Ok((vec![(pgcrypto::key(name), Some(rec.to_string()))], ()))
                 })?;
                 if let Some(m) = said {
@@ -41818,12 +42665,13 @@ impl Statement {
                     missing.clear();
                     let mut gone = vec![];
                     for n in names {
-                        let there = match n.as_str() {
-                            "pgcrypto" => v.get(&pgcrypto::key(n))?.is_some(),
-                            n => BUILT_IN_EXTENSIONS.contains(&n),
+                        let recorded = pgcrypto::version(n).is_some();
+                        let there = match recorded {
+                            true => v.get(&pgcrypto::key(n))?.is_some(),
+                            false => BUILT_IN_EXTENSIONS.contains(&n.as_str()),
                         };
                         match there {
-                            true if n == "pgcrypto" => gone.push((pgcrypto::key(n), None)),
+                            true if recorded => gone.push((pgcrypto::key(n), None)),
                             true => {}
                             false if *if_exists => missing.push(n.clone()),
                             false => return err("42704", format!("extension \"{n}\" does not exist")),
@@ -42073,6 +42921,7 @@ impl Statement {
                 columns,
                 picks,
                 dry,
+                rehearse,
                 into,
                 only_tables,
                 only_keys,
@@ -42103,7 +42952,10 @@ impl Statement {
                     settled_notice(&o, b, &into);
                     return Ok(Output::tag(format!("MERGE {n}")));
                 }
-                let plan = db.merge_preview(b, &o)?;
+                let plan = match rehearse {
+                    Some(stop) => db.merge_rehearsal(b, &o, *stop)?,
+                    None => db.merge_preview(b, &o)?,
+                };
                 notice(
                     "NOTICE",
                     format!(
@@ -42182,6 +43034,9 @@ impl Statement {
                 rows.extend(deletes_first.into_iter().map(|(_, r)| r));
                 if let Some(l) = &plan.live {
                     rows.push(line("postgres", live_summary(l)));
+                    if let Some(r) = &l.rehearsal {
+                        rows.extend(rehearsal_lines(r, &plan.rows).into_iter().map(|(o, d)| line(o, d)));
+                    }
                 }
                 if let Some(why) = plan.blocked {
                     rows.push(line("blocked", why));
@@ -42241,6 +43096,7 @@ impl Statement {
             }
             Stmt::UndoMerge { world, skip_changed } => {
                 let u = db.undo_merge(world, *skip_changed)?;
+                undone_notices(&u);
                 Ok(Output::tag(format!("UNDO MERGE {}", u.rows)))
             }
             Stmt::UndoDiff { from, to, except, skip_changed } => {
@@ -42254,6 +43110,7 @@ impl Statement {
             Stmt::UndoAgent { agent, since, skip_changed, run } => {
                 let w = db.world(branch)?.name;
                 let u = db.undo_run(agent, &w, when(since, params)?, *skip_changed, run.as_deref())?;
+                undone_notices(&u);
                 Ok(Output::tag(format!("UNDO AGENT {}", u.rows)))
             }
             Stmt::Restore { world, at, checkpoint } => {
@@ -42351,6 +43208,7 @@ impl Statement {
                             Value::Text(crate::agents::listed(&p.review_channels)),
                             limit(p.confirm_deletes_over),
                             p.reviewer.map_or(Value::Null, Value::Text),
+                            Value::Bool(p.rerun_reads),
                         ]
                     })
                     .collect();
@@ -42568,6 +43426,7 @@ impl Statement {
                                 0 => Value::Null,
                                 e => Value::TimestampTz(e as i64 * 1000),
                             },
+                            Value::Text(a.priority.name().into()),
                         ]
                     })
                     .collect();
@@ -43868,6 +44727,9 @@ struct SessState {
     /// the tables with foreign key checks the transaction put off, and the constraints: Postgres's
     /// pending trigger events (see `note_pending`)
     pending_events: Vec<(String, String)>,
+    /// unique keys the transaction let two rows hold until COMMIT (see `put_off_unique`): the table, the constraint,
+    /// the key's entry, and the rows that held it or took it since; checked against how things end up
+    deferred_uniques: Vec<DeferredUnique>,
     /// SET CONSTRAINTS, in order: a constraint's name (empty: ALL), and whether it defers
     fk_modes: Vec<(String, bool)>,
     /// constraint triggers the transaction put off until COMMIT, in order (see `defer_trigger`)
@@ -43897,6 +44759,10 @@ struct SessState {
     /// custom settings (`app.org_id`) this session has set: once made, one stays (empty, when it is
     /// reset or its transaction rolled back), as in Postgres
     placeholders: std::collections::HashSet<String>,
+    /// set_config()'s of the settings the session keeps itself (TimeZone, search_path, statement_timeout, role): name,
+    /// value (None: the default) and whether LOCAL, taken as SET takes them once the statement is done (see
+    /// `Session::step`)
+    own_set: Vec<(String, Option<String>, bool)>,
     /// the transaction's advisory locks, each with the savepoint depth it was taken at: a
     /// ROLLBACK TO lets go of those taken since, as Postgres does
     xact_locks: Vec<(advisory::Held, usize)>,
@@ -44248,6 +45114,25 @@ fn advisory_call(ctx: &Ctx, f: CtxFn, a: &[Value]) -> Result<Value> {
     }
 }
 
+/// The SET that set_config(`name`, `value`, `local`) of a setting the session keeps itself amounts to (see
+/// `Session::step`); None for one it doesn't set.
+fn own_setting_sql(name: &str, value: Option<&str>, local: bool) -> Option<String> {
+    if name == "role" {
+        let role = value.map_or_else(|| "NONE".to_string(), |v| format!("'{}'", v.replace('\'', "''")));
+        return Some(format!("SET {}ROLE {role}", if local { "LOCAL " } else { "" }));
+    }
+    let value = value.map_or_else(|| "DEFAULT".to_string(), |v| format!("'{}'", v.replace('\'', "''")));
+    Some(match (name, local) {
+        ("timezone", true) => format!("SET LOCAL TIME ZONE {value}"),
+        ("timezone", false) => format!("SET TIME ZONE {value}"),
+        ("search_path", false) => format!("SET search_path TO {value}"),
+        ("statement_timeout", false) => format!("SET statement_timeout TO {value}"),
+        // ponytail: no SET LOCAL of search_path or statement_timeout here, so set_config(..., true) of them sets
+        // nothing
+        _ => return None,
+    })
+}
+
 /// current_setting(name [, missing_ok]) and set_config(name, value, is_local) (see `setting`).
 /// A call of a function with SET clauses (other than search_path, which `with_own_path` gives it): its settings in
 /// force while it runs, as Postgres's fmgr_security_definer sets them at a new GUC nest level, and put back after.
@@ -44322,6 +45207,17 @@ fn setting_call(ctx: &Ctx, f: CtxFn, a: &[Value]) -> Result<Value> {
     }
     // (a null value is DEFAULT)
     let given = (a[1] != Value::Null).then(|| a[1].to_text());
+    // role: SET [LOCAL] ROLE once the statement is done, as PostgREST's `set_config('role', $1, true)` before each
+    // request expects (see `Session::step`); a role there isn't, or one the session user may not become, is refused
+    // now, as Postgres's check_role does, while the statement's writes can still be undone
+    if name == "role" {
+        let local = truth(&a[2])?.unwrap_or(false);
+        if let Some(r) = given.as_deref() {
+            roles::may_set_role(&ctx.core, &ctx.session_user, r)?;
+        }
+        ctx.state.lock().unwrap().own_set.push((name, given.clone(), local));
+        return Ok(Value::Text(given.unwrap_or_else(|| "none".into())));
+    }
     let checked = checked_setting(&name, given.as_deref())?;
     // (default_tablespace names a tablespace there is, as SET's does: see `tablespace::check_default`)
     if name == "default_tablespace"
@@ -44332,11 +45228,18 @@ fn setting_call(ctx: &Ctx, f: CtxFn, a: &[Value]) -> Result<Value> {
     let local = truth(&a[2])?.unwrap_or(false);
     let mut st = ctx.state.lock().unwrap();
     // kept as SET keeps them; SET LOCAL's outside a transaction last for the statement, so no
-    // longer than now. (search_path, statement_timeout and TimeZone are the session's own: a
-    // statement sets those, set_config() reads them back but leaves them.)
+    // longer than now. (search_path, statement_timeout and TimeZone are the session's own: the session takes them
+    // once the statement is done, as Django's `SELECT set_config('TimeZone', ..., false)` on connecting expects)
     let own = matches!(name.as_str(), "search_path" | "statement_timeout" | "timezone");
     if name.contains('.') {
         st.placeholders.insert(name.clone());
+    }
+    if own {
+        // (its value checked now, as its SET reads it, while an error still stops the statement's writes)
+        if let Some(set) = own_setting_sql(&name, checked.as_deref(), local) {
+            parse(&set)?;
+        }
+        st.own_set.push((name.clone(), checked.clone(), local));
     }
     if !own {
         // (outside a transaction block, LOCAL lasts to the end of the statement, which clears it; a setting SET
@@ -45065,7 +45968,13 @@ fn like_columns(
                 *key = cols;
             }
             for u in &src.uniques {
-                constraints.push(ConstraintDef::Unique { name: None, cols: names(&u.cols), nnd: u.nnd, space: None });
+                constraints.push(ConstraintDef::Unique {
+                    name: None,
+                    cols: names(&u.cols),
+                    nnd: u.nnd,
+                    space: None,
+                    defer: (u.deferrable, u.deferred),
+                });
             }
             indexes.extend(src.indexes.iter().map(|x| (src.clone(), x.clone())));
         }
@@ -48704,6 +49613,17 @@ impl Exec<'_> {
     /// CASCADE, the views reading them and the foreign keys referencing them go too; without,
     /// either stops the drop (2BP01).
     fn drop_relations(&self, kind: &'static str, names: &[String], if_exists: bool, cascade: bool) -> Result<Output> {
+        // (nor a DROP: see `alter`)
+        if let Some(n) = names.iter().find(|n| deferred_uniques_on(n)) {
+            return err(
+                "55006",
+                format!(
+                    "cannot DROP {} \"{}\" because it has pending trigger events",
+                    kind.to_uppercase(),
+                    rel_part(n)
+                ),
+            );
+        }
         let counters =
             self.db.batch_with(self.branch, |v| self.drop_relation_writes(v, kind, names, if_exists, cascade, None))?;
         for id in counters.1 {
@@ -49451,11 +50371,12 @@ impl Exec<'_> {
                 return Err(owned_sequence_moved(name, &table));
             }
             // ... which can be restarted (what ALTER SEQUENCE t_id_seq RESTART WITH n does); its other options are
-            // the column's type's, kept in no sequence of its own
+            // the column's type's, kept in no sequence of its own (AS the type it has is nothing to do: Django
+            // changes an AutoField's column to bigint, then its sequence AS bigint)
             if let Some(d) = sysinfo::implicit_sequence(&self.db.view_tx(self.branch)?, name)?
                 && d.owned.is_some()
             {
-                let others = opts.ty.is_some()
+                let others = opts.ty.is_some_and(|t| t != d.ty)
                     || opts.increment.is_some()
                     || opts.min.is_some()
                     || opts.max.is_some()
@@ -50031,6 +50952,8 @@ fn catalog_query(branch: &str, name: &str, cat: &catalog::Catalog) -> Select {
     let yes = |y: bool| t(if y { "YES" } else { "NO" });
     let null = Value::Null;
     let rels = |kinds: &'static str| info.iter().enumerate().filter(move |(_, r)| kinds.contains(r.kind));
+    // (a relation's owner, as pg_class's relowner has it: ALTER ... OWNER TO's role)
+    let owner_name = |r: &TableInfo| cat.reg.name_of(cat.rel_acl(r).0);
     let precision = |ty: Type| match ty {
         Type::SmallInt => int(16),
         Type::Int => int(32),
@@ -50477,7 +51400,7 @@ fn catalog_query(branch: &str, name: &str, cat: &catalog::Catalog) -> Select {
                     vec![
                         t(schema_part(&r.name)),
                         t(rel_part(&r.name)),
-                        t("chronos"),
+                        t(&owner_name(r)),
                         null.clone(),
                         b(!r.indexes.is_empty()),
                         b(false),
@@ -50495,7 +51418,7 @@ fn catalog_query(branch: &str, name: &str, cat: &catalog::Catalog) -> Select {
                     vec![
                         t(schema_part(&r.name)),
                         t(rel_part(&r.name)),
-                        t("chronos"),
+                        t(&owner_name(r)),
                         viewdef::shown(info, i, false, 0).map_or(Value::Null, Value::Text),
                     ]
                 })
@@ -50517,7 +51440,7 @@ fn catalog_query(branch: &str, name: &str, cat: &catalog::Catalog) -> Select {
                     vec![
                         t(schema_part(&r.name)),
                         t(rel_part(&r.name)),
-                        t("chronos"),
+                        t(&owner_name(r)),
                         null.clone(),
                         b(false),
                         b(r.populated),
@@ -50546,7 +51469,7 @@ fn catalog_query(branch: &str, name: &str, cat: &catalog::Catalog) -> Select {
                     vec![
                         t(schema_part(&r.name)),
                         t(rel_part(&r.name)),
-                        t("chronos"),
+                        t(&owner_name(r)),
                         // (a regtype: the type's oid)
                         Value::Reg(
                             match ty.as_str() {
@@ -50915,6 +51838,11 @@ struct Exec<'a> {
     working: std::cell::RefCell<HashMap<String, Arc<Vec<Vec<Value>>>>>,
     /// under EXPLAIN: how each table's rows were reached (see `access`)
     trace: std::cell::RefCell<Option<Vec<Traced>>>,
+    /// under EXPLAIN: which part of a UNION, INTERSECT or EXCEPT is being read, 0 outside one, so that a part run
+    /// again (a correlated subquery's, once per outer value) adds to its own reads' loops rather than making new ones
+    arm: std::cell::Cell<usize>,
+    /// each part's number for `arm`, by the enclosing part's and its place among its query's parts
+    arms: std::cell::RefCell<HashMap<(usize, usize), usize>>,
     /// a table's rows already found, in order, by an index read for ORDER BY ... LIMIT (see
     /// `ordered`): `access` hands them out for that table
     given: std::cell::RefCell<Option<(String, Rows)>>,
@@ -50974,6 +51902,8 @@ type Made<K, T> = std::cell::RefCell<HashMap<K, (Arc<functions::Function>, std::
 pub(super) struct Savepoint {
     rows: Option<(usize, crate::State)>,
     temp: Option<usize>,
+    /// how many index builds' writes it had made at once (see `Nest::undo`)
+    undo: usize,
 }
 
 /// What a statement shares with the functions and triggers it runs. While it writes, it holds
@@ -51009,6 +51939,9 @@ struct Nest {
     /// and what the changes do to its rows, left for it to do
     big: std::cell::RefCell<Option<String>>,
     redo: std::cell::RefCell<Option<rewrite::Redo>>,
+    /// what an index build a body ran wrote at once (see `long_write`): each key with its value before, so that a
+    /// block rolled back (`rollback_to`) or a statement that fails (`write`) puts the branch back as it was
+    undo: std::cell::RefCell<Vec<(String, Option<String>)>>,
 }
 
 impl<'a> Exec<'a> {
@@ -51048,6 +51981,11 @@ impl<'a> Exec<'a> {
         let (_, out) = self.db.batch_long(self.branch, usize::MAX, |v, _| {
             *self.nest.state.borrow_mut() = Some((v.born, v.s.clone()));
             let out = f(v);
+            // (what index builds it ran wrote at once goes with it if it fails, and is its own if it doesn't)
+            match out.is_err() {
+                true => self.undo_to(0),
+                false => self.nest.undo.borrow_mut().clear(),
+            }
             self.nest.state.take();
             self.nest.applied.set(0);
             let rows = std::mem::take(&mut *self.nest.pending.borrow_mut());
@@ -51194,19 +52132,58 @@ impl<'a> Exec<'a> {
         s.add(self.db, &start, std::mem::take(writes), std::mem::take(marks))
     }
 
-    /// `batch_long` for a change that needs the branch whole (an index built over a table's rows), returning what `f`
-    /// does. Inside a function, trigger or DO block of a statement that holds the branch already (its write, see
-    /// `write`), it can't take it again: the change is built from the branch as that statement sees it, and its rows
-    /// join the statement's (written with them, or not at all).
+    /// `batch_long` for a change that needs the branch whole (an index built over a table's rows, of `table`),
+    /// returning what `f` does. Inside a function, trigger or DO block of a statement that holds the branch already (its
+    /// write, see `write`), it can't take it again: where the body hasn't changed rows of `table` (one with no partitions
+    /// or children), the change is written at once, as the other DDL a body runs is (see `run_stmt`), so what the body
+    /// does next (a foreign key to the new UNIQUE constraint, a query of pg_constraint) sees it; else it is built from
+    /// the branch as that statement sees it, and its rows join the statement's (written with them, or not at all).
     #[allow(clippy::type_complexity)]
     fn long_write<T>(
         &self,
+        table: &str,
         every: usize,
         f: impl FnOnce(
             &View,
             &mut dyn FnMut(Vec<(String, Option<String>)>) -> crate::Result<()>,
         ) -> Result<(Vec<(String, Option<String>)>, T)>,
     ) -> Result<T> {
+        // (a partitioned table's or a parent's build makes its partitions' and children's too, from the view it's given:
+        // built from the statement's, as their rows may be among those it pushed)
+        // (and none of the table's own writes are still pending, its rows, its schema (a partition's, as an index on its
+        // parent spreads to it) or its index and key entries: written at once, this would be undone when they are; nor
+        // any table's schema, as a name an index pending there took is one this build's must not take)
+        let prefix = format!("{table}/");
+        let within = format!("/{table}/");
+        let schemas = format!("{SCHEMAS}/");
+        if self.nest.state.borrow().is_some()
+            && !self
+                .nest
+                .pending
+                .borrow()
+                .iter()
+                .any(|(k, _)| k.starts_with(&prefix) || k.starts_with(&schemas) || k.contains(&within))
+            && !load(&self.view()?, table)?.is_some_and(|t| t.hier.is_parent())
+        {
+            return self
+                .db
+                .batch_with::<T, SqlError>(self.branch, |v| {
+                    let mut parts = vec![];
+                    let (rows, out) = f(v, &mut |rows: Vec<(String, Option<String>)>| {
+                        parts.extend(rows);
+                        Ok::<(), crate::Error>(())
+                    })?;
+                    parts.extend(rows);
+                    // (what each key held, to put back if the block or statement is rolled back)
+                    let mut before = Vec::with_capacity(parts.len());
+                    for (k, _) in &parts {
+                        before.push((k.clone(), v.get(k)?.map(|x| x.to_string())));
+                    }
+                    self.nest.undo.borrow_mut().extend(before);
+                    Ok((parts, out))
+                })
+                .map(|(_, out)| out);
+        }
         if self.nest.state.borrow().is_some() {
             let v = self.view()?;
             let mut flush = |rows: Vec<(String, Option<String>)>| {
@@ -51317,13 +52294,14 @@ impl<'a> Exec<'a> {
             }
             _ => None,
         };
-        Ok(Savepoint { rows, temp })
+        Ok(Savepoint { rows, temp, undo: self.nest.undo.borrow().len() })
     }
 
     /// Takes back the rows pushed since `sp`, and what functions wrote to temporary tables since.
     /// Sequence numbers taken stay taken, as Postgres never takes back nextval (their counters are
     /// the database's, outside the write).
     fn rollback_to(&self, sp: Savepoint) {
+        self.undo_to(sp.undo);
         if let Some((n, s)) = sp.rows {
             self.nest.pending.borrow_mut().truncate(n);
             if let Some((_, st)) = self.nest.state.borrow_mut().as_mut() {
@@ -51334,6 +52312,18 @@ impl<'a> Exec<'a> {
         if let Some(n) = sp.temp {
             temp_unwind(n, false);
         }
+    }
+
+    /// Puts back what index builds wrote at once since `Nest::undo` had `n` entries, newest first, so each key ends as
+    /// it was before the first of them.
+    fn undo_to(&self, n: usize) {
+        let back: Vec<(String, Option<String>)> = self.nest.undo.borrow_mut().drain(n..).rev().collect();
+        if back.is_empty() {
+            return;
+        }
+        // (a key written twice: the older value is put back last, and stands)
+        // ponytail: an error putting them back can't be reported from here; the block's own error is
+        let _ = self.db.batch_with::<(), SqlError>(self.branch, |_| Ok((back, ())));
     }
 
     /// The block that began at `sp` ended without an error: what it wrote to temporary tables joins
@@ -51416,6 +52406,8 @@ impl<'a> Exec<'a> {
             subs: Default::default(),
             working: Default::default(),
             trace: Default::default(),
+            arm: Default::default(),
+            arms: Default::default(),
             given: Default::default(),
             plans: None,
             output: false,
@@ -52179,6 +53171,8 @@ struct Traced {
     loops: usize,
     /// looked up again with other values: once per row of the table it's joined to
     per_row: bool,
+    /// the part of a UNION, INTERSECT or EXCEPT that read it (see `Exec::arm`): each part's reads are its own
+    arm: usize,
 }
 
 /// A value as a SQL literal, for plans.
@@ -53933,7 +54927,8 @@ impl Exec<'_> {
     fn traced(&self, t: &Table, how: &str, cond: Vec<(String, &'static str, String)>, rows: Option<usize>) {
         let mut g = self.trace.borrow_mut();
         let Some(tr) = g.as_mut() else { return };
-        if let Some(x) = tr.iter_mut().find(|x| x.table == t.name && x.how == how) {
+        let arm = self.arm.get();
+        if let Some(x) = tr.iter_mut().find(|x| x.arm == arm && x.table == t.name && x.how == how) {
             let shape =
                 |c: &[(String, &'static str, String)]| c.iter().map(|(a, o, _)| (a.clone(), *o)).collect::<Vec<_>>();
             if shape(&x.cond) == shape(&cond) && x.cond != cond {
@@ -53947,8 +54942,8 @@ impl Exec<'_> {
             x.cond = cond;
             return;
         }
-        tr.retain(|x| x.table != t.name);
-        tr.push(Traced { table: t.name.clone(), how: how.into(), cond, rows, loops: 1, per_row: false });
+        tr.retain(|x| x.arm != arm || x.table != t.name);
+        tr.push(Traced { table: t.name.clone(), how: how.into(), cond, rows, loops: 1, per_row: false, arm });
     }
 
     /// The rows a B-tree index finds for `bounds`: through the index whose leading columns they
@@ -56318,7 +57313,20 @@ impl Exec<'_> {
             };
             out.rows.into_iter().map(|r| r.into_iter().zip(&columns).enumerate().map(fit).collect()).collect()
         };
-        let mut rows = fit(self.select_one(&first)?)?;
+        // (each part read as its own arm under EXPLAIN, see `arm`)
+        let outer = self.arm.get();
+        let in_arm = |i: usize, f: &mut dyn FnMut() -> Result<Output>| {
+            let id = {
+                let mut arms = self.arms.borrow_mut();
+                let next = arms.len() + 1;
+                *arms.entry((outer, i)).or_insert(next)
+            };
+            self.arm.set(id);
+            let out = f();
+            self.arm.set(outer);
+            out
+        };
+        let mut rows = fit(in_arm(0, &mut || self.select_one(&first))?)?;
         // (a column of text in a nondeterministic collation is told apart by the key its strings are equal by)
         let nd: Vec<Option<collation::Coll>> =
             colls.iter().map(|s| Some(s.coll()).filter(|c| c.nondeterministic())).collect();
@@ -56332,8 +57340,8 @@ impl Exec<'_> {
                 })
                 .collect::<Vec<_>>()
         };
-        for (op, all, part) in &s.set {
-            let other = fit(self.select(part)?)?;
+        for (i, (op, all, part)) in s.set.iter().enumerate() {
+            let other = fit(in_arm(i + 1, &mut || self.select(part))?)?;
             rows = match op {
                 SetOp::Union => {
                     rows.extend(other);
@@ -57003,6 +58011,7 @@ impl Exec<'_> {
             matview: None,
             by_columns: false,
             unlogged: false,
+            ri_off: vec![],
             hier: Default::default(),
             dropped: vec![],
         };
@@ -57199,7 +58208,7 @@ impl Exec<'_> {
                     None => new_pkey_name(v, &t)?.unwrap_or_else(|| format!("{}_pkey", rel_part(&t.name))),
                 };
                 let cols = at.iter().map(|&i| t.cols[i].id).collect();
-                t.uniques.push(Unique { name, cols, nnd: false, primary: true });
+                t.uniques.push(Unique { name, cols, nnd: false, primary: true, deferrable: false, deferred: false });
             }
             // where the key's index is kept: USING INDEX TABLESPACE's, else default_tablespace's; a partition's copy
             // of its parent's key is where that one is, as Postgres's generateClonedIndexStmt names it
@@ -57351,6 +58360,14 @@ impl Exec<'_> {
     }
 
     fn alter(&self, table: &str, changes: &[Alter], only: bool) -> Result<Output> {
+        // (the unique checks the transaction put off name the table and its constraints, and read its rows as they
+        // are: no ALTER while they are out, as Postgres's CheckTableNotInUse has it)
+        if deferred_uniques_on(table) {
+            return err(
+                "55006",
+                format!("cannot ALTER TABLE \"{}\" because it has pending trigger events", rel_part(table)),
+            );
+        }
         // SET ACCESS METHOD: checked first, as ATPrepCmd checks it before anything changes (tablecmds.c:4866), and
         // recorded after the statement's other changes: the table's own, not its partitions' or children's
         if changes.iter().any(|c| matches!(c, Alter::SetAccessMethod(_))) {
@@ -57417,7 +58434,7 @@ impl Exec<'_> {
             && !in_tree
         {
             // only the new constraint's rows: built like CREATE UNIQUE INDEX's
-            self.long_write(spill::work_mem(), |v, flush| {
+            self.long_write(table, spill::work_mem(), |v, flush| {
                 let mut t = need_table(v, table)?;
                 if !t.schema {
                     return err(
@@ -59314,9 +60331,6 @@ impl Exec<'_> {
                             ),
                         );
                     }
-                    if t.in_key(i) {
-                        return err("2BP01", format!("column \"{c}\" is in the primary key and can't be dropped"));
-                    }
                     let depend = |detail: Vec<String>| SqlError {
                         code: "2BP01",
                         message: format!(
@@ -59338,6 +60352,37 @@ impl Exec<'_> {
                     // (with CASCADE, Postgres drops the generated column too: not done here, refused as without it)
                     if let Some(g) = generated_reader(&t, c) {
                         return Err(depend(vec![format!("column {g} of table {}", rel_part(table))]));
+                    }
+                    // a primary key column takes the key with it, as the index Postgres keeps the key by depends on
+                    // the column: the foreign keys that reference the key go too with CASCADE (with the others it
+                    // takes, below), else 2BP01 (its rows stay under the keys they have, as when the key is dropped)
+                    let mut key_fks: Vec<(String, String)> = vec![];
+                    if t.in_key(i) {
+                        // (the table's own that the column is in go with it: they hold nothing back)
+                        let gone = t.cols[i].id;
+                        let fks: Vec<(String, String)> = schemas(v)?
+                            .into_iter()
+                            .filter(|o| o.name != t.name)
+                            .chain([t.clone()])
+                            .flat_map(|o| {
+                                o.fks
+                                    .iter()
+                                    .filter(|f| f.table == t.name && f.refs.is_empty())
+                                    .filter(|f| !(o.name == t.name && f.cols.contains(&gone)))
+                                    .map(|f| (o.name.clone(), f.name.clone()))
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect();
+                        if !fks.is_empty() && !*cascade {
+                            return Err(depend(
+                                fks.iter().map(|(o, f)| format!("constraint {f} on table {}", rel_part(o))).collect(),
+                            ));
+                        }
+                        key_fks = fks;
+                        (t.key, t.pk, t.pkey) = (None, vec![], None);
+                        for c in &mut t.cols {
+                            c.pk = false;
+                        }
                     }
                     // the triggers that depend on it, by UPDATE OF or by WHEN reading NEW.c or OLD.c; the views and
                     // materialized views whose queries read it (a `*` reads it), and the functions whose SQL-standard
@@ -59410,7 +60455,13 @@ impl Exec<'_> {
                     let included_uniques: Vec<Unique> =
                         t.uniques.iter().filter(|u| included.contains(&u.name)).cloned().collect();
                     if *cascade {
-                        let mut fks = referencing_fks(v, &t, None, t.cols[i].id)?;
+                        // (one drop of them all: each table's schema written once)
+                        let mut fks = key_fks;
+                        for f in referencing_fks(v, &t, None, t.cols[i].id)? {
+                            if !fks.contains(&f) {
+                                fks.push(f);
+                            }
+                        }
                         for u in &included_uniques {
                             for f in referencing_fks(v, &t, Some(u), 0)? {
                                 if !fks.contains(&f) {
@@ -59865,7 +60916,14 @@ impl Exec<'_> {
                             None => tablespace::place(v, space.as_deref(), 0, t.hier.part.is_some(), true)?,
                         };
                         t.hier.set_index_space(&name, space);
-                        t.uniques.push(Unique { name, cols: ids, nnd: false, primary: true });
+                        t.uniques.push(Unique {
+                            name,
+                            cols: ids,
+                            nnd: false,
+                            primary: true,
+                            deferrable: false,
+                            deferred: false,
+                        });
                         continue;
                     }
                     t.pkey = match named {
@@ -60595,14 +61653,43 @@ impl Exec<'_> {
                     }
                     t.cols[i].not_null = *on;
                 }
-                Alter::Trigger(name, mode) => {
+                Alter::Trigger(name, mode, all) => {
+                    // (ALL takes in the foreign keys' triggers, which are the system's: a superuser's to turn off, those
+                    // of the table's own foreign keys and those of the ones that reference it)
+                    if *all {
+                        // its own foreign keys, and those referencing it or the tables it is a partition of
+                        let mut off: Vec<String> = t.fks.iter().map(|f| f.name.clone()).collect();
+                        let mut above = vec![t.name.clone()];
+                        let mut up = t.hier.of.as_ref().map(|(p, ..)| p.clone());
+                        while let Some(p) = up {
+                            up = load(v, &p)?.and_then(|x| x.hier.of.map(|(q, ..)| q));
+                            above.push(p);
+                        }
+                        for o in schemas(v)? {
+                            for f in o.fks.iter().filter(|f| above.contains(&f.table)) {
+                                off.push(format!("{}/{}", o.name, f.name));
+                            }
+                        }
+                        if roles::checked().is_some() && !off.is_empty() {
+                            return err(
+                                "42501",
+                                format!(
+                                    "permission denied: the foreign key triggers of \"{}\" are system triggers",
+                                    rel_part(table)
+                                ),
+                            );
+                        }
+                        t.ri_off = if matches!(mode, 'O' | 'A') { vec![] } else { off };
+                    }
+                    // (the foreign keys' alone, a partition's copies: its own triggers stay as they are)
+                    let copies = *all && name.is_some();
                     let mut found = false;
-                    for x in t.triggers.iter_mut().filter(|x| name.as_ref().is_none_or(|n| x.name == *n)) {
+                    for x in t.triggers.iter_mut().filter(|x| !copies && name.as_ref().is_none_or(|n| x.name == *n)) {
                         x.mode = *mode;
                         x.enabled = matches!(mode, 'O' | 'A');
                         found = true;
                     }
-                    if let (Some(n), false) = (name, found) {
+                    if let (Some(n), false, false) = (name, found, copies) {
                         return err("42704", format!("trigger \"{n}\" for table \"{table}\" does not exist"));
                     }
                 }
@@ -61186,6 +62273,7 @@ impl Exec<'_> {
                     ctx: None,
                     mem: cap(),
                     threads: 0,
+                    low: false,
                 });
                 (false, (None, None))
             }
@@ -61724,7 +62812,7 @@ impl Exec<'_> {
         (options, space): (&[String], Option<&str>),
         said: &IndexSaid,
     ) -> Result<Output> {
-        self.long_write(spill::work_mem(), |v, flush| {
+        self.long_write(table, spill::work_mem(), |v, flush| {
             let mut t = need_table(v, table)?;
             // (a foreign table has no indexes, and a unique index can't be on partitions that are ones)
             foreign::no_index(&t)?;
@@ -62083,7 +63171,7 @@ impl Exec<'_> {
             let was = tablespace::Gens::load(v, table)?;
             let mut gens = was.clone();
             gens.forget(&name);
-            let u = unique.then_some(Unique { name, cols: ids, nnd, primary: false });
+            let u = unique.then_some(Unique { name, cols: ids, nnd, primary: false, deferrable: false, deferred: false });
             t.uniques.extend(u.clone());
             // the entries first, a part at a time, then the schema that makes them the index's
             let mut writes = build_index(v, &t, Some(&ix), u.as_ref(), flush)?;
@@ -64724,7 +65812,7 @@ impl<'a> Binder<'a> {
                 | ArrayPositions | ArrayRemove | ArrayReplace | ArrayFill | Grouping | ArrayNest,
             ) => 0,
             // (a function of an oid)
-            Func::Scalar(TablespaceLocation | StatReset) => 0,
+            Func::Scalar(TablespaceLocation | StatReset | InfoTypeFn(_)) => 0,
             Func::Scalar(ConcatWs | Format) => 1,
             Func::Lower
             | Func::Upper
@@ -67684,11 +68772,11 @@ impl<'a> Binder<'a> {
                 (Some(from @ (Type::Float | Type::Numeric | Type::Bool | Type::Json)), Type::Oid) => {
                     return err("42846", format!("cannot cast type {} to oid", from.pg_name()));
                 }
-                // a reg array casts only to text, an array of text, oids or integers, or the array of the reg type it
-                // pairs with
+                // a reg array casts only to text, an array of text, oids or integers, an oidvector, or the array of
+                // the reg type it pairs with
                 (Some(from), to)
                     if from.reg_array().is_some_and(|f| {
-                        !(matches!(to, Type::Text | Type::Array(25 | 26 | 20 | 23))
+                        !(matches!(to, Type::Text | Type::Array(25 | 26 | 20 | 23 | 30))
                             || to.reg_array().is_some_and(|r| f.casts_to(r)))
                     }) =>
                 {
@@ -71484,7 +72572,7 @@ fn fit_chars(x: &str, n: u32, fixed: bool) -> Result<String> {
 fn check_generated(t: &Table) -> Result<()> {
     for c in t.cols.iter().filter(|c| c.generated.is_some()) {
         let text = c.generated.as_deref().unwrap_or_default();
-        let e = check_expr(text)?;
+        let e = generated_expr(t, text)?;
         let mut sub = false;
         walk(&e, &mut |x| sub |= matches!(x, Expr::Sub(_) | Expr::Exists(..) | Expr::InSub(..)));
         if sub {
@@ -71544,6 +72632,20 @@ fn check_generated(t: &Table) -> Result<()> {
     Ok(())
 }
 
+/// A generated column's expression of `t`, its columns as the table's own: a column named with the table's name
+/// before it (`users.email_confirmed_at` in `auth.users`, as GoTrue's migrations write it) is the column, as Postgres
+/// reads it in a generation expression.
+fn generated_expr(t: &Table, text: &str) -> Result<Expr> {
+    let e = check_expr(text)?;
+    let own = |q: &str| q == t.name || q == rel_part(&t.name);
+    let e = rewrite(&e, &|x| match x {
+        Expr::Col(Some(q), n) if own(q) && t.cols.iter().any(|c| c.name == *n) => Some(Expr::Col(None, n.clone())),
+        _ => None,
+    });
+    // and the SQL functions it calls put in place (an IMMUTABLE one's body is what makes it immutable or not)
+    with_calls_inlined(e, schema_part(&t.name))
+}
+
 /// The generated column of `t` whose expression reads column `name`, if any.
 fn generated_reader(t: &Table, name: &str) -> Option<String> {
     t.cols.iter().find_map(|g| {
@@ -71562,7 +72664,7 @@ fn generate(t: &Table, vals: &mut [Value]) -> Result<()> {
     let mut made = vec![];
     for (i, c) in t.cols.iter().enumerate() {
         let Some(text) = &c.generated else { continue };
-        let e = Binder::plain(&t.cols, None).bind(&check_expr(text)?)?;
+        let e = Binder::plain(&t.cols, None).bind(&generated_expr(t, text)?)?;
         let v = eval(&e, &Env { cols: &t.cols, row: vals, params: &[], aggs: &[], sub: None })?;
         made.push((i, coerce(v, c.ty)?));
     }
@@ -72074,7 +73176,7 @@ mod tests {
         use std::sync::{Arc, atomic::AtomicBool};
         let on = |threads: usize| {
             let cancel = Arc::new(AtomicBool::new(false));
-            STOP.set(Some(Stop { deadline: None, cancel, gone: None, ctx: None, mem: None, threads }));
+            STOP.set(Some(Stop { deadline: None, cancel, gone: None, ctx: None, mem: None, threads, low: false }));
             let ids = par_run(32, |_, _| {
                 std::thread::sleep(std::time::Duration::from_millis(2));
                 Ok(std::thread::current().id())
@@ -72085,6 +73187,55 @@ mod tests {
         };
         assert_eq!(on(1), 1, "one thread: the statement's own");
         assert!(on(2) <= 2);
+    }
+
+    /// A low-priority agent's statement yields to the database's own users (issue #43): while one of their statements
+    /// runs, its parallel parts borrow no helpers and each check it passes sleeps for three times what it ran; a
+    /// normal statement does neither.
+    #[test]
+    fn a_low_priority_statement_yields_while_the_databases_users_run() {
+        use super::{Busy, RAN_FROM, STOP, Stop, YIELDED, par_run, stopped};
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::time::{Duration, Instant};
+        let set = |low: bool| {
+            let cancel = Arc::new(AtomicBool::new(false));
+            STOP.set(Some(Stop { deadline: None, cancel, gone: None, ctx: None, mem: None, threads: 0, low }));
+            RAN_FROM.set(None);
+        };
+        let threads = || {
+            let ids = par_run(32, |_, _| {
+                std::thread::sleep(Duration::from_millis(2));
+                Ok(std::thread::current().id())
+            })
+            .unwrap();
+            ids.into_iter().collect::<std::collections::HashSet<_>>().len()
+        };
+        // runs ~5 ms, then passes a check: how long the check took
+        let work_then_check = || {
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_millis(5) {
+                std::hint::spin_loop();
+            }
+            let t = Instant::now();
+            stopped().unwrap();
+            t.elapsed()
+        };
+        let busy = Busy::new(); // a statement of the database's own users, running
+        set(true);
+        assert_eq!(threads(), 1, "no helpers while they run");
+        stopped().unwrap(); // (its first check: nothing ran before it)
+        let before = YIELDED.get();
+        let slept = work_then_check();
+        assert_eq!(YIELDED.get(), before + 1);
+        assert!(slept >= Duration::from_millis(14), "three times the 5 ms it ran: {slept:?}");
+        assert!(slept < Duration::from_millis(500), "at most YIELD_MOST: {slept:?}");
+        // a normal statement doesn't yield
+        set(false);
+        stopped().unwrap();
+        work_then_check();
+        assert_eq!(YIELDED.get(), before + 1);
+        drop(busy);
+        STOP.set(None);
     }
 
     #[test]
@@ -72123,7 +73274,15 @@ mod tests {
         use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
         LINGER.store(300, Ordering::Relaxed); // helpers slow to get back to the pool
         let cancel = Arc::new(AtomicBool::new(false));
-        STOP.set(Some(Stop { deadline: None, cancel: cancel.clone(), gone: None, ctx: None, mem: None, threads: 0 }));
+        STOP.set(Some(Stop {
+            deadline: None,
+            cancel: cancel.clone(),
+            gone: None,
+            ctx: None,
+            mem: None,
+            threads: 0,
+            low: false,
+        }));
         let out = par_run(64, |i, _| {
             std::thread::sleep(std::time::Duration::from_millis(1));
             Ok(i)

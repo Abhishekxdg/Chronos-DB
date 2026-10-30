@@ -587,6 +587,8 @@ fn row_level_security_never_hides_rows_in_silence() {
     assert_eq!(cell(&db, "select count(*) from private_items"), "0", "none, rather than the policy's");
     assert_eq!(cell(&db, "select count(*) from tagged where tag = 'mixed'"), "1", "citext compares as citext");
     assert_eq!(cell(&db, "select count(*) from items"), "2");
+    // the extensions are made here, so pg_extension lists them
+    assert_eq!(cell(&db, "select count(*) from pg_extension where extname in ('pgcrypto', 'citext')"), "2");
     assert_eq!(cell(&db, "select encode(digest('a', 'sha1'), 'hex')"), "86f7e437faa5a7fce15d1ddcb9eaeaea377667b8");
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();

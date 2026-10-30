@@ -316,3 +316,39 @@ select ord, line, note from ol;
     let _ = server.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The empty text is a key as any other, as in Postgres (Rails' migrations write `schema_migrations` version ''):
+/// it's found, ordered first, referenced, changed, conflicted on and kept across reopening.
+#[test]
+fn the_empty_text_is_a_key() {
+    let dir = temp("empty");
+    let db = Db::open(&dir).unwrap();
+    let s = &mut Session::new(chronos::MAIN);
+    s.run(
+        &db,
+        "CREATE TABLE schema_migrations (version varchar PRIMARY KEY);
+         INSERT INTO schema_migrations (version) VALUES ('') RETURNING version;
+         INSERT INTO schema_migrations VALUES ('1'), ('a');
+         CREATE TABLE refs (id int4 PRIMARY KEY, v varchar REFERENCES schema_migrations);
+         INSERT INTO refs VALUES (1, '')",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(rows(&db, s, "SELECT version = '' FROM schema_migrations ORDER BY version"), ["true", "false", "false"]);
+    assert_eq!(rows(&db, s, "SELECT count(*) FROM schema_migrations WHERE version = ''"), ["1"]);
+    assert_eq!(fails(&db, s, "INSERT INTO schema_migrations VALUES ('')").code, "23505");
+    assert_eq!(fails(&db, s, "DELETE FROM schema_migrations WHERE version = ''").code, "23503");
+    s.run(&db, "INSERT INTO schema_migrations VALUES ('') ON CONFLICT DO NOTHING; DELETE FROM refs", &[]).unwrap();
+    s.run(&db, "UPDATE schema_migrations SET version = 'b' WHERE version = ''", &[]).unwrap();
+    s.run(&db, "UPDATE schema_migrations SET version = '' WHERE version = 'a'", &[]).unwrap();
+    db.close().unwrap();
+    drop(db);
+    let db = Db::open(&dir).unwrap();
+    let s = &mut Session::new(chronos::MAIN);
+    assert_eq!(
+        rows(&db, s, "SELECT '[' || version || ']' FROM schema_migrations ORDER BY version"),
+        ["[]", "[1]", "[b]"]
+    );
+    db.close().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

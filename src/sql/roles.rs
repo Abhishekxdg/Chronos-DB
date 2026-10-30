@@ -158,6 +158,11 @@ pub(crate) struct Registry {
     pub members: Vec<Member>,
     /// the next oid to give
     next: i64,
+    /// ALTER ROLE ... SET's settings of the bootstrap superuser, which isn't one of `roles`: `name=value`
+    boot_config: Vec<String>,
+    /// ALTER DATABASE ... SET's settings, by the id of the world the database is (so a database dropped and made
+    /// again has none): `name=value`
+    pub db_config: Vec<(String, Vec<String>)>,
 }
 
 /// How far `reached` follows memberships.
@@ -191,7 +196,18 @@ impl Registry {
                 })
             })
             .collect();
-        Registry { roles, members, next: j["next"].as_i64().unwrap_or(FIRST_OID) }
+        let texts = |j: &Json| -> Vec<String> {
+            j.as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from)).collect()
+        };
+        let db_config =
+            j["db_config"].as_object().into_iter().flatten().map(|(world, c)| (world.clone(), texts(c))).collect();
+        Registry {
+            roles,
+            members,
+            next: j["next"].as_i64().unwrap_or(FIRST_OID),
+            boot_config: texts(&j["boot_config"]),
+            db_config,
+        }
     }
 
     fn to_json(&self) -> String {
@@ -203,10 +219,14 @@ impl Registry {
                     "admin": m.admin, "inherit": m.inherit, "set": m.set})
             })
             .collect();
+        let db_config: serde_json::Map<String, Json> =
+            self.db_config.iter().map(|(w, c)| (w.clone(), Json::from(c.clone()))).collect();
         serde_json::json!({
             "next": self.next,
             "roles": self.roles.iter().map(Role::to_json).collect::<Vec<_>>(),
             "members": members,
+            "boot_config": self.boot_config,
+            "db_config": db_config,
         })
         .to_string()
     }
@@ -217,9 +237,19 @@ impl Registry {
         self.next - 1
     }
 
+    /// The bootstrap superuser, with the settings ALTER ROLE ... SET gave it.
+    fn boot(&self) -> Role {
+        Role { config: self.boot_config.clone(), ..Role::bootstrap() }
+    }
+
+    /// The settings ALTER DATABASE ... SET gave the database that is the world of id `world`.
+    pub(crate) fn db_settings(&self, world: &str) -> Vec<String> {
+        self.db_config.iter().find(|(w, _)| w == world).map(|(_, c)| c.clone()).unwrap_or_default()
+    }
+
     /// The built-in roles, then the ones made here.
     pub(crate) fn all(&self) -> Vec<Role> {
-        let mut out = vec![Role::bootstrap()];
+        let mut out = vec![self.boot()];
         out.extend(PREDEFINED.iter().map(|(o, n)| Role::new(*o, n)));
         out.extend(self.roles.iter().cloned());
         out
@@ -227,7 +257,7 @@ impl Registry {
 
     pub(crate) fn named(&self, name: &str) -> Option<Role> {
         if name == "chronos" {
-            return Some(Role::bootstrap());
+            return Some(self.boot());
         }
         if let Some((o, n)) = PREDEFINED.iter().find(|(_, n)| *n == name) {
             return Some(Role::new(*o, n));
@@ -237,7 +267,7 @@ impl Registry {
 
     pub(crate) fn by_oid(&self, oid: i64) -> Option<Role> {
         if oid == BOOTSTRAP {
-            return Some(Role::bootstrap());
+            return Some(self.boot());
         }
         if let Some((o, n)) = PREDEFINED.iter().find(|(o, _)| *o == oid) {
             return Some(Role::new(*o, n));
@@ -679,6 +709,11 @@ pub(crate) enum RoleStmt {
         name: Spec,
         setting: Option<(String, Option<String>)>,
     },
+    /// ALTER DATABASE name SET x = v | RESET x | RESET ALL (`setting`: None for RESET ALL)
+    DbConfig {
+        name: String,
+        setting: Option<(String, Option<String>)>,
+    },
     Drop {
         names: Vec<String>,
         if_exists: bool,
@@ -900,7 +935,7 @@ impl Parser {
     }
 
     /// `SET name {= | TO} value | FROM CURRENT`, `RESET name`, `RESET ALL`: (name, value), None for RESET ALL.
-    fn role_setting(&mut self) -> Result<Option<(String, Option<String>)>> {
+    pub(super) fn role_setting(&mut self) -> Result<Option<(String, Option<String>)>> {
         if self.kw("reset") {
             if self.kw("all") {
                 return Ok(None);
@@ -1103,6 +1138,7 @@ pub(super) fn run(db: &Db, st: &RoleStmt) -> Result<Output> {
         RoleStmt::Alter { name, opts } => alter(db, &who, name, opts),
         RoleStmt::Rename { name, to } => rename(db, &who, name, to),
         RoleStmt::Config { name, setting } => config(db, &who, name, setting),
+        RoleStmt::DbConfig { name, setting } => db_config(db, &who, name, setting),
         RoleStmt::Drop { names, if_exists } => drop_roles(db, &who, names, *if_exists),
         RoleStmt::AlterGroup { group, members, add } => {
             // (ADMIN OPTION on the group first, as Postgres's AlterRole asks it)
@@ -1402,11 +1438,29 @@ fn config(db: &Db, who: &Who, name: &Spec, setting: &Option<(String, Option<Stri
             ),
         ));
     }
-    if r.oid < FIRST_OID {
+    // (the bootstrap superuser's are kept beside the roles; a predefined role has none)
+    if r.oid < FIRST_OID && r.oid != BOOTSTRAP {
         return err(UNSUPPORTED, format!("the settings of role \"{}\" can't be changed here", r.name));
     }
-    // the value as SET would take it, kept as Postgres writes it: `name=value`
-    let entry = match setting {
+    let entry = config_entry(setting)?;
+    change(db, |reg| {
+        let config = match r.oid {
+            BOOTSTRAP => &mut reg.boot_config,
+            oid => match reg.roles.iter_mut().find(|x| x.oid == oid) {
+                Some(x) => &mut x.config,
+                None => return Err(missing(&r.name)),
+            },
+        };
+        set_config_entry(config, &entry);
+        Ok(())
+    })?;
+    tag("ALTER ROLE")
+}
+
+/// ALTER ROLE's or ALTER DATABASE's SET x = v (the value as SET would take it, kept as Postgres writes it:
+/// `name=value`), RESET x (None) or RESET ALL (None): the setting's name and its entry.
+fn config_entry(setting: &Option<(String, Option<String>)>) -> Result<Option<(String, Option<String>)>> {
+    Ok(match setting {
         Some((n, Some(v))) => {
             let checked = checked_setting(n, Some(v))?;
             let shown = settings::find(n).map_or_else(|| n.to_lowercase(), |d| d.name.to_string());
@@ -1414,27 +1468,52 @@ fn config(db: &Db, who: &Who, name: &Spec, setting: &Option<(String, Option<Stri
         }
         Some((n, None)) => Some((settings::find(n).map_or_else(|| n.to_lowercase(), |d| d.name.to_string()), None)),
         None => None,
+    })
+}
+
+/// `config` with `entry` (see `config_entry`) made, replaced or removed.
+fn set_config_entry(config: &mut Vec<String>, entry: &Option<(String, Option<String>)>) {
+    let Some((n, v)) = entry else {
+        config.clear();
+        return;
     };
+    let at = config.iter().position(|c| c.split_once('=').is_some_and(|(k, _)| k.eq_ignore_ascii_case(n)));
+    match (at, v) {
+        (Some(i), Some(v)) => config[i] = v.clone(),
+        (None, Some(v)) => config.push(v.clone()),
+        (Some(i), None) => {
+            config.remove(i);
+        }
+        (None, None) => {}
+    }
+}
+
+/// ALTER DATABASE name SET x = v | RESET x | RESET ALL: settings every session connecting to the database takes, before
+/// its role's (Postgres's pg_db_role_setting rows for no role). By its owner, which is the bootstrap superuser here, so
+/// by a superuser.
+fn db_config(db: &Db, who: &Who, name: &str, setting: &Option<(String, Option<String>)>) -> Result<Output> {
+    let Some(world) = super::database::world_of(db, name).and_then(|w| db.world(&w).ok()).map(|w| w.id) else {
+        return err("3D000", format!("database \"{name}\" does not exist"));
+    };
+    if !who.reg.has_privs_of(who.oid, BOOTSTRAP) {
+        return err("42501", format!("must be owner of database {name}"));
+    }
+    let entry = config_entry(setting)?;
     change(db, |reg| {
-        let Some(x) = reg.roles.iter_mut().find(|x| x.oid == r.oid) else { return Err(missing(&r.name)) };
-        match &entry {
-            None => x.config.clear(),
-            Some((n, v)) => {
-                let at =
-                    x.config.iter().position(|c| c.split_once('=').is_some_and(|(k, _)| k.eq_ignore_ascii_case(n)));
-                match (at, v) {
-                    (Some(i), Some(v)) => x.config[i] = v.clone(),
-                    (None, Some(v)) => x.config.push(v.clone()),
-                    (Some(i), None) => {
-                        x.config.remove(i);
-                    }
-                    (None, None) => {}
-                }
+        let at = match reg.db_config.iter().position(|(w, _)| *w == world) {
+            Some(i) => i,
+            None => {
+                reg.db_config.push((world.clone(), vec![]));
+                reg.db_config.len() - 1
             }
+        };
+        set_config_entry(&mut reg.db_config[at].1, &entry);
+        if reg.db_config[at].1.is_empty() {
+            reg.db_config.remove(at);
         }
         Ok(())
     })?;
-    tag("ALTER ROLE")
+    tag("ALTER DATABASE")
 }
 
 fn drop_roles(db: &Db, who: &Who, names: &[String], if_exists: bool) -> Result<Output> {
@@ -1803,6 +1882,26 @@ pub(crate) fn set_role(
     Ok(Some(r.oid))
 }
 
+/// Whether session user `session_user` may SET ROLE `name` (`none` always), as `set_role` checks it: for
+/// set_config('role', ...), which runs its SET ROLE once the statement is done, to refuse it while the statement's
+/// writes can still be undone. A login that is no role is a superuser; an agent's is its role's, if it has one.
+pub(crate) fn may_set_role(core: &crate::Core, session_user: &str, name: &str) -> Result<()> {
+    // (exactly `none`, as Postgres's check_role and SET ROLE's parser have it: `NONE` is a role's name)
+    if name == "none" {
+        return Ok(());
+    }
+    let reg = registry(core)?;
+    let r = set_target(&reg, name)?;
+    let may = match reg.named(session_user) {
+        Some(s) => s.superuser || reg.can_set(s.oid, r.oid),
+        None => !super::acl::agents(),
+    };
+    if !may {
+        return err("42501", format!("permission denied to set role \"{name}\""));
+    }
+    Ok(())
+}
+
 /// What SET SESSION AUTHORIZATION `name` makes the session user (None: the login's).
 pub(crate) fn set_auth(core: &crate::Core, ident: &Ident, name: Option<&str>) -> Result<Option<i64>> {
     let Some(name) = name else { return Ok(None) };
@@ -1899,6 +1998,22 @@ pub(crate) fn role_rows(reg: &Registry, login: Option<&str>, authid: bool) -> Ve
             ]
         })
         .collect()
+}
+
+/// pg_db_role_setting's rows: each database's ALTER DATABASE ... SET settings, by its oid as pg_database numbers the
+/// worlds (`worlds`: their ids, in that order; a dropped one's are left out), then each role's ALTER ROLE ... SET
+/// settings, in every database.
+pub(crate) fn db_role_setting_rows(reg: &Registry, worlds: &[String]) -> Vec<Vec<Value>> {
+    let dbs = reg.db_config.iter().filter_map(|(w, c)| {
+        let k = worlds.iter().position(|x| x == w)?;
+        Some(vec![Value::Int(16384 + k as i64), Value::Int(0), config_value(c)])
+    });
+    let roles = reg
+        .all()
+        .into_iter()
+        .filter(|r| !r.config.is_empty())
+        .map(|r| vec![Value::Int(0), Value::Int(r.oid), config_value(&r.config)]);
+    dbs.chain(roles).collect()
 }
 
 /// A role's settings as Postgres's text[] shows them.

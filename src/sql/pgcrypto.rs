@@ -22,6 +22,42 @@ pub(super) const VERSION: &str = "1.3";
 /// pgcrypto's oid in pg_extension (one of Chronos's own, below the oids of a world's objects).
 pub(super) const EXTENSION_OID: i64 = 16310;
 
+/// The extensions CREATE EXTENSION records, with the version each installs (Postgres 16's contrib modules', and
+/// pgvector's and PostGIS's): their functions, types and operators are built in, but pg_extension lists one only once
+/// it is made, as Postgres's does (Rails' `extensions`, Django's `CreateExtension` and schema dumps read it).
+const RECORDED: [(&str, &str); 16] = [
+    ("pgcrypto", VERSION),
+    ("hstore", "1.8"),
+    ("citext", "1.6"),
+    ("ltree", "1.2"),
+    ("pg_trgm", "1.6"),
+    ("fuzzystrmatch", "1.2"),
+    ("unaccent", "1.1"),
+    ("btree_gin", "1.3"),
+    ("btree_gist", "1.7"),
+    ("uuid-ossp", "1.1"),
+    ("intarray", "1.5"),
+    ("tablefunc", "1.0"),
+    ("pg_stat_statements", "1.10"),
+    ("vector", "0.8.0"),
+    ("postgis", "3.5.2"),
+    ("bloom", "1.0"),
+];
+
+/// The version CREATE EXTENSION `name` installs; None for one it doesn't record.
+pub(super) fn version(name: &str) -> Option<&'static str> {
+    RECORDED.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+}
+
+/// Extension `name`'s oid in pg_extension: pgcrypto's as before, the others' after it (Chronos's own, below a
+/// world's objects').
+pub(super) fn oid(name: &str) -> i64 {
+    match RECORDED.iter().position(|(n, _)| *n == name) {
+        Some(0) | None => EXTENSION_OID,
+        Some(i) => 16340 + i as i64,
+    }
+}
+
 /// The key CREATE EXTENSION keeps extension `name` under.
 pub(super) fn key(name: &str) -> String {
     format!("{EXTENSIONS}/{name}")

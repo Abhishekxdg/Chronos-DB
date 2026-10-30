@@ -62,6 +62,32 @@ attached folder it then checks the rows it would write against Postgres as it is
 The HTTP `merge` op with `dry_run: true` returns the same as `postgres: {source, at, error, triggers, summary,
 rows: [{key, changed, postgres}]}`, and MCP's `merge_preview` shows the column.
 
+### Rehearsing a merge on your own data
+
+A dry run reads; it runs none of the merge's statements, so triggers, constraints and cascades in Postgres aren't
+exercised. `merge world fix_leads rehearse` runs the whole write-back in Postgres and then rolls it back:
+
+- the same transaction a merge runs: the source and shape checks, the world's reads checked if it checks them, every
+  row locked (`FOR UPDATE`) and compared, then each update, insert and delete with `RETURNING`, so triggers, defaults,
+  constraints and foreign keys' actions act; then `SET CONSTRAINTS ALL IMMEDIATE`, so deferred constraints and
+  constraint triggers run now rather than at a `COMMIT`; then the merge checks on attached tables. Then `ROLLBACK`
+  instead of `COMMIT`;
+- it runs as the role `CHRONOS_SOURCE_URL` names, which must be allowed to write those tables, as for a merge. Its
+  locks are held for as long as the rehearsal runs, as a merge's are;
+- the plan comes back as a dry run's, with more rows: `rehearsed` for each statement it ran and the rows Postgres
+  returned; `postgres set` for each row Postgres stored otherwise than it was sent (a trigger or default set a
+  column: the value main would take); `postgres wrote` for tables triggers or cascades wrote besides; `held` for a
+  merge check that found rows; `stopped` for a statement that failed (which one, and Postgres's error) or a refusal
+  (a row changed in Postgres since main's copy, a read that changed); `rolled back`, the check after the rollback, in
+  a read-only transaction of its own, that Postgres holds each row as it did before; and `effect` for each
+  `NOTIFY ON MERGE` the merge would send once it lands. Nothing is sent, nothing is merged, and main doesn't take
+  Postgres's rows (as a merge's conflict would);
+- `merge world fix_leads rehearse fail at 2` stops after the second write statement, as if it had failed there, to
+  watch the rollback on your rows.
+
+`REHEARSE` is refused in a folder that isn't attached (use `DRY RUN`), and for a merge that doesn't write to Postgres
+(into a world other than main). Agents need the right to merge the world, not only to see it.
+
 ### Reads checked against live Postgres
 
 A world forked `with (check_reads = true)` (or by an agent whose merge policy has `check_reads`) has its reads
@@ -84,6 +110,11 @@ Postgres's rows are put in the world's fork point, with the index entries they m
 main is. A row the read couldn't have found (another email) doesn't hold the merge. A read that changed holds it as
 any stale read: refused with `40001` and nothing written (`read rows that changed in Postgres since it forked:
 suppressed/(12)`), or queued for a person under the agent's merge policy. A dry run reports the same.
+
+A world that [runs its reads again](../reference/worlds.md#stale-reads-check_reads) (`rerun_reads = true`, or a
+merge policy with `rerun_reads`) runs its SELECTs again on those Postgres rows before holding: the same answer there
+(a sum that came out the same) and nothing is held for it; another answer and the reason says so (`it read ``select
+sum(amount) from orders where status = 'open'``, which gave 30 then and gives 31 in Postgres now`).
 
 The check reads without a predicate lock (`READ COMMITTED`): a row Postgres takes between the check and `COMMIT`
 lands after the merge in time, an order in which the world's decision was right.
@@ -118,7 +149,8 @@ create merge check one_lead_per_email on tables (leads) as
 - `MERGE ... DRY RUN` runs merge checks on main only: its Postgres transaction is read only, so the merge's rows
   aren't there to check.
 
-Main's rows change only this way: writes to main, `RESTORE` and `UNDO` on main are refused, and no statement may
+Main's rows change only this way: writes to main and `RESTORE` on main are refused (an `UNDO` goes back through
+Postgres, as a merge: see [below](#undoing-a-merge-that-reached-postgres)), and no statement may
 change a table's shape here. Change it in Postgres: a refresh takes added columns (below); any other change needs a
 new attach into a new folder.
 
@@ -189,8 +221,33 @@ move: a row a world changed that Postgres changed too is a conflict at its merge
 ## Undoing a merge that reached Postgres
 
 `UNDO MERGE OF WORLD w` (or HTTP `undo_merge`) on a merge into main puts the rows back through Postgres: they go
-back in a world of main, which is merged as any world is, every row locked and compared there. A row changed in
-Postgres since the merge is a conflict, and nothing is written.
+back in a world of main, which is merged as any world is, every row locked and compared there, in one transaction.
+Updated rows get their old values, inserted rows are deleted, deleted rows come back with their ids.
+
+- A row changed since the merge (in main, or straight in Postgres) is a conflict: nothing is written. With `SKIP
+  CHANGED` that row is left as it is and the rest go back (a row changed only in Postgres is found by the write-back's
+  compare; main takes Postgres's row, and the undo runs once more without it).
+- `UNDO AGENT bot SINCE '-1 hour'` (and `UNDO DIFF`) on main go back through Postgres the same way.
+- Effects aren't undone: a webhook called or an email sent stays sent. The undo lists each effect the undone change
+  brought into main, in a `WARNING` (HTTP `undo_merge`: `effects_not_undone`), with where it is: `sent` (a worker
+  acknowledged it), `queued` (not sent yet: `ACK OUTBOX '<id>'` drops it), or `claimed` / `ambiguous` (it may have
+  been sent). The undo itself leaves the outbox alone.
+
+## Restore drill
+
+Before you let an agent merge unattended, rehearse the restore on your own data:
+
+1. **Rehearse the merge.** `merge world w rehearse` runs every statement in Postgres and rolls back: check the
+   `postgres set` rows (what triggers would set), any `stopped` row, and the `rolled back` row saying Postgres is as
+   it was. Postgres: unchanged. Outbox: unchanged (the `effect` rows list what the merge would send).
+2. **Watch it fail halfway.** `merge world w rehearse fail at 1` stops after the first statement: `rolled back` shows
+   the rollback held. Postgres: unchanged.
+3. **Merge.** `merge world w`. Postgres: the rows changed, in one committed transaction (and a row in
+   `chronos.merges`). Outbox: the merge's effects queued in main, sent once a worker claims them.
+4. **Undo.** `undo merge of world w` (`skip changed` if your app changed some of the rows since). Postgres: the rows
+   as they were before the merge, in one more transaction (and its own `chronos.merges` row); rows changed since are
+   left, and counted. Outbox: untouched; the `WARNING` lists the merge's effects, sent or still queued, for you to
+   follow up by hand (or drop the queued ones with `ACK OUTBOX`).
 
 ## Agents held to one tenant
 

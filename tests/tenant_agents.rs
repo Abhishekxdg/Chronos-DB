@@ -150,3 +150,31 @@ fn a_token_stops_working_once_valid_for_has_passed() {
     let r = out.rows.iter().find(|r| r[0].to_text() == "lasting").unwrap();
     assert_ne!(r[col("expires")].to_text(), "NULL");
 }
+
+#[test]
+fn a_tenant_column_no_table_has_is_refused() {
+    let db = Db::new();
+    setup(&db);
+    // a typo: no table has the column, so the agent would be held nowhere and see every tenant's rows
+    let spec = AgentSpec { tenant: Some(serde_json::json!({"nosuch": 1})), ..Default::default() };
+    let e = db.create_agent("typo", &spec).unwrap_err().to_string();
+    assert!(e.contains("no table has a column \"nosuch\""), "{e}");
+    assert!(e.contains("leads (id, org_id, name, owner)") && e.contains("plans (id, title)"), "{e}");
+    assert!(db.agent("typo").is_err(), "nothing was made");
+    // so in SQL, and when changing an agent's tenant
+    let e = run(&db, MAIN, "create agent typo2 with (tenant = 'org = 42')", &[]).unwrap_err();
+    assert!(e.message.contains("no table has a column \"org\""), "{}", e.message);
+    let e = run(&db, MAIN, "alter agent run42 set (tenant = 'org = 42')", &[]).unwrap_err();
+    assert!(e.message.contains("no table has a column \"org\""), "{}", e.message);
+    assert_eq!(db.agent("run42").unwrap().tenant_sql().unwrap(), "\"org_id\" = 42", "left as it was");
+    // a column some table has is taken, tables without it (plans) being shared lookup tables
+    let spec = AgentSpec { tenant: Some(serde_json::json!({"org_id": 7})), ..Default::default() };
+    let (a, _) = db.create_agent("run7", &spec).unwrap();
+    assert_eq!(a.tenant_sql().unwrap(), "\"org_id\" = 7");
+    let mut s = agent("run7");
+    assert_eq!(texts(&db, &mut s, "select count(*) from leads"), ["2"]);
+    assert_eq!(texts(&db, &mut s, "select count(*) from plans"), ["2"]);
+    // a database with no tables yet: nothing to check it against
+    let empty = Db::new();
+    empty.create_agent("early", &spec).unwrap();
+}

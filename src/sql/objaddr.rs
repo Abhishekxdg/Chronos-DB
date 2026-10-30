@@ -1050,7 +1050,7 @@ fn databases(cat: &Catalog) -> Vec<(i64, String)> {
 /// The extensions pg_extension has: plpgsql, and what CREATE EXTENSION recorded.
 fn extensions(cat: &Catalog) -> Vec<(i64, String)> {
     let mut out = vec![(13608, "plpgsql".to_string())];
-    out.extend(cat.extensions.iter().map(|(n, ..)| (super::pgcrypto::EXTENSION_OID, n.clone())));
+    out.extend(cat.extensions.iter().map(|(n, ..)| (super::pgcrypto::oid(n), n.clone())));
     out
 }
 

@@ -756,7 +756,7 @@ fn policy_sql(db: &chronos::Db, tool: &str, name: &str, a: &Value) -> Result<Str
     for (k, v) in &rules {
         if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(format!(
-                "'{k}' isn't a rule (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, require_scope)"
+                "'{k}' isn't a rule (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, rerun_reads, require_scope)"
             ));
         }
         let v = match v {
@@ -970,6 +970,7 @@ fn tools(hidden: &[&str]) -> Value {
             "overwrite": { "type": "boolean", "description": "May it overwrite rows changed in the parent since the fork? (default false)" },
             "critical": { "type": "boolean", "description": "May it change columns a reader marked critical reads (MARK READER ... CRITICAL)? (default false)" },
             "check_reads": { "type": "boolean", "description": "Keep what its worlds read, and hold a merge whose reads changed since the fork (default false)" },
+            "rerun_reads": { "type": "boolean", "description": "Check reads, and before holding a merge for them run its SELECTs again: held only if one gives another answer now (default false)" },
             "rows_per_hour": { "type": ["integer", "null"], "description": "Most rows one agent's merges into main may change in an hour, together (null: no limit)" },
             "deletes_per_hour": { "type": ["integer", "null"], "description": "Most rows one agent's merges into main may delete in an hour, together (null: no limit)" },
             "confirm_deletes_over": { "type": ["integer", "null"], "description": "A merge deleting more rows than this waits for a person, who approves it only by giving the count (MERGE WORLD x CONFIRM DELETES n)" },

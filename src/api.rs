@@ -562,7 +562,7 @@ fn agent(a: &chronos::Agent) -> Value {
         "name": a.name, "id": a.id, "can": a.can.iter().map(|c| c.name()).collect::<Vec<_>>(),
         "max_worlds": a.max_worlds, "writes_per_minute": a.writes_per_minute, "max_changes": a.max_changes,
         "world_ttl": a.world_ttl, "max_query_ms": a.max_query_ms, "max_concurrent": a.max_concurrent,
-        "max_memory_mb": a.max_memory_mb, "max_idle_ms": a.max_idle_ms, "max_threads": a.max_threads, "created": a.created, "disabled": a.disabled, "policy": a.policy,
+        "max_memory_mb": a.max_memory_mb, "max_idle_ms": a.max_idle_ms, "max_threads": a.max_threads, "priority": a.priority.name(), "created": a.created, "disabled": a.disabled, "policy": a.policy,
         "tenant": a.tenant_sql(), "expires": (a.expires > 0).then_some(a.expires),
         // made before agents had SCRAM verifiers: one login over HTTP with its token makes it one (see `admit`)
         "needs_http_login": a.verifier().is_none(),
@@ -587,6 +587,13 @@ fn agent_spec(a: &Value) -> Result<chronos::AgentSpec, Fail> {
         Some(Value::String(p)) => Some(p.clone()),
         Some(_) => return Err(bad("'policy' must be a merge policy's name, or null for none")),
     };
+    let priority = match a.get("priority") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(p)) => Some(
+            chronos::Priority::parse(p).ok_or_else(|| bad(format!("priority must be 'normal' or 'low', not '{p}'")))?,
+        ),
+        Some(_) => return Err(bad("'priority' must be 'normal' or 'low'")),
+    };
     Ok(chronos::AgentSpec {
         can,
         max_worlds: num("max_worlds"),
@@ -598,6 +605,7 @@ fn agent_spec(a: &Value) -> Result<chronos::AgentSpec, Fail> {
         max_memory_mb: num("max_memory_mb"),
         max_idle_ms: num("max_idle_ms"),
         max_threads: num("max_threads"),
+        priority,
         disabled: a.get("disabled").and_then(Value::as_bool),
         policy,
         tenant: a.get("tenant").cloned(),
@@ -844,7 +852,10 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
         "undo_merge" => {
             let skip = a.get("skip_changed").and_then(Value::as_bool) == Some(true);
             let u = db.undo_merge(need("branch")?, skip)?;
-            Ok(json!({ "ok": true, "parent": u.parent, "at": u.at, "undone": u.rows, "skipped": u.skipped }))
+            let effects: Vec<Value> =
+                u.effects.iter().map(|e| json!({ "id": e.id, "channel": e.channel, "state": e.state })).collect();
+            Ok(json!({ "ok": true, "parent": u.parent, "at": u.at, "undone": u.rows, "skipped": u.skipped,
+                       "effects_not_undone": effects }))
         }
         "restore" if s("checkpoint").is_some() => {
             let b = db.world(need("branch")?)?.name;

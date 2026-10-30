@@ -467,6 +467,69 @@ fn a_roles_settings_apply_when_it_logs_in() {
     assert_eq!(text(&mut admin, "show statement_timeout"), "0");
 }
 
+/// ALTER ROLE ... SET of the bootstrap superuser applies to a login that is no role (it is that superuser), and ALTER
+/// DATABASE ... SET to every login to that database, under the role's own: what Supabase's setup runs.
+#[test]
+fn the_superusers_and_a_databases_settings_apply_when_logging_in() {
+    let (_server, port) = start("dbconfig", None);
+    let mut admin = connect(port, "admin").unwrap();
+    admin
+        .batch_execute(
+            "create schema s; create role r2_cfg login; create database app;
+             alter role postgres set statement_timeout = '9s';
+             alter database app set search_path = s, public; alter database app set statement_timeout = '3s';
+             alter database app set \"app.settings.jwt_secret\" to 'shh';
+             alter role r2_cfg set statement_timeout = '7s'",
+        )
+        .unwrap();
+    assert_eq!(text(&mut connect(port, "admin").unwrap(), "show statement_timeout"), "9s");
+    let to_app =
+        |user: &str| Client::connect(&format!("host=127.0.0.1 port={port} user={user} dbname=app"), NoTls).unwrap();
+    let mut c = to_app("r2_cfg");
+    assert_eq!(text(&mut c, "show search_path"), "s, public");
+    assert_eq!(text(&mut c, "show statement_timeout"), "7s"); // the role's, over the database's
+    assert_eq!(text(&mut c, "select current_setting('app.settings.jwt_secret')"), "shh");
+    // they are what RESET puts back, as Postgres has it
+    c.batch_execute("set \"app.settings.jwt_secret\" = 'other'; reset all").unwrap();
+    assert_eq!(text(&mut c, "select current_setting('app.settings.jwt_secret')"), "shh");
+    // main has none of app's
+    let mut c = connect(port, "r2_cfg").unwrap();
+    assert_ne!(text(&mut c, "show search_path"), "s, public");
+    // pg_db_role_setting lists both kinds
+    let rows: Vec<String> = admin
+        .query(
+            "select (setdatabase <> 0)::text || '|' || setrole::regrole::text || '|' || setconfig::text
+             from pg_db_role_setting order by 1",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "false|chronos|{statement_timeout=9s}",
+            "false|r2_cfg|{statement_timeout=7s}",
+            "true|-|{\"search_path=s, public\",statement_timeout=3s,app.settings.jwt_secret=shh}",
+        ]
+    );
+    // RESET ALL takes them away; a database there isn't is refused
+    admin.batch_execute("alter database app reset all; alter role chronos reset all").unwrap();
+    assert_eq!(text(&mut to_app("r2_cfg"), "show search_path"), "\"$user\", public");
+    let e = admin.batch_execute("alter database nowhere set search_path = s").unwrap_err();
+    assert_eq!(e.code(), Some(&SqlState::UNDEFINED_DATABASE), "{e}");
+    // a database dropped and made again under its name has none of the old one's
+    admin.batch_execute("alter database app set \"app.settings.jwt_secret\" to 'shh'").unwrap();
+    admin.batch_execute("drop database app with (force)").unwrap();
+    admin.batch_execute("create database app").unwrap();
+    assert_eq!(
+        text(&mut to_app("r2_cfg"), "select coalesce(current_setting('app.settings.jwt_secret', true), '')"),
+        ""
+    );
+    assert_eq!(text(&mut admin, "select count(*)::text from pg_db_role_setting where setdatabase <> 0"), "0");
+}
+
 /// A predefined role is a role that may not log in: a login as one is refused, never taken for the
 /// superuser a name that is no role is.
 #[test]
@@ -1107,4 +1170,32 @@ fn statistics_objects_and_publications_keep_their_owners() {
     ok(&db, &mut s, "drop owned by r5s_a");
     assert_eq!(rows(&db, &mut s, "select count(*) from pg_publication"), [["0"]]);
     ok(&db, &mut s, "drop role r5s_a");
+}
+
+/// Supabase's migrations grant on built-in functions and hand some to its admin role: GRANT EXECUTE ON FUNCTION
+/// pg_catalog.pg_reload_conf(), ALTER FUNCTION pg_catalog.lo_export OWNER TO, by name alone where only one has it.
+#[test]
+fn built_in_functions_take_grants_and_owners() {
+    let db = Db::new();
+    let mut s = Session::new(chronos::MAIN);
+    ok(&db, &mut s, "create role r_admin; create role r_other");
+    ok(&db, &mut s, "grant execute on function pg_catalog.pg_reload_conf() to r_admin with grant option");
+    // every role runs a built-in function here: a REVOKE, which wouldn't stop one, is refused
+    assert_eq!(fails(&db, &mut s, "revoke execute on function pg_catalog.lower(text) from public").0, "0A000");
+    assert_eq!(fails(&db, &mut s, "revoke execute on function pg_reload_conf() from r_admin").0, "0A000");
+    // one made in pg_catalog is a function as any other: its privileges are its own
+    ok(&db, &mut s, "create function pg_catalog.custom_fn() returns int language sql as 'select 1'");
+    ok(&db, &mut s, "revoke execute on function pg_catalog.custom_fn() from public");
+    ok(&db, &mut s, "alter function pg_catalog.lo_export owner to r_admin");
+    ok(&db, &mut s, "alter function pg_catalog.lo_import(text) owner to r_admin");
+    ok(&db, &mut s, "alter function pg_catalog.lo_import(text, oid) owner to r_admin");
+    // kept through other statements' clean-up of what went
+    ok(&db, &mut s, "create table unrelated (a int4); drop table unrelated");
+    // (its owner, still: one who isn't may not alter it)
+    ok(&db, &mut s, "set role r_admin; alter function pg_catalog.lo_export owner to r_admin; reset role");
+    assert_eq!(fails(&db, &mut s, "set role r_other; alter function pg_catalog.lo_export owner to r_other").0, "42501");
+    ok(&db, &mut s, "reset role");
+    // the name alone names several: which one is meant isn't told
+    assert_eq!(fails(&db, &mut s, "alter function pg_catalog.lo_import owner to r_admin").0, "42725");
+    assert_eq!(fails(&db, &mut s, "grant execute on function no_such_fn() to r_admin").0, "42883");
 }

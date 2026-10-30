@@ -437,6 +437,14 @@ fn listen_and_notify_over_the_wire() {
     assert_eq!(got, ["jobs:two"]);
     talker.batch_execute("begin; notify jobs, 'never'; rollback; select pg_notify('jobs', 'three')").unwrap();
     assert_eq!(heard(&mut listener, 1000), ["jobs:three"]);
+    // NOTIFY in a PL/pgSQL function (PostgREST's schema-reload triggers), sent as the statement's transaction ends
+    talker
+        .batch_execute(
+            "create function ping() returns void language plpgsql as $$ begin notify jobs, 'from plpgsql'; end $$;
+             select ping()",
+        )
+        .unwrap();
+    assert_eq!(heard(&mut listener, 3000), ["jobs:from plpgsql"]);
     // a session hears its own, before its query's result is done
     listener.batch_execute("notify jobs, 'self'").unwrap();
     assert_eq!(listener.notifications().len(), 1);
@@ -1596,4 +1604,47 @@ fn a_new_served_database_protects_main() {
     chronos::sql::run(&db, "main", "alter system set protect_main = off", &[]).unwrap();
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One message of the Postgres protocol, its tag and body, from `s`.
+fn read_message(s: &mut std::net::TcpStream) -> (u8, Vec<u8>) {
+    use std::io::Read;
+    let mut head = [0u8; 5];
+    s.read_exact(&mut head).unwrap();
+    let len = u32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+    let mut body = vec![0u8; len - 4];
+    s.read_exact(&mut body).unwrap();
+    (head[0], body)
+}
+
+/// A message of the Postgres protocol: its tag, then its length and body.
+fn message(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut m = vec![tag];
+    m.extend(((body.len() + 4) as u32).to_be_bytes());
+    m.extend(body);
+    m
+}
+
+#[test]
+fn a_declared_cursor_is_a_portal_describe_can_name() {
+    use std::io::Write;
+    let (_server, port) = start("cursor-portal", None);
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let params = b"user\0tester\0database\0main\0\0";
+    let mut startup = ((params.len() + 8) as u32).to_be_bytes().to_vec();
+    startup.extend(196_608u32.to_be_bytes());
+    startup.extend(params);
+    s.write_all(&startup).unwrap();
+    while read_message(&mut s).0 != b'Z' {}
+    // DECLARE in SQL, then the extended protocol's Describe of a portal of the cursor's name, as psycopg does
+    s.write_all(&message(b'Q', b"declare c1 cursor with hold for select 1 as a, 'x'::text as b\0")).unwrap();
+    while read_message(&mut s).0 != b'Z' {}
+    let mut out = message(b'D', b"Pc1\0");
+    out.extend(message(b'S', b""));
+    s.write_all(&out).unwrap();
+    let (tag, body) = read_message(&mut s);
+    assert_eq!(tag, b'T', "{}", String::from_utf8_lossy(&body));
+    assert_eq!(i16::from_be_bytes([body[0], body[1]]), 2);
+    assert!(body.windows(2).any(|w| w == b"a\0") && body.windows(2).any(|w| w == b"b\0"));
+    while read_message(&mut s).0 != b'Z' {}
 }

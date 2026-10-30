@@ -203,6 +203,9 @@ pub(super) enum Scalar {
     RandomNormal,
     /// uuid_generate_v1() (false) and uuid_generate_v1mc() (true): a time-based UUID, of a random node
     UuidV1(bool),
+    /// information_schema's functions of a type's oid and typmod (`INFO_TYPE_FNS`, by place): what its views say of a
+    /// column's length, precision and scale
+    InfoTypeFn(u8),
     SetSeed,
     Pi,
     Nullif,
@@ -424,9 +427,22 @@ pub(super) enum Scalar {
 }
 
 /// The function a name calls, and how many arguments it takes.
+/// information_schema's functions of (typid, typmod), as `Scalar::InfoTypeFn` numbers them.
+pub(super) const INFO_TYPE_FNS: [&str; 6] = [
+    "_pg_char_max_length",
+    "_pg_char_octet_length",
+    "_pg_numeric_precision",
+    "_pg_numeric_precision_radix",
+    "_pg_numeric_scale",
+    "_pg_datetime_precision",
+];
+
 pub(super) fn lookup(name: &str) -> Option<(Scalar, std::ops::RangeInclusive<usize>)> {
     use Scalar::*;
     const MANY: usize = usize::MAX;
+    if let Some(k) = name.strip_prefix("information_schema.").and_then(|n| INFO_TYPE_FNS.iter().position(|f| *f == n)) {
+        return Some((InfoTypeFn(k as u8), 2..=2));
+    }
     if let Some((k, arity)) = super::jsontext::lookup(name) {
         return Some((JsonFn(k), arity));
     }
@@ -1028,7 +1044,7 @@ pub(super) fn result_type(f: Scalar, first: Option<Type>) -> Type {
         UuidV1(_) => Type::Uuid,
         Degrees | Radians | Sin | Cos | Tan | Cot | Asin | Acos | Atan | Atan2 | Sinh | Cosh | Tanh => Type::Float,
         Sind | Cosd | Tand | Cotd | Asind | Acosd | Atand | Atan2d | Asinh | Acosh | Atanh => Type::Float,
-        Scale | MinScale => Type::Int,
+        Scale | MinScale | InfoTypeFn(_) => Type::Int,
         Similarity | WordSimilarity | StrictWordSimilarity => Type::Float,
         Levenshtein | LevenshteinLessEqual | Difference => Type::Int,
         Soundex | Metaphone | Dmetaphone | DmetaphoneAlt | Unaccent => Type::Text,
@@ -2877,6 +2893,7 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
             }
             Float(x.atanh())
         }
+        InfoTypeFn(k) => info_type_fn(k, int(&a[0])?, int(&a[1])?).map_or(Null, Int),
         Scale | MinScale | TrimScale => {
             let d = exact(&a[0])?;
             if d.is_special() {
@@ -3872,6 +3889,55 @@ pub(super) fn call(f: Scalar, a: &[Value]) -> Result<Value> {
             unreachable!("handled above")
         }
     })
+}
+
+/// information_schema's function `INFO_TYPE_FNS[k]` of a type's oid and typmod, as Postgres's information_schema.sql
+/// writes them (a domain's are its base type's: see `_pg_truetypid`); None where it says null.
+fn info_type_fn(k: u8, typid: i64, typmod: i64) -> Option<i64> {
+    // (bpchar 1042, varchar 1043, bit 1560, varbit 1562, numeric 1700)
+    match INFO_TYPE_FNS[k as usize] {
+        "_pg_char_max_length" => match typid {
+            _ if typmod == -1 => None,
+            1042 | 1043 => Some(typmod - 4),
+            1560 | 1562 => Some(typmod),
+            _ => None,
+        },
+        // (the most bytes a character takes in the database's encoding, UTF8's 4, times the length; text and an
+        // unsized varchar or char: 1 GB, as Postgres says)
+        "_pg_char_octet_length" => match typid {
+            25 | 1042 | 1043 if typmod == -1 => Some(1 << 30),
+            1042 | 1043 => Some((typmod - 4) * 4),
+            _ => None,
+        },
+        "_pg_numeric_precision" => match typid {
+            21 => Some(16),
+            23 => Some(32),
+            20 => Some(64),
+            1700 => (typmod != -1).then(|| ((typmod - 4) >> 16) & 0xFFFF),
+            700 => Some(24),
+            701 => Some(53),
+            _ => None,
+        },
+        "_pg_numeric_precision_radix" => match typid {
+            21 | 23 | 20 | 700 | 701 => Some(2),
+            1700 => Some(10),
+            _ => None,
+        },
+        "_pg_numeric_scale" => match typid {
+            21 | 23 | 20 => Some(0),
+            // (the low 11 bits, signed: numeric(3, -3)'s is -3, as information_schema.columns has it)
+            1700 => (typmod != -1).then(|| (((typmod - 4) & 0x7FF) ^ 1024) - 1024),
+            _ => None,
+        },
+        // date; time, timestamp, timestamptz and timetz; interval
+        _ => match typid {
+            1082 => Some(0),
+            1083 | 1114 | 1184 | 1266 => Some(if typmod < 0 { 6 } else { typmod }),
+            1186 if typmod < 0 || typmod & 0xFFFF == 0xFFFF => Some(6),
+            1186 => Some(typmod & 0xFFFF),
+            _ => None,
+        },
+    }
 }
 
 /// `(s1, e1) OVERLAPS (s2, e2)` as Postgres works it out: each period is put in order, and a null

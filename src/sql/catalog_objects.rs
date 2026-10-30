@@ -690,7 +690,7 @@ pub(super) fn objects(name: &str, cat: &Catalog) -> Option<Whole> {
             let mut rows = catalog_schema::builtin_rows("pg_extension");
             rows.extend(cat.extensions.iter().map(|(name, schema, version)| {
                 row(vec![
-                    ("oid", int(super::pgcrypto::EXTENSION_OID)),
+                    ("oid", int(super::pgcrypto::oid(name))),
                     ("extname", t(name)),
                     ("extowner", int(cat.acls.get(&format!("ext/{name}")).and_then(|e| e.owner).unwrap_or(10))),
                     ("extnamespace", int(cat.schema_oid(schema))),

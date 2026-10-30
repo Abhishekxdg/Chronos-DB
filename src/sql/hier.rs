@@ -2594,12 +2594,16 @@ fn recursed(t: &Table, kids: &[Table], kid: &Table, changes: &[Alter], only: boo
                 }
             }
             _ if only => {}
-            // ENABLE / DISABLE TRIGGER: a partitioned table's row triggers' copies in its partitions too
-            Alter::Trigger(name, mode) if t.hier.part.is_some() => {
+            // ENABLE / DISABLE TRIGGER: a partitioned table's row triggers' copies in its partitions too, and with ALL
+            // its foreign keys' (each partition's own state from then on)
+            Alter::Trigger(name, mode, all) if t.hier.part.is_some() => {
                 for x in t.triggers.iter().filter(|x| x.row && name.as_ref().is_none_or(|n| x.name == *n)) {
                     if kid.hier.inherited.contains(&format!("trigger:{}", x.name)) {
-                        out.push(Alter::Trigger(Some(x.name.clone()), *mode));
+                        out.push(Alter::Trigger(Some(x.name.clone()), *mode, false));
                     }
+                }
+                if *all {
+                    out.push(Alter::Trigger(Some(String::new()), *mode, true));
                 }
             }
             Alter::AddColumn(d, quiet) if !(*quiet && t.cols.iter().any(|x| x.name == d.name)) => out.push(c.clone()),
@@ -2619,12 +2623,13 @@ fn recursed(t: &Table, kids: &[Table], kid: &Table, changes: &[Alter], only: boo
                 ConstraintDef::Check { no_inherit: false, .. } => out.push(c.clone()),
                 // (a partition names its own unique constraint, as it names its own key; its index is kept where
                 // the parent's statement says, as Postgres's DefineIndex gives each partition's the statement)
-                ConstraintDef::Unique { cols, nnd, space, .. } if t.hier.part.is_some() => {
+                ConstraintDef::Unique { cols, nnd, space, defer, .. } if t.hier.part.is_some() => {
                     out.push(Alter::AddConstraint(ConstraintDef::Unique {
                         name: None,
                         cols: cols.clone(),
                         nnd: *nnd,
                         space: space.clone(),
+                        defer: *defer,
                     }));
                 }
                 // (under the name the table gives it: its partitions' copies have that name too)
@@ -3463,7 +3468,14 @@ pub(super) fn clone_constraints(
                 || n == child.pkey_name()
         };
         let name = index_name(&child.name, &cn, if backing.is_some() { "idx" } else { "key" }, &taken);
-        child.uniques.push(Unique { name: name.clone(), cols: cols.clone(), nnd: u.nnd, primary: u.primary });
+        child.uniques.push(Unique {
+            name: name.clone(),
+            cols: cols.clone(),
+            nnd: u.nnd,
+            primary: u.primary,
+            deferrable: u.deferrable,
+            deferred: u.deferred,
+        });
         if let Some(x) = backing {
             let include = map_ids(&x.include, parent, child).unwrap_or_default();
             child.indexes.push(
@@ -4007,7 +4019,14 @@ pub(super) fn spread_index(
                     .said_as(ix, include),
                 );
                 if let Some(u) = u {
-                    kid.uniques.push(Unique { name: name.clone(), cols, nnd: u.nnd, primary: u.primary });
+                    kid.uniques.push(Unique {
+                        name: name.clone(),
+                        cols,
+                        nnd: u.nnd,
+                        primary: u.primary,
+                        deferrable: u.deferrable,
+                        deferred: u.deferred,
+                    });
                 }
                 kid.hier.forget_index(&name);
                 kid.hier.set_index_space(&name, space);

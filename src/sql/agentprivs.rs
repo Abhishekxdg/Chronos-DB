@@ -168,6 +168,23 @@ pub(super) fn show(db: &Db, name: &str, world: &str) -> Result<Vec<Vec<Value>>> 
                                 .into(),
                         );
                     }
+                    // a trigger that reads it as it is may not fire for the agent's UPDATE or DELETE
+                    let column = format!("column \"{}\"", c.name);
+                    let changes = cwrite.contains("update") || cwrite.contains("delete");
+                    for x in t.triggers.iter().filter(|x| {
+                        changes
+                            && x.enabled
+                            && x.events.iter().any(|e| matches!(e, functions::Event::Update | functions::Event::Delete))
+                    }) {
+                        let Some(what) = functions::trigger_reads_masked(&v, x, &masked)? else { continue };
+                        if what == column || !what.starts_with("column ") {
+                            cwrite = format!("{cwrite} (an update or delete that fires trigger {} is refused)", x.name);
+                            cwhy.push(format!(
+                                "trigger {} reads {what} as it is: this agent's UPDATE and DELETE that fire it are refused",
+                                x.name
+                            ));
+                        }
+                    }
                 }
             }
             let cmerge = merge_of(&a, policy.as_ref(), &t.name, Some(&c.name), &mut cwhy);

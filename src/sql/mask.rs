@@ -112,7 +112,46 @@ pub(crate) fn of(v: &View, name: &str) -> Result<Vec<(String, char)>> {
             }
         }
     }
+    // a tsvector_update_trigger's column holds the words of the text columns it reads, as they are: masked with HASH
+    let mut words = vec![];
+    for t in &tables {
+        for x in t.triggers.iter().filter(|x| x.enabled && functions::builtin_trigger(&x.func).is_some()) {
+            if x.args.len() >= 3 && x.args[2..].iter().any(|a| out.iter().any(|(o, _)| o == a)) {
+                words.push(x.args[0].clone());
+            }
+        }
+    }
+    for w in words {
+        if !out.iter().any(|(o, _)| *o == w) {
+            out.push((w, HASH));
+        }
+    }
     Ok(out)
+}
+
+/// What SQL or PL/pgSQL text `src` (a trigger function's body, or a trigger's WHEN) reads of the row it fires for, in
+/// OLD or NEW, of the masked columns `masked`: the first such column (`column "email"`), `the whole row` for a row
+/// read whole (`NEW.*`, `row_to_json(NEW)`, a variable or alias it is given to), or None. `RETURN NEW` and `RETURN OLD`
+/// aren't reads (the row goes back to be written). Text that can't be followed (it doesn't lex) reads the whole row.
+pub(super) fn row_reads(src: &str, masked: &[(String, char)]) -> Option<String> {
+    let whole = || Some("the whole row".to_string());
+    let Ok(toks) = lex(src) else { return whole() };
+    let row = |t: &Tok| matches!(t, Tok::Word(w) | Tok::Ident(w) if w == "new" || w == "old");
+    for (i, t) in toks.iter().enumerate() {
+        if !row(t) {
+            continue;
+        }
+        match (toks.get(i + 1), toks.get(i + 2)) {
+            (Some(Tok::Sym(".")), Some(Tok::Word(c) | Tok::Ident(c))) => {
+                if masked.iter().any(|(m, _)| m == c) {
+                    return Some(format!("column \"{c}\""));
+                }
+            }
+            (Some(Tok::Sym(";")) | None, _) if i > 0 && matches!(&toks[i - 1], Tok::Word(r) if r == "return") => {}
+            _ => return whole(),
+        }
+    }
+    None
 }
 
 /// Whether `src`, a table read where masks apply, is one `wrap` makes a subquery of: not the table

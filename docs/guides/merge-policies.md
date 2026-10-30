@@ -108,6 +108,7 @@ Every rule is optional. A rule left out doesn't limit anything, except `schema` 
 | `overwrite` | `false` and it overwrites rows its parent changed since the fork | `false` |
 | `critical` | `false` and it changes a column a reader marked critical reads (`MARK READER billing CRITICAL`) | `false` |
 | `check_reads` | `true` and it read rows that changed in its parent since the fork (its agent decided on state that's gone) | `false` |
+| `rerun_reads` | `true`, it read rows that changed in its parent since the fork, and a SELECT it read them with gives another answer when run again now (see [run again](../reference/worlds.md#stale-reads-check_reads)): a reviewer is shown what it gave then and gives now, and a hold that changed nothing isn't made | `false` |
 | `require_scope` | never itself: `true` makes its agents declare what each world may change when forking it (`may_change`, `tenant`); a merge outside that [declared scope](../reference/worlds.md#declared-scope-may_change-tenant) waits for a person | `false` |
 | `reviewer` | never itself: an agent that decides its held merges before a person ([a reviewer before a person](#a-reviewer-before-a-person)) | none |
 

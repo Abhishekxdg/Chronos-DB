@@ -1,4 +1,4 @@
-//! Resource limits and world cleanup: agents' max_query_ms, max_concurrent and max_memory_mb;
+//! Resource limits and world cleanup: agents' max_query_ms, max_concurrent, max_memory_mb and priority;
 //! the database's statement_timeout, max_worlds and world_idle_ttl; storage given back after
 //! worlds are dropped; DROP WORLD ... CASCADE.
 
@@ -56,6 +56,69 @@ fn runaway_queries_stop_at_the_agents_max_query_ms() {
     let cols: Vec<&str> = shown[0].columns.as_ref().unwrap().iter().map(|(n, _)| n.as_str()).collect();
     let at = cols.iter().position(|c| *c == "max_query_ms").unwrap();
     assert_eq!(shown[0].rows[0][at].to_text(), "200");
+}
+
+/// An agent's priority (issue #43): `low` makes its statements yield to the database's own users while theirs run
+/// (`agent_yield_ms` counts the time), and never otherwise; `normal`, the default, is as before.
+#[test]
+fn a_low_priority_agent_yields_to_the_databases_own_users() {
+    let db = Db::new();
+    table(&db, "t", 1000, 10);
+    run(
+        &db,
+        MAIN,
+        "create agent batch with (can = 'read', priority = 'low'); create agent helper with (can = 'read')",
+        &[],
+    )
+    .unwrap();
+    let priorities = || {
+        let shown = run(&db, MAIN, "show agents", &[]).unwrap();
+        let cols: Vec<&str> = shown[0].columns.as_ref().unwrap().iter().map(|(n, _)| n.as_str()).collect();
+        let at = cols.iter().position(|c| *c == "priority").unwrap();
+        let mut out: Vec<(String, String)> = shown[0].rows.iter().map(|r| (r[0].to_text(), r[at].to_text())).collect();
+        out.sort();
+        out
+    };
+    let want = |b: &str, h: &str| vec![("batch".to_string(), b.to_string()), ("helper".to_string(), h.to_string())];
+    assert_eq!(priorities(), want("low", "normal"));
+    run(&db, MAIN, "alter agent helper set (priority = 'LOW')", &[]).unwrap();
+    assert_eq!(priorities(), want("low", "low"));
+    run(&db, MAIN, "alter agent helper set (priority = 'normal')", &[]).unwrap();
+    assert_eq!(priorities(), want("low", "normal"));
+    let e = run(&db, MAIN, "alter agent helper set (priority = 'urgent')", &[]).unwrap_err();
+    assert!(e.message.contains("priority must be 'normal' or 'low'"), "{}", e.message);
+
+    let yielded = || db.counters().into_iter().find(|(n, _)| *n == "agent_yield_ms").map(|(_, v)| v).unwrap();
+    // nobody else's statement running: it doesn't yield
+    assert_eq!(code(session("batch").run(&db, SLOW, &[])), "ok");
+    assert_eq!(yielded(), 0);
+    // a person's statements running, one after another
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|sc| {
+        let person = sc.spawn(|| {
+            let mut s = Session::new(MAIN);
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                s.run(&db, SLOW, &[]).unwrap();
+            }
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        // a normal agent's statement doesn't yield to them
+        assert_eq!(code(session("helper").run(&db, SLOW, &[])), "ok");
+        assert_eq!(yielded(), 0);
+        // a low-priority one's does
+        for _ in 0..20 {
+            assert_eq!(code(session("batch").run(&db, SLOW, &[])), "ok");
+            if yielded() > 0 {
+                break;
+            }
+        }
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        person.join().unwrap();
+    });
+    assert!(yielded() > 0, "it yielded while a person's statements ran");
+    // and its result is the same
+    let n = session("batch").run(&db, "select count(*) from t", &[]).unwrap();
+    assert_eq!(n[0].rows[0][0].to_text(), "1000");
 }
 
 #[test]

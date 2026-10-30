@@ -18,6 +18,7 @@ pub(super) fn handles(f: CtxFn) -> bool {
             | CtxFn::DbEncoding
             | CtxFn::ExportSnapshot
             | CtxFn::InRecovery
+            | CtxFn::OtherTempSchema
             | CtxFn::PostmasterStart
             | CtxFn::InetNull(_)
             | CtxFn::Sleep
@@ -91,6 +92,8 @@ pub(super) fn call(ctx: &Ctx, f: CtxFn, a: &[Value]) -> Result<Value> {
             Text(export_snapshot(&ctx.core, &ctx.home, ctx.session, ctx.txid, ctx.tx.as_deref())?)
         }
         CtxFn::InRecovery => Bool(false),
+        CtxFn::OtherTempSchema if a[0] == Null => Null,
+        CtxFn::OtherTempSchema => Bool(false),
         CtxFn::PostmasterStart => TimestampTz(time::started()),
         CtxFn::TxidCurrent => Int(current_xact_id(ctx.txid, ctx.tx.is_some(), false).unwrap_or(ctx.txid)),
         CtxFn::XactId(xid8, if_assigned) => match current_xact_id(ctx.txid, ctx.tx.is_some(), if_assigned) {

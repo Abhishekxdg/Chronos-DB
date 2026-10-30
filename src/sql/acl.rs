@@ -455,6 +455,34 @@ pub(crate) fn func(v: &View, f: &functions::Function) -> Result<Obj> {
     Ok(Obj::new(kind, key, rel_part(&f.name).to_string(), e, BOOTSTRAP))
 }
 
+/// Built-in function `name` (in pg_catalog, or bare) of argument types `types` (any, where none are given and only one
+/// has the name), as privileges see it: the bootstrap superuser's, its grants and owner kept as a made function's are
+/// (`func/pg_catalog.<name>(<types>)`), as a catalog table's are. None where no built-in function is so; 42725 where
+/// the name alone names more than one.
+fn builtin_func(v: &View, name: &str, types: Option<&[Type]>) -> Result<Option<Obj>> {
+    let Some(bare) = name.strip_prefix("pg_catalog.").or_else(|| (!name.contains('.')).then_some(name)) else {
+        return Ok(None);
+    };
+    let want: Option<Vec<i64>> = types.map(|ts| ts.iter().map(|t| i64::from(t.oid())).collect());
+    let found: Vec<(i64, Vec<i64>)> = catalog_schema::builtin_procs(bare)
+        .into_iter()
+        .filter_map(|o| catalog_schema::builtin_proc_facts(o).map(|(_, _, args)| (o, args)))
+        .filter(|(_, args)| want.as_ref().is_none_or(|w| w == args))
+        .collect();
+    let (_, args) = match &found[..] {
+        [] => return Ok(None),
+        [one] => one,
+        _ => return err("42725", format!("function name \"{}\" is not unique", written(name))),
+    };
+    let shown: Vec<String> = args
+        .iter()
+        .map(|&o| Type::from_oid(o as u32).map_or_else(|| o.to_string(), |t| t.name().into_owned()))
+        .collect();
+    let key = key_of(Kind::Function, &format!("pg_catalog.{bare}({})", shown.join(", ")));
+    let e = entry(v, &key)?;
+    Ok(Some(Obj::new(Kind::Function, key, bare.to_string(), e, BOOTSTRAP)))
+}
+
 /// User aggregate `key` (its row's, see `userdefs::agg_key`), named `name`, as privileges see it: EXECUTE, as a
 /// function's (`func/<name>(<types>)`), owned by the role that made it.
 pub(crate) fn aggregate(v: &View, key: &str, name: &str) -> Result<Obj> {
@@ -2493,8 +2521,8 @@ fn bit(name: &str) -> u32 {
     }
 }
 
-/// The objects a GRANT is on, in world `v`.
-fn targets(v: &View, on: &On) -> Result<Vec<Obj>> {
+/// The objects a GRANT (with `revoke`, a REVOKE) is on, in world `v`.
+fn targets(v: &View, on: &On, revoke: bool) -> Result<Vec<Obj>> {
     let mut out = vec![];
     match on {
         On::Rels(names, seq) => {
@@ -2526,6 +2554,24 @@ fn targets(v: &View, on: &On) -> Result<Vec<Obj>> {
         On::Routines(names, kind) => {
             for (name, types) in names {
                 let Some(f) = functions::find_routine(v, name, types.as_deref())? else {
+                    // a built-in function (pg_catalog.pg_reload_conf(), as Supabase grants it)
+                    if *kind != Some(true)
+                        && let Some(o) = builtin_func(v, name, types.as_deref())?
+                    {
+                        // (it runs for every role here, whatever its ACL says: REVOKE is refused rather than recorded
+                        // to no effect; GRANT only adds to what every role has)
+                        if revoke {
+                            return err(
+                                UNSUPPORTED,
+                                format!(
+                                    "REVOKE on built-in function {} isn't supported: every role may run it",
+                                    o.name
+                                ),
+                            );
+                        }
+                        out.push(o);
+                        continue;
+                    }
                     // an aggregate is a function here (ON FUNCTION or ROUTINE), by its argument types
                     if *kind != Some(true)
                         && let Some(types) = types
@@ -2705,7 +2751,7 @@ pub(super) fn run_grant(db: &Db, branch: &str, g: &Grant) -> Result<Output> {
     let mut notes = vec![];
     db.batch_with::<(), SqlError>(branch, |v| {
         let mut writes = vec![];
-        for obj in targets(v, &g.on)? {
+        for obj in targets(v, &g.on, !g.grant)? {
             // the privileges asked for on the object, and on each column
             let mut want = 0u32;
             let mut per_col: Vec<(String, u32)> = vec![];
@@ -3778,12 +3824,14 @@ pub(super) fn alter_owner(db: &Db, branch: &str, what: &Owned, to: &Spec) -> Res
                 }
                 (schema(v, n)?, String::new())
             }
-            Owned::Routine(n, types, _) => {
-                let Some(f) = functions::find_routine(v, n, types.as_deref())? else {
-                    return err(NO_FUNCTION, format!("function {} does not exist", written(n)));
-                };
-                (func(v, &f)?, schema_part(&f.name).to_string())
-            }
+            Owned::Routine(n, types, _) => match functions::find_routine(v, n, types.as_deref())? {
+                Some(f) => (func(v, &f)?, schema_part(&f.name).to_string()),
+                // a built-in function (pg_catalog.lo_export, as Supabase hands its own to its admin role)
+                None => match builtin_func(v, n, types.as_deref())? {
+                    Some(o) => (o, "pg_catalog".to_string()),
+                    None => return err(NO_FUNCTION, format!("function {} does not exist", written(n))),
+                },
+            },
             Owned::Type(n, domain) => {
                 let Some(o) = type_obj(v, n)? else {
                     return err("42704", format!("type \"{n}\" does not exist"));
@@ -4444,7 +4492,14 @@ pub(crate) fn after(db: &Db, branch: &str, moves: Vec<(String, String)>) -> Resu
                 None => false,
             },
             "schema" => schemas.iter().any(|s| s == rest),
-            "func" => funcs.contains(rest),
+            // (a built-in function's, which GRANT and ALTER OWNER keep as `pg_catalog.name(types)`: see `builtin_func`)
+            "func" => {
+                funcs.contains(rest)
+                    || rest
+                        .strip_prefix("pg_catalog.")
+                        .and_then(|r| r.split_once('('))
+                        .is_some_and(|(name, _)| !catalog_schema::builtin_procs(name).is_empty())
+            }
             "type" => v.get(&format!("_sonos_types/{rest}"))?.is_some(),
             "ext" => v.get(&pgcrypto::key(rest))?.is_some(),
             // a schema's default privileges go with it

@@ -52,7 +52,8 @@ use sync::mpsc::{SyncSender, sync_channel};
 use sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, Weak};
 
 pub use agents::{
-    Acting, Agent, AgentSpec, Audit, Can, GUEST, MergePolicy, Outcome, Outcomes, Review, SYSTEM, Slot, Verdict,
+    Acting, Agent, AgentSpec, Audit, Can, GUEST, MergePolicy, Outcome, Outcomes, Priority, Review, SYSTEM, Slot,
+    Verdict,
 };
 pub use backup::{Backup, Verified};
 pub use checks::MergeCheck;
@@ -432,7 +433,14 @@ impl Branch {
         if !self.info.read().unwrap().meta.contains_key(stale::CHECK_READS) {
             return None;
         }
-        Some(self.reads.write().unwrap().get_or_insert_with(|| Arc::new(Mutex::new(stale::ReadSet::default()))).clone())
+        let meta = self.info.read().unwrap().meta.clone();
+        Some(
+            self.reads
+                .write()
+                .unwrap()
+                .get_or_insert_with(|| Arc::new(Mutex::new(stale::ReadSet::of(&meta, false))))
+                .clone(),
+        )
     }
     fn snapshot(&self) -> State {
         self.snap.read().unwrap().clone()
@@ -886,6 +894,27 @@ pub struct LiveCheck {
     /// for a world that checks its reads: what it read that Postgres changed since its fork (see `attach::live_reads`),
     /// which would hold the merge
     pub stale_reads: Vec<String>,
+    /// `MERGE WORLD x REHEARSE`: the write-back run in Postgres and rolled back (see `attach::rehearse`)
+    pub rehearsal: Option<Rehearsal>,
+}
+
+/// A write-back run in Postgres, then rolled back (`MERGE WORLD x REHEARSE [FAIL AT n]`, see `attach::rehearse`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Rehearsal {
+    /// each write statement it ran, in order, with the rows Postgres returned (`update public.leads: 2 rows`)
+    pub statements: Vec<String>,
+    /// rows Postgres stored otherwise than they were sent (a trigger or a default set a column), as Postgres returned
+    /// them: `public.leads (id = 1): {...}`
+    pub returned: Vec<String>,
+    /// attached tables the writes made Postgres write besides (triggers, rules, foreign keys' actions)
+    pub besides: Vec<String>,
+    /// merge checks that found rows in Postgres as the writes left it: the merge would be held
+    pub checks: Vec<String>,
+    /// where it stopped before the end: a statement that failed and why, a refusal, or FAIL AT's stop
+    pub stopped: Option<String>,
+    /// after the rollback, each row compared again: Ok, Postgres holds them as before; Err, what differs (or why it
+    /// couldn't be checked). None: nothing was written to check
+    pub afterwards: Option<std::result::Result<String, String>>,
 }
 
 /// A row a merge would write to Postgres, as the dry run found it there.
@@ -3593,7 +3622,7 @@ impl Core {
             self.state_diff(&base, &ours)?.into_iter().map(|c| c.key).collect();
         let now = self.branch(&parent)?.snapshot();
         let mut out: Vec<(String, String)> =
-            self.stale_reasons(&set, &base, &now, &wrote)?.into_iter().map(|r| (parent.clone(), r)).collect();
+            self.stale_reasons(&set, &parent, &base, &now, &wrote)?.into_iter().map(|r| (parent.clone(), r)).collect();
         if parent == MAIN
             && let Some(att) = self.attached.as_deref()
         {
@@ -3830,15 +3859,6 @@ impl Core {
             return Err(no_history(format!("no merge of {child} within the history window")));
         };
         self.may_undo_into(&parent)?;
-        // in a folder attached to Postgres, main changes only by a merge written there first: the rows go back in a
-        // world of main, which is then merged into it as any world is (each row locked and compared in Postgres, a
-        // row changed there since the merge a conflict, and nothing written)
-        let via = (parent == MAIN && self.attached.is_some())
-            .then(|| format!("undo-{}-{}", child.replace('/', "-"), disk::now_ms()));
-        if let Some(w) = &via {
-            self.fork(MAIN, w)?;
-        }
-        let target = via.clone().unwrap_or_else(|| parent.clone());
         // the world it merged into, just before and just after that record
         let (base_seg, _, base) = hist.iter().rev().find(|h| h.0 <= place.0).expect("the first history is older");
         let (_, _, man) = disk::read_manifest_at(base, log.crypt.as_deref())?
@@ -3861,45 +3881,52 @@ impl Core {
         })?;
         let (before, after) = states.ok_or_else(|| no_history(format!("the merge of {child} can't be rebuilt")))?;
         let changes = self.state_diff(&before, &after)?;
-        let written = self.batch_with(&target, |v| {
-            let (mut rows, mut changed) = (vec![], vec![]);
-            for c in changes.iter().filter(|c| !c.key.starts_with("_sonos_seq/")) {
-                if self.val(&v.s, &c.key)? == c.after {
-                    rows.push((c.key.clone(), c.before.as_deref().map(String::from)));
-                } else if !sql::internal(&c.key) && !sql::btree_entry(&c.key) {
-                    changed.push(c.key.clone());
+        // the effects it brought into main aren't undone (an email sent stays sent): listed, for a person to follow up
+        let effects = self.effects_undone(&changes)?;
+        let changes: Vec<Change> =
+            changes.into_iter().filter(|c| !c.key.starts_with("_sonos_seq/") && !outbox::entry(&c.key)).collect();
+        let put = |target: &str| {
+            let _back = Recovering::enter(); // a way back: main's protection lets it through
+            self.batch_with(target, |v| {
+                let (mut rows, mut changed) = (vec![], vec![]);
+                for c in &changes {
+                    if self.val(&v.s, &c.key)? == c.after {
+                        rows.push((c.key.clone(), c.before.as_deref().map(String::from)));
+                    } else if !sql::internal(&c.key) && !sql::btree_entry(&c.key) {
+                        changed.push(c.key.clone());
+                    }
                 }
-            }
-            if !changed.is_empty() && !skip_changed {
-                let some: Vec<std::borrow::Cow<str>> = changed.iter().take(10).map(|k| sql::show_key(k)).collect();
-                return Err(Error::Constraint {
-                    code: "40001",
-                    message: format!(
-                        "{} rows the merge changed have changed again since ({}); UNDO MERGE ... SKIP CHANGED undoes the rest; nothing was undone",
-                        changed.len(),
-                        some.join(", ")
-                    ),
-                });
-            }
-            let n = rows.iter().filter(|(k, _)| !sql::internal(k) && !sql::btree_entry(k) && !k.starts_with("_sonos_")).count();
-            Ok((rows, (n, changed.len())))
-        });
-        let (_, (rows, skipped)) = match (written, &via) {
-            (Ok(w), _) => w,
-            (Err(e), Some(w)) => {
-                let _ = self.discard(w);
-                return Err(e);
-            }
-            (Err(e), None) => return Err(e),
+                if !changed.is_empty() && !skip_changed {
+                    let some: Vec<std::borrow::Cow<str>> = changed.iter().take(10).map(|k| sql::show_key(k)).collect();
+                    return Err(Error::Constraint {
+                        code: "40001",
+                        message: format!(
+                            "{} rows the merge changed have changed again since ({}); UNDO MERGE ... SKIP CHANGED undoes the rest; nothing was undone",
+                            changed.len(),
+                            some.join(", ")
+                        ),
+                    });
+                }
+                let n = rows
+                    .iter()
+                    .filter(|(k, _)| !sql::internal(k) && !sql::btree_entry(k) && !k.starts_with("_sonos_"))
+                    .count();
+                Ok((rows, (n, changed.len())))
+            })
+            .map(|(_, done)| done)
         };
-        if let Some(w) = via {
-            drop(back); // (the merge writes back to Postgres: not as a way back that skips it)
-            if let Err(e) = self.merge_with(&w, &MergeOptions::default()) {
-                let _ = self.discard(&w);
-                return Err(e);
+        // in a folder attached to Postgres, main changes only by a merge written there first: the rows go back in a
+        // world of main, which is then merged into it as any world is (each row locked and compared in Postgres, a
+        // row changed there since the merge a conflict, and nothing written)
+        let (rows, skipped) = match parent == MAIN && self.attached.is_some() {
+            false => put(&parent)?,
+            true => {
+                drop(back); // (the merge writes back to Postgres: not as a way back that skips it)
+                let via = format!("undo-{}-{}", child.replace('/', "-"), disk::now_ms());
+                self.undo_through_postgres(&via, skip_changed, put)?
             }
-        }
-        Ok(Undone { parent, at: when, rows, skipped })
+        };
+        Ok(Undone { parent, at: when, rows, skipped, effects })
     }
 
     /// In world `b`, puts back each row of `rows` (its key: its value before, after, and whether anyone else changed
@@ -3919,8 +3946,8 @@ impl Core {
             let (mut put, mut changed) = (std::collections::BTreeMap::new(), vec![]);
             let mut owned = vec![]; // unique and reference rows: back only with their rows
             for (k, (before, after, others)) in rows {
-                if k.starts_with("_sonos_seq/") || sql::btree_entry(k) || agents::agent_row(k) {
-                    continue;
+                if k.starts_with("_sonos_seq/") || sql::btree_entry(k) || agents::agent_row(k) || outbox::entry(k) {
+                    continue; // (an effect isn't undone: see `effects_landed`)
                 }
                 let now = self.val(&v.s, k)?;
                 if sql::internal(k) {
@@ -3983,17 +4010,23 @@ impl Core {
         skip_changed: bool,
         except: &[String],
     ) -> Result<(usize, usize)> {
-        if b == MAIN {
-            attach::refuse_main(self, "UNDO DIFF")?;
-        }
-        let _back = Recovering::enter(); // a way back: main's protection lets it through
+        let back = Recovering::enter(); // a way back: main's protection lets it through
         self.may_undo_into(b)?;
         let (x, y) = self.diff_ends(from, Some(to))?;
         let rows = (self.state_diff(&x, &y)?.into_iter())
             .filter(|c| !except.iter().any(|t| t == table_of(&c.key)))
             .map(|c| (c.key, (c.before, c.after, false)))
             .collect();
-        self.put_back(b, &rows, skip_changed, &format!("the diff from {from} to {to}"), "UNDO DIFF")
+        let whose = format!("the diff from {from} to {to}");
+        if b == MAIN && self.attached.is_some() {
+            drop(back); // (written back to Postgres: see `undo_through_postgres`)
+            let via = format!("undo-diff-{}", disk::now_ms());
+            return self.undo_through_postgres(&via, skip_changed, |w| {
+                let _back = Recovering::enter();
+                self.put_back(w, &rows, skip_changed, &whose, "UNDO DIFF")
+            });
+        }
+        self.put_back(b, &rows, skip_changed, &whose, "UNDO DIFF")
     }
 
     /// Undoes what agent `agent` changed in world `b` since `since` (ms since 1970, within the
@@ -4012,10 +4045,7 @@ impl Core {
     /// metadata has that `run_id` (see `agents::RUN_KEYS`). The agent's other changes count as anyone else's: a row
     /// another of its runs changed after this one is left, and named.
     pub fn undo_run(&self, agent: &str, b: &str, since: u64, skip_changed: bool, run: Option<&str>) -> Result<Undone> {
-        if b == MAIN {
-            attach::refuse_main(self, "UNDO AGENT")?;
-        }
-        let _back = Recovering::enter(); // a way back: main's protection lets it through
+        let back = Recovering::enter(); // a way back: main's protection lets it through
         self.may_undo_into(b)?;
         let Some(log) = &self.log else {
             return Err(no_history("an in-memory database keeps no history".into()));
@@ -4119,8 +4149,73 @@ impl Core {
             return Err(e);
         }
         let whose = format!("agent {agent}");
-        let (n, skipped) = self.put_back(b, &rows, skip_changed, &whose, "UNDO AGENT")?;
-        Ok(Undone { parent: b.into(), at: since, rows: n, skipped })
+        let effects = self.effects_landed(rows.iter().filter_map(|(k, (before, after, _))| {
+            before.is_none().then_some((k.as_str(), after.as_ref()?)) // effects it brought: new rows of the outbox
+        }))?;
+        let (n, skipped) = match b == MAIN && self.attached.is_some() {
+            false => self.put_back(b, &rows, skip_changed, &whose, "UNDO AGENT")?,
+            true => {
+                drop(back); // (written back to Postgres: see `undo_through_postgres`)
+                let via = format!("undo-{}-{}", agent.replace('/', "-"), disk::now_ms());
+                self.undo_through_postgres(&via, skip_changed, |w| {
+                    let _back = Recovering::enter();
+                    self.put_back(w, &rows, skip_changed, &whose, "UNDO AGENT")
+                })?
+            }
+        };
+        Ok(Undone { parent: b.into(), at: since, rows: n, skipped, effects })
+    }
+
+    /// Puts rows back in main of a folder attached to Postgres (UNDO MERGE, UNDO AGENT, UNDO DIFF): `put` writes them
+    /// in world `via`, forked from main now, which is then merged as any world is, so that each row is locked and
+    /// compared in Postgres first. A row changed there since main last had it is a conflict: nothing is written, and
+    /// main takes Postgres's row (see `attach::after_failed`). With `skip_changed` the undo then runs once more, in a
+    /// new world, and leaves that row as it leaves one main had already changed. Returns `put`'s counts.
+    fn undo_through_postgres(
+        &self,
+        via: &str,
+        skip_changed: bool,
+        put: impl Fn(&str) -> Result<(usize, usize)>,
+    ) -> Result<(usize, usize)> {
+        for again in [false, true] {
+            let w = if again { format!("{via}-again") } else { via.to_string() };
+            self.fork(MAIN, &w)?;
+            match put(&w).and_then(|done| self.merge_with(&w, &MergeOptions::default()).map(|_| done)) {
+                Ok(done) => return Ok(done),
+                Err(e) => {
+                    let _ = self.discard(&w);
+                    if again || !skip_changed || !attach::is_conflict(&e) {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        unreachable!("the second time returns")
+    }
+
+    /// The effects among `changes` (a merge's, or an agent's) that came into main with them: never undone, as what a
+    /// worker did with one (an email sent, a webhook called) isn't in the database to put back. See `effects_landed`.
+    fn effects_undone(&self, changes: &[Change]) -> Result<Vec<UndoneEffect>> {
+        self.effects_landed(
+            changes.iter().filter(|c| c.before.is_none()).filter_map(|c| Some((c.key.as_str(), c.after.as_ref()?))),
+        )
+    }
+
+    /// Of `new` (rows a change added, by key, as added), the effects (outbox entries), each with where it is now:
+    /// `sent` once a worker acknowledged it (it's gone from main's outbox), else its state there (`queued`: still to
+    /// be sent, which ACK OUTBOX drops; `claimed`; `ambiguous`).
+    fn effects_landed<'a>(&self, new: impl IntoIterator<Item = (&'a str, &'a Val)>) -> Result<Vec<UndoneEffect>> {
+        let now: HashMap<String, &'static str> = self.outbox(MAIN)?.into_iter().map(|e| (e.id, e.state)).collect();
+        let mut out = vec![];
+        for (k, v) in new {
+            let Some(id) = k.strip_prefix(&format!("{}/", outbox::OUTBOX)) else { continue };
+            out.push(UndoneEffect {
+                id: id.to_string(),
+                channel: outbox::channel_of(v).unwrap_or_default(),
+                state: now.get(id).copied().unwrap_or("sent"),
+            });
+        }
+        Ok(out)
     }
 
     /// The raw writes that turn state `from` into state `to`, but for agents' rows: restoring or
@@ -4185,6 +4280,8 @@ impl Core {
             ("rows_written", m.rows_written.load(Ordering::Relaxed)),
             ("errors", m.errors.load(Ordering::Relaxed)),
             ("conflicts", m.conflicts.load(Ordering::Relaxed)),
+            // ms low-priority agents' statements yielded to the database's own users (an agent's `priority`)
+            ("agent_yield_ms", m.agent_yield_us.load(Ordering::Relaxed) / 1000),
             ("worlds", worlds as u64),
             // 1 while an HNSW graph builds in the background (searches scan until it's done)
             ("search_graphs_building", u64::from(!self.search_graphs_ready())),
@@ -4639,7 +4736,7 @@ impl Core {
             let reads = match name.starts_with("_tx_") {
                 true => src.recorder(),
                 false if info.meta.contains_key(stale::CHECK_READS) && self.me.get().is_some() => {
-                    Some(Arc::new(Mutex::new(stale::ReadSet::complete())))
+                    Some(Arc::new(Mutex::new(stale::ReadSet::of(&info.meta, true))))
                 }
                 false => None,
             };
@@ -4926,6 +5023,27 @@ impl Core {
     /// What `merge_with(b, o)` would do, row by row, without doing it: conflicts are listed, not
     /// errors. Nothing changes.
     pub fn merge_preview(&self, b: &str, o: &MergeOptions) -> Result<MergePlan> {
+        self.preview(b, o, None)
+    }
+
+    /// `merge_preview`, with the write-back to Postgres of an attached folder's main run there and rolled back
+    /// (`MERGE WORLD b REHEARSE [FAIL AT n]`, see `attach::rehearse`): what Postgres returned, and that it holds what
+    /// it held before. `stop`: stop after that many write statements. Refused outside a merge into main of an attached
+    /// folder.
+    pub fn merge_rehearsal(&self, b: &str, o: &MergeOptions, stop: Option<usize>) -> Result<MergePlan> {
+        self.preview(b, o, Some(stop))
+    }
+
+    fn preview(&self, b: &str, o: &MergeOptions, rehearse: Option<Option<usize>>) -> Result<MergePlan> {
+        if rehearse.is_some() && self.attached.is_none() {
+            return Err(Error::Constraint {
+                code: "0A000",
+                message:
+                    "REHEARSE runs a merge's write-back in the Postgres a folder is attached to (chronos attach); \
+                          this one isn't attached: use DRY RUN"
+                        .into(),
+            });
+        }
         let picks = settles(o);
         let (mut plan, dry) = {
             let _g = self.gate();
@@ -4940,10 +5058,31 @@ impl Core {
             ));
         }
         // into main of a folder attached to Postgres: checked there too, now that the merge's locks are let go
-        if let (Some(dry), Some(att)) = (dry, self.attached.as_deref()) {
-            let live = attach::dry_run(self, att, dry);
-            plan.blocked = plan.blocked.or_else(|| attach::dry_blocked(&live));
-            plan.live = Some(live);
+        match (dry, self.attached.as_deref(), rehearse) {
+            (Some(dry), Some(att), None) => {
+                let live = attach::dry_run(self, att, dry);
+                plan.blocked = plan.blocked.or_else(|| attach::dry_blocked(&live));
+                plan.live = Some(live);
+            }
+            // (blocked here, or with conflicts: Postgres isn't asked, as the merge wouldn't get there)
+            (Some(_), Some(att), Some(_)) if plan.blocked.is_some() || plan.conflicts > 0 => {
+                let why = "not rehearsed: the merge is refused in Chronos first (see the plan)".to_string();
+                plan.live = Some(LiveCheck { source: att.source(), error: Some(why), ..Default::default() });
+            }
+            (Some(dry), Some(att), Some(stop)) => {
+                let live = attach::rehearse(self, att, dry, stop);
+                plan.blocked = plan.blocked.or_else(|| attach::dry_blocked(&live));
+                plan.live = Some(live);
+            }
+            (None, _, Some(_)) => {
+                return Err(Error::Constraint {
+                    code: "0A000",
+                    message: format!(
+                        "REHEARSE runs the write-back of a merge into main; {b}'s merge doesn't write to Postgres"
+                    ),
+                });
+            }
+            _ => {}
         }
         Ok(plan)
     }
@@ -5466,7 +5605,7 @@ impl Core {
                 broken.extend(self.failed_checks(&name, &merged, &keys)?);
             }
             if let Some(set) = &read_set {
-                broken.extend(self.stale_reasons(set, &base_state, &theirs_state, &wrote)?);
+                broken.extend(self.stale_reasons(set, &name, &base_state, &theirs_state, &wrote)?);
             }
             let refused = match (&policy, &declared) {
                 (None, Some(s)) if !strayed.is_empty() => Some(scope::refused(b, s, &strayed)),
@@ -5588,7 +5727,7 @@ impl Core {
         // find joins the policy's broken rules
         let failed = if tx || rebase { vec![] } else { self.failed_checks(&name, &next, &keys)? };
         let stale = match &read_set {
-            Some(set) => self.stale_reasons(set, &base_state, &theirs_state, &wrote)?,
+            Some(set) => self.stale_reasons(set, &name, &base_state, &theirs_state, &wrote)?,
             None => vec![],
         };
         broken.extend(failed.iter().chain(&stale).cloned());
@@ -6735,6 +6874,16 @@ pub struct Undone {
     pub at: u64,        // when the merge was (ms since 1970)
     pub rows: usize,    // rows put back
     pub skipped: usize, // rows left as they are: changed since the merge
+    /// the effects the undone change brought into main: not undone (see `Core::effects_landed`)
+    pub effects: Vec<UndoneEffect>,
+}
+
+/// An effect an undo leaves (see `Undone::effects`): its id, channel, and `sent`, `queued`, `claimed` or `ambiguous`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UndoneEffect {
+    pub id: String,
+    pub channel: String,
+    pub state: &'static str,
 }
 
 /// One thing that happened to a world (see `Core::history`).
@@ -6952,8 +7101,8 @@ const ATTACHED_REVIEW: &str = "attached";
 pub(crate) const REBASED: &str = "_sonos_rebased";
 
 /// Words MERGE WORLD reads after WORLD as its own, not as a world's name (see `check_name`).
-pub(crate) const MERGE_WORDS: [&str; 11] =
-    ["using", "ours", "theirs", "confirm", "by", "resolve", "dry", "into", "only", "at", "target"];
+pub(crate) const MERGE_WORDS: [&str; 12] =
+    ["using", "ours", "theirs", "confirm", "by", "resolve", "dry", "into", "only", "at", "target", "rehearse"];
 
 /// Refuses a transaction's own world (see `check_name`): private to the session that made it,
 /// which reaches it through its own paths, never by a name given to the API or in SQL.

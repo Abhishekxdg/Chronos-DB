@@ -529,3 +529,62 @@ fn the_catalogs_one_letter_columns_are_char() {
         [r#"a|"char"|"char""#]
     );
 }
+
+/// information_schema's helpers PostgREST reads a column's type with: a domain's base type and typmod
+/// (`_pg_truetypid`, `_pg_truetypmod` of the pg_attribute and pg_type rows), and from them the length, precision
+/// and scale its views show; and pg_is_other_temp_schema, which its schema discovery asks of every schema.
+#[test]
+fn information_schema_type_helpers() {
+    let helpers = r"select a.attname, information_schema._pg_truetypid(a.*, t.*)::regtype,
+            information_schema._pg_char_max_length(information_schema._pg_truetypid(a.*, t.*), information_schema._pg_truetypmod(a.*, t.*)),
+            information_schema._pg_numeric_precision(information_schema._pg_truetypid(a.*, t.*), information_schema._pg_truetypmod(a.*, t.*)),
+            information_schema._pg_numeric_scale(information_schema._pg_truetypid(a.*, t.*), information_schema._pg_truetypmod(a.*, t.*)),
+            information_schema._pg_datetime_precision(information_schema._pg_truetypid(a.*, t.*), information_schema._pg_truetypmod(a.*, t.*))
+        from pg_attribute a join pg_type t on t.oid = a.atttypid
+        where a.attrelid = 'pr'::regclass and a.attnum > 0 order by a.attnum";
+    script(&[
+        ("create domain email as text", Ok(&[])),
+        ("create table pr (a varchar(20), b numeric(10, 2), c email, d timestamptz(3), e int, f char(4), g numeric(3, -3))", Ok(&[])),
+        (
+            helpers,
+            Ok(&[
+                "a|character varying|20|||",
+                "b|numeric||10|2|",
+                "c|text||||",
+                "d|timestamp with time zone||||3",
+                "e|integer||32|0|",
+                "f|character|4|||",
+                "g|numeric||3|-3|",
+            ]),
+        ),
+        (
+            "select information_schema._pg_char_max_length(1043, -1), information_schema._pg_char_octet_length(1043, 24),
+                information_schema._pg_numeric_precision_radix(1700, -1), information_schema._pg_char_max_length(null, 24)",
+            Ok(&["|80|10|"]),
+        ),
+        (
+            "select pg_is_other_temp_schema('public'::regnamespace), pg_is_other_temp_schema(null)",
+            Ok(&["f|"]),
+        ),
+    ]);
+}
+
+/// pg_tables', pg_views', pg_matviews' and pg_sequences' owner is the relation's, as pg_class has it, after
+/// ALTER ... OWNER TO too.
+#[test]
+fn the_owner_views_follow_owner_to() {
+    script(&[
+        ("create role own2", Ok(&[])),
+        ("create table ow (id serial, a int)", Ok(&[])),
+        ("create view owv as select a from ow", Ok(&[])),
+        ("create sequence ows", Ok(&[])),
+        ("select tableowner from pg_tables where tablename = 'ow'", Ok(&["chronos"])),
+        ("alter table ow owner to own2", Ok(&[])),
+        ("alter view owv owner to own2", Ok(&[])),
+        ("alter sequence ows owner to own2", Ok(&[])),
+        ("select tableowner from pg_tables where tablename = 'ow'", Ok(&["own2"])),
+        ("select relowner::regrole from pg_class where relname = 'ow'", Ok(&["own2"])),
+        ("select viewowner from pg_views where viewname = 'owv'", Ok(&["own2"])),
+        ("select sequenceowner from pg_sequences where sequencename = 'ows'", Ok(&["own2"])),
+    ]);
+}

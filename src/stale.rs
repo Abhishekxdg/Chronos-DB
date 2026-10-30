@@ -12,6 +12,19 @@
 //!     used doesn't count (an insert or a delete always does: it changes what a read finds)
 //!   merge ─> each read, fork point vs the world merged into now ─> changed: held
 //!
+//! A hold found that way may be a false one: the rows changed, but what the agent got from them didn't (a sum that
+//! came out the same, a row its read found again as it was). A world forked `WITH (rerun_reads = true)` (which checks
+//! its reads too), or by an agent whose merge policy has `rerun_reads`, keeps each plain SELECT it reads through (see
+//! `sql::Session::replayable`) with a hash of what it gave (at most MOST_KEPT, of MOST_ROWS rows each), and what it
+//! read any other way (a statement of another kind, a row read over HTTP) apart, as `outside`. A merge that would be
+//! held, for rows only the kept SELECTs read, runs them again: on the world it merges into as it is, and on the fork
+//! point. Each gives what it gave then on both: not held. One gives something else now: held, the reasons saying what
+//! it gave then and gives now too. One that fails, runs past TIMEOUT, or gives something else on the fork point (a read
+//! of the world's own writes, of the clock, of random()): held as found. In a folder attached to Postgres they run on
+//! Postgres's rows as well (see `attach::check_reads`).
+//!
+//!   held ─> each kept SELECT, as its session ran it ─> now: as then? ─> fork point: as then? ─> not held
+//!
 //! Opt-in: a world forked `WITH (check_reads = true)`, or any world an agent keeping to a merge
 //! policy with `check_reads` forks (`_sonos_check_reads` in its metadata, which only the database
 //! sets). A transaction's reads count for its world. The read set is kept in memory, and written
@@ -25,7 +38,7 @@
 
 use crate::{Core, Error, Result, State};
 use serde_json::{Map, Value as Json, json};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::path::Path;
@@ -38,10 +51,15 @@ pub(crate) type Using = Arc<HashMap<String, BTreeSet<String>>>;
 
 thread_local! {
     pub(crate) static USING: RefCell<Option<Using>> = const { RefCell::new(None) };
+    /// A plain SELECT that is kept to run again at the merge is running (see `sql::Session::replayable`): what it
+    /// reads meanwhile is read by it. Anything read while it isn't set wasn't, and can't be run again.
+    pub(crate) static REPLAY: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Metadata key marking a world whose reads are checked at merge.
 pub(crate) const CHECK_READS: &str = "_sonos_check_reads";
+/// Metadata key marking a world whose SELECTs are run again at a merge their reads would hold.
+pub(crate) const RERUN_READS: &str = "_sonos_rerun_reads";
 /// Keys one world remembers before a table's reads count as the whole table.
 const MOST_KEYS: usize = 10_000;
 /// Key ranges likewise.
@@ -50,6 +68,25 @@ const MOST_RANGES: usize = 1_000;
 const MOST_FILTERS: usize = 1_000;
 /// Changed keys a reason names before it says how many more.
 const SHOWN: usize = 10;
+/// SELECTs one world keeps to run again at its merge; past it, its reads can't all be run again.
+const MOST_KEPT: usize = 100;
+/// Rows a SELECT may give to be kept.
+const MOST_ROWS: usize = 10_000;
+/// How long each kept SELECT may take when run again, in ms: as long as a merge check, which runs under the same locks.
+const TIMEOUT: u64 = 1000;
+/// How long a merge spends running them again in all, in ms; past it, held as found.
+const ALL_TIMEOUT: u64 = 5000;
+/// Characters of a kept SELECT a reason shows.
+const TEXT_SHOWN: usize = 100;
+
+/// A SELECT kept to run again at the merge (see the module docs): how, and what it gave.
+#[derive(Clone)]
+pub(crate) struct Kept {
+    run: crate::sql::Replay,
+    digest: [u8; 32],
+    /// what it gave, as a reason shows it
+    shown: String,
+}
 
 /// What a world read (see the module docs).
 #[derive(Default)]
@@ -68,6 +105,15 @@ pub(crate) struct ReadSet {
     seen: HashSet<String>,
     /// per table read (its group), the columns its reads used (None: any); a table not here, every column
     columns: BTreeMap<String, Option<BTreeSet<String>>>,
+    /// its SELECTs are kept to run again at its merge (see the module docs)
+    rerun: bool,
+    /// the SELECTs it read through, to run again at its merge
+    kept: Vec<Kept>,
+    /// what it read otherwise, which can't be run again: a hold for it stays
+    outside: Option<Box<ReadSet>>,
+    /// a SELECT read and wasn't kept (it failed, or gave too many rows; too many were kept), or what was read before a
+    /// restart isn't known: a hold can't be lifted by running the kept ones again
+    loose: bool,
 }
 
 /// The group a key's read falls in: a table's rows (`orders/`) or, for the rows SQL keeps behind
@@ -87,6 +133,24 @@ impl ReadSet {
         ReadSet { complete: true, ..Default::default() }
     }
 
+    /// For a world whose metadata is `meta`: kept since its fork (`complete`) or not.
+    pub(crate) fn of(meta: &Map<String, Json>, complete: bool) -> ReadSet {
+        ReadSet { complete, rerun: meta.contains_key(RERUN_READS), ..Default::default() }
+    }
+
+    /// Whether its SELECTs are kept to run again (see the module docs).
+    pub(crate) fn reruns(&self) -> bool {
+        self.rerun && !self.loose
+    }
+
+    /// Where what's read now goes besides: `outside`, unless a kept SELECT reads it.
+    fn apart(&mut self) -> Option<&mut ReadSet> {
+        match self.reruns() && !REPLAY.get() {
+            true => Some(self.outside.get_or_insert_with(|| Box::new(ReadSet::complete()))),
+            false => None,
+        }
+    }
+
     /// Table group `g` read by the statement running: the columns it uses join those its reads used.
     fn used(&mut self, g: &str) {
         let Some(table) = g.strip_suffix('/').filter(|t| !t.contains('/')) else { return }; // a table's own rows
@@ -102,6 +166,9 @@ impl ReadSet {
     }
 
     pub(crate) fn key(&mut self, k: &str) {
+        if let Some(o) = self.apart() {
+            o.key(k);
+        }
         let Some(g) = group(k) else { return };
         self.used(&g);
         if self.groups.contains(&g) {
@@ -114,6 +181,9 @@ impl ReadSet {
     }
 
     pub(crate) fn range(&mut self, prefix: &str, after: Option<&str>, upto: Option<&str>) {
+        if let Some(o) = self.apart() {
+            o.range(prefix, after, upto);
+        }
         let Some(g) = group(prefix).or_else(|| group(&format!("{prefix}/"))) else { return };
         self.used(&g);
         if self.groups.contains(&g) {
@@ -127,6 +197,9 @@ impl ReadSet {
 
     /// A search: it may have read any row of `table`.
     pub(crate) fn table(&mut self, table: &str) {
+        if let Some(o) = self.apart() {
+            o.table(table);
+        }
         if let Some(g) = group(&format!("{table}/")) {
             self.columns.insert(g.clone(), None); // a search may rank by any column
             self.whole(g);
@@ -135,6 +208,9 @@ impl ReadSet {
 
     /// A scan of `table` whose rows `f` matches: any of them it may have read.
     pub(crate) fn filtered(&mut self, table: &str, f: crate::sql::RowFilter) {
+        if let Some(o) = self.apart() {
+            o.filtered(table, f.clone());
+        }
         let Some(g) = group(&format!("{table}/")) else { return };
         self.used(&g);
         if self.groups.contains(&g) {
@@ -150,6 +226,30 @@ impl ReadSet {
             return self.whole(g);
         }
         self.filters.push((g, f));
+    }
+
+    /// A SELECT read and can't be run again (it failed): no hold is lifted by running the kept ones again.
+    pub(crate) fn loosen(&mut self) {
+        self.loose = true;
+        self.kept.clear();
+        self.outside = None;
+    }
+
+    /// Plain SELECT `run` gave `out` (see `sql::Session::replayable`): kept to run again at the merge. Too many, or
+    /// too many rows: its reads can't all be run again.
+    pub(crate) fn keep(&mut self, run: crate::sql::Replay, out: &crate::sql::Output) {
+        if !self.reruns() {
+            return;
+        }
+        if out.rows.len() > MOST_ROWS || self.kept.len() >= MOST_KEPT {
+            return self.loosen();
+        }
+        let digest = run.digest(out);
+        // (the same statement giving the same again, an agent's loop: kept once)
+        let same = |k: &Kept| k.digest == digest && k.run.same(&run);
+        if !self.kept.iter().any(same) {
+            self.kept.push(Kept { shown: crate::sql::result_summary(out), run, digest });
+        }
     }
 
     /// Per table read, by its name as rows are keyed: the row keys read one by one, and whether more of it was read
@@ -234,6 +334,8 @@ impl ReadSet {
             "groups": groups,
             "filters": filters,
             "columns": self.columns,
+            // (the SELECTs kept to run again aren't written out: after a restart a hold stays as found)
+            "rerun": self.rerun,
         })
     }
 
@@ -274,6 +376,10 @@ impl ReadSet {
             filters,
             seen,
             columns,
+            rerun: j["rerun"].as_bool().unwrap_or(false),
+            kept: vec![],
+            outside: None,
+            loose: true,
         })
     }
 }
@@ -290,15 +396,21 @@ fn named(g: &str) -> String {
 
 /// `check_reads` in a new world's metadata: true becomes the database's own key; false, or none,
 /// leaves nothing.
+/// `rerun_reads = true` likewise, and it checks its reads too.
 pub(crate) fn from_meta(meta: &mut Map<String, Json>) -> Result<()> {
-    match meta.remove("check_reads") {
-        None | Some(Json::Bool(false)) => Ok(()),
-        Some(Json::Bool(true)) => {
-            meta.insert(CHECK_READS.into(), Json::Bool(true));
-            Ok(())
-        }
-        Some(_) => Err(crate::bad_meta("check_reads must be true or false".into())),
+    let flag = |meta: &mut Map<String, Json>, k: &str| match meta.remove(k) {
+        None | Some(Json::Bool(false)) => Ok(false),
+        Some(Json::Bool(true)) => Ok(true),
+        Some(_) => Err(crate::bad_meta(format!("{k} must be true or false"))),
+    };
+    let (check, rerun) = (flag(meta, "check_reads")?, flag(meta, "rerun_reads")?);
+    if check || rerun {
+        meta.insert(CHECK_READS.into(), Json::Bool(true));
     }
+    if rerun {
+        meta.insert(RERUN_READS.into(), Json::Bool(true));
+    }
+    Ok(())
 }
 
 /// How the error `stale` gives ends: what tells it from the other refusals that share its SQLSTATE.
@@ -395,16 +507,35 @@ impl Core {
     }
 
     /// Why a merge is held for reading what changed, given the merged world's read set `set`:
-    /// `base` its fork point, `now` the world it merges into as it is, `wrote` the keys it changed
-    /// itself (those conflict, or settle, on their own).
+    /// `base` its fork point, `now` world `into`, the one it merges into, as it is, `wrote` the keys
+    /// it changed itself (those conflict, or settle, on their own). When what it read came only from
+    /// SELECTs kept to run again, and they give what they gave, nothing (see the module docs).
     pub(crate) fn stale_reasons(
         &self,
         set: &crate::Recorder,
+        into: &str,
         base: &State,
         now: &State,
         wrote: &HashSet<String>,
     ) -> Result<Vec<String>> {
         let set = set.lock().unwrap();
+        let out = self.reasons(&set, base, now, wrote)?;
+        // (rows changed that something other than a kept SELECT read: held, whatever they give)
+        if out.is_empty() || !set.complete || !set.reruns() || set.kept.is_empty() {
+            return Ok(out);
+        }
+        if let Some(o) = &set.outside
+            && !self.reasons(o, base, now, wrote)?.is_empty()
+        {
+            return Ok(out);
+        }
+        let kept = set.kept.clone();
+        drop(set);
+        self.run_again(into, base, now, &kept, out)
+    }
+
+    /// `stale_reasons` for read set `set`, as read.
+    fn reasons(&self, set: &ReadSet, base: &State, now: &State, wrote: &HashSet<String>) -> Result<Vec<String>> {
         let mut out = vec![];
         if !set.complete {
             out.push(
@@ -438,7 +569,7 @@ impl Core {
         }
         for g in &set.groups {
             let found = in_range(g, None, None)?;
-            if !found.is_empty() && !self.unused(&set, base, now, found)?.is_empty() {
+            if !found.is_empty() && !self.unused(set, base, now, found)?.is_empty() {
                 whole.push(g.clone());
             }
         }
@@ -469,7 +600,7 @@ impl Core {
         }
         changed.sort();
         changed.dedup();
-        let changed = self.unused(&set, base, now, changed)?;
+        let changed = self.unused(set, base, now, changed)?;
         // rows first, then what's behind indexes and constraints, which a row read usually covers
         let (rows, behind): (Vec<String>, Vec<String>) =
             changed.into_iter().partition(|k| group(k).is_some_and(|g| !crate::reserved_table(&g[..g.len() - 1])));
@@ -484,6 +615,61 @@ impl Core {
             out.push(format!("read {}, which changed since it forked", named(&g)));
         }
         Ok(out)
+    }
+
+    /// The reasons `held` a merge into `into` is held for, given that the rows changed were read only by the SELECTs
+    /// `kept`: none when each gives what it gave, on `base` and on `now`; else `held`, and for each that gives
+    /// something else now, what it gave and gives (`held` alone when one can't be run again, or gives something else
+    /// on `base`).
+    fn run_again(
+        &self,
+        into: &str,
+        base: &State,
+        now: &State,
+        kept: &[Kept],
+        held: Vec<String>,
+    ) -> Result<Vec<String>> {
+        static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let Some(db) = self.db() else { return Ok(held) };
+        let started = std::time::Instant::now();
+        let run = |k: &Kept, s: &State| -> Option<crate::sql::Output> {
+            let left = ALL_TIMEOUT.saturating_sub(started.elapsed().as_millis() as u64);
+            if left == 0 {
+                return None;
+            }
+            // a name only this run reads the state by; `@` makes it read only (see `checks`)
+            let at = format!("{into}@reads-{}", RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            self.merging.lock().unwrap().insert(at.clone(), s.clone());
+            let out = k.run.run(&db, &at, TIMEOUT.min(left));
+            self.merging.lock().unwrap().remove(&at);
+            out.ok()
+        };
+        let mut changed = vec![];
+        for k in kept {
+            // as then on the fork point: what it gave came from the rows (not its own writes, the clock, chance)
+            match run(k, base) {
+                Some(b) if k.run.digest(&b) == k.digest => {}
+                _ => return Ok(held),
+            }
+            let Some(o) = run(k, now) else { return Ok(held) };
+            if k.run.digest(&o) != k.digest {
+                let mut text: String = k.run.text.chars().take(TEXT_SHOWN).collect();
+                if text.len() < k.run.text.len() {
+                    text.push_str("...");
+                }
+                let now_shown = match crate::sql::result_summary(&o) {
+                    s if s == k.shown => format!("{s}, not the same"),
+                    s => s,
+                };
+                changed.push(format!("read `{text}`, which gave {} then and gives {now_shown} now", k.shown));
+            }
+        }
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+        let mut held = held;
+        held.extend(changed);
+        Ok(held)
     }
 
     /// Of `keys`, changed between `base` and `now`, those that count against what was read: all

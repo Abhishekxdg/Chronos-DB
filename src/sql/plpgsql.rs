@@ -222,6 +222,8 @@ enum S {
         /// the statement as Postgres shows it in an error's CONTEXT: as written, its INTO blanked out, PERFORM
         /// as SELECT
         text: String,
+        /// a utility statement run as a query (NOTIFY, as pg_notify's): FOUND and ROW_COUNT stay as they were
+        utility: bool,
     },
     Raise {
         level: &'static str,
@@ -1513,7 +1515,9 @@ impl P<'_> {
             "set" => return self.sql(false),
             // EXPLAIN's lines, as PERFORM or a query's rows (`FOR ln IN EXPLAIN ...` is a FOR loop's)
             "explain" => return self.sql(false),
-            "copy" | "reset" | "show" | "notify" | "listen" | "vacuum" | "analyze" | "lock" => {
+            // NOTIFY: pg_notify's call (see `statement`)
+            "notify" => return self.sql(false),
+            "copy" | "reset" | "show" | "listen" | "vacuum" | "analyze" | "lock" => {
                 return refuse(&w.to_uppercase());
             }
             _ => {}
@@ -2152,6 +2156,12 @@ impl P<'_> {
             ];
             s = Stmt::Select(Box::new(super::select_of(Expr::Func(Func::Ctx(CtxFn::SetConfig), args))));
         }
+        // NOTIFY channel[, 'payload']: pg_notify's call, sent as the transaction commits (PostgREST's schema-reload
+        // event triggers: `NOTIFY pgrst, 'reload schema'`)
+        if let Stmt::Notify(channel, payload) = &s {
+            let args = vec![Expr::Lit(Value::Text(channel.clone())), Expr::Lit(Value::Text(payload.clone()))];
+            s = Stmt::Select(Box::new(super::select_of(Expr::Func(Func::Ctx(CtxFn::Notify), args))));
+        }
         if !matches!(
             s,
             Stmt::Select(_)
@@ -2160,6 +2170,8 @@ impl P<'_> {
                 | Stmt::Update { .. }
                 | Stmt::Delete { .. }
                 | Stmt::Merge(_)
+                // (a WITH whose queries write: Supabase Storage's backfill inserts from one, SELECT ... INTO its counts)
+                | Stmt::With(_)
                 | Stmt::Explain { .. }
         ) {
             return err(UNSUPPORTED, format!("{} isn't supported in PL/pgSQL functions", functions::what(&s)));
@@ -2176,15 +2188,17 @@ impl P<'_> {
             // (Postgres writes SELECT over the word PERFORM)
             text = format!("SELECT{}", text.chars().skip(7).collect::<String>());
         }
+        let utility = matches!(toks.first(), Some(Tok::Word(w)) if w == "notify");
         let stmt = self.statement(toks)?;
         self.semi()?;
-        // (SET and RESET of a setting: run for their effect, as PERFORM set_config(...) is)
-        let perform = perform || set_config_of(&stmt);
+        // (SET and RESET of a setting, and NOTIFY: run for their effect, as PERFORM set_config(...) and PERFORM
+        // pg_notify(...) are)
+        let perform = perform || set_config_of(&stmt) || utility;
         let into = match into {
             None => None,
             Some(_) if perform => return err(SYNTAX, "PERFORM runs a query for its effects: it has no INTO"),
             Some((names, strict)) => {
-                let returns = match &stmt {
+                let returns = match main_of(&stmt) {
                     Stmt::Insert { returning, .. }
                     | Stmt::Update { returning, .. }
                     | Stmt::Delete { returning, .. } => returning.is_some(),
@@ -2196,7 +2210,7 @@ impl P<'_> {
                 Some((self.targets(names)?, strict))
             }
         };
-        Ok(S::Sql { stmt: Box::new(stmt), into, perform, text })
+        Ok(S::Sql { stmt: Box::new(stmt), into, perform, text, utility })
     }
 
     /// INTO's targets: one record, or variables and records' fields.
@@ -2670,6 +2684,14 @@ fn pl_assigned(v: Value, from: Option<Type>, to: Type) -> Result<Value> {
 }
 
 /// Whether `s` is the set_config call a PL/pgSQL SET LOCAL is (see `statement`).
+/// The statement `s` runs as: a WITH whose queries write, its main one (see `Exec::with_dml`); any other, itself.
+fn main_of(s: &Stmt) -> &Stmt {
+    match s {
+        Stmt::With(w) => &w.main,
+        s => s,
+    }
+}
+
 fn set_config_of(s: &Stmt) -> bool {
     matches!(s, Stmt::Select(q) if matches!(&q.items[..], [Item::Expr(Expr::Func(Func::Ctx(CtxFn::SetConfig), a), None)] if a.len() == 3) && q.from.is_none())
 }
@@ -4076,8 +4098,9 @@ impl Frame<'_> {
                     self.assign(t, &out.columns, row)?;
                 }
             }
-            S::Sql { stmt, into, perform, text } => {
-                let select = matches!(**stmt, Stmt::Select(_) | Stmt::Locking(..));
+            S::Sql { stmt, into, perform, text, utility } => {
+                // (a WITH whose queries write is what its main statement is)
+                let select = matches!(main_of(stmt), Stmt::Select(_) | Stmt::Locking(..));
                 if select && into.is_none() && !perform {
                     return err(
                         SYNTAX,
@@ -4085,6 +4108,10 @@ impl Frame<'_> {
                     );
                 }
                 let out = self.query(stmt).map_err(|e| Frame::statement_context(e, text))?;
+                if *utility {
+                    self.row_count = 0; // (as SPI leaves it after a utility statement; FOUND stays)
+                    return Ok(Flow::Next);
+                }
                 let n = if select {
                     out.rows.len()
                 } else {

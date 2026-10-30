@@ -426,3 +426,96 @@ fn copies_a_person_makes_stay_masked() {
     let p = run(&db, MAIN, "select email from copy where id = 1", &[]).unwrap().pop().unwrap();
     assert_eq!(p.rows[0][0].to_text(), "ann@example.com");
 }
+
+/// A person's trigger that reads a masked column of the rows it fires for (in NEW or OLD, its WHEN, or its transition
+/// tables) would hand the agent the value as it is (copied to a table of its own, raised, acted on): it may not fire
+/// for an agent's UPDATE or DELETE. An INSERT's NEW is the agent's own row, and a trigger that reads only columns that
+/// aren't masked fires as ever. Issue #45.
+#[test]
+fn a_trigger_that_reads_a_masked_column_does_not_fire_for_an_agent() {
+    let db = Db::new();
+    setup(&db);
+    run(
+        &db,
+        MAIN,
+        "create table audit (id int, what text);
+         create function copy_email() returns trigger language plpgsql as $$
+           begin insert into audit values (new.id, new.email); return new; end $$;
+         create function copy_row() returns trigger language plpgsql as $$
+           begin insert into audit values (old.id, row_to_json(old)::text); return old; end $$;
+         create function copy_tier() returns trigger language plpgsql as $$
+           begin insert into audit values (new.id, new.tier); return new; end $$;
+         create trigger cp after insert or update on customers for each row execute function copy_email();
+         create trigger gone after delete on customers for each row execute function copy_row()",
+        &[],
+    )
+    .unwrap();
+    let mut s = bot(&db);
+    s.run(&db, "create world w; use world w", &[]).unwrap();
+    let m = refused(&db, &mut s, "update customers set tier = 'silver' where id = 1");
+    assert!(m.contains("trigger \"cp\"") && m.contains("column \"email\""), "{m}");
+    let m = refused(&db, &mut s, "delete from customers where id = 2");
+    assert!(m.contains("trigger \"gone\"") && m.contains("the whole row"), "{m}");
+    assert_eq!(rows(&db, &mut s, "select count(*) from audit"), [["0"]], "nothing was copied");
+    // an insert's NEW is the agent's own row
+    s.run(&db, "insert into customers values (3, 'cy@example.com', null, null, 'free')", &[]).unwrap();
+    let p = run(&db, "w", "select what from audit", &[]).unwrap().pop().unwrap();
+    assert_eq!(p.rows[0][0].to_text(), "cy@example.com");
+    // what it says to the agent's owner
+    let shown = run(&db, MAIN, "show agent bot privileges", &[]).unwrap().pop().unwrap();
+    let email = shown.rows.iter().find(|r| r[0].to_text() == "customers" && r[1].to_text() == "email").unwrap();
+    assert!(email[3].to_text().contains("fires trigger cp is refused"), "{email:?}");
+    assert!(email[5].to_text().contains("trigger gone reads the whole row"), "{email:?}");
+    // a trigger that reads only what isn't masked fires
+    run(
+        &db,
+        MAIN,
+        "drop trigger cp on customers; drop trigger gone on customers;
+         create trigger t after update on customers for each row execute function copy_tier()",
+        &[],
+    )
+    .unwrap();
+    let mut s = bot2(&db);
+    s.run(&db, "create world w2; use world w2", &[]).unwrap();
+    s.run(&db, "update customers set tier = 'silver' where id = 1", &[]).unwrap();
+    // a WHEN that tests a masked column is a read of it
+    run(
+        &db,
+        MAIN,
+        "create trigger probe after update on customers for each row when (old.email like 'a%') execute function copy_tier()",
+        &[],
+    )
+    .unwrap();
+    let mut s = bot2_peer(&db);
+    s.run(&db, "create world w3; use world w3", &[]).unwrap();
+    let m = refused(&db, &mut s, "update customers set tier = 'silver' where id = 1");
+    assert!(m.contains("trigger \"probe\"") && m.contains("column \"email\""), "{m}");
+    // a person, and an agent with 'unmask', fire them
+    run(&db, MAIN, "update customers set tier = 'bronze' where id = 1", &[]).unwrap();
+    let mut u = agent(&db, "support", &[Can::Read, Can::Fork, Can::WriteOwn, Can::Unmask]);
+    u.run(&db, "create world w4; use world w4", &[]).unwrap();
+    u.run(&db, "update customers set tier = 'silver' where id = 1", &[]).unwrap();
+}
+
+/// tsvector_update_trigger copies the words of the text columns it reads into its tsvector column: of a masked
+/// column, that column is masked too. Issue #45.
+#[test]
+fn a_tsvector_made_from_a_masked_column_is_masked() {
+    let db = Db::new();
+    run(
+        &db,
+        MAIN,
+        "create table docs (id int primary key, body text, tsv tsvector);
+         create trigger words before insert or update on docs for each row
+           execute function tsvector_update_trigger(tsv, 'pg_catalog.english', body);
+         insert into docs values (1, 'secret merger plans', null);
+         alter table docs alter column body set masked",
+        &[],
+    )
+    .unwrap();
+    let p = run(&db, MAIN, "select tsv::text from docs", &[]).unwrap().pop().unwrap();
+    assert!(p.rows[0][0].to_text().contains("merger"), "a person reads the words");
+    let mut s = bot(&db);
+    let r = rows(&db, &mut s, "select tsv::text from docs");
+    assert!(r[0][0].starts_with("m_"), "{r:?}");
+}

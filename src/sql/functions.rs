@@ -622,13 +622,19 @@ impl Function {
     /// MAX_DEPTH: calls in calls' arguments would nest bodies in bodies past what the parser
     /// allows (and evaluating or dropping it could overflow the stack); those stay calls.
     fn inline(&self, args: &[Expr]) -> Option<Expr> {
+        self.inline_with(args, false)
+    }
+
+    /// `inline`; with `strict_too`, a STRICT function's as well, null when an argument is (what a row's expression
+    /// takes: see `inline_row_calls`).
+    fn inline_with(&self, args: &[Expr], strict_too: bool) -> Option<Expr> {
         // (a SECURITY DEFINER function runs as its owner, and one with SET clauses with its own settings: never in its
         // caller's place, as in Postgres)
         if self.definer || !self.config.is_empty() {
             return None;
         }
         let (Code::Sql(stmts), Ret::Value(rt)) = (&self.code, &self.ret) else { return None };
-        let ([Stmt::Select(q)], false) = (&stmts[..], self.strict) else { return None };
+        let ([Stmt::Select(q)], false) = (&stmts[..], self.strict && !strict_too) else { return None };
         let plain = q.set.is_empty()
             && !q.distinct
             && q.from.is_none()
@@ -660,11 +666,13 @@ impl Function {
             | Expr::Default => simple = false,
             _ => {}
         });
-        // an argument read twice is evaluated twice: only for ones that can't differ
+        // an argument read twice is evaluated twice: only for ones that can't differ (a STRICT one's is read once more,
+        // by the test for null)
         let cheap =
             |a: &Expr| matches!(a, Expr::Lit(_) | Expr::Idx(_) | Expr::Param(_) | Expr::Col(..) | Expr::AggRef(_));
+        let reads = |u: usize| u + usize::from(self.strict);
         // and every argument is converted to its type, even one the body doesn't read
-        if !simple || uses.iter().zip(args).any(|(u, a)| *u == 0 || (*u > 1 && !cheap(a))) {
+        if !simple || uses.iter().zip(args).any(|(u, a)| *u == 0 || (reads(*u) > 1 && !cheap(a))) {
             return None;
         }
         let arg = |i: usize| Expr::Cast(Box::new(args[i].clone()), self.args[i].1);
@@ -673,8 +681,99 @@ impl Function {
             Expr::Col(None, n) => self.arg_named(n).map(arg),
             _ => None,
         });
-        Some(Expr::Cast(Box::new(e), *rt)).filter(|e| depth(e) <= MAX_DEPTH / 2)
+        let mut e = Expr::Cast(Box::new(e), *rt);
+        // STRICT: null when an argument is, as the function isn't called then
+        if self.strict && !args.is_empty() {
+            let null = args
+                .iter()
+                .map(|a| Expr::IsNull(Box::new(a.clone()), false))
+                .reduce(|a, b| Expr::Bin(Box::new(a), Op::Or, Box::new(b)));
+            let none = Expr::Cast(Box::new(Expr::Lit(Value::Null)), *rt);
+            e = Expr::Case(None, vec![(null.expect("an argument"), none)], Some(Box::new(e)));
+        }
+        Some(e).filter(|e| depth(e) <= MAX_DEPTH / 2)
     }
+}
+
+/// `e` with each call of a LANGUAGE sql function made here whose body is one `SELECT expression` (and that only one
+/// function of its name and number of arguments can be) put in its place, as Postgres inlines such functions: what a
+/// CHECK or a generated column, which run where no query does, can run. A STRICT one's is null when an argument is. A
+/// call this can't put in place is left, and fails where it runs. A name without a schema is looked for in the table's
+/// `schema`, then in public.
+pub(super) fn inline_row_calls(v: &View, e: &Expr, schema: &str) -> Result<Expr> {
+    let mut e = e.clone();
+    // (a body's own calls too, a few levels down)
+    for _ in 0..8 {
+        let mut names = vec![];
+        walk(&e, &mut |x| {
+            if let Expr::Call(c) = x
+                && !c.builtin
+            {
+                names.push(c.name.clone());
+            }
+        });
+        let mut fs: HashMap<String, Vec<Arc<Function>>> = HashMap::new();
+        for n in names {
+            if let std::collections::hash_map::Entry::Vacant(e) = fs.entry(n) {
+                // (a name without a schema is the table's schema's, or public's: what it meant where the table is,
+                // whatever search_path the row's writer has)
+                let found = match e.key().strip_prefix(PLAIN) {
+                    Some(plain) => {
+                        let mut found = named(v, &qualify(schema, plain))?;
+                        if found.is_empty() {
+                            found = named(v, &qualify("public", plain))?;
+                        }
+                        found
+                    }
+                    None => named(v, e.key())?,
+                };
+                e.insert(found);
+            }
+        }
+        let changed = std::cell::Cell::new(false);
+        let denied: std::cell::RefCell<Option<SqlError>> = std::cell::RefCell::new(None);
+        let who = roles::checked();
+        let next = rewrite(&e, &|x| {
+            let Expr::Call(c) = x else { return None };
+            let mut takes = fs.get(&c.name)?.iter().filter(|f| f.args.len() == c.args.len());
+            let (Some(f), None) = (takes.next(), takes.next()) else { return None };
+            // (run as a query would run it: by a role that may, its arguments in the function's order)
+            if let Some(w) = &who
+                && let Err(e) = acl::may_execute(v, w, f)
+            {
+                denied.borrow_mut().get_or_insert(e);
+                return None;
+            }
+            let body = f.inline_with(&in_order(f, c)?, true)?;
+            changed.set(true);
+            Some(body)
+        });
+        if let Some(e) = denied.into_inner() {
+            return Err(e);
+        }
+        e = next;
+        if !changed.get() {
+            break;
+        }
+    }
+    Ok(e)
+}
+
+/// Call `c`'s arguments in function `f`'s order, those it names (`b => 1`) put where `f` has them; None where one isn't
+/// given (a default isn't put in here) or is given twice.
+fn in_order(f: &Function, c: &super::Call) -> Option<Vec<Expr>> {
+    if c.names.is_empty() {
+        return Some(c.args.clone());
+    }
+    let mut out: Vec<Option<Expr>> = vec![None; f.args.len()];
+    for (i, (n, a)) in c.names.iter().zip(&c.args).enumerate() {
+        let at = if n.is_empty() { i } else { f.arg_named(n)? };
+        if out.get(at)?.is_some() {
+            return None;
+        }
+        out[at] = Some(a.clone());
+    }
+    out.into_iter().collect()
 }
 
 /// A LANGUAGE sql body: SELECT, INSERT, UPDATE and DELETE statements, the last one giving the
@@ -1061,6 +1160,30 @@ fn whole_rows(w: &str, t: &Table) -> Result<String> {
     Ok(out.join(" "))
 }
 
+/// What trigger `x` reads, as it is, of the masked columns `masked` of its table's rows (see `mask::row_reads`): in its
+/// WHEN or its function, or every column through its transition tables. A built-in trigger function's: none for
+/// tsvector_update_trigger's (its column is masked too: see `mask::of`), the whole row for
+/// suppress_redundant_updates_trigger's (whether an UPDATE is skipped tells whether the row was already so).
+pub(super) fn trigger_reads_masked(v: &View, x: &Trigger, masked: &[(String, char)]) -> Result<Option<String>> {
+    if x.old_table.is_some() || x.new_table.is_some() {
+        return Ok(Some("the rows as they are, in its transition tables".into()));
+    }
+    if !x.row {
+        return Ok(None);
+    }
+    if let Some(w) = &x.when
+        && let Some(r) = mask::row_reads(w, masked)
+    {
+        return Ok(Some(r));
+    }
+    let f = named(v, &x.func)?.into_iter().find(|f| f.args.is_empty() && f.ret == Ret::Trigger);
+    Ok(match f {
+        Some(f) => mask::row_reads(&f.body, masked),
+        None if x.func == SUPPRESS_REDUNDANT => Some("the whole row".into()),
+        None => None,
+    })
+}
+
 /// Postgres's `"rel" is a view` (a table, ...), with its DETAIL: what that kind of relation can't have.
 fn is_a(code: &'static str, rel: &str, what: &str, detail: &str) -> SqlError {
     SqlError {
@@ -1087,7 +1210,7 @@ const SUPPRESS_REDUNDANT: &str = "suppress_redundant_updates_trigger";
 
 /// The trigger functions of pg_catalog that are built in, when none of that name was made: whether the function
 /// reads its configuration from a column (`tsvector_update_trigger_column`) rather than naming it.
-fn builtin_trigger(name: &str) -> Option<bool> {
+pub(super) fn builtin_trigger(name: &str) -> Option<bool> {
     match name {
         "tsvector_update_trigger" => Some(false),
         "tsvector_update_trigger_column" => Some(true),
@@ -3895,6 +4018,13 @@ pub(super) fn substitute(
     s: &mut Stmt,
     f: &mut dyn FnMut(&mut Expr, &HashSet<String>) -> Result<()>,
 ) -> Result<()> {
+    // (a WITH whose queries write: each of them, and its main statement, with the names it sees itself)
+    if let Stmt::With(w) = s {
+        for (_, st) in &mut w.dml {
+            substitute(v, st, f)?;
+        }
+        return substitute(v, &mut w.main, f);
+    }
     let all = column_names(v, s)?;
     let Stmt::Insert { .. } = s else { return visit(s, &mut |e| f(e, &all), &mut |_| {}) };
     let bare = names_in(v, s, false)?;
@@ -5222,7 +5352,7 @@ impl Exec<'_> {
             after_triggers_begin();
         }
         for x in firing(t, ev, before, false, set) {
-            if self.when(t, x, None, None)? {
+            if self.when(t, x, ev, None, None)? {
                 self.fire(t, x, ev, None, None)?;
             }
         }
@@ -5241,11 +5371,12 @@ impl Exec<'_> {
     ) -> Result<Option<Vec<Value>>> {
         let mut new = new;
         for x in firing(t, ev, true, true, set) {
-            if !self.when(t, x, old, new.as_deref())? {
+            if !self.when(t, x, ev, old, new.as_deref())? {
                 continue;
             }
             // (an UPDATE whose new row is the old one, skipped; any other row written as it is)
             if x.func == SUPPRESS_REDUNDANT && ev == Event::Update && !self.has_trigger_function(&x.func) {
+                self.masked_trigger(t, x, ev)?;
                 if old.is_some() && new.as_deref() == old {
                     return Ok(None);
                 }
@@ -5354,7 +5485,7 @@ impl Exec<'_> {
         for i in 0..olds.len().max(news.len()) {
             let (old, new) = (olds.get(i).map(Vec::as_slice), news.get(i).map(Vec::as_slice));
             for x in &xs {
-                if self.when(t, x, old, new)? {
+                if self.when(t, x, ev, old, new)? {
                     // a constraint trigger the transaction defers fires at its COMMIT
                     if super::trigger_defers(x) {
                         super::defer_trigger(&t.name, &x.name, ev, old, new);
@@ -5371,9 +5502,39 @@ impl Exec<'_> {
         Ok(())
     }
 
+    /// Where masks apply (an agent without 'unmask'), trigger `x` firing for an UPDATE or DELETE of `t`, which has
+    /// masked columns, when it reads one of them as it is (see `trigger_reads_masked`): refused, as `mask::target`
+    /// refuses a statement that would. An update's NEW holds the columns it didn't set as they were, and what the
+    /// trigger does with them (copies them to a table of its own, raises them, acts on them) the agent could learn;
+    /// an INSERT's NEW is the row the agent wrote.
+    fn masked_trigger(&self, t: &Table, x: &Trigger, ev: Event) -> Result<()> {
+        if ev == Event::Insert || !mask::on() {
+            return Ok(());
+        }
+        let v = self.view()?;
+        let masked = mask::of(&v, &t.name)?;
+        if masked.is_empty() {
+            return Ok(());
+        }
+        match trigger_reads_masked(&v, x, &masked)? {
+            None => Ok(()),
+            Some(what) => err(
+                "42501",
+                format!(
+                    "trigger \"{}\" on table \"{}\" reads {what} of the rows it fires for as it is, and the table has \
+                     masked columns: an agent without 'unmask' may not fire it with UPDATE or DELETE (have the trigger \
+                     read only columns that aren't masked)",
+                    x.name,
+                    rel_part(&t.name)
+                ),
+            ),
+        }
+    }
+
     /// Whether trigger `x`'s WHEN holds for the row.
-    fn when(&self, t: &Table, x: &Trigger, old: Option<&[Value]>, new: Option<&[Value]>) -> Result<bool> {
+    fn when(&self, t: &Table, x: &Trigger, ev: Event, old: Option<&[Value]>, new: Option<&[Value]>) -> Result<bool> {
         let Some(w) = &x.when else { return Ok(true) };
+        self.masked_trigger(t, x, ev)?;
         let e = check_expr(&whole_rows(w, t)?)?;
         let mut cols: Vec<Col> = t.cols.iter().map(|c| Col::new("new", &c.name, c.ty)).collect();
         cols.extend(t.cols.iter().map(|c| Col::new("old", &c.name, c.ty)));
@@ -5503,6 +5664,7 @@ impl Exec<'_> {
         old: Option<&[Value]>,
         new: Option<&[Value]>,
     ) -> Result<Option<Vec<Value>>> {
+        self.masked_trigger(t, x, ev)?;
         let f = self.functions(&x.func)?.iter().find(|f| f.args.is_empty() && f.ret == Ret::Trigger).cloned();
         // (a built-in trigger function fired as a statement's or after the row: Postgres's own refusals)
         if f.is_none() && x.func == SUPPRESS_REDUNDANT {

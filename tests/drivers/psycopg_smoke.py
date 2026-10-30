@@ -36,6 +36,12 @@ with psycopg.connect(URL, autocommit=True) as conn:
         cur.executemany("insert into drv_psycopg (id, name) values (%s, %s)", [(i, f"n{i}") for i in range(10, 20)])
     assert conn.execute("select count(*) from drv_psycopg").fetchone() == (12,)
 
+    # a server-side (named) cursor, as Django's .iterator() uses: DECLARE, a Describe of the portal of its name, FETCH
+    with conn.cursor(name="drv_srv", withhold=True) as cur:
+        cur.execute("select id from drv_psycopg where id >= %s order by id", (10,))
+        assert [r[0] for r in cur.fetchmany(3)] == [10, 11, 12]
+        assert [r[0] for r in cur.fetchmany(2)] == [13, 14]
+
     # a transaction that is rolled back leaves nothing; one that commits does
     conn.autocommit = False
     conn.execute("insert into drv_psycopg (id, name) values (100, 'gone')")

@@ -55,7 +55,7 @@ A merge conflict returns the rows involved:
 | `world` | `branch` (a name or a world ID) | `world` |
 | `set_meta` | `branch`, `meta` (object; null removes a key) | `world` |
 | `history` | `branch`, `limit` (100) | `{events: [{at, world, event, rows}]}` (newest first) |
-| `create_agent` | `name`, `can` (list), `max_worlds`, `max_changes`, `writes_per_minute`, `world_ttl` (ms), `max_query_ms`, `max_concurrent`, `max_memory_mb`, `max_idle_ms`, `max_threads`, `policy` (a [merge policy](guides/merge-policies.md)'s name, or `null`), `tenant` (`"org_id = 42"` or `{"org_id": 42}`: it reads and changes that tenant's rows only, see [attach](guides/attach-postgres.md#agents-held-to-one-tenant)), `valid_for` (ms: its token stops working after) | `{agent, token}` (the token only now) |
+| `create_agent` | `name`, `can` (list), `max_worlds`, `max_changes`, `writes_per_minute`, `world_ttl` (ms), `max_query_ms`, `max_concurrent`, `max_memory_mb`, `max_idle_ms`, `max_threads`, `priority` (`"normal"` or `"low"`), `policy` (a [merge policy](guides/merge-policies.md)'s name, or `null`), `tenant` (`"org_id = 42"` or `{"org_id": 42}`: it reads and changes that tenant's rows only, see [attach](guides/attach-postgres.md#agents-held-to-one-tenant)), `valid_for` (ms: its token stops working after) | `{agent, token}` (the token only now) |
 | `alter_agent` | the same, plus `disabled` | `{agent}` |
 | `drop_agent` | `name` | `{ok}` |
 | `agents` |  | `{agents: [...]}` |

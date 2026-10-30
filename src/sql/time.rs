@@ -1049,6 +1049,47 @@ pub fn between(a: i64, b: i64) -> Interval {
     Interval { months: 0, days: (d / DAY as i128) as i32, micros: (d % DAY as i128) as i64 }
 }
 
+/// `date_trunc(unit, interval)`, as Postgres's interval_trunc cuts it: the interval as years, months, days, hours,
+/// minutes, seconds and microseconds (each part of the one above it, toward zero), the parts below the unit zeroed (a
+/// decade, century or millennium a whole number of years of it). `Err(true)` for a week, which an interval's months
+/// don't divide into; `Err(false)` for a unit it isn't cut to.
+pub fn trunc_interval(unit: &str, i: Interval) -> Result<Interval, bool> {
+    let (mut year, mut mon, mut mday) = (i.months / 12, i.months % 12, i.days);
+    let (mut hour, mut rest) = (i.micros / HOUR, i.micros % HOUR);
+    let (mut min, mut sec, mut usec) = (rest / MINUTE, rest % MINUTE / 1_000_000, rest % 1_000_000);
+    let unit = match field_name(unit) {
+        Some("week") => return Err(true),
+        Some(u) => u,
+        None => return Err(false),
+    };
+    // (each unit zeroes what the one below it does too, as interval_trunc's cases fall through)
+    const ORDER: [&str; 10] =
+        ["millennium", "century", "decade", "year", "quarter", "month", "day", "hour", "minute", "second"];
+    match ORDER.iter().position(|u| *u == unit) {
+        Some(from) => {
+            for u in &ORDER[from..] {
+                match *u {
+                    "millennium" => year = year / 1000 * 1000,
+                    "century" => year = year / 100 * 100,
+                    "decade" => year = year / 10 * 10,
+                    "year" => mon = 0,
+                    "quarter" => mon = 3 * (mon / 3),
+                    "month" => mday = 0,
+                    "day" => hour = 0,
+                    "hour" => min = 0,
+                    "minute" => sec = 0,
+                    _ => usec = 0,
+                }
+            }
+        }
+        None if unit == "milliseconds" => usec = usec / 1000 * 1000,
+        None if unit == "microseconds" => {}
+        None => return Err(false),
+    }
+    rest = hour * HOUR + min * MINUTE + sec * 1_000_000 + usec;
+    Ok(Interval { months: year * 12 + mon, days: mday, micros: rest })
+}
+
 /// `date_trunc(unit, ts)`: the start of its microsecond, second, ..., year.
 /// The unit is read as extract reads its (`MILLENNIUM`, `mon`, `centuries`); a century and a millennium start at
 /// their year 1 (2001, and 100 BC for 55 BC), as timestamp_trunc has them.

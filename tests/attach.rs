@@ -670,6 +670,53 @@ fn reads_are_checked_against_postgres() {
     drop_db(&name);
 }
 
+/// A world that runs its reads again (`rerun_reads`), attached: rows it read that changed in Postgres since its fork
+/// hold its merge only when its SELECTs, run again on Postgres's rows, give another answer; the reason says what they
+/// gave and give there. Issue #38.
+#[test]
+fn reads_run_again_on_postgres_hold_only_a_changed_answer() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("rerun") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table orders (id int primary key, status text, amount int);
+         create table tasks (id int primary key, done bool);
+         insert into orders values (1, 'open', 10), (2, 'open', 20), (3, 'closed', 30);
+         insert into tasks values (1, false), (2, false);",
+    )
+    .unwrap();
+    let dir = folder("rerun");
+    let (ok, out) = attach(&dir, &["--tables", "orders,tasks"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    let sum = "select sum(amount) from orders where status = 'open'";
+
+    // the sum came out the same in Postgres: merged, and written there
+    run(&db, MAIN, "create world same with (rerun_reads = true)", &[]).unwrap();
+    assert_eq!(cell(&db, "same", sum), "30");
+    run(&db, "same", "update tasks set done = true where id = 1", &[]).unwrap();
+    pg.batch_execute("update orders set amount = 15 where id in (1, 2)").unwrap();
+    run(&db, MAIN, "merge world same", &[]).unwrap();
+    assert_eq!(pg_cell(&mut pg, "select done from tasks where id = 1"), "t");
+
+    // another answer there: held, saying what it gave and gives in Postgres, and nothing written
+    run(&db, MAIN, "create world other with (rerun_reads = true)", &[]).unwrap();
+    assert_eq!(cell(&db, "other", sum), "30");
+    run(&db, "other", "update tasks set done = true where id = 2", &[]).unwrap();
+    pg.batch_execute("update orders set amount = 16 where id = 1").unwrap();
+    let e = run(&db, MAIN, "merge world other", &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    assert!(e.message.contains("changed in Postgres since it forked"), "{}", e.message);
+    assert!(e.message.contains("which gave 30 then and gives 31 in Postgres now"), "{}", e.message);
+    assert_eq!(pg_cell(&mut pg, "select done from tasks where id = 2"), "f", "nothing written");
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
 /// "Found nothing, then production added it": an agent looks for a lead, finds none, creates one and queues a welcome;
 /// Postgres gets a matching lead straight before the merge. The merge is held or refused, with neither the lead nor
 /// the welcome landing: through the world's own reads, through a merge check run in Postgres inside the write-back
@@ -1451,4 +1498,199 @@ fn merges_keep_one_connection_and_make_a_new_one_when_it_is_gone() {
     std::fs::remove_dir_all(&dir).unwrap();
     drop(pg);
     drop_db(&name);
+}
+
+/// UNDO MERGE ... SKIP CHANGED in an attached folder leaves a row changed straight in Postgres (one main hasn't heard
+/// of yet) and puts the rest back there; the effects the merge sent aren't undone, and are listed with where they are.
+/// UNDO AGENT on main goes back through Postgres too. Issue Abhishekxdg/Chronos-DB#48.
+#[test]
+fn undo_skips_rows_changed_in_postgres_and_lists_the_effects_it_cant_undo() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("undoskip") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table leads (id int primary key, status text);
+         insert into leads values (1, 'active'), (2, 'active'), (3, 'active');",
+    )
+    .unwrap();
+    let dir = folder("undoskip");
+    let (ok, out) = attach(&dir, &["--tables", "leads"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    // the run that hurt: records marked inactive, and a webhook told of it
+    let e = change(
+        &db,
+        "w",
+        "update leads set status = 'inactive'; notify on merge sync, 'deactivated 3'; notify on merge mail, 'bye'",
+    );
+    assert!(e.is_none(), "{:?}", e.map(|e| e.message));
+    assert_eq!(pg_cell(&mut pg, "select string_agg(status, ',' order by id) from leads"), "inactive,inactive,inactive");
+    // a worker sent the webhook; the email waits
+    let sync = db.outbox(MAIN).unwrap().into_iter().find(|e| e.channel == "sync").unwrap();
+    db.ack_outbox(std::slice::from_ref(&sync.id)).unwrap();
+    // someone fixes row 2 by hand in Postgres; main hasn't seen it
+    pg.batch_execute("update leads set status = 'archived' where id = 2").unwrap();
+    assert_eq!(cell(&db, MAIN, "select status from leads where id = 2"), "inactive");
+
+    let u = db.undo_merge("w", true).unwrap();
+    assert_eq!((u.rows, u.skipped), (2, 1), "{u:?}");
+    assert_eq!(pg_cell(&mut pg, "select string_agg(status, ',' order by id) from leads"), "active,archived,active");
+    assert_eq!(cell(&db, MAIN, "select string_agg(status, ',' order by id) from leads"), "active,archived,active");
+    let mut effects: Vec<(String, &str)> = u.effects.iter().map(|e| (e.channel.clone(), e.state)).collect();
+    effects.sort();
+    assert_eq!(effects, [("mail".to_string(), "queued"), ("sync".to_string(), "sent")]);
+    assert_eq!(db.outbox(MAIN).unwrap().len(), 1, "the email is still queued: the undo leaves effects alone");
+
+    // UNDO AGENT on main: through Postgres as well, conflicts and all
+    run(&db, MAIN, "create merge policy p with (max_rows = 100)", &[]).unwrap();
+    run(&db, MAIN, "create agent bot with (can = 'read,fork,write_own,write_main,merge_own', policy = 'p')", &[])
+        .unwrap();
+    let mut bot = Session::new(MAIN);
+    bot.agent = Some("bot".into());
+    bot.run(
+        &db,
+        "create world b; use world b; update leads set status = 'gone' where id in (1, 3); use world main",
+        &[],
+    )
+    .unwrap();
+    bot.run(&db, "merge world b", &[]).unwrap();
+    assert_eq!(pg_cell(&mut pg, "select string_agg(status, ',' order by id) from leads"), "gone,archived,gone");
+    pg.batch_execute("update leads set status = 'kept' where id = 3").unwrap();
+    let e = run(&db, MAIN, "undo agent bot since '-1 hour'", &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    assert_eq!(pg_cell(&mut pg, "select string_agg(status, ',' order by id) from leads"), "gone,archived,kept");
+    let out = run(&db, MAIN, "undo agent bot since '-1 hour' skip changed", &[]).unwrap();
+    assert_eq!(out[0].tag, "UNDO AGENT 1");
+    assert_eq!(pg_cell(&mut pg, "select string_agg(status, ',' order by id) from leads"), "active,archived,kept");
+    assert_eq!(cell(&db, MAIN, "select string_agg(status, ',' order by id) from leads"), "active,archived,kept");
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+/// A rehearsal's lines: (outcome, detail) of each line of its plan.
+fn plan_lines(db: &Db, sql: &str) -> Vec<(String, String)> {
+    let out = run(db, MAIN, sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message)).pop().unwrap();
+    out.rows.iter().map(|r| (r[2].to_text(), r[3].to_text())).collect()
+}
+
+fn line<'a>(lines: &'a [(String, String)], outcome: &str) -> Vec<&'a str> {
+    lines.iter().filter(|(o, _)| o == outcome).map(|(_, d)| d.as_str()).collect()
+}
+
+/// `MERGE WORLD w REHEARSE [FAIL AT n]`: the write-back run in Postgres (triggers, constraints, deferred ones too),
+/// then rolled back, Postgres checked unchanged after, and the effects the merge would send listed, unsent. Issue
+/// Abhishekxdg/Chronos-DB#48.
+#[test]
+fn a_rehearsal_runs_the_write_back_in_postgres_and_rolls_it_back() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("rehearse") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table accounts (id int primary key, name text);
+         create table leads (id int primary key, account int references accounts (id) deferrable initially deferred,
+             status text, touched text);
+         create function touch() returns trigger language plpgsql as
+             $$ begin new.touched := 'by trigger: ' || new.status; return new; end $$;
+         create trigger leads_touch before insert or update on leads for each row execute function touch();
+         insert into accounts values (1, 'acme'), (2, 'globex');
+         insert into leads values (1, 1, 'active', null), (2, 2, 'active', null);",
+    )
+    .unwrap();
+    let dir = folder("rehearse");
+    let (ok, out) = attach(&dir, &["--tables", "accounts,leads"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    let before = "select string_agg(id || ':' || status || ':' || coalesce(touched, '-'), ',' order by id) from leads";
+    let was = pg_cell(&mut pg, before);
+
+    // to the end: each statement, what the trigger set, rolled back, Postgres as it was, the effect unsent
+    run(&db, MAIN, "create world w", &[]).unwrap();
+    run(
+        &db,
+        "w",
+        "update accounts set name = 'Acme' where id = 1; update leads set status = 'inactive'; \
+         notify on merge sync, 'deactivated'",
+        &[],
+    )
+    .unwrap();
+    let l = plan_lines(&db, "merge world w rehearse");
+    let steps = line(&l, "rehearsed");
+    assert_eq!(steps.len(), 2, "{l:?}");
+    assert!(steps[0].contains("update accounts: 1 rows") && steps[1].contains("update leads: 2 rows"), "{steps:?}");
+    assert_eq!(line(&l, "postgres set").len(), 2, "{l:?}");
+    assert!(line(&l, "postgres set")[0].contains("by trigger: inactive"), "{l:?}");
+    assert!(line(&l, "rolled back")[0].contains("as it did before"), "{l:?}");
+    assert!(line(&l, "stopped").is_empty(), "{l:?}");
+    assert!(line(&l, "postgres")[0].contains("rehearsed in Postgres"), "{l:?}");
+    assert!(line(&l, "effect")[0].contains("sync") && line(&l, "effect")[0].contains("sent nothing"), "{l:?}");
+    assert_eq!(pg_cell(&mut pg, before), was);
+    assert_eq!(pg_cell(&mut pg, "select name from accounts where id = 1"), "acme");
+    assert!(db.outbox(MAIN).unwrap().is_empty(), "nothing sent, nothing merged");
+    assert_eq!(cell(&db, "w", "select status from leads where id = 1"), "inactive", "the world is as it was");
+
+    // FAIL AT 1: the first statement runs, then the rollback, on the real rows
+    let l = plan_lines(&db, "merge world w rehearse fail at 1");
+    assert_eq!(line(&l, "rehearsed").len(), 1, "{l:?}");
+    assert!(line(&l, "stopped")[0].contains("FAIL AT"), "{l:?}");
+    assert!(line(&l, "rolled back")[0].contains("as it did before"), "{l:?}");
+    assert_eq!(pg_cell(&mut pg, "select name from accounts where id = 1"), "acme");
+
+    // a constraint Postgres has that Chronos doesn't: the statement that breaks it, and where
+    pg.batch_execute("alter table leads add constraint known check (status in ('active', 'archived'))").unwrap();
+    let l = plan_lines(&db, "merge world w rehearse");
+    let stopped = line(&l, "stopped");
+    assert!(stopped[0].contains("statement 2 (update leads)") && stopped[0].contains("known"), "{l:?}");
+    assert_eq!(pg_cell(&mut pg, before), was);
+    pg.batch_execute("alter table leads drop constraint known").unwrap();
+
+    // a deferred constraint trigger, run at SET CONSTRAINTS ALL IMMEDIATE as the merge runs it, not at COMMIT
+    pg.batch_execute(
+        "create function no_moving() returns trigger language plpgsql as
+             $$ begin if new.status = 'moved' then raise exception 'no moving leads'; end if; return null; end $$;
+         create constraint trigger leads_no_moving after update on leads deferrable initially deferred
+             for each row execute function no_moving();",
+    )
+    .unwrap();
+    run(&db, MAIN, "create world d", &[]).unwrap();
+    run(&db, "d", "update leads set status = 'moved' where id = 2", &[]).unwrap();
+    let l = plan_lines(&db, "merge world d rehearse");
+    assert_eq!(line(&l, "rehearsed").len(), 1, "the statement itself went through: {l:?}");
+    let stopped = line(&l, "stopped");
+    assert!(stopped[0].contains("SET CONSTRAINTS") && stopped[0].contains("no moving leads"), "{l:?}");
+    assert_eq!(pg_cell(&mut pg, before), was);
+
+    // a row changed in Postgres since main's copy: said, and main doesn't take it (a rehearsal changes nothing)
+    pg.batch_execute("update accounts set name = 'ACME' where id = 1").unwrap();
+    let l = plan_lines(&db, "merge world w rehearse");
+    assert!(line(&l, "changed in postgres").len() == 1 && line(&l, "rehearsed").is_empty(), "{l:?}");
+    assert!(line(&l, "stopped")[0].contains("changed in Postgres"), "{l:?}");
+    assert_eq!(cell(&db, MAIN, "select name from accounts where id = 1"), "acme");
+    assert!(!line(&l, "blocked").is_empty(), "{l:?}");
+
+    // a merge into another world doesn't write to Postgres: nothing to rehearse
+    run(&db, MAIN, "create world x; create world y", &[]).unwrap();
+    let e = run(&db, MAIN, "merge world x into y rehearse", &[]).unwrap_err();
+    assert_eq!(e.code, "0A000", "{}", e.message);
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+#[test]
+fn a_rehearsal_is_refused_where_nothing_is_attached() {
+    let dir = folder("rehearse-none");
+    let db = Db::open(&dir).unwrap();
+    run(&db, MAIN, "create table t (id int primary key); create world w", &[]).unwrap();
+    run(&db, "w", "insert into t values (1)", &[]).unwrap();
+    let e = run(&db, MAIN, "merge world w rehearse", &[]).unwrap_err();
+    assert!(e.code == "0A000" && e.message.contains("DRY RUN"), "{}", e.message);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }

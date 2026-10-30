@@ -850,7 +850,12 @@ fn alter_table() {
     sql(&db, "alter table p drop column years");
     sql(&db, "alter table p add column years int");
     assert_eq!(rows(&sql(&db, "select * from p where id = 1")), ["1|Ada|true|null"]);
-    assert_eq!(fails(&db, "alter table p drop column id").0, "2BP01");
+    // (a primary key's column drops the key with it, as in Postgres)
+    sql(&db, "create table pk_gone (id int primary key, v text); alter table pk_gone drop column id");
+    assert_eq!(
+        rows(&sql(&db, "select count(*) from pg_constraint where conrelid = 'pk_gone'::regclass and contype = 'p'")),
+        ["0"]
+    );
     sql(&db, "alter table p drop column if exists nope");
 
     // changing a type converts every value, or refuses

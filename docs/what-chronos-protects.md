@@ -20,7 +20,7 @@ agent does anywhere else. If agents work on production data, read this page befo
 - **Any agent's changes can be undone.** `UNDO AGENT bot SINCE '-2 hours'`, `UNDO MERGE OF WORLD w` and
   `RESTORE WORLD main TO '-10 minutes'` work within the history window ([undoing](security.md#undoing)).
 - **Masks hide columns.** [Masked columns](sql.md#masked-columns) show agents a stand-in instead of the value.
-  The masks have [known gaps](https://github.com/Abhishekxdg/chronosdb/issues/45), listed with them.
+  What they don't hide (a person's own copies, a unique column's insert) is [listed with them](sql.md#masked-columns).
 - **Beside your Postgres:** in a folder [attached to Postgres](guides/attach-postgres.md), the same rules apply
   before a merge is written to Postgres, and nothing reaches Postgres any other way.
 

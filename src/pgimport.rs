@@ -592,10 +592,10 @@ impl Import<'_> {
         let mut built_in: Vec<String> = vec![];
         for r in self.pg("select extname from pg_extension where extname <> 'plpgsql' order by 1")? {
             let e = r[0].clone().unwrap_or_default();
-            // one Chronos has built in (pgcrypto, uuid-ossp, citext, ...): made here as Postgres had it
-            if ["vector", "postgis"].contains(&e.as_str())
-                || self.attempt(&format!("create extension if not exists {}", q(&e))).is_ok()
-            {
+            // one Chronos has built in (pgcrypto, uuid-ossp, citext, pgvector, PostGIS, ...): made here as Postgres had
+            // it, so pg_extension lists it (pgvector and PostGIS are carried over even where that fails)
+            let made = self.attempt(&format!("create extension if not exists {}", q(&e))).is_ok();
+            if made || ["vector", "postgis"].contains(&e.as_str()) {
                 self.report.carried.push(format!("extension {e} (built into Chronos)"));
                 built_in.push(e);
             } else {

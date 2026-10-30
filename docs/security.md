@@ -218,6 +218,7 @@ All are off (`0`) by default, for agents and for the guest.
 | `max_memory_mb` | rows one of its statements holds (joined rows, a join's other side, its result); its sorts, groups and joins spill at a quarter of it | stopped, `53200` | 413 |
 | `max_idle_ms` | how long a Postgres connection of its sits idle inside a transaction. It may lower its `idle_in_transaction_session_timeout`, never raise it past this | connection dropped (FATAL `25P03`), its transaction rolled back and its locks let go | |
 | `max_threads` | threads one of its statements runs on, its own included: a big scan is split into parts run at once, by default on as many cores as the server's pool lends; `1` runs them one after another on one core, leaving the rest to everyone else | slower, never refused | |
+| `priority` | `'normal'` (the default) or `'low'`: while any statement of the database's own users (sessions no agent runs) is running, a low-priority agent's statements yield to them. Each of its threads runs at most a quarter of the time (it sleeps three times as long as it ran, up to 50 ms at a time), and its parallel scans borrow no helper threads. When nobody else's statement runs, it runs at full speed | slower while others run, never refused; the time yielded counts toward its `max_query_ms`, and in `agent_yield_ms` (`SHOW METRICS`) | |
 
 - **`max_changes` counts a transaction at `COMMIT`,** so one huge transaction uses memory before it's refused.
 - **`max_memory_mb` counts rows,** not every structure: a `GROUP BY`'s groups and a window's rows aren't counted (see [operations](operations.md#memory-and-spilling-to-disk)).
@@ -226,7 +227,9 @@ All are off (`0`) by default, for agents and for the guest.
 - **Keeping one agent's heavy scan from slowing everyone else:** a world isolates data, not CPU, so an agent's
   unfiltered scan in its own world competes with main's traffic. `max_threads` (say `2`) caps how many cores one of its
   statements takes, `max_concurrent` how many statements it runs at once, and `max_query_ms` how long each may run.
-  There is no priority between statements yet: an agent's statement that runs gets its share of the CPU as any other.
+  `priority = 'low'` (`ALTER AGENT bot SET (priority = 'low')`) makes its statements give way to the database's own
+  users' while theirs run, and run at full speed otherwise. Agents' statements don't yield to each other's: two
+  low-priority agents share the CPU as any two statements do.
 - **The guest has no quotas,** and all guests share one set of worlds. Bound what it can do with the server-wide limits below.
 
 ## Protecting `main`

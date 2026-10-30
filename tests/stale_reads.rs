@@ -495,3 +495,149 @@ fn only_the_columns_a_read_used_hold_its_merge() {
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A world that runs its reads again (`rerun_reads`): a merge its reads would hold runs the SELECTs it read through
+/// again, on main as it is and on its fork point, and is held only when one gives another answer now, saying what it
+/// gave then and gives now. Rows read any other way hold it as before. Issue #38.
+#[test]
+fn a_hold_is_lifted_when_the_read_gives_the_same_answer() {
+    use chronos::sql::Value;
+    let db = Db::new();
+    let fresh = |db: &Db| {
+        run(
+            db,
+            MAIN,
+            "create table if not exists orders (id int primary key, status text, amount int);
+             create table if not exists out_rows (id int primary key, v int);
+             delete from orders; delete from out_rows;
+             insert into orders values (1, 'open', 10), (2, 'open', 20), (3, 'closed', 30)",
+            &[],
+        )
+        .unwrap();
+    };
+    // forks `w` (with `with`), reads with `sql` (and `params`), writes elsewhere, and main then runs `main`: the
+    // merge's error, if any
+    let attempt = |w: &str, with: &str, sql: &str, params: &[Value], main: &str| {
+        fresh(&db);
+        run(&db, MAIN, &format!("create world {w} with ({with})"), &[]).unwrap();
+        let mut s = Session::new(w);
+        s.run(&db, sql, params).unwrap();
+        s.run(&db, "insert into out_rows values (1, 1)", &[]).unwrap();
+        run(&db, MAIN, main, &[]).unwrap();
+        run(&db, MAIN, &format!("merge world {w}"), &[]).err().map(|e| e.message)
+    };
+    let sum = "select sum(amount) from orders where status = 'open'";
+    let same_sum = "update orders set amount = 15 where id in (1, 2)"; // 10 + 20, then 15 + 15
+
+    // the sum came out the same: held when only checked, not when run again
+    let e = attempt("checked", "check_reads = true", sum, &[], same_sum).unwrap();
+    assert!(e.contains("read rows that changed since it forked: orders/1, orders/2"), "{e}");
+    assert_eq!(attempt("rerun", "rerun_reads = true", sum, &[], same_sum), None);
+    assert_eq!(cell(&db, "select v from out_rows"), "1", "merged");
+    // two changes that cancel out, through parameters
+    let count = "select count(*) from orders where status = $1";
+    let swap = "update orders set status = 'closed' where id = 1; update orders set status = 'open' where id = 3";
+    assert_eq!(attempt("params", "rerun_reads = true", count, &[Value::Text("open".into())], swap), None);
+    // the rows a filter found, found again (one of them changed, in the column filtered on)
+    let over = "select id from orders where amount > 15";
+    assert_eq!(attempt("found", "rerun_reads = true", over, &[], "update orders set amount = 40 where id = 3"), None);
+
+    // another answer now: held, with what it gave then and gives now, and nothing merged
+    let e = attempt("changed", "rerun_reads = true", sum, &[], "update orders set amount = 11 where id = 1").unwrap();
+    assert!(e.starts_with("merging changed read rows that changed since it forked: orders/1"), "{e}");
+    assert!(
+        e.contains("read `select sum(amount) from orders where status = 'open'`, which gave 30 then and gives 31 now"),
+        "{e}"
+    );
+    assert!(db.world("changed").is_ok() && cell(&db, "select count(*) from out_rows") == "0");
+    // CHECK READS between steps says the same, without merging
+    let found = db.reads_changed("changed").unwrap();
+    assert!(found.iter().any(|(_, r)| r.contains("which gave 30 then and gives 31 now")), "{found:?}");
+    let e = attempt(
+        "rows",
+        "rerun_reads = true",
+        "select id from orders where status = 'open' order by id",
+        &[],
+        "insert into orders values (4, 'open', 1)",
+    )
+    .unwrap();
+    assert!(e.contains("which gave 2 rows then and gives 3 rows now"), "{e}");
+
+    // rows read another way (here a row the row API got) hold it as found, whatever the SELECTs give
+    fresh(&db);
+    db.put(MAIN, "notes/1", r#"{"v":1}"#).unwrap();
+    run(&db, MAIN, "create world mixed with (rerun_reads = true)", &[]).unwrap();
+    run(&db, "mixed", sum, &[]).unwrap();
+    assert!(db.get("mixed", "notes/1").unwrap().is_some());
+    run(&db, "mixed", "insert into out_rows values (1, 1)", &[]).unwrap();
+    run(&db, MAIN, same_sum, &[]).unwrap();
+    db.put(MAIN, "notes/1", r#"{"v":2}"#).unwrap();
+    let e = run(&db, MAIN, "merge world mixed", &[]).unwrap_err().message;
+    assert!(e.contains("notes/1") && !e.contains("which gave"), "{e}");
+    // a read of the world's own writes gives another answer on the fork point: held as found
+    fresh(&db);
+    run(&db, MAIN, "create world own with (rerun_reads = true)", &[]).unwrap();
+    run(&db, "own", "insert into orders values (4, 'open', 5)", &[]).unwrap();
+    run(&db, "own", sum, &[]).unwrap();
+    run(&db, MAIN, same_sum, &[]).unwrap();
+    let e = run(&db, MAIN, "merge world own", &[]).unwrap_err().message;
+    assert!(e.contains("orders/1") && !e.contains("which gave"), "{e}");
+    // and one of the clock: what it gives depends on when it runs
+    fresh(&db);
+    run(&db, MAIN, "create world clock with (rerun_reads = true)", &[]).unwrap();
+    run(&db, "clock", "select sum(amount), clock_timestamp() from orders where status = 'open'", &[]).unwrap();
+    run(&db, "clock", "insert into out_rows values (1, 1)", &[]).unwrap();
+    run(&db, MAIN, same_sum, &[]).unwrap();
+    assert!(run(&db, MAIN, "merge world clock", &[]).is_err());
+    // a SELECT that failed read and isn't kept: held as found
+    fresh(&db);
+    run(&db, MAIN, "create world failed with (rerun_reads = true)", &[]).unwrap();
+    run(&db, "failed", sum, &[]).unwrap();
+    assert!(run(&db, "failed", "select amount / (amount - 10) from orders where status = 'open'", &[]).is_err());
+    run(&db, "failed", "insert into out_rows values (1, 1)", &[]).unwrap();
+    run(&db, MAIN, same_sum, &[]).unwrap();
+    assert!(run(&db, MAIN, "merge world failed", &[]).is_err());
+
+    // an agent whose merge policy has rerun_reads: its worlds check their reads and run them again
+    fresh(&db);
+    run(&db, MAIN, "create merge policy rerun with (rerun_reads = true)", &[]).unwrap();
+    let shown = run(&db, MAIN, "show merge policies", &[]).unwrap().pop().unwrap();
+    let at = shown.columns.as_ref().unwrap().iter().position(|(n, _)| n == "rerun_reads").unwrap();
+    assert_eq!(shown.rows[0][at].to_text(), "true");
+    let can = "read,fork,write_own,write_main,merge_own";
+    run(&db, MAIN, &format!("create agent bot with (can = '{can}', policy = 'rerun')"), &[]).unwrap();
+    let mut bot = Session::new(MAIN);
+    bot.agent = Some("bot".into());
+    bot.run(&db, &format!("create world pay; use world pay; {sum}; insert into out_rows values (1, 1)"), &[]).unwrap();
+    run(&db, MAIN, same_sum, &[]).unwrap();
+    bot.run(&db, "use world main; merge world pay", &[]).unwrap();
+    assert_eq!(cell(&db, "select v from out_rows"), "1");
+    bot.run(&db, &format!("create world pay2; use world pay2; {sum}; insert into out_rows values (2, 2)"), &[])
+        .unwrap();
+    run(&db, MAIN, "update orders set amount = 1 where id = 1", &[]).unwrap();
+    let e = bot.run(&db, "use world main; merge world pay2", &[]).unwrap_err();
+    assert_eq!(e.code, "42501", "queued for a person: {}", e.message);
+    let reviews = run(&db, MAIN, "show reviews", &[]).unwrap().pop().unwrap();
+    let why = format!("{:?}", reviews.rows);
+    assert!(why.contains("which gave 30 then and gives 16 now"), "{why}");
+
+    // what was kept isn't written out: after a restart a hold stays as found
+    let dir = std::env::temp_dir().join(format!("chronos-stale-rerun-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    {
+        let db = Db::open(&dir).unwrap();
+        fresh(&db);
+        run(&db, MAIN, "create world w with (rerun_reads = true)", &[]).unwrap();
+        run(&db, "w", sum, &[]).unwrap();
+        run(&db, "w", "insert into out_rows values (1, 1)", &[]).unwrap();
+    }
+    let db = Db::open(&dir).unwrap();
+    run(&db, MAIN, same_sum, &[]).unwrap();
+    assert!(run(&db, MAIN, "merge world w", &[]).is_err());
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn cell(db: &Db, sql: &str) -> String {
+    run(db, MAIN, sql, &[]).unwrap().pop().unwrap().rows[0][0].to_text()
+}

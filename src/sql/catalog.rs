@@ -299,10 +299,14 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
     for u in t.uniques.iter().filter(|u| !t.indexes.iter().any(|x| x.name == u.name)) {
         let parts: Vec<String> = u.cols.iter().map(|&c| named(c)).collect();
         let cols: Vec<i64> = u.cols.iter().map(|&c| num(c)).collect();
-        let def = match u.primary {
+        let mut def = match u.primary {
             true => format!("PRIMARY KEY ({})", parts.join(", ")),
             false => format!("UNIQUE {}({})", if u.nnd { "NULLS NOT DISTINCT " } else { "" }, parts.join(", ")),
         };
+        // (as pg_get_constraintdef writes it)
+        if u.deferrable {
+            def.push_str(if u.deferred { " DEFERRABLE INITIALLY DEFERRED" } else { " DEFERRABLE" });
+        }
         let from = from_up_unique(u);
         cons.push(Con {
             name: u.name.clone(),
@@ -311,7 +315,7 @@ pub(super) fn describe(v: &View, t: &Table) -> (Vec<Con>, Vec<Idx>) {
             parent: None,
             pretty: def.clone(),
             def,
-            defer: (false, false),
+            defer: (u.deferrable, u.deferred),
             local: from.is_none(),
             inh: i64::from(from.is_some()),
             no_inherit: false,
@@ -933,6 +937,8 @@ pub(crate) struct Catalog {
     pub cons: Vec<(usize, Con)>,
     /// every database (world), oldest first: `pg_database`
     pub worlds: Vec<String>,
+    /// each of `worlds`' id: a world made again under a name has another
+    pub world_ids: Vec<String>,
     /// the functions and procedures made with CREATE FUNCTION, in name order (see `catalog_objects`)
     pub(super) funcs: Vec<Arc<functions::Function>>,
     /// their oids (see `catalog_objects::func_oids`)
@@ -1141,6 +1147,7 @@ impl Catalog {
         let mut worlds = core.worlds();
         worlds.retain(|w| !w.name.starts_with("_tx_"));
         worlds.sort_by(|a, b| (a.created, &a.name).cmp(&(b.created, &b.name)));
+        let world_ids = worlds.iter().map(|w| w.id.clone()).collect();
         let worlds = worlds.into_iter().map(|w| w.name).collect();
         let v = core.view_tx(branch)?;
         let mut funcs = vec![];
@@ -1194,6 +1201,7 @@ impl Catalog {
             idx,
             cons,
             worlds,
+            world_ids,
             funcs,
             func_oids,
             enums,
@@ -1229,6 +1237,7 @@ impl Catalog {
             idx: vec![],
             cons: vec![],
             worlds: vec![],
+            world_ids: vec![],
             funcs: vec![],
             func_oids: vec![],
             enums: vec![],
@@ -3986,6 +3995,11 @@ pub(super) fn rows(branch: &str, name: &str, cat: &Catalog) -> Option<Rows> {
                 ("set_option", B),
             ],
             super::roles::member_rows(&cat.reg),
+        ),
+        // ALTER DATABASE ... SET's settings (setrole 0) and ALTER ROLE ... SET's (setdatabase 0)
+        "pg_db_role_setting" => (
+            &[("setdatabase", Oid), ("setrole", Oid), ("setconfig", Type::Array(25))],
+            super::roles::db_role_setting_rows(&cat.reg, &cat.world_ids),
         ),
         // the zones SET TIME ZONE takes (the system's tz database), as they are right now, and the abbreviations
         // AT TIME ZONE and timestamp text take

@@ -783,6 +783,7 @@ impl Session {
             ctx: None,
             mem: None,
             threads: agent.as_ref().map_or(0, |a| a.max_threads as usize),
+            low: agent.as_ref().is_some_and(|a| a.priority == crate::Priority::Low),
         };
         let filter = c.filter.clone().map(|f| {
             let cols = t.cols.iter().filter(|x| names.contains(&x.name)).cloned().collect::<Vec<_>>();
