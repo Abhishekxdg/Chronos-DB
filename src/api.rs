@@ -368,9 +368,12 @@ pub fn row_security(db: &Db, agent: Option<&str>, op: &str, a: &Value) -> Result
     };
     let names: Vec<&str> = tables.iter().map(String::as_str).collect();
     let rows_as_they_are = !matches!(op, "diff" | "merge");
+    // (a table shared by every tenant reads whole for an agent held to one, and isn't written: see
+    // `sql::tenant_refuses`)
+    let writes = matches!(op, "put" | "delete" | "batch");
     for w in worlds {
         let refused = match agent {
-            Some(agent) if rows_as_they_are => match sql::tenant_refuses(db, agent, w, &names) {
+            Some(agent) if rows_as_they_are => match sql::tenant_refuses(db, agent, w, &names, writes) {
                 Ok(None) => sql::row_security_refuses(db, agent, w, &names),
                 other => other,
             },
@@ -824,20 +827,33 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
         // what the folder is attached to, and how old main's rows are (no secret)
         "attached" => Ok(match db.attached() {
             None => json!({ "attached": false }),
-            Some(att) => json!({
-                "attached": true,
-                "source": att.source(),
-                "copied_at": att.at,
-                "refreshed_at": att.refreshed_at(),
-                "as_of": att.as_of(),
-                "pending": att.pending(),
-                "tables": att.tables().iter().map(|t| json!({
-                    "name": t.name,
-                    "postgres": t.pg,
-                    "key": t.key.iter().map(|&i| t.cols[i].name.clone()).collect::<Vec<_>>(),
-                    "columns": t.cols.iter().map(|c| json!({"name": c.name, "type": c.ty})).collect::<Vec<_>>(),
-                })).collect::<Vec<_>>(),
-            }),
+            Some(att) => {
+                json!({
+                    "attached": true,
+                    "source": att.source(),
+                    "copied_at": att.at,
+                    "refreshed_at": att.refreshed_at(),
+                    "as_of": att.as_of(),
+                    "pending": att.pending(),
+                    "tables": att.tables().iter().map(|t| json!({
+                        "name": t.name,
+                        "sql": t.sql,
+                        "postgres": t.pg,
+                        "key": t.key.iter().map(|&i| t.cols[i].name.clone()).collect::<Vec<_>>(),
+                        "columns": ({
+                            // (masked ones with how: SET MASKED on main)
+                            let m = chronos::attach::masks(db, t);
+                            t.cols.iter().map(|c| {
+                                let mut j = json!({"name": c.name, "type": c.ty});
+                                if let Some((_, how)) = m.iter().find(|(n, _)| *n == c.name) {
+                                    j["mask"] = json!(how);
+                                }
+                                j
+                            }).collect::<Vec<_>>()
+                        }),
+                    })).collect::<Vec<_>>(),
+                })
+            }
         }),
         "review" => {
             let verdict = match need("verdict")? {

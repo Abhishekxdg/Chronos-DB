@@ -736,7 +736,7 @@ create agent bot with (can = 'read,fork,write_own', max_worlds = 10, world_ttl =
 alter agent bot set (writes_per_minute = 600, disabled = false);
 alter agent bot set (max_query_ms = 30000, max_concurrent = 4, max_memory_mb = 512);
 show agents;                              -- name, id, can, quotas, world_ttl, created, disabled, limits, tenant, expires
-create agent run_42 with (tenant = 'org_id = 42', valid_for = '1 hour');  -- one tenant's rows only; token expires
+create agent run_42 with (tenant = 'org_id = 42', valid_for = '1 hour');  -- one tenant's rows only (below); token expires
 show agent bot privileges;                -- what bot may read, write and merge, table by table
 show agent bot privileges in world w;     -- the same, for world w's tables
 show audit for agent bot limit 20;        -- at, agent, world, action, rows
@@ -749,16 +749,30 @@ drop agent bot;                           -- its token stops working; its worlds
 
 See [concepts](concepts.md#agents) for what agents may do. The names `guest` and `system` are the database's own.
 
+An agent made `WITH (tenant = 'org_id = 42')` works for that tenant alone, in every world, whatever its role, the
+tables' own row security or `row_security` (as if a policy said so on every table):
+
+- a table with an `org_id` column: it reads and changes only the rows holding 42, and a row it writes must hold 42;
+- a table without it but with a foreign key to one that has it, up to three hops away (`order_items.order_id` to
+  `orders.id`, `item_notes.item_id` to `order_items.id`): only the rows whose key names a row of the tenant's
+  (`order_id in (select id from orders)`, `orders` itself held to the tenant), and a row it writes must name one; a
+  null key names none. Where several foreign keys lead there, the one in the fewest hops, the first of those;
+- a table with neither is shared by every tenant (a lookup table): it reads it whole, and an `INSERT`, `UPDATE`,
+  `DELETE`, `MERGE` or `COPY FROM` of it is refused (`42501`, `an agent held to tenant "org_id" = 42 may only read
+  table "countries": ...`).
+
+Creating or changing an agent's tenant is refused when no table has its column.
+
 `SHOW AGENT name PRIVILEGES` puts together everything that decides what an agent may do with a table: its capabilities,
-the privileges of a role of its name (both must allow), row-level security, [masked columns](#masked-columns) and its
-merge policy. A row per table of the world (the session's, or `IN WORLD w`), and one per column that differs from its
+the privileges of a role of its name (both must allow), row-level security, its tenant, [masked columns](#masked-columns)
+and its merge policy. A row per table of the world (the session's, or `IN WORLD w`), and one per column that differs from its
 table (a column its role was granted SELECT, INSERT or UPDATE on by itself, a masked one, one its policy's
 `review_columns` names):
 
 | column | what it says |
 |---|---|
-| `read` | `yes`, `no`, `rows its policies allow` (row-level security), or for a column `masked (hash)` |
-| `write` | which of insert, update and delete, and where: `its own worlds`, `any world but main`, `main` |
+| `read` | `yes`, `no`, `rows its policies allow` (row-level security), `its tenant's rows` (an agent held to a tenant: by the column, or through which foreign keys), or for a column `masked (hash)` |
+| `write` | which of insert, update and delete, and where: `its own worlds`, `any world but main`, `main`; `no` for a table an agent held to a tenant shares with every tenant |
 | `merge` | `on its own`, `on its own within policy p`, `waits for a person`, `refused` (not in the policy's `tables`), `not into main`, or `a person merges` |
 | `why` | the rules behind the row, in words |
 

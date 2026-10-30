@@ -20,7 +20,7 @@
 //!   chronos serve mydb [--listen 127.0.0.1:7070] [--pg 127.0.0.1:5433|off] [--token T]
 //!                [--tls-cert cert.pem --tls-key key.pem]   HTTPS, and TLS on the Postgres port (needed
 //!                                to listen on any address but loopback, unless --insecure-no-tls)
-//!                [--admin-token A] [--safe | --unsafe] [--studio-api] [--refresh-every 5m]   a server token is the guest's: clients
+//!                [--admin-token A] [--safe | --unsafe] [--studio-api] [--refresh-every 5m] [--follow]   a server token is the guest's: clients
 //!                                with it get MCP's safe mode; the admin token is the database's own user
 //!                                (--unsafe: the server token is, as before 0.4)
 //!                                HTTP JSON API, and the Postgres protocol for psql and drivers
@@ -198,6 +198,8 @@ fn main() {
         flag(&["--admin-token"]).or_else(|| std::env::var("CHRONOS_ADMIN_TOKEN").ok()).filter(|t| !t.is_empty());
     let anchor = flag(&["--anchor"]).or_else(|| std::env::var("CHRONOS_ANCHOR").ok()).filter(|a| !a.is_empty());
     let safe = args.iter().position(|a| a == "--safe").map(|i| args.remove(i)).is_some();
+    let follow = args.iter().position(|a| a == "--follow").map(|i| args.remove(i)).is_some();
+    let unfollow = args.iter().position(|a| a == "--unfollow").map(|i| args.remove(i)).is_some();
     let unsafe_ = args.iter().position(|a| a == "--unsafe").map(|i| args.remove(i)).is_some();
     let studio_api = args.iter().position(|a| a == "--studio-api").map(|i| args.remove(i)).is_some();
     let insecure_no_tls = args.iter().position(|a| a == "--insecure-no-tls").map(|i| args.remove(i)).is_some();
@@ -272,7 +274,7 @@ fn main() {
     // chronos refresh <attached folder>: main takes Postgres's rows as they are now (see chronos::attach::refresh)
     if args[0] == "refresh" {
         if args.len() != 2 {
-            eprintln!("usage: chronos refresh <attached folder>   (CHRONOS_SOURCE_URL, or --source-file)");
+            eprintln!("usage: chronos refresh <attached folder> [--unfollow]   (CHRONOS_SOURCE_URL, or --source-file)");
             std::process::exit(2);
         }
         let opts = chronos::Open {
@@ -294,10 +296,31 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        if unfollow {
+            let code = match chronos::attach::unfollow(&db) {
+                Ok(true) => {
+                    println!("dropped replication slot {}: Postgres keeps no WAL for this folder now", slot(&db));
+                    0
+                }
+                Ok(false) => {
+                    println!("no replication slot to drop ({} isn't there)", slot(&db));
+                    0
+                }
+                Err(e) => {
+                    eprintln!("chronos refresh --unfollow: {e}");
+                    1
+                }
+            };
+            let _ = db.close();
+            std::process::exit(code);
+        }
         let code = match chronos::attach::refresh(&db) {
             Ok(r) => {
                 for c in &r.added {
                     println!("column added in Postgres, taken: {c}");
+                }
+                for c in &r.altered {
+                    println!("changed in Postgres, taken: {c}");
                 }
                 for l in &r.labels {
                     println!("enum label added in Postgres, taken: {l}");
@@ -320,6 +343,10 @@ fn main() {
     }
     if attach_tables.is_some() || yes {
         eprintln!("chronos: --tables and --yes are for chronos attach");
+        std::process::exit(2);
+    }
+    if unfollow {
+        eprintln!("chronos: --unfollow is for chronos refresh on an attached folder");
         std::process::exit(2);
     }
     // chronos import <folder> postgres://...: a live Postgres database, moved in one command
@@ -395,6 +422,10 @@ fn main() {
     let serve = args[0] == "serve";
     if refresh_every.is_some() && !serve {
         eprintln!("chronos: --refresh-every is for chronos serve on an attached folder");
+        std::process::exit(2);
+    }
+    if follow && !serve {
+        eprintln!("chronos: --follow is for chronos serve on an attached folder");
         std::process::exit(2);
     }
     let mcp = args[0] == "mcp";
@@ -661,31 +692,47 @@ fn main() {
                 loop {
                     std::thread::sleep(every);
                     match chronos::attach::refresh(&db) {
-                        Ok(r)
-                            if r.changed() > 0
-                                || !r.skipped.is_empty()
-                                || !r.added.is_empty()
-                                || !r.labels.is_empty() =>
-                        {
-                            for c in &r.added {
-                                eprintln!("chronos: column added in Postgres, taken: {c}");
-                            }
-                            for l in &r.labels {
-                                eprintln!("chronos: enum label added in Postgres, taken: {l}");
-                            }
-                            let tables: Vec<String> = r
-                                .tables
-                                .iter()
-                                .filter(|t| t.1 + t.2 + t.3 > 0)
-                                .map(|(t, i, u, d)| format!("{t} +{i} ~{u} -{d}"))
-                                .collect();
-                            eprintln!("chronos: refreshed from Postgres: {}", tables.join(", "));
-                            for s in &r.skipped {
-                                eprintln!("chronos: refresh left as it was: {s}");
-                            }
-                        }
-                        Ok(_) => {}
+                        Ok(r) => said(&r),
                         Err(e) => eprintln!("chronos: refresh from Postgres failed (tried again in {every:?}): {e}"),
+                    }
+                }
+            });
+        }
+        // --follow: main takes Postgres's rows as they change there, through a replication slot (see
+        // chronos::attach::follow)
+        if follow {
+            if db.attached().is_none() {
+                eprintln!("chronos: --follow is for a folder attached to Postgres (chronos attach)");
+                std::process::exit(2);
+            }
+            let db = sh.db.clone();
+            std::thread::spawn(move || {
+                // (a failure is said once until it changes, and tried again less often while it lasts)
+                let mut failing: Option<String> = None;
+                let mut wait = FOLLOW_EVERY;
+                loop {
+                    std::thread::sleep(wait);
+                    match chronos::attach::follow(&db) {
+                        Ok(r) => {
+                            if failing.take().is_some() {
+                                eprintln!("chronos: following Postgres's changes again");
+                            }
+                            if let Some(s) = &r.slot {
+                                eprintln!(
+                                    "chronos: following Postgres's changes through replication slot {s} (it keeps \
+                                     Postgres's WAL until read: chronos refresh <folder> --unfollow drops it)"
+                                );
+                            }
+                            wait = FOLLOW_EVERY;
+                            said(&r);
+                        }
+                        Err(e) => {
+                            if failing.as_deref() != Some(e.as_str()) {
+                                eprintln!("chronos: following Postgres's changes failed (tried again): {e}");
+                                failing = Some(e);
+                            }
+                            wait = (wait * 2).min(std::time::Duration::from_secs(60));
+                        }
                     }
                 }
             });
@@ -931,7 +978,7 @@ fn db_key() -> std::io::Result<Option<[u8; 32]>> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: chronos [-b branch] [--remote s3://bucket/prefix [--takeover]] [--anchor FILE [--anchor-reset]] <folder> [command]\n       chronos mcp <folder> [--allow-merge | --agent NAME] [--unmask]   (MCP server for AI agents, over stdio; without --allow-merge, agents can't merge; --agent acts as that agent; masked columns read masked unless --unmask)\n       chronos import <folder> <table> <data.csv> --schema <schema.csv>   (a copy of one Postgres table)\n       chronos attach <new folder> --tables a,b | --schema s [--yes]   (work beside a Postgres: merges into main are written there; CHRONOS_SOURCE_URL)\n       chronos refresh <attached folder>   (main takes Postgres's rows as they are now; chronos serve --refresh-every 5m does it on a timer)\n       chronos restore <backup> <new folder>   (start a database from a backup, and verify it)\n       chronos init [--no-open]   (in a project folder: its Chronos Cloud database, wired up for agents; chronos cloud help)\n       chronos keygen   (a new encryption key: CHRONOS_KEY=<key> chronos <new folder> makes an encrypted database)\n       chronos studio <folder> [--port N] [--no-open]   (a web UI for the database, on 127.0.0.1; works beside a running serve)\n       chronos studio <folder> --login [--port N | --listen ADDR:PORT] [--host NAME[:PORT]]... [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--no-open]\n                                  (the web UI, signed in with a database role and its password, acting with its privileges;\n                                   make one with: create role admin login superuser password '...'; any address but loopback needs TLS)\n       chronos serve <folder> [--listen 127.0.0.1:7070] [--pg 127.0.0.1:5433|off] [--token T] [--admin-token A] [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--safe | --unsafe] [--studio-api]
+        "usage: chronos [-b branch] [--remote s3://bucket/prefix [--takeover]] [--anchor FILE [--anchor-reset]] <folder> [command]\n       chronos mcp <folder> [--allow-merge | --agent NAME] [--unmask]   (MCP server for AI agents, over stdio; without --allow-merge, agents can't merge; --agent acts as that agent; masked columns read masked unless --unmask)\n       chronos import <folder> <table> <data.csv> --schema <schema.csv>   (a copy of one Postgres table)\n       chronos attach <new folder> --tables a,b | --schema s [--yes]   (work beside a Postgres: merges into main are written there; CHRONOS_SOURCE_URL)\n       chronos refresh <attached folder> [--unfollow]   (main takes Postgres's rows as they are now; chronos serve --refresh-every 5m does it on a timer, serve --follow as they change; --unfollow drops --follow's replication slot)\n       chronos restore <backup> <new folder>   (start a database from a backup, and verify it)\n       chronos init [--no-open]   (in a project folder: its Chronos Cloud database, wired up for agents; chronos cloud help)\n       chronos keygen   (a new encryption key: CHRONOS_KEY=<key> chronos <new folder> makes an encrypted database)\n       chronos studio <folder> [--port N] [--no-open]   (a web UI for the database, on 127.0.0.1; works beside a running serve)\n       chronos studio <folder> --login [--port N | --listen ADDR:PORT] [--host NAME[:PORT]]... [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--no-open]\n                                  (the web UI, signed in with a database role and its password, acting with its privileges;\n                                   make one with: create role admin login superuser password '...'; any address but loopback needs TLS)\n       chronos serve <folder> [--listen 127.0.0.1:7070] [--pg 127.0.0.1:5433|off] [--token T] [--admin-token A] [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--safe | --unsafe] [--studio-api]
                                   (HTTP JSON API, and Postgres protocol: psql postgres://127.0.0.1:5433/main; the server token T
                                    lets a client in as the guest, which only forks and changes its own worlds; the admin token A
                                    is the database's own user; --unsafe makes T the database's own user, as before 0.4, and --safe
@@ -1015,6 +1062,35 @@ fn is_sql(line: &str) -> bool {
 }
 
 /// A time such as `90`, `90s`, `5m` or `1h` (seconds without a unit), at least one second.
+/// How often `serve --follow` reads Postgres's changes.
+const FOLLOW_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What a refresh or a follow took from Postgres, said by `serve` (nothing when nothing changed).
+fn said(r: &chronos::attach::Refreshed) {
+    for c in &r.added {
+        eprintln!("chronos: column added in Postgres, taken: {c}");
+    }
+    for c in &r.altered {
+        eprintln!("chronos: changed in Postgres, taken: {c}");
+    }
+    for l in &r.labels {
+        eprintln!("chronos: enum label added in Postgres, taken: {l}");
+    }
+    let tables: Vec<String> =
+        r.tables.iter().filter(|t| t.1 + t.2 + t.3 > 0).map(|(t, i, u, d)| format!("{t} +{i} ~{u} -{d}")).collect();
+    if !tables.is_empty() {
+        eprintln!("chronos: refreshed from Postgres: {}", tables.join(", "));
+    }
+    for s in &r.skipped {
+        eprintln!("chronos: refresh left as it was: {s}");
+    }
+}
+
+/// The replication slot `serve --follow` reads for attached folder `db` (see chronos::attach::follow).
+fn slot(db: &Db) -> String {
+    db.attached().map_or_else(String::new, |a| a.slot())
+}
+
 fn every_of(s: &str) -> Option<std::time::Duration> {
     let s = s.trim();
     let (n, unit) = s.find(|c: char| !c.is_ascii_digit()).map_or((s, ""), |i| s.split_at(i));

@@ -37,7 +37,9 @@ What happens at `merge world`:
 1. Chronos's own checks, as for any merge: conflicts with main, constraints, merge policies, merge checks, stale reads.
 2. One Postgres transaction: each row the world changed is locked and compared with the value main holds. Any
    difference means it changed in Postgres since: everything is rolled back, main takes Postgres's current values
-   for those rows, and the merge returns the conflicts. Merge again and settle them as any conflict.
+   for those rows, and the merge returns the conflicts. Merge again and settle them as any conflict. A merge
+   `BY COLUMNS` does that once by itself: a row where the world and Postgres changed different columns combines
+   (the world's columns, Postgres's for the rest), and only a column both changed is still a conflict.
 3. Otherwise the updates, inserts and deletes are applied with `RETURNING`. Then, in the same transaction, the
    [merge checks](#merge-checks-against-live-postgres) on attached tables run on Postgres as those writes leave it;
    rows found roll everything back. Otherwise it commits. Values a Postgres trigger or default set come back into
@@ -151,8 +153,15 @@ create merge check one_lead_per_email on tables (leads) as
 
 Main's rows change only this way: writes to main and `RESTORE` on main are refused (an `UNDO` goes back through
 Postgres, as a merge: see [below](#undoing-a-merge-that-reached-postgres)), and no statement may
-change a table's shape here. Change it in Postgres: a refresh takes added columns and enum labels (below); any other
-change needs a new attach into a new folder.
+change a table's shape here. Change it in Postgres: a refresh takes columns added, dropped, renamed or retyped there,
+and enum labels (below); a change to a key, to row-level security or to a generated column needs a new attach into a
+new folder.
+
+Masking a column is the one change of definition main takes: `ALTER TABLE ... ALTER COLUMN ... SET MASKED` (or
+`DROP MASKED`) on main, which changes only what agents read here, never Postgres (see
+[masked columns](../sql.md#masked-columns)). Worlds forked after read the column masked; one forked before keeps the
+table as it was then. A refresh keeps the mask, and the `attached` answer marks each masked column (`mask`). In a
+world it's refused.
 
 An agent's merge into main needs a person unless the agent has a [merge policy](merge-policies.md) of its own; a
 person approves by merging the queued world.
@@ -162,14 +171,31 @@ person approves by merging the queued world.
 - Postgres 12 or later: attach reads catalog columns 12 added (`attgenerated`, `relispartition`). Tested on 12 to
   18 (and Neon's 17), with TLS `verify-full` and through PgBouncer in transaction mode (`tests/attach_compat.rs`:
   column types with the citext, hstore, pgvector and PostGIS ones, key shapes, constraints, foreign keys, settings,
-  LATIN1 and SQL_ASCII databases). On 11 or older the check and attach fail with Postgres's own error ("column
-  attgenerated does not exist") rather than saying the version is too old.
+  LATIN1 and SQL_ASCII databases). On 11 or older attach refuses before reading or making anything, saying
+  the version is too old.
 - A timestamp written without an offset (`'2026-03-01'` into a `timestamptz` or `tstzrange`) is read in UTC, as
   Chronos's sessions are, not in the database's own `timezone` setting; write the offset if they differ.
 - Main sorts text by its bytes (`C`), so `ORDER BY` a text column can list rows in another order than a database with
   a language collation (`en_US.UTF-8`) does.
-- Each table needs a primary key, and no generated column or row-level security. Partitioned and inheriting tables
-  aren't attached.
+- Each table needs a primary key, or else a unique index on NOT NULL columns to stand for one (no `WHERE`, no
+  expressions, checked at once rather than deferred; a constraint's first, then the fewest columns). Its rows are
+  found by those columns in Postgres, and main gets them as its primary key. A refresh stops on the table if the
+  index goes or a column of it may be NULL. Inheriting tables (`INHERITS`) aren't attached.
+- A partitioned table is attached whole, as one plain table in main with all its partitions' rows (a partition alone
+  is refused: attach its partitioned table). A merge writes the partitioned table, and Postgres puts each row in its
+  partition, moving one whose partition key changed; a row no partition takes fails the merge, with Postgres's
+  error. Partitions added or detached in Postgres later need nothing: a refresh reads the partitioned table.
+- Generated columns (`GENERATED ALWAYS AS (...) STORED`) are attached: Postgres works them out, and main works them
+  out too, from the same expression (attach fails, saying so, if Chronos can't run it). A world can't write one; a
+  merge never sends them, and they're never compared with Postgres's, so a value the two print differently (a
+  division's digits) isn't a conflict. A column that becomes generated, or stops being, stops the refresh.
+- A table with row-level security on (Supabase turns it on for every table its dashboard makes) is attached when the
+  role reads past it: a superuser, a role with `BYPASSRLS`, the table's owner (unless the table `FORCE`s it), or a role
+  a policy shows every row, `CREATE POLICY chronos_all ON t TO <role> USING (true) WITH CHECK (true)`, with no
+  restrictive policy that applies to it. Otherwise attach refuses it, saying so, rather than copy only the rows the
+  policies show (the rest would look deleted), and a refresh stops taking a table whose policies come to hide rows.
+  The policies stay in Postgres, for your app's users; agents are held by Chronos's own rules (an agent held to one
+  tenant sees only its rows).
 - Serial and identity columns take their new values from Postgres's own sequence, reserved 1,000 at a time, so an
   id a world gives a row is never given to another by Postgres, and is the id written at merge. The cost is gaps in
   the sequence. An id typed by hand into such a column is refused at merge. The role needs USAGE on the sequence.
@@ -188,6 +214,10 @@ person approves by merging the queued world.
   before the counts are read (`SET CONSTRAINTS ALL IMMEDIATE`), so a deferred check that fails refuses the merge
   there rather than at COMMIT. Until that refresh is done the pending record stays, so after a crash recovery does
   it. With `track_counts` off, they wait for the next refresh.
+- Tested on Supabase (Postgres 17, through its pooler Supavisor in session and transaction mode): the
+  compatibility cases above, PostGIS aside (its install hit Supabase's statement timeout), and the gateway's
+  end-to-end test. Supabase prints floats with 15 digits (`extra_float_digits = 0`); main keeps all of them, as
+  Postgres stores them.
 - Tested on Neon, both straight to the database and through its pooler (PgBouncer, transaction mode): a merge of
   1,000 rows took about 1.2 s from a machine 60 ms away, mostly round trips ([BENCHMARKS.md §14](https://github.com/Abhishekxdg/chronosdb/blob/main/BENCHMARKS.md#14-attach-writing-merges-back-to-a-managed-postgres-neon)).
 - The folder keeps one connection to Postgres between merges (refreshes and dry runs use it too), so a merge doesn't
@@ -221,10 +251,47 @@ move: a row a world changed that Postgres changed too is a conflict at its merge
   values Postgres holds in the columns it never had, settled `USING OURS` too: it can't have meant to change them.
   A row it inserts leaves those columns out, so Postgres fills them as it fills its own rows (`now()` is the
   insert's time), and main takes the row back as Postgres has it.
-- A table whose columns were dropped, renamed or retyped, or whose key or row security changed, is left as it was
-  and named (`skipped`); attach again into a new folder to take the new shape.
+- **Columns dropped, renamed or retyped in Postgres** are so in main too, before its rows are read (`altered`); a
+  retyped column's values are then Postgres's, as the refresh compares them. Attach keeps each column's `attnum`, so
+  a rename is told from a drop and an add (a folder attached before it was kept fills it in at its next refresh, and
+  until then a rename is refused as below). Until a refresh has taken the change, a merge writing to the table is
+  refused and says to refresh. A world forked before can't merge rows of the table after, nor a merge that checks
+  its reads of it: it is refused, saying to fork a new world from main and make its changes again (a renamed column
+  would read there as never set).
+- A table whose key, row security, or generated columns changed, or with a key or generated column retyped, or a
+  column added taking values from a sequence, is left as it was and named (`skipped`); attach again into a new
+  folder to take the new shape.
 - `POST /v1/attached` says what the folder is attached to, its tables, and `as_of`: how old main's untouched rows
   may be (the last refresh, else the attach).
+
+## Following Postgres's changes (serve --follow)
+
+```bash
+chronos serve ./crm --follow                     # main takes Postgres's changes about a second after they commit
+chronos serve ./crm --follow --refresh-every 1h  # and a whole refresh now and then, to be sure
+chronos refresh ./crm --unfollow                 # drop the replication slot, once the folder is no longer followed
+```
+
+A refresh reads every row of every attached table; `--follow` reads only the rows that changed. Postgres says which
+through a logical replication slot (`chronos_<id>`, made by the first follow with the `test_decoding` plugin that
+comes with Postgres). Every second the server reads the changes since the last time from it, then reads the rows
+they name as Postgres has them now and compares them with main's as a refresh does, under the write-back lock. The
+slot only says where to look: a change read twice, or a merge's own write coming back, takes nothing. The slot moves
+past the changes only once main took them, so a server stopped halfway reads them again.
+
+- **Postgres needs `wal_level = logical`**, and the role attach connects as needs `REPLICATION` (or superuser).
+  Self-hosted: `ALTER SYSTEM SET wal_level = logical` and a restart. RDS and Aurora: `rds.logical_replication = 1`
+  in the parameter group, and `GRANT rds_replication TO <role>`. Cloud SQL: `cloudsql.logical_decoding = on`.
+  Supabase has it on. Neon: turn on logical replication in the project's settings. Without it the server says why,
+  and keeps trying less often; `--refresh-every` works on any Postgres.
+- **The first follow refreshes every table**, as changes before the slot was made aren't in it. So does a follow
+  after Postgres gave up on the slot (`max_slot_wal_keep_size`).
+- **A table is refreshed whole** where a change doesn't say which row: a `TRUNCATE`, a delete or key change under
+  `REPLICA IDENTITY NOTHING`, more than 100,000 rows changed at once, or columns that changed (which a refresh takes,
+  see above). A partitioned table's partitions count as it.
+- **A slot keeps Postgres's WAL until it is read.** While the server is stopped, WAL piles up on the database's disk.
+  Drop the slot (`chronos refresh ./crm --unfollow`) when the folder won't be followed again, and on Postgres 13 or
+  later set `max_slot_wal_keep_size` so a forgotten slot can't fill the disk.
 
 ## Undoing a merge that reached Postgres
 
@@ -264,10 +331,16 @@ For an agent working for one of your customers, `create agent run_42 with (tenan
 
 - in every world it reads and changes only rows of tables with an `org_id` column that hold 42, whatever its role,
   the table's own row security, or `row_security`; a row it writes must hold 42 before and after;
+- a table without the column is held to the tenant through its foreign keys, up to three (a line item through its
+  order, a line item's note through the item and the order): it reads and changes only rows whose key names a row
+  of the tenant's, and a row it writes must name one (a null key names none). Of a table's foreign keys, the one
+  that reaches a table with the column in the fewest hops counts (the first of those);
+- a table with neither the column nor such a foreign key is shared by every tenant (a lookup table): it reads it
+  whole and may not write it (`42501`, `... may only read table "countries" ...`);
 - every world it forks is declared that tenant's (`tenant` in its scope), so its merge is held to it too;
 - it sees changes as rows (`DIFF`, a dry run, `CHECK READS`, `history`) only of the worlds it forked, and not `SHOW
   REVIEWS`, `SHOW AUDIT` or the whole `SHOW HISTORY`; the row API is refused on tables the tenant limits (SQL
-  applies it);
+  applies it), and its writes on shared tables;
 - its token stops working once `valid_for` has passed.
 
 ## After a crash

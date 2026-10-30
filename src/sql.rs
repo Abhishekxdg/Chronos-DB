@@ -26474,7 +26474,7 @@ pub(crate) fn table_columns(v: &View, t: &str) -> crate::Result<Option<Vec<Strin
 }
 
 /// The tables of `branch` made with CREATE TABLE (or attached), each with its columns: what an agent's tenant is held
-/// to (see `rls::tenant_policy`), so what `Core::create_agent` checks its column against.
+/// to (see `rls::reach`), so what `Core::create_agent` checks its column against.
 pub(crate) fn tables_and_columns(db: &crate::Core, branch: &str) -> crate::Result<Vec<(String, Vec<String>)>> {
     let v = db.view_tx(branch)?;
     let mut out = vec![];
@@ -29155,6 +29155,22 @@ pub(crate) fn column_names(schema: &Val) -> Option<Vec<String>> {
     Some(schema_of(schema).ok()?.cols.iter().filter(|c| !c.hidden).map(|c| c.name.clone()).collect())
 }
 
+/// Each column of schema row `schema`'s table that is masked (SET MASKED), with how: `hash`, `null`, `partial` or
+/// `format` (see `mask`).
+pub(crate) fn column_masks(schema: &Val) -> Option<Vec<(String, &'static str)>> {
+    let t = schema_of(schema).ok()?;
+    Some(t.cols.iter().filter_map(|c| Some((c.name.clone(), mask::mode_name(c.opts.mask?)))).collect())
+}
+
+/// The columns of schema row `schema`'s table as its rows are packed by them: each one's id (see `Col::id`), name,
+/// and type with its modifiers, in words. Where one table's list starts another's, a row the first packed reads in
+/// the second as it was meant (the second only added columns after it).
+pub(crate) fn column_shapes(schema: &Val) -> Option<Vec<(u32, String, String)>> {
+    let t = schema_of(schema).ok()?;
+    let shape = |c: &Col| format!("{:?} {:?} {:?} {:?} {}", c.ty, c.numeric, c.chars, c.dim, c.small);
+    Some(t.cols.iter().filter(|c| !c.hidden).map(|c| (c.id, c.name.clone(), shape(c))).collect())
+}
+
 /// A row of SQL table `table` given as each column's text as Postgres writes it (the other way from `row_texts`), as
 /// `v` stores it: its row key and its packed value. For rows read from the Postgres a folder is attached to (see
 /// `crate::attach`); a column not given is null.
@@ -31818,22 +31834,34 @@ pub fn masks_refuse(db: &Db, branch: &str, tables: &[&str]) -> Result<Option<Str
 }
 
 /// For the row API's reads and writes of rows (get, find, put, delete, batch) by agent `agent` held to a tenant: the
-/// message refusing it a table of `tables` with the tenant's column, which SQL keeps to the tenant and the row API,
-/// reading rows as they are, can't. Its own world's diff and merge aren't asked: every row in it was written held to
-/// the tenant, and it may see no other world's (see `Acting::may_see_changes`).
-pub fn tenant_refuses(db: &Db, agent: &str, branch: &str, tables: &[&str]) -> Result<Option<String>> {
+/// message refusing it a table of `tables` held to the tenant (with the tenant's column, or a foreign key to a table
+/// that has it: see `rls::reach`), which SQL keeps to the tenant and the row API, reading rows as they are, can't; and,
+/// when it `writes`, a table shared by every tenant, which it may only read. Its own world's diff and merge aren't
+/// asked: every row in it was written held to the tenant, and it may see no other world's (see
+/// `Acting::may_see_changes`).
+pub fn tenant_refuses(db: &Db, agent: &str, branch: &str, tables: &[&str], writes: bool) -> Result<Option<String>> {
     if let Ok(a) = db.agent(agent)
         && let Some(col) = a.tenant.as_ref().and_then(|t| t["column"].as_str().map(String::from))
     {
         let v = db.view_tx(branch)?;
+        let cond = a.tenant_sql().unwrap_or_default();
         for t in tables {
-            if load_world(&v, t)?.is_some_and(|tb| tb.cols.iter().any(|c| c.name == col)) {
-                return Ok(Some(format!(
-                    "agent {agent} works for one tenant ({}), and the row API works on rows as they are: read and \
-                     change table \"{}\" with SQL (the sql tool, or POST /v1/sql), which keeps to the tenant",
-                    a.tenant_sql().unwrap_or_default(),
-                    rel_part(t)
-                )));
+            match rls::reach(&v, t, &col)? {
+                Some(rls::Reach::Shared) if writes => {
+                    return Ok(Some(format!(
+                        "agent {agent} works for one tenant ({cond}) and may only read table \"{}\": it has no column \
+                         {col} and no foreign key to a table that has it, so its rows are every tenant's",
+                        rel_part(t)
+                    )));
+                }
+                Some(rls::Reach::Column | rls::Reach::Through { .. }) => {
+                    return Ok(Some(format!(
+                        "agent {agent} works for one tenant ({cond}), and the row API works on rows as they are: read \
+                         and change table \"{}\" with SQL (the sql tool, or POST /v1/sql), which keeps to the tenant",
+                        rel_part(t)
+                    )));
+                }
+                _ => {}
             }
         }
     }
@@ -41284,11 +41312,28 @@ fn non_volatile_refusal(s: &Stmt) -> Option<SqlError> {
 /// In a folder attached to Postgres (see `crate::attach`), in any world: a statement that changes what tables there are
 /// or their shape (CREATE, ALTER, DROP, TRUNCATE, REFRESH, ...: a DDL command's tag, and TRUNCATE), which can't be
 /// written back to Postgres as rows. Reads and row writes, transactions, and the database's own commands (worlds,
-/// merges, agents, policies) go on; so do GRANT, REVOKE and COMMENT, which stay here.
-fn attached_refusal(db: &Db, s: &Stmt) -> Result<()> {
+/// merges, agents, policies) go on; so do GRANT, REVOKE and COMMENT, which stay here, and on main (`branch`; None: a
+/// function's statement) SET MASKED and DROP MASKED, which change only what agents read here, never Postgres.
+fn attached_refusal(db: &Db, branch: Option<&str>, s: &Stmt) -> Result<()> {
     let Some(att) = db.core.attached.as_deref() else { return Ok(()) };
     if crate::RECOVERING.get() {
         return Ok(());
+    }
+    if let Stmt::Alter { changes, .. } = s
+        && !changes.is_empty()
+        && changes.iter().all(|c| matches!(c, Alter::ColOpt(_, ColOpt::Mask(_))))
+    {
+        return match branch == Some(crate::MAIN) {
+            true => Ok(()),
+            false => err(
+                "0A000",
+                format!(
+                    "masking a column in a folder attached to Postgres ({}) is done on main, which every world forked \
+                     after reads masked",
+                    att.source()
+                ),
+            ),
+        };
     }
     let tag = match s {
         Stmt::Truncate { .. } => Some("TRUNCATE TABLE".to_string()),
@@ -42304,7 +42349,7 @@ impl Statement {
     }
 
     fn execute_inner(&self, db: &Db, branch: &str, params: &[Value], types: &[Type]) -> Result<Output> {
-        attached_refusal(db, &self.0)?;
+        attached_refusal(db, Some(branch), &self.0)?;
         // the event triggers a DDL command fires (not the statements a command runs itself: see `IN_COMMAND`)
         let fires = if userdefs::IN_COMMAND.get() { None } else { event_tag(&self.0) };
         if let Some(tag) = &fires {
@@ -52462,7 +52507,7 @@ impl<'a> Exec<'a> {
 
     /// Runs a statement from a function's body (SELECT, INSERT, UPDATE or DELETE).
     fn run_stmt(&self, s: &Stmt) -> Result<Output> {
-        attached_refusal(self.db, s)?;
+        attached_refusal(self.db, None, s)?;
         // (in a READ ONLY transaction, what a function or trigger writes to the world is refused too)
         if read_only_in(&self.db.core)
             && let Some(e) = read_only_refusal(s)

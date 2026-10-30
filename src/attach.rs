@@ -114,6 +114,17 @@ pub struct Col {
     pub ty: String,
     /// GENERATED ALWAYS AS IDENTITY: never in an UPDATE's SET
     pub always: bool,
+    /// GENERATED ALWAYS AS (...) STORED: Postgres works it out, and main does too, so it's never written to either
+    /// and never compared (the two may print a value differently: see `plain`)
+    pub generated: bool,
+    /// Postgres's `attnum`, which a rename keeps: how a refresh tells a column renamed from one dropped and another
+    /// added (see `shape`). 0 in a record made before it was kept: the next refresh fills it in
+    pub attnum: i16,
+}
+
+/// `t`'s columns that are written and compared: all but its generated ones (see `Col::generated`).
+fn plain(t: &Table) -> Vec<usize> {
+    (0..t.cols.len()).filter(|&i| !t.cols[i].generated).collect()
 }
 
 /// An attached folder's record (`FILE`).
@@ -394,7 +405,7 @@ impl Table {
         json!({
             "name": self.name, "sql": self.sql, "pg": self.pg, "key": self.key,
             "seqs": self.seqs.iter().map(|q| json!({"col": q.col, "pg": q.pg, "counter": q.counter})).collect::<Vec<_>>(),
-            "cols": self.cols.iter().map(|c| json!({"name": c.name, "ty": c.ty, "always": c.always})).collect::<Vec<_>>(),
+            "cols": self.cols.iter().map(|c| json!({"name": c.name, "ty": c.ty, "always": c.always, "generated": c.generated, "attnum": c.attnum})).collect::<Vec<_>>(),
         })
     }
 
@@ -426,6 +437,8 @@ impl Table {
                         name: c["name"].as_str()?.into(),
                         ty: c["ty"].as_str()?.into(),
                         always: c["always"].as_bool().unwrap_or(false),
+                        generated: c["generated"].as_bool().unwrap_or(false),
+                        attnum: c["attnum"].as_i64().and_then(|n| i16::try_from(n).ok()).unwrap_or(0),
                     })
                 })
                 .collect::<Option<_>>()?,
@@ -818,6 +831,13 @@ fn as_at(core: &Core, state: &State, t: &Table) -> Result<Table> {
     Ok(t)
 }
 
+/// Each masked column of attached table `t` as main has it (SET MASKED there, which an attached folder takes: it changes
+/// only what agents read here), with how (`hash`, `null`, `partial`, `format`).
+pub fn masks(db: &crate::Db, t: &Table) -> Vec<(String, &'static str)> {
+    let schema = db.core.get(MAIN, &format!("{}/{}", crate::sql::SCHEMAS, t.name)).ok().flatten();
+    schema.as_ref().and_then(crate::sql::column_masks).unwrap_or_default()
+}
+
 /// Whether merges into `name` in this database write back to Postgres now.
 pub(crate) fn writes_back(core: &Core, name: &str, tx: bool) -> bool {
     name == MAIN && !tx && core.attached.is_some() && core.me.get().is_some() && !crate::RECOVERING.get() && !SKIP.get()
@@ -862,6 +882,14 @@ fn rows_of(
             None => None,
         };
         if let std::collections::hash_map::Entry::Vacant(e) = unseen.entry(ti) {
+            if forked_before(core, ours, theirs, t)? {
+                return Err(refused(format!(
+                    "{world} was forked before Postgres changed the columns of table {} (dropped, renamed or \
+                     retyped one; a refresh took it into main), so its rows there can't be written back as it meant \
+                     them: fork a new world from main and make its changes again; nothing was merged",
+                    t.name
+                )));
+            }
             let had = core.val(ours, &format!("{}/{}", crate::sql::SCHEMAS, t.name))?;
             let had = had.as_ref().and_then(crate::sql::column_names).unwrap_or_default();
             let missing = (0..t.cols.len()).filter(|&i| !had.is_empty() && !had.contains(&t.cols[i].name)).collect();
@@ -1512,9 +1540,11 @@ fn write_rows(
         let t = &tables[ti];
         let all: Vec<usize> = (0..t.cols.len()).collect();
         let back: Vec<String> = t.cols.iter().map(|c| format!("t.{}::text", q(&c.name))).collect();
-        let sent: Vec<String> = all.iter().map(|&i| format!("k.c{i}::{}::text", t.cols[i].ty)).collect();
+        // (what's compared with what was sent: generated columns are Postgres's to work out)
+        let back_cmp: Vec<String> = plain(t).iter().map(|&i| format!("t.{}::text", q(&t.cols[i].name))).collect();
+        let sent: Vec<String> = plain(t).iter().map(|&i| format!("k.c{i}::{}::text", t.cols[i].ty)).collect();
         let updates: Vec<&Row> = rs.iter().copied().filter(|r| r.before.is_some() && r.after.is_some()).collect();
-        let set: Vec<usize> = all.iter().copied().filter(|i| !t.key.contains(i) && !t.cols[*i].always).collect();
+        let set: Vec<usize> = plain(t).into_iter().filter(|i| !t.key.contains(i) && !t.cols[*i].always).collect();
         if !updates.is_empty() && !set.is_empty() {
             let sets: Vec<String> =
                 set.iter().map(|&i| format!("{} = k.c{i}::{}", q(&t.cols[i].name), t.cols[i].ty)).collect();
@@ -1524,7 +1554,7 @@ fn write_rows(
                 sets.join(", "),
                 unnest(t, false, &all, 1),
                 key_match(t, "t"),
-                back.join(", "),
+                back_cmp.join(", "),
                 sent.join(", "),
                 back.join(", ")
             );
@@ -1543,10 +1573,10 @@ fn write_rows(
             // columns the world's table hadn't (one world's rows: the same for each) are Postgres's to fill, and
             // compared as unknown, so main takes what Postgres put there
             let unseen = &inserts[0].unseen;
-            let given_cols: Vec<usize> = all.iter().copied().filter(|i| !unseen.contains(i)).collect();
+            let given_cols: Vec<usize> = plain(t).into_iter().filter(|i| !unseen.contains(i)).collect();
             let cols: Vec<String> = given_cols.iter().map(|&i| q(&t.cols[i].name)).collect();
             let given: Vec<String> = given_cols.iter().map(|&i| format!("k.c{i}::{}", t.cols[i].ty)).collect();
-            let sent: Vec<String> = all
+            let sent: Vec<String> = plain(t)
                 .iter()
                 .map(|&i| match unseen.contains(&i) {
                     true => "null::text".to_string(),
@@ -1554,6 +1584,8 @@ fn write_rows(
                 })
                 .collect();
             let back_ins: Vec<String> = t.cols.iter().map(|c| format!("ins.{}::text", q(&c.name))).collect();
+            let back_ins_cmp: Vec<String> =
+                plain(t).iter().map(|&i| format!("ins.{}::text", q(&t.cols[i].name))).collect();
             let key_eq: Vec<String> = t
                 .key
                 .iter()
@@ -1567,7 +1599,7 @@ fn write_rows(
                 cols.join(", "),
                 if t.cols.iter().any(|c| c.always) { " overriding system value" } else { "" },
                 given.join(", "),
-                back_ins.join(", "),
+                back_ins_cmp.join(", "),
                 sent.join(", "),
                 back_ins.join(", "),
                 key_eq.join(" and ")
@@ -1604,12 +1636,15 @@ fn write_rows(
 /// foreign key's ON DELETE / ON UPDATE action wrote them, and main has no other way to hear of it. By place, from
 /// Postgres's counts of rows inserted, updated and deleted in this transaction
 /// (`pg_stat_xact_user_tables`, subtransactions included; with `track_counts` off they read 0, and nothing is found,
-/// as before). Which rows isn't asked: their `xmin` may be a subtransaction's, and finding them reads the table
-/// whole anyway, so main takes those tables by a refresh.
+/// as before; a partitioned table's are its partitions', summed, from `pg_partition_tree`, which lists no plain
+/// table, not even itself). Which rows isn't asked: their `xmin` may be a subtransaction's, and finding them reads
+/// the table whole anyway, so main takes those tables by a refresh.
 fn others(pg: &mut Client, tables: &[Table], by_table: &BTreeMap<usize, Vec<&Row>>) -> Result<Vec<usize>> {
     let names = text_array(tables.iter().map(|t| Some(t.pg.as_str())));
-    let sql = "select k.i, s.n_tup_ins, s.n_tup_upd, s.n_tup_del from unnest($1::text[]) with ordinality as k(t, i) \
-               join pg_stat_xact_user_tables s on s.relid = k.t::regclass";
+    let sql = "select k.i, sum(s.n_tup_ins), sum(s.n_tup_upd), sum(s.n_tup_del) \
+               from unnest($1::text[]) with ordinality as k(t, i) join pg_stat_xact_user_tables s \
+               on s.relid = k.t::regclass or s.relid in (select relid from pg_partition_tree(k.t::regclass)) \
+               group by k.i";
     let mut out = vec![];
     for r in run(pg, "counting the rows the transaction wrote", sql, &[names])? {
         let n = |i: usize| r[i].as_deref().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
@@ -1709,14 +1744,15 @@ fn compare(pg: &mut Client, t: &Table, rs: &[&Row]) -> Result<Vec<Compared>> {
     let all: Vec<usize> = (0..t.cols.len()).collect();
     let params = arrays(rs, t, true, &all, false);
     let pg_text: Vec<String> = t.cols.iter().map(|c| format!("t.{}::text", q(&c.name))).collect();
-    let held: Vec<String> = all.iter().map(|&i| format!("k.c{i}::{}::text", t.cols[i].ty)).collect();
+    let pg_cmp: Vec<String> = plain(t).iter().map(|&i| format!("t.{}::text", q(&t.cols[i].name))).collect();
+    let held: Vec<String> = plain(t).iter().map(|&i| format!("k.c{i}::{}::text", t.cols[i].ty)).collect();
     let canon_keys: Vec<String> =
         t.key.iter().enumerate().map(|(n, &i)| format!("k.k{n}::{}::text", t.cols[i].ty)).collect();
     let k0 = format!("t.{}", q(&t.cols[t.key[0]].name));
     let sql = format!(
         "select k.i, ({k0} is null) = k.p or (k.p and ({}) is distinct from ({})), {k0} is null, {}, {} \
          from {} left join {} t on {} order by k.i",
-        pg_text.join(", "),
+        pg_cmp.join(", "),
         held.join(", "),
         canon_keys.join(", "),
         pg_text.join(", "),
@@ -1777,8 +1813,18 @@ fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result
             crate::sql::shown_name(&t.name)
         )
     };
+    let main = core.view(MAIN)?;
     for (name, (read, mut whole)) in read_tables {
         let Some(ti) = att.table(&name) else { continue };
+        // a table Postgres changed the columns of since the fork (see `forked_before`): what the world read of it
+        // can't be compared with Postgres's rows as they are now
+        if forked_before(core, r.base, &main.s, &tables[ti])? {
+            out.push(format!(
+                "read {} before Postgres changed its columns (a refresh took that into main)",
+                crate::sql::shown_name(&tables[ti].name)
+            ));
+            continue;
+        }
         // as the world saw it: columns Postgres added after its fork (see `widen`) weren't there to read
         let t = &as_at(core, r.base, &tables[ti])?;
         // the fork point's rows the read covers: those read one by one, or every one of the table
@@ -1944,11 +1990,43 @@ fn keep_changed(t: &Table, ti: usize, got: pgclient::Rows, out: &mut Vec<Stored>
 /// A table's shape in Postgres, against the folder's record of it (see `shape`).
 enum Shape {
     Same,
-    /// only columns added after the recorded ones, each of which a refresh can add here too (see `widen`)
-    Added(Vec<Added>),
-    /// anything else, in words: a column dropped, renamed or retyped, the key, row-level security, a generated or
-    /// sequence-fed column added
+    /// changed in Postgres in ways a refresh takes here too (see `reshape`), or only the recorded columns' attnums to
+    /// fill in (see `Col::attnum`)
+    Reshaped(Reshape),
+    /// anything else, in words: the key, row-level security, a column made generated or not, a key or generated
+    /// column retyped, a sequence-fed column added
     Changed(Vec<String>),
+}
+
+/// What Postgres changed in an attached table's columns that a refresh takes into main too (see `reshape`). Columns
+/// by place in the recorded ones.
+#[derive(Default)]
+struct Reshape {
+    /// each recorded column's attnum in Postgres now (0: dropped there)
+    attnums: Vec<i16>,
+    dropped: Vec<usize>,
+    /// with the name it has now
+    renamed: Vec<(usize, String)>,
+    /// with the type it has now (`format_type`)
+    retyped: Vec<(usize, String)>,
+    /// after the others (see `widen`)
+    added: Vec<Added>,
+}
+
+impl Reshape {
+    /// Nothing for main to change: only the attnums.
+    fn quiet(&self) -> bool {
+        self.dropped.is_empty() && self.renamed.is_empty() && self.retyped.is_empty() && self.added.is_empty()
+    }
+
+    /// The columns dropped, renamed and retyped, in words (`t`: the table as recorded before).
+    fn said(&self, t: &Table) -> Vec<String> {
+        let name = |i: usize| &t.cols[i].name;
+        let mut out: Vec<String> = self.dropped.iter().map(|&i| format!("column {} dropped", name(i))).collect();
+        out.extend(self.renamed.iter().map(|(i, n)| format!("column {} renamed {n}", name(*i))));
+        out.extend(self.retyped.iter().map(|(i, ty)| format!("column {} now {ty}", name(*i))));
+        out
+    }
 }
 
 /// A column Postgres added to an attached table: as the record keeps it, and its definition here.
@@ -1960,49 +2038,106 @@ struct Added {
     not_null: bool,
 }
 
-/// `t`'s shape in Postgres now: its columns (names, types, generated or not), primary key, and row-level security
-/// (on, the role sees only some rows, and the rest would look gone), against what the folder recorded.
+/// SQL, true when row-level security keeps rows of the table `c` (a `pg_class` row) from the role connected as: it's
+/// on, the role doesn't read past it (a superuser, BYPASSRLS, the owner of a table that doesn't FORCE it, as
+/// `row_security_active` says), and no policy shows the role every row. Such a policy is permissive, for all
+/// commands, applies to the role (or everyone), and is `USING (true)` with no other check; a restrictive policy
+/// that applies to the role cuts any policy down, so then none does. The copy would hold only some rows, and the
+/// rest would look deleted.
+pub const RLS_HIDES: &str = "(c.relrowsecurity and row_security_active(c.oid) and not (\
+     exists (select 1 from pg_policy p where p.polrelid = c.oid and p.polpermissive and p.polcmd = '*' \
+       and (0 = any (p.polroles) or exists (select 1 from pg_roles o where o.oid = any (p.polroles) and pg_has_role(o.oid, 'usage'))) \
+       and pg_get_expr(p.polqual, p.polrelid) = 'true' \
+       and coalesce(pg_get_expr(p.polwithcheck, p.polrelid), 'true') = 'true') \
+     and not exists (select 1 from pg_policy p where p.polrelid = c.oid and not p.polpermissive \
+       and (0 = any (p.polroles) or exists (select 1 from pg_roles o where o.oid = any (p.polroles) and pg_has_role(o.oid, 'usage'))))))";
+
+/// SQL, the key columns (`attnum`s, in order) attach finds rows of the table `rel` (an oid) by: its primary key, or
+/// without one a unique index on columns that are all NOT NULL, which Postgres checks at once, with no predicate or
+/// expression (one a constraint makes first, then the fewest columns, then by name). NULL when it has neither: rows
+/// written back couldn't be found again.
+pub fn key_cols(rel: &str) -> String {
+    format!(
+        "(select (i.indkey::int2[])[0:i.indnkeyatts - 1] from pg_index i join pg_class x on x.oid = i.indexrelid \
+         where i.indrelid = {rel} and (i.indisprimary or (i.indisunique and i.indisvalid and i.indimmediate \
+         and i.indpred is null and i.indexprs is null and not exists (select 1 from pg_attribute n \
+         where n.attrelid = i.indrelid and n.attnum = any ((i.indkey::int2[])[0:i.indnkeyatts - 1]) and not n.attnotnull))) \
+         order by i.indisprimary desc, not exists (select 1 from pg_constraint k where k.conindid = i.indexrelid), \
+         i.indnkeyatts, x.relname limit 1)"
+    )
+}
+
+/// `t`'s shape in Postgres now: its columns (names, types, generated or not), key (see `key_cols`), and row-level security
+/// that hides rows from the role (see `RLS_HIDES`: the rest would look gone), against what the folder recorded.
 fn shape(pg: &mut Client, t: &Table) -> Result<Shape> {
-    let sql = "select a.attname, format_type(a.atttypid, a.atttypmod), a.attgenerated <> '', c.relrowsecurity, \
-               array_position(i.indkey::int2[], a.attnum), a.attnotnull, pg_get_expr(d.adbin, d.adrelid), \
-               a.attidentity <> '' or coalesce(pg_get_expr(d.adbin, d.adrelid), '') like 'nextval(%' \
+    let sql = &format!(
+        "select a.attname, format_type(a.atttypid, a.atttypmod), a.attgenerated <> '', {RLS_HIDES}, \
+               array_position({}, a.attnum), a.attnotnull, pg_get_expr(d.adbin, d.adrelid), \
+               a.attidentity <> '' or coalesce(pg_get_expr(d.adbin, d.adrelid), '') like 'nextval(%', a.attnum \
                from pg_class c join pg_attribute a on a.attrelid = c.oid \
-               left join pg_index i on i.indrelid = c.oid and i.indisprimary \
                left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum \
-               where c.oid = $1::regclass and a.attnum > 0 and not a.attisdropped order by a.attnum";
+               where c.oid = $1::regclass and a.attnum > 0 and not a.attisdropped order by a.attnum",
+        key_cols("c.oid")
+    );
     let rows = run(pg, &format!("reading {}'s columns", t.pg), sql, std::slice::from_ref(&t.pg))?;
     let v = |r: &Texts, i: usize| r[i].clone().unwrap_or_default();
     let mut diffs = vec![];
     if rows.first().is_some_and(|r| r[3].as_deref() == Some("t")) {
-        diffs.push("row-level security is on".to_string());
+        diffs.push("row-level security hides some of its rows from the role connected as".to_string());
     }
-    let now: Vec<(String, String)> = rows.iter().map(|r| (v(r, 0), v(r, 1))).collect();
-    let was: Vec<(String, String)> = t.cols.iter().map(|c| (c.name.clone(), c.ty.clone())).collect();
-    // Postgres numbers a column added later after every one there: the recorded ones first, unchanged, then new
-    let widened = now.len() > was.len() && now[..was.len()] == was[..];
-    if now != was && !widened {
-        let show = |v: &[(String, String)]| v.iter().map(|(n, ty)| format!("{n} {ty}")).collect::<Vec<_>>().join(", ");
-        diffs.push(format!("its columns are ({}), not ({})", show(&now), show(&was)));
+    let attnum = |r: &Texts| r[8].as_deref().and_then(|n| n.parse::<i16>().ok()).unwrap_or(0);
+    // each recorded column's place among Postgres's now: by attnum, which a rename keeps; by name in a record made
+    // before attnums were kept (a column renamed there then reads as one dropped and another added)
+    let by_num = t.cols.iter().all(|c| c.attnum > 0);
+    let found: Vec<Option<usize>> = t
+        .cols
+        .iter()
+        .map(|c| rows.iter().position(|r| if by_num { attnum(r) == c.attnum } else { v(r, 0) == c.name }))
+        .collect();
+    let mut re =
+        Reshape { attnums: found.iter().map(|f| f.map_or(0, |j| attnum(&rows[j]))).collect(), ..Reshape::default() };
+    // Postgres numbers a column added later after every one there: the recorded ones keep their order, new ones last
+    let kept: Vec<usize> = found.iter().flatten().copied().collect();
+    let new: Vec<usize> = (0..rows.len()).filter(|j| !kept.contains(j)).collect();
+    if !kept.is_sorted() || new.iter().any(|&j| kept.last().is_some_and(|&l| j < l)) {
+        let now: Vec<String> = rows.iter().map(|r| format!("{} {}", v(r, 0), v(r, 1))).collect();
+        let was: Vec<String> = t.cols.iter().map(|c| format!("{} {}", c.name, c.ty)).collect();
+        diffs.push(format!("its columns are ({}), not ({})", now.join(", "), was.join(", ")));
     }
-    if let Some(r) = rows.iter().find(|r| r[2].as_deref() == Some("t")) {
-        diffs.push(format!("column {} is generated", v(r, 0)));
+    for (i, c) in t.cols.iter().enumerate() {
+        let Some(j) = found[i] else {
+            re.dropped.push(i);
+            continue;
+        };
+        let r = &rows[j];
+        // a column that became generated or stopped being
+        if (r[2].as_deref() == Some("t")) != c.generated {
+            let now = if c.generated { "isn't generated now" } else { "is generated now" };
+            diffs.push(format!("column {} {now}", v(r, 0)));
+        }
+        if v(r, 0) != c.name {
+            re.renamed.push((i, v(r, 0)));
+        }
+        if v(r, 1) != c.ty {
+            // (main's rows are keyed by the key's values, and a generated column's expression is main's own)
+            match t.key.contains(&i) || c.generated {
+                true => diffs.push(format!("column {} is {} now, not {}", v(r, 0), v(r, 1), c.ty)),
+                false => re.retyped.push((i, v(r, 1))),
+            }
+        }
     }
-    let mut key: Vec<(i64, String)> =
-        rows.iter().filter_map(|r| Some((r[4].as_deref()?.parse().ok()?, v(r, 0)))).collect();
+    let mut key: Vec<(i64, usize)> =
+        rows.iter().enumerate().filter_map(|(j, r)| Some((r[4].as_deref()?.parse().ok()?, j))).collect();
     key.sort();
-    let key: Vec<String> = key.into_iter().map(|(_, n)| n).collect();
-    let was_key: Vec<String> = t.key.iter().map(|&i| t.cols[i].name.clone()).collect();
+    let key: Vec<Option<usize>> = key.into_iter().map(|(_, j)| Some(j)).collect();
+    let was_key: Vec<Option<usize>> = t.key.iter().map(|&i| found[i]).collect();
     if key != was_key {
-        diffs.push(format!("its primary key is ({}), not ({})", key.join(", "), was_key.join(", ")));
+        let now: Vec<String> = key.iter().flatten().map(|&j| v(&rows[j], 0)).collect();
+        let was: Vec<String> = t.key.iter().map(|&i| t.cols[i].name.clone()).collect();
+        diffs.push(format!("its key is ({}), not ({})", now.join(", "), was.join(", ")));
     }
-    if !diffs.is_empty() {
-        return Ok(Shape::Changed(diffs));
-    }
-    if !widened {
-        return Ok(Shape::Same);
-    }
-    let mut added = vec![];
-    for r in &rows[was.len()..] {
+    for j in new {
+        let r = &rows[j];
         let (name, ty) = (v(r, 0), v(r, 1));
         if r[7].as_deref() == Some("t") {
             // values from a sequence: attach reserves them from Postgres, and that is set up only at attach
@@ -2013,24 +2148,35 @@ fn shape(pg: &mut Client, t: &Table) -> Result<Shape> {
         // (see `settle`): a column added NULL, filled, then made NOT NULL in Postgres has no default to fill it here
         let default = r[6].clone().filter(|e| !crate::sql::default_refused(e));
         let not_null = r[5].as_deref() == Some("t");
-        added.push(Added { col: Col { name, ty, always: false }, default, not_null });
+        let col = Col { name, ty, always: false, generated: false, attnum: attnum(r) };
+        re.added.push(Added { col, default, not_null });
     }
-    Ok(match diffs.is_empty() {
-        true => Shape::Added(added),
-        false => Shape::Changed(diffs),
-    })
+    if !diffs.is_empty() {
+        return Ok(Shape::Changed(diffs));
+    }
+    if re.quiet() && t.cols.iter().zip(&re.attnums).all(|(c, &n)| c.attnum == n) {
+        return Ok(Shape::Same);
+    }
+    Ok(Shape::Reshaped(re))
 }
 
-/// Refuses a write-back to a table whose shape in Postgres isn't as recorded (see `shape`). Columns Postgres added
-/// come over at the next refresh; any other change needs a new attach.
+/// Refuses a write-back to a table whose shape in Postgres isn't as recorded (see `shape`). Columns Postgres added,
+/// dropped, renamed or retyped come over at the next refresh; any other change needs a new attach.
 fn same_shape(pg: &mut Client, t: &Table) -> Result<()> {
     match shape(pg, t)? {
         Shape::Same => Ok(()),
-        Shape::Added(cols) => Err(refused(format!(
+        Shape::Reshaped(re) if re.quiet() => Ok(()),
+        Shape::Reshaped(re) if re.said(t).is_empty() => Err(refused(format!(
             "{} has columns in Postgres main hasn't taken yet ({}): a refresh takes them (chronos refresh, or serve \
              --refresh-every), then merge again; nothing was merged",
             t.pg,
-            cols.iter().map(|a| a.col.name.as_str()).collect::<Vec<_>>().join(", ")
+            re.added.iter().map(|a| a.col.name.as_str()).collect::<Vec<_>>().join(", ")
+        ))),
+        Shape::Reshaped(re) => Err(refused(format!(
+            "{} changed in Postgres since main took its shape ({}): a refresh takes it (chronos refresh, or serve \
+             --refresh-every), and then a world forked from main after it can merge; nothing was merged",
+            t.pg,
+            re.said(t).join("; ")
         ))),
         Shape::Changed(diffs) => Err(refused(format!(
             "{} changed in Postgres since the attach: {}. Attach it again into a new folder (worlds here, and their \
@@ -2147,10 +2293,12 @@ fn store(core: &Core, att: &Attached, rows: &[Stored]) -> std::result::Result<()
     }
     for (&ti, rs) in &by_table {
         let t = &tables[ti];
-        let cols: Vec<String> = t.cols.iter().map(|c| q(&c.name)).collect();
+        // (main works its generated columns out itself)
+        let cols: Vec<String> = plain(t).iter().map(|&i| q(&t.cols[i].name)).collect();
         let keys: Vec<String> = t.key.iter().map(|&i| q(&t.cols[i].name)).collect();
         let overriding = if t.cols.iter().any(|c| c.always) { " overriding system value" } else { "" };
-        let sets: Vec<String> = (0..t.cols.len())
+        let sets: Vec<String> = plain(t)
+            .into_iter()
             .filter(|i| !t.key.contains(i) && !t.cols[*i].always)
             .map(|i| format!("{c} = excluded.{c}", c = q(&t.cols[i].name)))
             .collect();
@@ -2159,8 +2307,8 @@ fn store(core: &Core, att: &Attached, rows: &[Stored]) -> std::result::Result<()
             false => format!("do update set {}", sets.join(", ")),
         };
         for r in rs.iter().filter(|r| r.row.is_some()) {
-            let vals: Vec<String> =
-                r.row.as_ref().unwrap().iter().map(|v| v.as_deref().map_or("null".into(), lit)).collect();
+            let row = r.row.as_ref().unwrap();
+            let vals: Vec<String> = plain(t).iter().map(|&i| row[i].as_deref().map_or("null".into(), lit)).collect();
             sql.push(format!(
                 "insert into {} ({}){overriding} values ({}) on conflict ({}) {on}",
                 t.sql,
@@ -2305,12 +2453,16 @@ pub struct Refreshed {
     pub tables: Vec<(String, usize, usize, usize)>,
     /// columns Postgres added that main took (`table.column type`), before its rows (see `widen`)
     pub added: Vec<String>,
+    /// columns Postgres dropped, renamed or retyped that main took (`table: column a renamed b`; see `reshape`)
+    pub altered: Vec<String>,
     /// enum labels Postgres added that main's types took (`type 'label'`), before the rows (see `take_labels`)
     pub labels: Vec<String>,
     /// tables left as they were, and why (their shape changed in Postgres)
     pub skipped: Vec<String>,
     /// when Postgres was read (ms since 1970)
     pub at: u64,
+    /// the replication slot `follow` made (and refreshed every table, as its changes start there)
+    pub slot: Option<String>,
 }
 
 impl Refreshed {
@@ -2325,8 +2477,10 @@ impl Refreshed {
             "tables": self.tables.iter().map(|(t, i, u, d)| json!({"table": t, "inserted": i, "updated": u, "deleted": d}))
                 .collect::<Vec<_>>(),
             "added": self.added,
+            "altered": self.altered,
             "labels": self.labels,
             "skipped": self.skipped,
+            "slot": self.slot,
         })
     }
 }
@@ -2337,9 +2491,9 @@ impl Refreshed {
 /// taking what it read. Each of main's rows is compared with Postgres's as the write-back compares them (main's value
 /// cast to the column's type there, so a row nobody changed always compares equal), and rows Postgres has that main
 /// hasn't are read whole; main takes the differences in one change. Open worlds then see main moved, and settle the
-/// rows they changed too as any conflict at their merge. Columns Postgres added to a table are added to main's first
-/// (see `widen`), so its rows then take their values; a table whose shape changed otherwise is left as it was, and
-/// said.
+/// rows they changed too as any conflict at their merge. Columns Postgres added, dropped, renamed or retyped are so
+/// in main's table first (see `reshape`), so its rows then take Postgres's values; a table whose shape changed
+/// otherwise is left as it was, and said.
 pub fn refresh(core: &Core) -> std::result::Result<Refreshed, String> {
     refresh_with(core, None)
 }
@@ -2404,17 +2558,21 @@ fn refresh_read(
         let t = &before[ti];
         match shape(pg, t)? {
             Shape::Same => {}
-            Shape::Added(cols) => {
+            Shape::Reshaped(re) => {
                 let named: Vec<String> =
-                    cols.iter().map(|a| format!("{}.{} {}", t.name, a.col.name, a.col.ty)).collect();
-                if let Err(e) = widen(core, att, ti, cols) {
+                    re.added.iter().map(|a| format!("{}.{} {}", t.name, a.col.name, a.col.ty)).collect();
+                let said = re.said(t);
+                if let Err(e) = reshape(core, att, ti, re) {
+                    let all: Vec<String> =
+                        said.iter().cloned().chain(named.iter().map(|n| format!("{n} added"))).collect();
                     out.skipped.push(format!(
-                        "{}: columns added in Postgres ({}) couldn't be added here: {e}",
+                        "{}: changed in Postgres ({}), and main couldn't take it: {e}",
                         t.name,
-                        named.join(", ")
+                        all.join("; ")
                     ));
                     continue;
                 }
+                out.altered.extend(said.into_iter().map(|s| format!("{}: {s}", t.name)));
                 out.added.extend(named);
             }
             Shape::Changed(diffs) => {
@@ -2492,6 +2650,423 @@ fn refresh_read(
     Ok((out, rows))
 }
 
+// ---------------------------------------------------------------- following Postgres's changes
+
+/// Changes `follow` reads from the slot at a time (whole transactions: a few more may come): the rest at the next.
+const FOLLOW_CHANGES: usize = 50_000;
+/// Rows of one table a `follow` reads by key at most: past it, the table is refreshed whole.
+const FOLLOW_KEYS: usize = 100_000;
+
+/// What the slot said changed in one attached table: the keys of its rows changed, as Postgres writes them, or that
+/// the whole table is to be compared (a TRUNCATE, a change that didn't say its row's key, too many rows).
+#[derive(Debug, Default, PartialEq)]
+struct Changed {
+    keys: HashSet<Vec<Option<String>>>,
+    whole: bool,
+}
+
+impl Changed {
+    fn key(&mut self, k: Vec<Option<String>>) {
+        if !self.whole {
+            self.keys.insert(k);
+            if self.keys.len() > FOLLOW_KEYS {
+                self.whole();
+            }
+        }
+    }
+
+    fn whole(&mut self) {
+        self.whole = true;
+        self.keys.clear();
+    }
+}
+
+impl Attached {
+    /// The logical replication slot `follow` reads in Postgres: one per attached folder.
+    pub fn slot(&self) -> String {
+        format!("chronos_{}", self.id)
+    }
+}
+
+/// `chronos serve --follow`: main takes Postgres's rows as they change there, without a refresh's read of every row.
+/// Postgres says which rows changed through a logical replication slot (`Attached::slot`, made by the first follow
+/// with the `test_decoding` plugin: Postgres needs `wal_level = logical`, and the role REPLICATION). Each follow reads
+/// the changes since the last from it (`pg_logical_slot_peek_changes`); the rows they name are then read as Postgres
+/// has them now and compared with main's as a refresh compares them, under the write-back lock. The slot only says
+/// where to look: a change read twice, or a merge's own write coming back, takes nothing. A table the slot can't name
+/// rows of (a TRUNCATE, a delete under REPLICA IDENTITY NOTHING, more than `FOLLOW_KEYS` rows) or whose columns
+/// changed is refreshed whole. The slot moves past the changes only once main took them
+/// (`pg_replication_slot_advance`), so a follow stopped partway reads them again. The first follow, which makes the
+/// slot, refreshes every table: changes before it aren't in the slot. A slot keeps Postgres's WAL until it is read:
+/// `unfollow` drops it.
+pub fn follow(core: &Core) -> std::result::Result<Refreshed, String> {
+    let Some(att) = core.attached.as_deref() else {
+        return Err("this folder isn't attached to Postgres (chronos attach makes one that is)".into());
+    };
+    let _held = att.hold();
+    if att.pending() {
+        resolve(core).map_err(|e| format!("a merge written to Postgres before isn't settled yet: {e}"))?;
+    }
+    let slot = att.slot();
+    let mut pg = att.lease()?;
+    let status = "select coalesce(to_jsonb(s) ->> 'wal_status', '') from pg_replication_slots s where slot_name = $1";
+    let found = pg.first(|pg| pg.query_params(status, &[Some(&slot)])).map_err(|e| e.to_string())?;
+    let lost = found.first().is_some_and(|r| r[0].as_deref() == Some("lost"));
+    if found.is_empty() || lost {
+        // (a slot Postgres gave up on, its WAL removed for max_slot_wal_keep_size, is made again: it missed changes)
+        if lost {
+            pg.query_params("select pg_drop_replication_slot($1)", &[Some(&slot)]).map_err(|e| cant_follow(&e))?;
+        }
+        pg.query_params("select 1 from pg_create_logical_replication_slot($1, 'test_decoding')", &[Some(&slot)])
+            .map_err(|e| cant_follow(&e))?;
+        drop(pg);
+        let mut r = refresh_now(core, att, None)?;
+        r.slot = Some(slot);
+        return Ok(r);
+    }
+    let at = crate::now_ms();
+    let out = follow_read(core, att, &mut pg, &slot, at);
+    rollback(&mut pg);
+    drop(pg);
+    let (mut out, rows, whole, last, more) = out.map_err(|e| e.to_string())?;
+    store(core, att, &rows)?;
+    out.skipped.extend(settle(core, att));
+    if !whole.is_empty() {
+        let r = refresh_now(core, att, Some(&whole))?;
+        out.tables.extend(r.tables);
+        out.added.extend(r.added);
+        out.altered.extend(r.altered);
+        out.labels.extend(r.labels);
+        out.skipped.extend(r.skipped);
+    }
+    if let Some(lsn) = last {
+        let mut pg = att.lease()?;
+        pg.first(|pg| {
+            pg.query_params("select 1 from pg_replication_slot_advance($1, $2::pg_lsn)", &[Some(&slot), Some(&lsn)])
+        })
+        .map_err(|e| format!("moving replication slot {slot} past what main took: {e}"))?;
+    }
+    // (main is as Postgres was when the slot was read; the record is written at most once a minute)
+    if !more && (out.changed() > 0 || at.saturating_sub(att.refreshed_at()) > 60_000) {
+        att.refreshed(at).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
+}
+
+/// The read of a `follow`: the changes in the slot, and the rows they name as Postgres has them. What main is to
+/// take, the tables to refresh whole (by place), the slot's position after the changes read (None: there were none),
+/// and whether more are left in it.
+#[allow(clippy::type_complexity)]
+fn follow_read(
+    core: &Core,
+    att: &Attached,
+    pg: &mut Client,
+    slot: &str,
+    at: u64,
+) -> Result<(Refreshed, Vec<Stored>, Vec<usize>, Option<String>, bool)> {
+    let tables = att.tables();
+    let mut out = Refreshed { at, ..Default::default() };
+    // (under SETTINGS, so the keys come written as attach and refresh read them)
+    let peek = format!(
+        "select lsn::text, data from pg_logical_slot_peek_changes($1, null, {FOLLOW_CHANGES}, 'include-xids', '0', \
+         'skip-empty-xacts', '1')"
+    );
+    let start = format!("begin; set local statement_timeout = '{STATEMENT_TIMEOUT}'; {SETTINGS}");
+    pg.query(&start).map_err(|e| failed("starting to read the replication slot", &e))?;
+    let read = run(pg, &format!("reading replication slot {slot}"), &peek, &[slot.to_string()])?;
+    pg.query("commit").map_err(|e| failed("reading the replication slot", &e))?;
+    let more = read.len() >= FOLLOW_CHANGES;
+    let last = read.last().and_then(|r| r[0].clone());
+    if read.is_empty() {
+        return Ok((out, vec![], vec![], None, false));
+    }
+    let rels = relations(pg, &tables)?;
+    let mut changed: BTreeMap<usize, Changed> = BTreeMap::new();
+    for r in &read {
+        if let Some(data) = r[1].as_deref() {
+            note(data, &tables, &rels, &mut changed);
+        }
+    }
+    let mut whole = vec![];
+    let mut rows = vec![];
+    if changed.values().any(|c| !c.whole) {
+        let start = format!(
+            "begin isolation level repeatable read, read only; set local statement_timeout = '{STATEMENT_TIMEOUT}'; \
+             {SETTINGS}"
+        );
+        pg.query(&start).map_err(|e| failed("starting to read changed rows", &e))?;
+        take_labels(core, pg, &mut out)?;
+    }
+    for (&ti, c) in &changed {
+        let t = &tables[ti];
+        if c.whole || !matches!(shape(pg, t)?, Shape::Same) {
+            whole.push(ti);
+            continue;
+        }
+        match by_keys(core, pg, t, ti, &c.keys, &mut rows)? {
+            Some((i, u, d)) => out.tables.push((t.name.clone(), i, u, d)),
+            None => whole.push(ti),
+        }
+    }
+    Ok((out, rows, whole, last, more))
+}
+
+/// The names `test_decoding` writes attached tables by (`public.leads`, `app."Orders"`), with each one's place: a
+/// partitioned table's partitions name it too, as Postgres says a row of one changed.
+fn relations(pg: &mut Client, tables: &[Table]) -> Result<HashMap<String, usize>> {
+    let sql = "select k.i, quote_ident(n.nspname) || '.' || quote_ident(c.relname) \
+               from unnest($1::text[]) with ordinality as k(t, i) join pg_class c on c.oid = k.t::regclass \
+               or c.oid in (select relid from pg_partition_tree(k.t::regclass)) \
+               join pg_namespace n on n.oid = c.relnamespace";
+    let names = text_array(tables.iter().map(|t| Some(t.pg.as_str())));
+    let mut out = HashMap::new();
+    for r in run(pg, "reading the attached tables' names", sql, &[names])? {
+        if let (Some(i), Some(n)) = (r[0].as_deref().and_then(|i| i.parse::<usize>().ok()), r[1].clone()) {
+            out.insert(n, i - 1);
+        }
+    }
+    Ok(out)
+}
+
+/// One line `test_decoding` wrote (`table public.leads: UPDATE: id[integer]:7 name[text]:'Ada'`), noted in `changed`
+/// if it is a change of an attached table (`rels`: see `relations`): the key of each row it names (an UPDATE that
+/// changed the key names the old one too), or the whole table where it names none. BEGIN, COMMIT and other tables'
+/// changes are left.
+fn note(data: &str, tables: &[Table], rels: &HashMap<String, usize>, changed: &mut BTreeMap<usize, Changed>) {
+    let Some(rest) = data.strip_prefix("table ") else { return };
+    // (a TRUNCATE names every table it emptied: `table public.a, public.b: TRUNCATE: (no-flags)`)
+    if let Some(end) = rest.find(": TRUNCATE:") {
+        let list = &rest[..end];
+        for (name, &ti) in rels {
+            let one = list == name
+                || list.starts_with(&format!("{name}, "))
+                || list.ends_with(&format!(", {name}"))
+                || list.contains(&format!(", {name}, "));
+            if one {
+                changed.entry(ti).or_default().whole();
+            }
+        }
+        return;
+    }
+    let Some((name, &ti)) =
+        rels.iter().find(|(n, _)| rest.strip_prefix(n.as_str()).is_some_and(|r| r.starts_with(": ")))
+    else {
+        return;
+    };
+    let Some((_op, tuple)) = rest[name.len() + 2..].split_once(": ") else { return };
+    let t = &tables[ti];
+    let c = changed.entry(ti).or_default();
+    let mut found = false;
+    for section in fields(tuple) {
+        let key: Option<Vec<Option<String>>> = t
+            .key
+            .iter()
+            .map(|&i| match section.iter().find(|(n, _)| *n == t.cols[i].name) {
+                Some((_, Field::Text(v))) => Some(Some(v.clone())),
+                _ => None,
+            })
+            .collect();
+        if let Some(k) = key {
+            c.key(k);
+            found = true;
+        }
+    }
+    if !found {
+        c.whole();
+    }
+}
+
+/// A column's value as `test_decoding` writes it.
+#[derive(Debug, PartialEq)]
+enum Field {
+    Text(String),
+    Null,
+    /// `unchanged-toast-datum`: a big value the change didn't touch, not written
+    Unsaid,
+}
+
+/// The columns `test_decoding` wrote of a change's rows (`id[integer]:7 name[text]:'Ada'`), each part of it its own
+/// list: an UPDATE that changed the key writes `old-key: ... new-tuple: ...`. Empty for `(no-tuple-data)`.
+fn fields(s: &str) -> Vec<Vec<(String, Field)>> {
+    let mut out: Vec<Vec<(String, Field)>> = vec![vec![]];
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b' ' {
+            i += 1;
+            continue;
+        }
+        let rest = &s[i..];
+        if rest.starts_with("(no-tuple-data)") {
+            return vec![];
+        }
+        if let Some(r) = rest.strip_prefix("old-key:").or_else(|| rest.strip_prefix("new-tuple:")) {
+            if !out.last().is_some_and(Vec::is_empty) {
+                out.push(vec![]);
+            }
+            i = s.len() - r.len();
+            continue;
+        }
+        // the column's name, as quote_identifier writes it
+        let name = if b[i] == b'"' {
+            let mut n = String::new();
+            i += 1;
+            loop {
+                match s[i..].find('"') {
+                    None => return out,
+                    Some(j) => {
+                        n.push_str(&s[i..i + j]);
+                        i += j + 1;
+                        if s[i..].starts_with('"') {
+                            n.push('"');
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            n
+        } else {
+            let Some(j) = s[i..].find('[') else { return out };
+            let n = s[i..i + j].to_string();
+            i += j;
+            n
+        };
+        // [type]:
+        let Some(j) = s[i..].find("]:") else { return out };
+        i += j + 2;
+        let rest = &s[i..];
+        let quoted = rest.strip_prefix('\'').or_else(|| rest.strip_prefix("B'"));
+        let value = match quoted {
+            Some(q) => {
+                i = s.len() - q.len();
+                let mut v = String::new();
+                loop {
+                    match s[i..].find('\'') {
+                        None => return out,
+                        Some(j) => {
+                            v.push_str(&s[i..i + j]);
+                            i += j + 1;
+                            if s[i..].starts_with('\'') {
+                                v.push('\'');
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Field::Text(v)
+            }
+            None => {
+                let j = rest.find(' ').unwrap_or(rest.len());
+                i += j;
+                match &rest[..j] {
+                    "null" => Field::Null,
+                    "unchanged-toast-datum" => Field::Unsaid,
+                    v => Field::Text(v.to_string()),
+                }
+            }
+        };
+        out.last_mut().expect("a list").push((name, value));
+    }
+    out
+}
+
+/// The rows of attached table `t` (place `ti`) with keys `keys`, as Postgres has them now, compared with main's as a
+/// refresh compares them: what main is to take, added to `rows`, and how many rows it inserts, updates and deletes.
+/// None: a key main can't read as its table's (the table is refreshed whole).
+fn by_keys(
+    core: &Core,
+    pg: &mut Client,
+    t: &Table,
+    ti: usize,
+    keys: &HashSet<Vec<Option<String>>>,
+    rows: &mut Vec<Stored>,
+) -> Result<Option<(usize, usize, usize)>> {
+    let main = core.view(MAIN)?;
+    let mut held = vec![];
+    let mut absent: Vec<&Vec<Option<String>>> = vec![];
+    for k in keys {
+        let named: Vec<(String, Option<String>)> =
+            t.key.iter().zip(k).map(|(&i, v)| (t.cols[i].name.clone(), v.clone())).collect();
+        let Ok((mk, _)) = crate::sql::row_from_texts(&main, &t.name, &named) else { return Ok(None) };
+        match core.val(&main.s, &mk)? {
+            Some(raw) => {
+                let before = texts(core, &main.s, t, &mk, &raw)?;
+                held.push(Row { key: mk, table: ti, before: Some(before), after: None, kept: false, unseen: vec![] });
+            }
+            None => absent.push(k),
+        }
+    }
+    let (mut ins, mut upd, mut del) = (0, 0, 0);
+    // rows main has: changed or gone in Postgres
+    for part in held.chunks(REFRESH_BATCH) {
+        let batch: Vec<&Row> = part.iter().collect();
+        for c in compare(pg, t, &batch)?.into_iter().filter(|c| c.changed) {
+            match &c.now {
+                Some(_) => upd += 1,
+                None => del += 1,
+            }
+            rows.push(Stored { table: ti, key: c.key, row: c.now });
+        }
+    }
+    // rows main hasn't: inserted in Postgres (or there neither, deleted since)
+    let pg_text: Vec<String> = t.cols.iter().map(|c| format!("t.{}::text", q(&c.name))).collect();
+    let k_cols: Vec<String> = (0..t.key.len()).map(|n| format!("k{n}")).collect();
+    let k_params: Vec<String> = (1..=t.key.len()).map(|n| format!("${n}::text[]")).collect();
+    let sql = format!(
+        "select {} from {} t join unnest({}) as k({}) on {}",
+        pg_text.join(", "),
+        t.pg,
+        k_params.join(", "),
+        k_cols.join(", "),
+        key_match(t, "t"),
+    );
+    for part in absent.chunks(REFRESH_BATCH) {
+        let params: Vec<String> = (0..t.key.len()).map(|n| text_array(part.iter().map(|k| k[n].as_deref()))).collect();
+        for r in run(pg, &format!("reading rows of {} inserted there", t.pg), &sql, &params)? {
+            let key = t.key.iter().map(|&i| r[i].clone()).collect();
+            rows.push(Stored { table: ti, key, row: Some(r) });
+            ins += 1;
+        }
+    }
+    Ok(Some((ins, upd, del)))
+}
+
+/// Drops the slot `follow` reads, if there is one: Postgres keeps no WAL for this folder after. Whether there was.
+pub fn unfollow(core: &Core) -> std::result::Result<bool, String> {
+    let Some(att) = core.attached.as_deref() else {
+        return Err("this folder isn't attached to Postgres (chronos attach makes one that is)".into());
+    };
+    let _held = att.hold();
+    let slot = att.slot();
+    let mut pg = att.lease()?;
+    let sql = "select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = $1";
+    let r = pg.first(|pg| pg.query_params(sql, &[Some(&slot)])).map_err(|e| cant_follow(&e))?;
+    Ok(!r.is_empty())
+}
+
+/// Why Postgres won't give `follow` a slot, and what makes it.
+fn cant_follow(e: &io::Error) -> String {
+    let hint = match pg_error(e).map(|p| p.code.as_str()) {
+        Some("55000") if e.to_string().contains("wal_level") => {
+            ": following Postgres's changes needs wal_level = logical there (ALTER SYSTEM SET wal_level = logical, then \
+             a restart; RDS: rds.logical_replication = 1; Cloud SQL: cloudsql.logical_decoding = on). Until then, \
+             chronos serve --refresh-every 5m takes them on a timer"
+        }
+        Some("42501") => {
+            ": following Postgres's changes needs a role with REPLICATION (ALTER ROLE ... REPLICATION; RDS: GRANT \
+             rds_replication TO ...). Until then, chronos serve --refresh-every 5m takes them on a timer"
+        }
+        Some("53400") => ": every replication slot Postgres allows is in use (max_replication_slots)",
+        Some("58P01") => ": Postgres hasn't the test_decoding plugin (it comes with Postgres's contrib modules)",
+        _ => "",
+    };
+    format!("Postgres, making the replication slot: {e}{hint}")
+}
+
 /// Labels Postgres added to an enum type main has (`ALTER TYPE ... ADD VALUE` there since the attach or the last
 /// refresh), added to main's type in Postgres's order, before the rows that may hold them are read (see `refresh`):
 /// as `widen` adds columns, as the database's own change. Without them a world can't write the label, and a row
@@ -2551,6 +3126,82 @@ fn take_labels(core: &Core, pg: &mut Client, out: &mut Refreshed) -> Result<()> 
         }
     }
     Ok(())
+}
+
+/// Takes `re`, Postgres's change to the columns of attached table `ti`, into main's table and then the folder's record
+/// in memory, as `widen` takes added columns (and then does): each column dropped, renamed or retyped there is so here
+/// too, an ALTER TABLE made as the database's own change, under the write-back lock (see `refresh`). A retyped
+/// column's values here are converted as Chronos converts them, and the refresh then compares them with Postgres's
+/// and takes Postgres's where they differ. The record's places (the key's, the sequence-fed columns') follow the
+/// columns kept. Stopped partway, the folder opens with the old record and the next refresh finds the change again: a
+/// column dropped or renamed here already isn't again. A world forked before can't merge rows of the table after
+/// (see `forked_before`): main's rows read its rows by column, and a renamed column would read as never set.
+fn reshape(core: &Core, att: &Attached, ti: usize, re: Reshape) -> std::result::Result<(), String> {
+    let db = core.db().ok_or("no database")?;
+    let t = att.tables()[ti].clone();
+    let main = core.view(MAIN).map_err(|e| e.to_string())?;
+    let schema = core.val(&main.s, &format!("{}/{}", crate::sql::SCHEMAS, t.name)).map_err(|e| e.to_string())?;
+    let has = schema.as_ref().and_then(crate::sql::column_names).unwrap_or_default();
+    let alter = |sql: String| {
+        let _r = crate::Recovering::enter();
+        let skip = SKIP.replace(true);
+        let out = crate::sql::run(&db, MAIN, &sql, &[]);
+        SKIP.set(skip);
+        out.map(|_| ()).map_err(|e| e.message)
+    };
+    let name = |i: usize| re.renamed.iter().find(|(r, _)| *r == i).map_or(&t.cols[i].name, |(_, n)| n);
+    for &i in &re.dropped {
+        if has.contains(&t.cols[i].name) {
+            alter(format!("alter table {} drop column {}", t.sql, q(&t.cols[i].name)))?;
+        }
+    }
+    for (i, to) in &re.renamed {
+        if has.contains(&t.cols[*i].name) && !has.contains(to) {
+            alter(format!("alter table {} rename column {} to {}", t.sql, q(&t.cols[*i].name), q(to)))?;
+        }
+    }
+    for (i, ty) in &re.retyped {
+        alter(format!("alter table {} alter column {} type {ty}", t.sql, q(name(*i))))?;
+    }
+    {
+        let mut tables = att.tables.write().unwrap_or_else(|p| p.into_inner());
+        let mut next = (**tables).clone();
+        let nt = &mut next[ti];
+        let mut place: Vec<Option<usize>> = vec![None; nt.cols.len()];
+        let mut cols = vec![];
+        for (i, c) in nt.cols.iter().enumerate() {
+            if re.dropped.contains(&i) {
+                continue;
+            }
+            let mut c = c.clone();
+            c.name = name(i).clone();
+            if let Some((_, ty)) = re.retyped.iter().find(|(r, _)| *r == i) {
+                c.ty = ty.clone();
+            }
+            c.attnum = re.attnums[i];
+            place[i] = Some(cols.len());
+            cols.push(c);
+        }
+        nt.cols = cols;
+        nt.key = nt.key.iter().filter_map(|&i| place[i]).collect();
+        nt.seqs = nt.seqs.iter().filter_map(|s| Some(Seq { col: place[s.col]?, ..s.clone() })).collect();
+        *tables = Arc::new(next);
+    }
+    if re.added.is_empty() { Ok(()) } else { widen(core, att, ti, re.added) }
+}
+
+/// Whether `state` (a world, or the point it forked from) has attached table `t` in a shape whose rows main no longer
+/// reads as they were meant: Postgres dropped, renamed or retyped a column of it since, and a refresh took that into
+/// main (see `reshape`). Columns added since are no matter: main's columns then start with the world's.
+fn forked_before(core: &Core, state: &State, main: &State, t: &Table) -> Result<bool> {
+    let key = format!("{}/{}", crate::sql::SCHEMAS, t.name);
+    let shapes = |s: &State| -> Result<Option<Vec<(u32, String, String)>>> {
+        Ok(core.val(s, &key)?.as_ref().and_then(crate::sql::column_shapes))
+    };
+    Ok(match (shapes(state)?, shapes(main)?) {
+        (Some(had), Some(now)) => !now.starts_with(&had),
+        _ => false,
+    })
 }
 
 /// Adds `added`, columns Postgres added to attached table `ti`, to main's table and then to the folder's record in
@@ -2705,8 +3356,8 @@ mod tests {
             sql: "\"app\".\"orders\"".into(),
             pg: "\"app\".\"orders\"".into(),
             cols: vec![
-                Col { name: "id".into(), ty: "uuid".into(), always: false },
-                Col { name: "total".into(), ty: "numeric(10,2)".into(), always: false },
+                Col { name: "id".into(), ty: "uuid".into(), always: false, generated: false, attnum: 0 },
+                Col { name: "total".into(), ty: "numeric(10,2)".into(), always: false, generated: false, attnum: 0 },
             ],
             key: vec![0],
             seqs: vec![],
@@ -2738,8 +3389,8 @@ mod tests {
             sql: "\"t\"".into(),
             pg: "\"public\".\"t\"".into(),
             cols: vec![
-                Col { name: "a".into(), ty: "integer".into(), always: false },
-                Col { name: "b".into(), ty: "text".into(), always: false },
+                Col { name: "a".into(), ty: "integer".into(), always: false, generated: false, attnum: 0 },
+                Col { name: "b".into(), ty: "text".into(), always: false, generated: false, attnum: 0 },
             ],
             key: vec![0],
             seqs: vec![],
@@ -2773,5 +3424,50 @@ mod tests {
             message: "Postgres, writing t: lock timeout; nothing was written: safe to merge again".into(),
         };
         assert!(!is_conflict(&busy) && !crate::stale::is_stale(&busy));
+    }
+
+    /// `test_decoding`'s lines read as the keys of the rows they changed: quoted names and values, an UPDATE that
+    /// changed the key (both keys), a partition's rows as its table's, and the whole table where a line names no key.
+    #[test]
+    fn follow_reads_the_keys_test_decoding_writes() {
+        let col = |n: &str| Col { name: n.into(), ty: "text".into(), always: false, generated: false, attnum: 0 };
+        let t = |name: &str, cols: &[&str], key: Vec<usize>| Table {
+            name: name.into(),
+            sql: q(name),
+            pg: format!("\"public\".{}", q(name)),
+            cols: cols.iter().map(|c| col(c)).collect(),
+            key,
+            seqs: vec![],
+        };
+        let tables = vec![t("leads", &["id", "name"], vec![0]), t("Odd", &["org id", "at"], vec![0, 1])];
+        let rels: HashMap<String, usize> = [("public.leads", 0), ("public.\"Odd\"", 1), ("public.\"Odd_2026\"", 1)]
+            .map(|(n, i)| (n.to_string(), i))
+            .into();
+        let mut changed = BTreeMap::new();
+        for line in [
+            "BEGIN",
+            "table public.leads: INSERT: id[integer]:7 name[text]:'it''s: a [x]:y'",
+            "table public.leads: UPDATE: old-key: id[integer]:8 new-tuple: id[integer]:9 name[text]:null",
+            "table public.leads: DELETE: id[integer]:10",
+            "table public.other: INSERT: id[integer]:1",
+            "table public.\"Odd_2026\": UPDATE: \"org id\"[integer]:3 at[date]:'2026-03-01' x[text]:unchanged-toast-datum",
+            "COMMIT",
+        ] {
+            note(line, &tables, &rels, &mut changed);
+        }
+        let k = |v: &[&str]| v.iter().map(|s| Some(s.to_string())).collect::<Vec<_>>();
+        assert_eq!(changed[&0].keys, [k(&["7"]), k(&["8"]), k(&["9"]), k(&["10"])].into_iter().collect());
+        assert_eq!(changed[&1].keys, [k(&["3", "2026-03-01"])].into_iter().collect());
+        assert!(!changed[&0].whole && !changed[&1].whole);
+        // no key said: the table is compared whole
+        note("table public.leads: DELETE: (no-tuple-data)", &tables, &rels, &mut changed);
+        assert!(changed[&0].whole && changed[&0].keys.is_empty());
+        let mut changed = BTreeMap::new();
+        note("table public.\"Odd\": UPDATE: at[date]:'2026-03-01'", &tables, &rels, &mut changed);
+        assert!(changed[&1].whole);
+        let mut changed = BTreeMap::new();
+        note("table public.x, public.leads: TRUNCATE: (no-flags)", &tables, &rels, &mut changed);
+        assert!(changed[&0].whole && !changed.contains_key(&1));
+        assert_eq!(fields("id[integer]:1 b[bit(3)]:B'101'")[0][1], ("b".to_string(), Field::Text("101".into())));
     }
 }

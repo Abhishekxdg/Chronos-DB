@@ -353,7 +353,7 @@ fn call(sh: &mut Shell, g: &mut Guard, name: &str, a: &Value) -> Result<String, 
                     && match me {
                         Some(ag) => {
                             !matches!(chronos::sql::row_security_refuses(&db, ag, &sh.branch, &[t]), Ok(None))
-                                || !matches!(chronos::sql::tenant_refuses(&db, ag, &sh.branch, &[t]), Ok(None))
+                                || !matches!(chronos::sql::tenant_refuses(&db, ag, &sh.branch, &[t], false), Ok(None))
                         }
                         None => masked && !matches!(chronos::sql::masks_refuse(&db, &sh.branch, &[t]), Ok(None)),
                     }

@@ -4932,7 +4932,20 @@ impl Core {
     /// `merge_with`, and for a branch that stays open (merged in part, or into another world) its
     /// version as the merge left it, read under the merge's locks: what the caller merges at next,
     /// with no other writer's change in it.
+    ///
+    /// Into main of a folder attached to Postgres, a merge by columns that met rows Postgres changed
+    /// meanwhile (a conflict, nothing written) runs once more: main has taken Postgres's rows by then
+    /// (`attach::after_failed`), so a row whose two sides changed different columns combines, and only
+    /// a column both changed is still a conflict.
     pub fn merge_kept(&self, b: &str, o: &MergeOptions) -> Result<(usize, Option<u64>)> {
+        match self.merge_once(b, o) {
+            Err(e) if o.columns && self.attached.is_some() && attach::is_conflict(&e) => self.merge_once(b, o),
+            out => out,
+        }
+    }
+
+    /// `merge_kept`, tried once.
+    fn merge_once(&self, b: &str, o: &MergeOptions) -> Result<(usize, Option<u64>)> {
         let _t = self.metrics.time(if b.starts_with("_tx_") { metrics::Op::Commit } else { metrics::Op::Merge });
         self.guard_shipping()?;
         // the rows a merge brings count toward the parent's changes, and its agent's quota there

@@ -1,10 +1,11 @@
 //! SHOW AGENT name PRIVILEGES [IN WORLD w]: what an agent may actually do with each table of a world, once its
-//! capabilities, the privileges of a role of its name (both must allow), row-level security, masked columns and
-//! its merge policy are put together. A row per table, and one per column that differs from its table (a masked
-//! column, a column's own grant, a column its policy sends to review).
+//! capabilities, the privileges of a role of its name (both must allow), row-level security, its tenant, masked
+//! columns and its merge policy are put together. A row per table, and one per column that differs from its table (a
+//! masked column, a column's own grant, a column its policy sends to review).
 //!
-//! It reads what decides, as the checks themselves read it (`Agent::may`, `acl`, `rls::limits`, `mask::of`,
-//! `MergePolicy`), so what it says is what the agent's statements meet. It doesn't run anything as the agent.
+//! It reads what decides, as the checks themselves read it (`Agent::may`, `acl`, `rls::limits`, `rls::reach`,
+//! `mask::of`, `MergePolicy`), so what it says is what the agent's statements meet. It doesn't run anything as the
+//! agent.
 
 use super::roles::Who;
 use super::*;
@@ -34,6 +35,12 @@ pub(super) fn show(db: &Db, name: &str, world: &str) -> Result<Vec<Vec<Value>>> 
         _ => None,
     };
     let unmask = a.may(crate::Can::Unmask);
+    // held to a tenant: its column, and the condition in words (`"org_id" = 42`)
+    let tenant = a
+        .tenant
+        .as_ref()
+        .and_then(|t| t["column"].as_str())
+        .map(|c| (c.to_string(), a.tenant_sql().unwrap_or_default()));
     let can = |c: crate::Can| a.may(c);
     // where it may change rows: an agent keeping to a merge policy changes main only by merging
     let mut places: Vec<&str> = vec![];
@@ -64,6 +71,12 @@ pub(super) fn show(db: &Db, name: &str, world: &str) -> Result<Vec<Vec<Value>>> 
             _ => true,
         };
         let role = who.as_ref().map(|w| w.name.clone()).unwrap_or_default();
+        // how the table stands to its tenant (see `rls::reach`): held to it, or shared by every tenant
+        let reach = match &tenant {
+            Some((col, _)) => rls::reach(&v, &t.name, col)?,
+            None => None,
+        };
+        let shared = reach == Some(rls::Reach::Shared);
         // read
         let limited = match &who {
             Some(w) => rls::limits(&v, &t.name, Some(w)).unwrap_or(true),
@@ -75,6 +88,12 @@ pub(super) fn show(db: &Db, name: &str, world: &str) -> Result<Vec<Vec<Value>>> 
         } else if !has(acl::SELECT) {
             why.push(format!("role {role} has no SELECT on it (columns it was granted are listed)"));
             "no".into()
+        } else if let (Some(r), Some((col, cond))) = (reach.as_ref().filter(|_| !shared), &tenant) {
+            why.push(format!("tenant {cond}: {}", r.words(col)));
+            if limited {
+                why.push(format!("row-level security: only the rows role {role}'s policies allow"));
+            }
+            "its tenant's rows".into()
         } else if limited {
             why.push(format!("row-level security: only the rows role {role}'s policies allow"));
             "rows its policies allow".into()
@@ -84,11 +103,13 @@ pub(super) fn show(db: &Db, name: &str, world: &str) -> Result<Vec<Vec<Value>>> 
         // write
         const VERBS: [(&str, u32); 3] = [("insert", acl::INSERT), ("update", acl::UPDATE), ("delete", acl::DELETE)];
         let verbs: Vec<&str> = VERBS.into_iter().filter(|(_, p)| has(*p)).map(|(n, _)| n).collect();
-        let writes = !(a.disabled || places.is_empty());
+        let writes = !(a.disabled || places.is_empty() || shared);
         let write_of = |verbs: &[&str]| format!("{} in {}", verbs.join(", "), places.join(" and "));
         let write = if !writes {
             if places.is_empty() {
                 why.push("no 'write_own', 'write' or 'write_main' capability".into());
+            } else if let (true, Some((col, cond))) = (shared, &tenant) {
+                why.push(format!("tenant {cond}: {}", rls::Reach::Shared.words(col)));
             }
             "no".to_string()
         } else if verbs.is_empty() {

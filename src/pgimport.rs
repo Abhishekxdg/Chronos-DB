@@ -701,9 +701,21 @@ impl Import<'_> {
             "select c.oid, n.nspname, c.relname, c.relrowsecurity, greatest(c.reltuples, 0)::bigint, c.relkind, \
              case when c.relkind = 'p' then pg_get_partkeydef(c.oid) end, \
              exists (select 1 from pg_inherits h where h.inhparent = c.oid), \
-             c.relforcerowsecurity, pg_get_userbyid(c.relowner) = current_user from pg_class c \
+             c.relforcerowsecurity, pg_get_userbyid(c.relowner) = current_user, {}, {} from pg_class c \
              join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r', 'p') and not c.relispartition \
              and {user}{} and {} order by 2, 3",
+            // (only attach reads it: an import reads past row-level security or not at all, below)
+            if self.attach { attach::RLS_HIDES } else { "false" },
+            // attach: the key a table without a primary key is found by (see `attach::key_cols`), by its columns' names
+            match self.attach {
+                true => format!(
+                    "case when not exists (select 1 from pg_index i where i.indrelid = c.oid and i.indisprimary) then \
+                     (select string_agg(quote_ident(a.attname), ', ' order by k.n) from unnest({}) with ordinality \
+                     k(attnum, n) join pg_attribute a on a.attrelid = c.oid and a.attnum = k.attnum) end",
+                    attach::key_cols("c.oid")
+                ),
+                false => "null".into(),
+            },
             self.rel,
             oid("c.oid")
         ))?;
@@ -841,7 +853,12 @@ impl Import<'_> {
                 ));
             }
             // its owner reads past its own policies unless the table FORCEs them
-            let hidden = v(3) == "t" && !bypass && !(v(9) == "t" && v(8) != "t");
+            // attach reads with row-level security on, so a policy showing the role every row will do too (see
+            // `attach::RLS_HIDES`); an import turns it off, as pg_dump does, and then only reading past it will
+            let hidden = match self.attach {
+                true => v(10) == "t",
+                false => v(3) == "t" && !bypass && !(v(9) == "t" && v(8) != "t"),
+            };
             for (c, e) in dropped.remove(&rel).unwrap_or_default() {
                 self.report.skipped.push(format!(
                     "default {e} of {name}.{}: Postgres works it out afresh for each row and Chronos keeps a default \
@@ -864,11 +881,34 @@ impl Import<'_> {
             let inherits = parents.get(&rel).map_or(String::new(), |ps| format!(" inherits ({})", ps.join(", ")));
             let mut with_keys = own_cols;
             with_keys.extend(constraints.clone());
+            // attached without a primary key: main finds its rows by the unique index's columns, as the write-back
+            // does in Postgres, so they're its key (Chronos keys rows by it; a row changing them is then a row
+            // deleted and one inserted, as Postgres sees it)
+            let unique_key = r[11].as_deref().filter(|k| !k.is_empty()).map(|k| format!("primary key ({k})"));
+            with_keys.extend(unique_key.clone());
             let create = format!("create table {name} ({}){inherits}{tail}", with_keys.join(", "));
             // (the same without partitioning or inheritance: every column, and the constraints it has of its own)
             let mut flat_cols = all_cols;
             flat_cols.extend(constraints);
+            flat_cols.extend(unique_key);
             let flat = (key.is_some() || inheriting).then(|| format!("create table {name} ({})", flat_cols.join(", ")));
+            // attach: a partitioned table comes over as one plain table with all its rows. Main has no use for its
+            // partitions: a merge writes the partitioned table, and Postgres puts each row in its partition (moving
+            // one whose partition key changed), as it does for the app
+            if self.attach && key.is_some() {
+                out.push(Table {
+                    create: flat.unwrap_or_default(),
+                    name,
+                    rows: v(4).parse().unwrap_or(0),
+                    copied: copied.remove(&rel).unwrap_or_default(),
+                    oid: rel,
+                    parts: vec![],
+                    flat: None,
+                    only: false,
+                    hidden,
+                });
+                continue;
+            }
             let mut parts_of: Vec<(String, String)> = vec![];
             if key.is_some() {
                 // its partitions, parents before their own partitions, and constraints of theirs
@@ -928,7 +968,8 @@ impl Import<'_> {
             visit(i, &out, &parents, &mut seen, &mut order);
         }
         let mut slots: Vec<Option<Table>> = out.into_iter().map(Some).collect();
-        self.part_oids = part_oids;
+        // (attach: none, the partitioned tables being plain ones here; their partitions' own indexes go with them)
+        self.part_oids = if self.attach { vec![] } else { part_oids };
         Ok(order.into_iter().filter_map(|i| slots[i].take()).collect())
     }
 
@@ -1609,11 +1650,13 @@ pub fn attach_help() -> &'static str {
      The connection string is read from CHRONOS_SOURCE_URL, or from the file CHRONOS_SOURCE_FILE names (mode 600),\n\
      never from the command line, and is written nowhere. chronos serve on the folder needs it too.\n\
      Attach makes one table in Postgres, chronos.merges (a row per merge written), or prints what an administrator\n\
-     runs to make it. A table needs a primary key, and no generated column or row-level security. Inserts into\n\
+     runs to make it. A table needs a primary key (or a unique index on NOT NULL columns); generated columns are\n\
+     worked out here as in Postgres and never written back; a partitioned table is one plain table here (merges\n\
+     write it, and Postgres puts each row in its partition); one with row-level security only if the role reads every row past it. Inserts into\n\
      tables keyed by a sequence or identity column are refused for now (updates and deletes go). Triggers stay in\n\
      Postgres and run as merges are written. Above 1,000,000 rows (Postgres's estimate) it asks for --yes.\n\
-     Columns added in Postgres later come over at the next chronos refresh (or serve --refresh-every); other\n\
-     changes to a table's shape there: attach again into a new folder."
+     Columns added, dropped, renamed or retyped in Postgres later come over at the next chronos refresh (or serve\n\
+     --refresh-every); a changed key or row-level security: attach again into a new folder."
 }
 
 /// What attach reads of a table before copying it: its name, kind, what Chronos's attach refuses in it, and its
@@ -1643,6 +1686,18 @@ pub fn attach(dir: &str, opts: &chronos::Open, tables: &[String], schemas: &[Str
     let url = attach::source_url()?;
     let mut pg = Client::connect_as(&url, "chronos attach")
         .map_err(|e| format!("Postgres at {}:{}: {e}", url.host, url.port))?;
+    // Postgres 12 or later: attach reads catalog columns 12 added (`attgenerated`), so on 11 or older it would fail
+    // with "column attgenerated does not exist"
+    let version = pg
+        .query("select current_setting('server_version_num'), current_setting('server_version')")
+        .map_err(|e| e.to_string())?;
+    let (num, shown) = version.first().map(|r| (r[0].clone(), r[1].clone())).unwrap_or_default();
+    if num.and_then(|n| n.parse::<u32>().ok()).is_some_and(|n| n < 120000) {
+        return Err(format!(
+            "Postgres {} is too old: attach needs Postgres 12 or later (nothing was copied)",
+            shown.unwrap_or_default()
+        ));
+    }
     // Chronos's own table there: a row per merge written (see `chronos::attach`), and one naming this folder
     let role = pg.query("select current_user").map_err(|e| e.to_string())?;
     let role = role.first().and_then(|r| r[0].clone()).unwrap_or_default();
@@ -1805,7 +1860,7 @@ pub fn attach(dir: &str, opts: &chronos::Open, tables: &[String], schemas: &[Str
     }
     println!(
         "\nnext: chronos serve {dir} (with CHRONOS_SOURCE_URL set), fork a world, change rows there, and MERGE WORLD:\n\
-         the change goes to Postgres first. main's own rows can't be written directly; tables change shape only as Postgres's do (a refresh takes added columns)."
+         the change goes to Postgres first. main's own rows can't be written directly; tables change shape only as Postgres's do (a refresh takes columns added, dropped, renamed or retyped)."
     );
     Ok(())
 }
@@ -1815,11 +1870,16 @@ fn read_sources(pg: &mut Client, named: &[String], schemas: &[String]) -> Result
     let list = |v: &[String]| crate::pgclient::text_array(v.iter().map(|s| Some(s.as_str())));
     let rel = pg
         .query_params(
-            "select c.oid, n.nspname, c.relname, c.relkind, c.relrowsecurity, c.relispartition, \
+            &format!(
+                "select c.oid, n.nspname, c.relname, c.relkind, {}, c.relispartition, \
              exists (select 1 from pg_inherits h where h.inhrelid = c.oid or h.inhparent = c.oid), \
-             greatest(c.reltuples, 0)::bigint from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+             case when c.relkind = 'p' then (select coalesce(sum(greatest(x.reltuples, 0)), 0)::bigint \
+             from pg_partition_tree(c.oid) t join pg_class x on x.oid = t.relid) \
+             else greatest(c.reltuples, 0)::bigint end from pg_class c join pg_namespace n on n.oid = c.relnamespace \
              where (n.nspname || '.' || c.relname = any($1::text[]) and c.relkind in ('r', 'p', 'v', 'm', 'f')) \
              or (n.nspname = any($2::text[]) and c.relkind in ('r', 'p') and not c.relispartition) order by 2, 3",
+                attach::RLS_HIDES
+            ),
             &[Some(&list(named)), Some(&list(schemas))],
         )
         .map_err(|e| format!("reading Postgres: {e}"))?;
@@ -1828,16 +1888,25 @@ fn read_sources(pg: &mut Client, named: &[String], schemas: &[String]) -> Result
         let v = |i: usize| r[i].clone().unwrap_or_default();
         let mut refused = vec![];
         match v(3).as_str() {
-            "r" => {}
-            "p" => refused.push("a partitioned table (not attached yet)".to_string()),
+            "r" | "p" => {}
             "v" | "m" => refused.push("a view: attach the tables it reads".to_string()),
             _ => refused.push("not a table".to_string()),
         }
         if v(4) == "t" {
-            refused.push("row-level security is on (the copy could hold only some of its rows)".into());
+            // (on, and read past, it is no matter: the copy holds every row, and the merges' writes are past it too)
+            refused.push(format!(
+                "row-level security hides some of its rows from this role, so the copy would hold only those: connect \
+                 as the table's owner or a role with BYPASSRLS, or give the role a policy that shows it every row \
+                 (CREATE POLICY chronos_all ON {}.{} TO <role> USING (true) WITH CHECK (true)) and no restrictive one",
+                q(&v(1)),
+                q(&v(2))
+            ));
         }
-        if v(5) == "t" || v(6) == "t" {
-            refused.push("a partition, or inherits or is inherited from (not attached yet)".into());
+        if v(5) == "t" {
+            refused.push("a partition: attach its partitioned table, which holds its rows".into());
+        } else if v(6) == "t" && v(3) != "p" {
+            // (a partitioned table's partitions are in pg_inherits too)
+            refused.push("inherits or is inherited from (not attached yet)".into());
         }
         out.push(Source {
             oid: v(0),
@@ -1858,34 +1927,43 @@ fn read_sources(pg: &mut Client, named: &[String], schemas: &[String]) -> Result
         .query(&format!(
             "select a.attrelid, a.attname, format_type(a.atttypid, a.atttypmod), a.attidentity, a.attgenerated, \
              coalesce(pg_get_expr(d.adbin, d.adrelid), '') like 'nextval(%', \
-             array_position((select i.indkey::int2[] from pg_index i where i.indrelid = a.attrelid and i.indisprimary), a.attnum), \
-             s.seq, s.seq is not null and has_sequence_privilege(s.seq, 'usage') \
+             array_position({}, a.attnum), \
+             s.seq, s.seq is not null and has_sequence_privilege(s.seq, 'usage'), a.attnum \
              from pg_attribute a left join pg_attrdef d on d.adrelid = a.attrelid and d.adnum = a.attnum \
              cross join lateral (select pg_get_serial_sequence(a.attrelid::regclass::text, a.attname) seq) s \
-             where a.attrelid in {oids} and a.attnum > 0 and not a.attisdropped order by a.attrelid, a.attnum"
+             where a.attrelid in {oids} and a.attnum > 0 and not a.attisdropped order by a.attrelid, a.attnum",
+            attach::key_cols("a.attrelid")
         ))
         .map_err(|e| format!("reading Postgres: {e}"))?;
     let mut keys: HashMap<String, Vec<(i64, usize)>> = HashMap::new();
     for r in cols {
         let v = |i: usize| r[i].clone().unwrap_or_default();
         let Some(s) = out.iter_mut().find(|s| s.oid == v(0)) else { continue };
-        if !v(4).is_empty() {
-            s.refused.push(format!("column {} is generated (Postgres works it out; it can't be written back)", v(1)));
-        }
         if !v(3).is_empty() || v(5) == "t" {
             s.seqs.push((s.cols.len(), r[7].clone().filter(|_| v(8) == "t")));
         }
         if let Ok(p) = v(6).parse::<i64>() {
             keys.entry(v(0)).or_default().push((p, s.cols.len()));
         }
-        s.cols.push(attach::Col { name: v(1), ty: v(2), always: v(3) == "a" });
+        // (a generated column: Postgres works it out, and main too; never written back, never compared)
+        s.cols.push(attach::Col {
+            name: v(1),
+            ty: v(2),
+            always: v(3) == "a",
+            generated: !v(4).is_empty(),
+            attnum: v(9).parse().unwrap_or(0),
+        });
     }
     for s in &mut out {
         let mut k = keys.remove(&s.oid).unwrap_or_default();
         k.sort();
         s.key = k.into_iter().map(|(_, i)| i).collect();
         if s.key.is_empty() && s.refused.is_empty() {
-            s.refused.push("no primary key (a row written back must be found by one)".into());
+            s.refused.push(
+                "no primary key, nor a unique index on NOT NULL columns to stand for one (a row written back must be \
+                 found by one)"
+                    .into(),
+            );
         }
     }
     Ok(out)

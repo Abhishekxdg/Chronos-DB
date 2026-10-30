@@ -19,6 +19,9 @@ agent does anywhere else. If agents work on production data, read this page befo
   is held when something it read changed before its merge.
 - **Any agent's changes can be undone.** `UNDO AGENT bot SINCE '-2 hours'`, `UNDO MERGE OF WORLD w` and
   `RESTORE WORLD main TO '-10 minutes'` work within the history window ([undoing](security.md#undoing)).
+- **Agents held to one tenant see only its rows.** An agent made `WITH (tenant = 'org_id = 42')` reads and changes
+  only rows of that tenant, in tables with the column and in tables tied to one by foreign keys; tables with neither
+  are shared, read-only for it ([agents](sql.md#agents)).
 - **Masks hide columns.** [Masked columns](sql.md#masked-columns) show agents a stand-in instead of the value.
   What they don't hide (a person's own copies, a unique column's insert) is [listed with them](sql.md#masked-columns).
 - **Beside your Postgres:** in a folder [attached to Postgres](guides/attach-postgres.md), the same rules apply

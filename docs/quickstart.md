@@ -13,7 +13,7 @@ chronos --version
 
 The examples below use `psql`; on a machine without it: `sudo apt-get install postgresql-client` (Debian, Ubuntu) or `brew install libpq` (macOS).
 
-The script picks the build for your OS and CPU, checks its SHA-256 against the release's `SHA256SUMS`, and installs it for your user; it never runs anything as root. `CHRONOS_INSTALL_DIR=<folder>` installs into another folder you can write (for `/usr/local/bin`, download the script and run it with `sudo` yourself), `CHRONOS_VERSION=v0.4.3` picks a release, and `CHRONOS_VERIFY=1` also checks the build's signature with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/): proof Chronos DB's release workflow built it. The Linux builds are static (musl), so they run on any distribution.
+The script picks the build for your OS and CPU, checks its SHA-256 against the release's `SHA256SUMS`, and installs it for your user; it never runs anything as root. `CHRONOS_INSTALL_DIR=<folder>` installs into another folder you can write (for `/usr/local/bin`, download the script and run it with `sudo` yourself), `CHRONOS_VERSION=v0.4.4` picks a release, and `CHRONOS_VERIFY=1` also checks the build's signature with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/): proof Chronos DB's release workflow built it. The Linux builds are static (musl), so they run on any distribution.
 
 ## Already run Postgres? Start beside it
 
@@ -30,11 +30,12 @@ claude mcp add chronos -- chronos mcp ./crm                  # agents get worlds
 The URL is read from the environment (or a file only you can read), never from the command line, and isn't written
 to the folder. What attach doesn't do yet, before you rely on it:
 
-- **Each table needs a primary key**, and no generated column or row-level security; partitioned and inheriting
-  tables aren't attached.
+- **Each table needs a primary key** (or a unique index on NOT NULL columns); inheriting tables aren't
+  attached (partitioned ones are, as one table).
+  A table with row-level security is attached when the role reads past it (see the [attach guide](guides/attach-postgres.md)).
 - **At most 50,000 changed rows per merge** by default (`CHRONOS_ATTACH_MAX_ROWS` raises it, to 1,000,000; past that, merge a world a table at a time).
-- **Rows no merge touches are as fresh as the last refresh** (`chronos refresh`, or `chronos serve --refresh-every 5m`), which reads every attached table whole.
-- **Your schema doesn't change through Chronos:** change tables in Postgres. A refresh picks up added columns; other changes need a new attach.
+- **Rows no merge touches are as fresh as the last refresh** (`chronos refresh`, or `chronos serve --refresh-every 5m`), which reads every attached table whole, or about a second old with `chronos serve --follow`, which needs `wal_level = logical` in Postgres.
+- **Your schema doesn't change through Chronos:** change tables in Postgres. A refresh picks up columns added, dropped, renamed or retyped there; a changed primary key needs a new attach.
 - **For staging copies first.** It's Stage 1: [the guide](guides/attach-postgres.md) has the details, the limits and
   what happens at a merge.
 

@@ -144,6 +144,10 @@ fn key(name: &str, ty: &str, keys: [&str; 5]) -> Case {
     .read("select k::text, v from t order by k::text")
 }
 
+/// A partitioned table's rows, each with the partition it's in.
+const PARTS: &str =
+    "select coalesce(string_agg(x.tableoid::regclass::text || ' ' || x::text, E'\\n' order by x::text), '') from {t} x";
+
 fn cases() -> Vec<Case> {
     let mut c = vec![
         // A. column types
@@ -425,6 +429,159 @@ fn cases() -> Vec<Case> {
         )
         .min_role()
         .snap("select coalesce(string_agg(v, ',' order by v), '') from {t}"),
+        // row-level security (Supabase turns it on for every table): attached when the role reads past it
+        Case::new(
+            "row-level security, read past as the owner",
+            "create table t (id int primary key, v text); alter table t enable row level security;
+             create policy own on t using (v = current_user); insert into t values (1, 'a'), (2, 'b'), (3, 'c');",
+            "update t set v = 'z' where id = 1; insert into t values (4, 'd'); delete from t where id = 2;",
+        ),
+        Case::new(
+            "row-level security forced, a policy shows the role every row",
+            "create table t (id int primary key, v text); alter table t enable row level security;
+             alter table t force row level security; create policy own on t using (v = current_user);
+             create policy chronos_all on t to public using (true) with check (true);
+             insert into t values (1, 'a'), (2, 'b'), (3, 'c');",
+            "update t set v = 'z' where id = 1; insert into t values (4, 'd'); delete from t where id = 2;",
+        )
+        .min_role(),
+        Case::new(
+            "row-level security hiding rows refused",
+            "create table t (id int primary key, v text); alter table t enable row level security;
+             create policy own on t using (v = current_user); insert into t values (1, 'a'), (2, 'b');",
+            "update t set v = 'z' where id = 1;",
+        )
+        .min_role()
+        .expect(Expect::AttachRefused("row-level security hides")),
+        Case::new(
+            "row-level security with a restrictive policy refused",
+            "create table t (id int primary key, v text); alter table t enable row level security;
+             create policy chronos_all on t to public using (true) with check (true);
+             create policy small on t as restrictive using (id < 100); insert into t values (1, 'a'), (2, 'b');",
+            "update t set v = 'z' where id = 1;",
+        )
+        .min_role()
+        .expect(Expect::AttachRefused("row-level security hides")),
+        Case::new(
+            "row-level security turned on after attach, read past",
+            "create table t (id int primary key, v text); insert into t values (1, 'a'), (2, 'b'), (3, 'c');",
+            "update t set v = 'z' where id = 1; insert into t values (4, 'd'); delete from t where id = 2;",
+        )
+        .after_attach(
+            "alter table t enable row level security; create policy none on t using (false);",
+        )
+        .refresh(),
+        // no primary key: a unique index on NOT NULL columns stands for one
+        Case::new(
+            "no primary key, a unique constraint on NOT NULL columns",
+            "create table t (code text not null unique, v text);
+             insert into t values ('a', '1'), ('b', '2'), ('c', '3');",
+            "update t set v = 'z' where code = 'a'; insert into t values ('d', '4'); delete from t where code = 'b';
+             update t set code = 'cc' where code = 'c';",
+        ),
+        Case::new(
+            "no primary key, a unique index on NOT NULL columns",
+            "create table t (a int not null, b int not null, v text); create unique index t_ab on t (a, b);
+             create unique index t_v on t (v) where v is not null;
+             insert into t values (1, 1, 'x'), (1, 2, 'y'), (2, 1, null);",
+            "update t set v = 'z' where a = 1 and b = 1; insert into t values (3, 3, 'w'); delete from t where a = 2;",
+        ),
+        Case::new(
+            "no primary key, unique only on a nullable column refused",
+            "create table t (code text unique, v text); insert into t values ('a', '1');",
+            "update t set v = 'z';",
+        )
+        .expect(Expect::AttachRefused("no primary key")),
+        Case::new(
+            "no primary key, only a partial unique index refused",
+            "create table t (code text not null, v text); create unique index t_code on t (code) where v is not null;
+             insert into t values ('a', '1');",
+            "update t set v = 'z';",
+        )
+        .expect(Expect::AttachRefused("no primary key")),
+        // generated columns: Postgres works them out, main too; never written back, never compared
+        Case::new(
+            "generated column",
+            "create table t (id int primary key, a int, b int generated always as (a * 2) stored,
+               c text generated always as (coalesce(a::text, '?') || '-x') stored);
+             insert into t (id, a) values (1, 1), (2, 2), (3, null);",
+            "update t set a = 10 where id = 1; insert into t (id, a) values (4, 4); delete from t where id = 2;
+             update t set a = 7 where id = 3;",
+        )
+        .read("select id, coalesce(a::text, '<null>'), coalesce(b::text, '<null>'), c from t"),
+        Case::new(
+            "generated column",
+            "create table t (id int primary key, a numeric, b numeric generated always as (a / 3) stored);
+             insert into t (id, a) values (1, 1), (2, 2);",
+            "update t set a = 10 where id = 1; insert into t (id, a) values (3, 3);",
+        )
+        .refresh(),
+        // partitioned tables: one plain table in main; merges write the partitioned one, Postgres places each row
+        // (compared with the partition each is in)
+        Case::new(
+            "partitioned table",
+            "create table t (id int primary key, v text) partition by range (id);
+             create table t_a partition of t for values from (0) to (100);
+             create table t_b partition of t for values from (100) to (200);
+             insert into t values (1, 'a'), (2, 'b'), (150, 'c');",
+            "update t set v = 'z' where id = 1; update t set id = 120 where id = 2; insert into t values (160, 'd');
+             delete from t where id = 150;",
+        )
+        .snap(PARTS)
+        .min_role(),
+        Case::new(
+            "partitioned table, partitioned again, by a unique index",
+            "create table t (region text not null, id int not null, v text) partition by list (region);
+             create unique index t_key on t (region, id);
+             create table t_eu partition of t for values in ('eu') partition by range (id);
+             create table t_eu_low partition of t_eu for values from (0) to (100);
+             create table t_eu_high partition of t_eu for values from (100) to (1000);
+             create table t_us partition of t for values in ('us');
+             insert into t values ('eu', 1, 'a'), ('eu', 500, 'b'), ('us', 1, 'c');",
+            "update t set id = 200 where region = 'eu' and id = 1; update t set region = 'us' where id = 500;
+             insert into t values ('eu', 2, 'd'); delete from t where region = 'us' and id = 1;",
+        )
+        .snap(PARTS),
+        Case::new(
+            "partitioned table, a row no partition takes refused",
+            "create table t (id int primary key, v text) partition by range (id);
+             create table t_a partition of t for values from (0) to (100); insert into t values (1, 'a');",
+            "insert into t values (500, 'b');",
+        )
+        .expect(Expect::Refused),
+        Case::new(
+            "partitioned table, a partition added after attach",
+            "create table t (id int primary key, v text) partition by range (id);
+             create table t_a partition of t for values from (0) to (100); insert into t values (1, 'a');",
+            "insert into t values (150, 'b'); update t set id = 160 where id = 1;",
+        )
+        .after_attach(
+            "create table t_b partition of t for values from (100) to (200);
+             create table twin.t_b partition of twin.t for values from (100) to (200);",
+        )
+        .snap(PARTS)
+        .refresh(),
+        Case::new(
+            "partitioned table, a trigger on a partition writes more rows",
+            "create table t (id int primary key, v text) partition by range (id);
+             create table t_a partition of t for values from (0) to (100);
+             create table t_b partition of t for values from (100) to (200);
+             create function echo() returns trigger language plpgsql set search_path from current as
+               $$ begin insert into t values (new.id + 100, 'echo'); return null; end $$;
+             create trigger echo after insert on t_a for each row execute function echo();
+             insert into t values (1, 'a');",
+            "insert into t values (2, 'b'); update t set v = 'z' where id = 1;",
+        )
+        .snap(PARTS)
+        .read("select id, v from t"),
+        Case::new(
+            "a partition alone refused",
+            "create table t (id int primary key, v text) partition by range (id);
+             create table t_a partition of t for values from (0) to (100); insert into t values (1, 'a');",
+            "update t set v = 'z';",
+        )
+        .attach(&["t_a"])
+        .expect(Expect::AttachRefused("a partition: attach its partitioned table")),
     ];
     for x in &mut c {
         if x.read.is_none() && x.expect == Expect::Merge && x.attach == ["t"] && x.schema == "public" {
@@ -520,6 +677,10 @@ fn pg_read(pg: &mut postgres::Client, schema: &str, q: &str) -> String {
 /// filled in (another way to the same server: TLS checked, through PgBouncer).
 fn source_url(url: &str, db: &str, role: Option<(&str, &str)>) -> String {
     let userinfo = url.split_once("://").and_then(|(_, r)| r.split_once('@')).map(|(u, _)| u).unwrap_or("");
+    // (a pooler that tells projects apart by the user's name, as Supabase's `role.project`, wants it on the role's too)
+    let suffixed =
+        role.map(|(u, p)| (format!("{u}{}", std::env::var("CHRONOS_COMPAT_ROLE_SUFFIX").unwrap_or_default()), p));
+    let role = suffixed.as_ref().map(|(u, p)| (u.as_str(), *p));
     let (user, password) = role.unwrap_or_else(|| userinfo.split_once(':').unwrap_or((userinfo, "")));
     match std::env::var("CHRONOS_COMPAT_SOURCE") {
         Ok(t) => t.replace("{user}", user).replace("{password}", password).replace("{db}", db),
@@ -549,17 +710,41 @@ fn run_case(admin_url: &str, version: u32, pass: &Pass, n: usize, case: &Case) -
     }
     let name = format!("chronos_compat_{}_{n}_{}", pass.name, std::process::id());
     let mut admin = postgres::Client::connect(admin_url, postgres::NoTls).unwrap();
+    // this run's databases a pooler kept open past their case, dropped now that it has let them go
+    let left = pg_text(
+        &mut admin,
+        &format!("select datname from pg_database where datname like 'chronos\\_compat\\_%\\_{}'", std::process::id()),
+    )
+    .unwrap_or_default();
+    for d in left.lines() {
+        drop_database(&mut admin, d, 1);
+    }
     admin.batch_execute(&format!("drop database if exists {name}")).unwrap();
     if let Err(e) = admin.batch_execute(&format!("create database {name} {}", pass.create)) {
         return format!("SKIP: create database: {e}");
     }
     let result = run_in(admin_url, &name, pass, n, case);
-    let _ = admin.batch_execute(&format!(
-        "select pg_terminate_backend(pid) from pg_stat_activity where datname = '{name}' and pid <> pg_backend_pid()"
-    ));
-    let _ = admin.batch_execute(&format!("drop database if exists {name}"));
+    drop_database(&mut admin, &name, 10);
     let _ = admin.batch_execute(&format!("drop role if exists {name}_r"));
     result
+}
+
+/// Its sessions ended, then dropped, `tries` times at most: a pooler in front (Supabase's) may open one to it again
+/// between the two. What's left is dropped at the next case (see `run_case`), so a hosted project's disk doesn't fill.
+fn drop_database(admin: &mut postgres::Client, name: &str, tries: usize) {
+    // `with (force)` (13+) ends the sessions and drops in one step, before a pooler like Supavisor can reconnect
+    if admin.batch_execute(&format!("drop database if exists {name} with (force)")).is_ok() {
+        return;
+    }
+    for _ in 0..tries {
+        let _ = admin.batch_execute(&format!(
+            "select pg_terminate_backend(pid) from pg_stat_activity where datname = '{name}' and pid <> pg_backend_pid()"
+        ));
+        if admin.batch_execute(&format!("drop database if exists {name}")).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
 }
 
 fn run_in(admin_url: &str, name: &str, pass: &Pass, n: usize, case: &Case) -> String {
@@ -723,6 +908,11 @@ fn attach_compat_matrix() {
     let full = pg_text(&mut admin, "show server_version").unwrap();
     drop(admin);
     let only = std::env::var("CHRONOS_COMPAT_ONLY").ok();
+    // `i/n`: every n-th case from the i-th, so a slow (far) Postgres can take several processes at once
+    let shard = std::env::var("CHRONOS_COMPAT_SHARD").ok().map(|s| {
+        let (i, n) = s.split_once('/').expect("CHRONOS_COMPAT_SHARD is i/n");
+        (i.parse::<usize>().unwrap(), n.parse::<usize>().unwrap())
+    });
     let passes: Vec<&Pass> = match std::env::var("CHRONOS_COMPAT_PASSES") {
         Ok(p) => PASSES.iter().filter(|x| p.split(',').any(|n| n == x.name)).collect(),
         Err(_) => PASSES.iter().collect(),
@@ -733,7 +923,7 @@ fn attach_compat_matrix() {
     let mut failed = vec![];
     for pass in passes {
         for (n, case) in cases().iter().enumerate() {
-            if only.as_deref().is_some_and(|o| !case.name.contains(o)) {
+            if only.as_deref().is_some_and(|o| !case.name.contains(o)) || shard.is_some_and(|(i, k)| n % k != i) {
                 continue;
             }
             let r = run_case(&admin_url, version, pass, n, case);

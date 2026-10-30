@@ -23,6 +23,7 @@ The short version: **agents can't write `main`, and a person approves merges.** 
 
 - **Reads aren't restricted.** Anyone who may read reads every world, `main` and the past included. There are no per-table, per-row or per-world read rights.
 - **Agents are rows in the database,** not OS or Postgres users. A tenant's agents only exist in that tenant's folder (see [operations](operations.md#tenants)).
+- **An agent held to one tenant** (`CREATE AGENT ... WITH (tenant = 'org_id = 42')`) reads and writes only that tenant's rows: of tables with the column, and of tables tied to one through their foreign keys (up to three hops). A table with neither is shared by every tenant: it reads it whole and may not write it. See [agents](sql.md#agents).
 - **Safe mode and agents are guardrails for tool calls,** not a sandbox. An agent that can also run shell commands as the OS user that owns the folder can run `chronos <folder> merge <world>` itself. Run agents as a different OS user, or somewhere they can't reach the folder (see [agents in containers](#agents-in-containers)).
 
 ## Authentication

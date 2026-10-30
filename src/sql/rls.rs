@@ -242,7 +242,8 @@ pub(super) fn any(v: &View) -> Result<bool> {
 
 /// The tenant the running statement's agent is held to (see `crate::agents::Agent::tenant`): the condition, as SQL
 /// (`"org_id" = 42`), every row it reads or writes of a table with that column meets, whatever its role and whatever
-/// the table's own row security says. None: an agent with no tenant, or no agent.
+/// the table's own row security says; a table without it is held to it through its foreign keys, or read-only (see
+/// `reach`). None: an agent with no tenant, or no agent.
 pub(crate) fn tenant() -> Option<Arc<str>> {
     STOP.with_borrow(|s| s.as_ref().and_then(|s| s.ctx.as_ref()).and_then(|c| c.tenant.clone()))
 }
@@ -252,26 +253,183 @@ pub(super) fn possible(core: &crate::Core) -> bool {
     core.has_row_security() || tenant().is_some()
 }
 
+/// The column a tenant's condition (`"org_id" = 42`, see `tenant`) names: `org_id`.
+pub(crate) fn tenant_column(cond: &str) -> String {
+    let col = cond.split_once(" = ").map_or("", |(c, _)| c);
+    col.strip_prefix('"').and_then(|c| c.strip_suffix('"')).unwrap_or(col).replace("\"\"", "\"")
+}
+
+/// The most foreign keys an agent held to a tenant is followed through, from a table without the tenant's column to
+/// one with it (grandchild, child, parent: a line item's note, a line item, an order).
+pub(crate) const MOST_HOPS: usize = 3;
+
+/// How a table stands to a tenant whose column is `col` (see `reach`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Reach {
+    /// it has the column: its rows are the tenant's that hold its value
+    Column,
+    /// it hasn't, but a foreign key leads from it to a table that has, in `hops` foreign keys at most: its rows are the
+    /// tenant's whose columns `cols` are the columns `refs` of a row of `parent` that is the tenant's (its own one
+    /// hop nearer, or its value)
+    Through { cols: Vec<String>, parent: String, refs: Vec<String>, hops: usize },
+    /// neither: its rows are every tenant's (a lookup table), read whole, and written by none
+    Shared,
+}
+
+impl Reach {
+    /// The condition, as SQL, a row of the table meets when it is the tenant's of condition `cond` (see `tenant`).
+    /// None for a shared table, whose rows all are, to read, and none, to write.
+    fn condition(&self, cond: &str) -> Option<String> {
+        match self {
+            Reach::Column => Some(cond.to_string()),
+            Reach::Through { cols, parent, refs, .. } => {
+                let list = |cs: &[String]| cs.iter().map(|c| ident(c)).collect::<Vec<_>>().join(", ");
+                let mine = match cols.len() {
+                    1 => list(cols),
+                    _ => format!("({})", list(cols)),
+                };
+                // (the parent's rows read here are held to the tenant in turn, its own one hop nearer: see `reach`)
+                Some(format!("{mine} in (select {} from {})", list(refs), ident_rel(parent)))
+            }
+            Reach::Shared => None,
+        }
+    }
+
+    /// In words, for messages and SHOW AGENT ... PRIVILEGES: how its rows are the tenant's of column `col`.
+    pub(crate) fn words(&self, col: &str) -> String {
+        match self {
+            Reach::Column => format!("its rows with the tenant's {col}"),
+            Reach::Through { cols, parent, hops, .. } => format!(
+                "its rows whose {} is a row of {} that is the tenant's (through {hops} foreign key{})",
+                cols.join(", "),
+                rel_part(parent),
+                if *hops == 1 { "" } else { "s" }
+            ),
+            Reach::Shared => {
+                format!(
+                    "shared by every tenant: no column {col} and no foreign key to a table that has it, so read-only"
+                )
+            }
+        }
+    }
+}
+
+/// How table `table` of world `v` stands to the tenant whose column is `col`: it has the column, or a foreign key
+/// leads from it to a table that has it (in `MOST_HOPS` at most), or neither and it is shared; None when there is no
+/// such table. Of the foreign keys that lead there, the one in the fewest hops, the table's first of those: so the
+/// parent it is held through is held in fewer hops itself, and following them never comes back round (two tables
+/// whose keys point at each other aren't each other's way to the tenant). The foreign key's columns are matched to
+/// the columns it references (its unique constraint's, or the parent's primary key).
+pub(crate) fn reach(v: &View, table: &str, col: &str) -> Result<Option<Reach>> {
+    let mut seen: HashMap<String, Option<std::rc::Rc<Table>>> = HashMap::new();
+    let Some(t) = loaded(v, table, &mut seen)? else { return Ok(None) };
+    if t.cols.iter().any(|c| c.name == col) {
+        return Ok(Some(Reach::Column));
+    }
+    for hops in 1..=MOST_HOPS {
+        for fk in &t.fks {
+            let Some(p) = loaded(v, &fk.table, &mut seen)? else { continue };
+            let Some((cols, refs)) = fk_link(&t, fk, &p) else { continue };
+            if reaches(v, &p, col, hops - 1, &mut seen)? {
+                return Ok(Some(Reach::Through { cols, parent: fk.table.clone(), refs, hops }));
+            }
+        }
+    }
+    Ok(Some(Reach::Shared))
+}
+
+/// World table `name`, loaded once for one `reach` (`seen`).
+fn loaded(
+    v: &View,
+    name: &str,
+    seen: &mut HashMap<String, Option<std::rc::Rc<Table>>>,
+) -> Result<Option<std::rc::Rc<Table>>> {
+    if let Some(t) = seen.get(name) {
+        return Ok(t.clone());
+    }
+    let t = load_world(v, name)?.map(std::rc::Rc::new);
+    seen.insert(name.to_string(), t.clone());
+    Ok(t)
+}
+
+/// Whether table `t` has column `col`, or a foreign key leads from it to a table that has, in `hops` at most.
+fn reaches(
+    v: &View,
+    t: &Table,
+    col: &str,
+    hops: usize,
+    seen: &mut HashMap<String, Option<std::rc::Rc<Table>>>,
+) -> Result<bool> {
+    if t.cols.iter().any(|c| c.name == col) {
+        return Ok(true);
+    }
+    if hops == 0 {
+        return Ok(false);
+    }
+    for fk in &t.fks {
+        let Some(p) = loaded(v, &fk.table, seen)? else { continue };
+        if fk_link(t, fk, &p).is_some() && reaches(v, &p, col, hops - 1, seen)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Foreign key `fk` of table `t` by name: its columns, and the columns of `parent` they reference (those of its
+/// unique constraint, or the parent's primary key). None when a column isn't there (a parent without a key).
+fn fk_link(t: &Table, fk: &Fk, parent: &Table) -> Option<(Vec<String>, Vec<String>)> {
+    let name = |tb: &Table, id: &u32| tb.cols.iter().find(|c| c.id == *id).map(|c| c.name.clone());
+    let cols: Vec<String> = fk.cols.iter().map(|id| name(t, id)).collect::<Option<_>>()?;
+    let refs: Vec<String> = if fk.refs.is_empty() {
+        parent.key_cols().iter().map(|&k| parent.cols.get(k).map(|c| c.name.clone())).collect::<Option<_>>()?
+    } else {
+        fk.refs.iter().map(|id| name(parent, id)).collect::<Option<_>>()?
+    };
+    (!cols.is_empty() && cols.len() == refs.len()).then_some((cols, refs))
+}
+
+/// How `table` stands to the running statement's agent's tenant (see `reach`); None: no tenant, or no such table.
+fn tenant_reach(v: &View, table: &str) -> Result<Option<Reach>> {
+    let Some(cond) = tenant() else { return Ok(None) };
+    reach(v, table, &tenant_column(&cond))
+}
+
 /// The policy holding the running statement's agent to its tenant on `table` (see `tenant`), when the table has the
-/// tenant's column: for every command, every role, its condition both USING and WITH CHECK.
+/// tenant's column or a foreign key to a table that has it (see `reach`): for every command, every role, its
+/// condition both USING and WITH CHECK. A shared table has none: it reads whole, and `read_only` refuses its writes.
 fn tenant_policy(v: &View, table: &str) -> Result<Option<Policy>> {
     let Some(cond) = tenant() else { return Ok(None) };
-    let col = cond.split_once(" = ").map_or("", |(c, _)| c);
-    let col = col.strip_prefix('"').and_then(|c| c.strip_suffix('"')).unwrap_or(col).replace("\"\"", "\"");
-    let Some(t) = load_world(v, table)? else { return Ok(None) };
-    if !t.cols.iter().any(|c| c.name == col) {
+    let Some(using) = reach(v, table, &tenant_column(&cond))?.and_then(|r| r.condition(&cond)) else {
         return Ok(None);
-    }
+    };
     Ok(Some(Policy {
         name: "chronos_tenant".into(),
         table: table.into(),
         cmd: '*',
         permissive: true,
         roles: vec![PUBLIC],
-        using: Some(cond.to_string()),
-        check: Some(cond.to_string()),
+        using: Some(using.clone()),
+        check: Some(using),
         made: 0,
     }))
+}
+
+/// 42501 for a write to `table` by an agent held to a tenant when the table is shared by every tenant (see `reach`):
+/// a row it inserted, changed or deleted there would be every tenant's to see, so it may only read it.
+fn read_only(v: &View, table: &str) -> Result<()> {
+    let Some(cond) = tenant() else { return Ok(()) };
+    let col = tenant_column(&cond);
+    if reach(v, table, &col)? != Some(Reach::Shared) {
+        return Ok(());
+    }
+    err(
+        "42501",
+        format!(
+            "an agent held to tenant {cond} may only read table \"{}\": it has no column {col} and no foreign key to a \
+             table that has it (in {MOST_HOPS} at most), so its rows are every tenant's",
+            rel_part(table)
+        ),
+    )
 }
 
 /// The policies a read or write of `table` by `who` keeps to: the table's own, and, for an agent held to a tenant,
@@ -299,6 +457,12 @@ pub(super) fn touched(v: &View, st: &Stmt) -> Result<bool> {
         Stmt::Explain { stmt, .. } => return touched(v, stmt),
         Stmt::Insert { table, .. } => names.push(table.clone()),
         _ => {}
+    }
+    // (a write to a table shared by every tenant, by an agent held to one: refused, see `read_only`)
+    if let Stmt::Insert { table, .. } | Stmt::Update { table, .. } | Stmt::Delete { table, .. } = st
+        && tenant_reach(v, table)? == Some(Reach::Shared)
+    {
+        return Ok(true);
     }
     reads_of(st, &mut names);
     // (a table read AS OF a moment: its policies then, whatever its name has now)
@@ -392,7 +556,8 @@ pub(crate) fn limits(v: &View, table: &str, who: Option<&Who>) -> Result<bool> {
 }
 
 /// `applies`, with `row_security` on or off (`on`). An agent held to a tenant is limited on every table with the
-/// tenant's column, whatever its role and whatever `row_security` says (see `tenant`).
+/// tenant's column or a foreign key to one (see `reach`), whatever its role and whatever `row_security` says (see
+/// `tenant`).
 pub(crate) fn applies_as(v: &View, table: &str, who: Option<&Who>, on: bool) -> Result<bool> {
     if tenant_policy(v, table)?.is_some() {
         return Ok(true);
@@ -825,6 +990,7 @@ pub(super) fn write(
         Stmt::Delete { table, .. } => (table.clone(), 'd'),
         _ => return Ok(false),
     };
+    read_only(v, &table)?;
     if !applies(v, &table, who)? {
         return Ok(false);
     }
