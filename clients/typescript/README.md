@@ -16,6 +16,6 @@ console.log(await agent.diff());
 await agent.merge();                                // or agent.discard()
 ```
 
-Every method, its options and its errors: [the client reference](https://abhishekxdg.github.io/Chronos-DB/reference/clients). The client speaks the HTTP API, not the Postgres port: for Postgres drivers (`pg`, Prisma, Drizzle, ...) see [Postgres compatibility](https://abhishekxdg.github.io/Chronos-DB/postgres-compatibility).
+Every method, its options and its errors: [the client reference](https://chronosdb-docs.vercel.app/reference/clients). The client speaks the HTTP API, not the Postgres port: for Postgres drivers (`pg`, Prisma, Drizzle, ...) see [Postgres compatibility](https://chronosdb-docs.vercel.app/postgres-compatibility).
 
 MIT licensed.

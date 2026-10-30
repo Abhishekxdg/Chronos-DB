@@ -10,7 +10,7 @@
 ![rust](https://img.shields.io/badge/rust-1.90%2B-b7410e?style=flat-square&logo=rust&logoColor=white)
 ![license](https://img.shields.io/badge/license-BUSL--1.1%20engine%20%2B%20MIT-64748b?style=flat-square)
 
-[**Docs site**](https://abhishekxdg.github.io/Chronos-DB/) ·
+[**Docs site**](https://chronosdb-docs.vercel.app/) ·
 [**Quickstart**](docs/quickstart.md) ·
 [**Concepts**](docs/concepts.md) ·
 [**SQL**](docs/sql.md) ·
@@ -301,7 +301,7 @@ Engineering numbers from one machine, not a published benchmark. Unless noted: o
 | [Chronos Cloud](docs/cloud.md) (private alpha) | [Agent evaluation](docs/guides/agent-evaluation.md) | [MCP](docs/reference/mcp.md), [Clients](docs/reference/clients.md) | [Operations](docs/operations.md) |
 | | [Scenario planning](docs/guides/scenario-planning.md) | [CLI and settings](docs/reference/cli.md), [Errors](docs/reference/errors.md) | [Benchmarks](BENCHMARKS.md), [Changelog](CHANGELOG.md) |
 
-The same pages, with search, are on the [docs site](https://abhishekxdg.github.io/Chronos-DB/). The guides' SQL scripts are in [`examples/guides`](examples/guides).
+The same pages, with search, are on the [docs site](https://chronosdb-docs.vercel.app/). The guides' SQL scripts are in [`examples/guides`](examples/guides).
 
 ## Feedback and contributing
 

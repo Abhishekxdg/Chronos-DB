@@ -2,9 +2,10 @@
 module.exports = {
   title: 'Chronos DB',
   tagline: 'Fork the world, try everything, merge what works.',
-  // GitHub Pages (.github/workflows/docs.yml); a custom domain later changes these two lines
-  url: 'https://abhishekxdg.github.io',
-  baseUrl: '/Chronos-DB/',
+  // Where the site is served: Vercel by default (project chronos-docs, at chronosdb-docs.vercel.app); GitHub Pages
+  // (.github/workflows/docs.yml) sets DOCS_URL and DOCS_BASE_URL for its /Chronos-DB/ path
+  url: process.env.DOCS_URL || 'https://chronosdb-docs.vercel.app',
+  baseUrl: process.env.DOCS_BASE_URL || '/',
   onBrokenLinks: 'throw',
   markdown: { format: 'detect', hooks: { onBrokenMarkdownLinks: 'warn' } },
   presets: [
