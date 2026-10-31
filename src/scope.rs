@@ -22,7 +22,7 @@
 use crate::sql::{self, Described};
 use crate::{Core, Error, Result, View};
 use serde_json::{Map, Value as Json, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Metadata key holding a world's declared scope.
 pub(crate) const SCOPE: &str = "_sonos_scope";
@@ -243,8 +243,15 @@ pub fn summary(scope: &Json) -> String {
 
 /// What `changes` (a merge's rows, as JSON: see `sql::describe`) does outside `scope`, in words
 /// (none: all within it). Only rows in `applied` (those the merge writes, not those left in
-/// conflict) count toward `max_rows` and `max_deletes`.
-pub(crate) fn outside(scope: &Json, changes: &[Described], applied: &std::collections::HashSet<&str>) -> Vec<String> {
+/// conflict) count toward `max_rows` and `max_deletes`. A row of a table held to the tenant through a foreign key
+/// (see `rls::reach`) has no column of the tenant's: `reached` has, by its key, the tenant its foreign key leads to,
+/// as it was and as it is (see `rls::reached_tenant`; none: no tenant's).
+pub(crate) fn outside(
+    scope: &Json,
+    changes: &[Described],
+    applied: &std::collections::HashSet<&str>,
+    reached: &HashMap<String, (Option<Json>, Option<Json>)>,
+) -> Vec<String> {
     let targets = scope["may_change"].as_array();
     let tenant = scope["tenant"]["column"].as_str().map(|c| (c, &scope["tenant"]["value"]));
     let (max_rows, max_deletes) = limits(scope);
@@ -293,8 +300,13 @@ pub(crate) fn outside(scope: &Json, changes: &[Described], applied: &std::collec
             _ => {}
         }
         if let Some((c, v)) = tenant {
-            let of = |row: &Option<Json>| row.as_ref().is_none_or(|r| same(&r[c], v));
-            if !of(&d.before) || !of(&d.after) {
+            let through = reached.get(&d.key);
+            let of = |row: &Option<Json>, by: Option<&Option<Json>>| match row {
+                None => true,
+                Some(r) if r.get(c).is_some() => same(&r[c], v),
+                Some(_) => by.is_some_and(|t| t.as_ref().is_some_and(|t| same(t, v))),
+            };
+            if !of(&d.before, through.map(|t| &t.0)) || !of(&d.after, through.map(|t| &t.1)) {
                 add(format!("changes {} rows outside tenant {c} = {}", d.table, lit(v)));
             }
         }

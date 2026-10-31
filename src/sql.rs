@@ -108,6 +108,7 @@ pub(crate) use impact::critical_reasons;
 pub use impact::{Impact, Reader, impact};
 pub(crate) use opt::stats::KEY as RELSTATS;
 pub(crate) use opt::stats::merged as relstats_merged;
+pub(crate) use rls::reached_tenant;
 pub use safe::Reach;
 pub(crate) use tablespace::FILENODES;
 pub use time::Interval;

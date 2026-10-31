@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.4.5 (beta), 2026-10-31
+
+**A run held to a tenant can change child tables.** In 0.4.4 a tenant agent could write a table held to it through a foreign key, but the merge then took every such row for another tenant's: the change was held, and refused when approved. It merges now, and another tenant's child rows are still refused.
+
+The macOS builds need **macOS 13 or later**, as for 0.2.0.
+
+**Fixed:**
+- **A world held to a tenant merges its changes to child tables.** A row of a table held to the tenant through a foreign key (0.4.4) has no tenant column, and the merge's scope check took it for another tenant's: an agent's insert of a note under its own lead was held "outside tenant", then refused when approved. The check now follows the row's foreign keys to its tenant: as the row was, in the parent now, and as the world has it. A world forked with a tenant by any user is checked the same way, so a child row of another tenant, or of none, is still refused.
+
 ## 0.4.4 (beta), 2026-10-31
 
 **Attach to the Postgres you already run: tested on Postgres 12 to 18 and Supabase, and tables with row-level security, without a primary key, with generated columns or partitioned are attached. Main keeps up with Postgres as it changes (`serve --follow`), masked columns work on attached folders, and agents held to a tenant are held to it in child tables too.**

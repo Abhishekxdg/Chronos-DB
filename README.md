@@ -4,7 +4,7 @@
 
 ### Let AI agents write to your Postgres. Each run works on its own branch; your rules decide what lands.
 
-![release](https://img.shields.io/badge/release-v0.4.4%20beta-f59e0b?style=flat-square)
+![release](https://img.shields.io/badge/release-v0.4.5%20beta-f59e0b?style=flat-square)
 ![postgres wire](https://img.shields.io/badge/postgres-wire%20protocol-336791?style=flat-square&logo=postgresql&logoColor=white)
 ![mcp](https://img.shields.io/badge/MCP-ready-7c3aed?style=flat-square)
 ![rust](https://img.shields.io/badge/rust-1.90%2B-b7410e?style=flat-square&logo=rust&logoColor=white)
@@ -27,7 +27,7 @@ It speaks the Postgres wire protocol, so `psql`, drivers and ORMs connect to it.
 <p align="center"><img src="docs/assets/attach-demo.gif" alt="An agent cleans up a CRM in its own world beside a real Postgres: the diff, a merge policy holding back its deletes, Postgres unchanged until a person approves, then the change written to Postgres" width="820"></p>
 
 > [!IMPORTANT]
-> **Public beta, version 0.4.4.** Try it on a staging copy first, not production. It is built by one person and has no outside production use yet. Chronos is not Postgres: it runs much of Postgres 16's SQL, not all of it. Read [Where it stands](#where-it-stands) before you move data in.
+> **Public beta, version 0.4.5.** Try it on a staging copy first, not production. It is built by one person and has no outside production use yet. Chronos is not Postgres: it runs much of Postgres 16's SQL, not all of it. Read [Where it stands](#where-it-stands) before you move data in.
 
 ## In one example
 
@@ -91,7 +91,7 @@ Options, set as environment variables for the script:
 | Variable | What it does |
 |---|---|
 | `CHRONOS_INSTALL_DIR=<folder>` | installs into another folder you can write (default `~/.local/bin`) |
-| `CHRONOS_VERSION=v0.4.4` | installs a given release tag instead of the latest |
+| `CHRONOS_VERSION=v0.4.5` | installs a given release tag instead of the latest |
 | `CHRONOS_VERIFY=1` | also checks the build's signature with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) (keyless, Sigstore) |
 
 If `~/.local/bin` isn't on your `PATH`, the script says so; add it with `export PATH="$HOME/.local/bin:$PATH"`. The examples below use `psql`: `brew install libpq` on macOS, `sudo apt-get install postgresql-client` on Debian or Ubuntu.
@@ -212,7 +212,7 @@ Other things in the box: time travel (`select * from orders as of '-1 hour'`, `r
 
 ## Where it stands
 
-Chronos DB 0.4.4 is a **public beta**. Use it with staging copies first. More detail: [What Chronos guarantees today](docs/guarantees.md) and [What it protects, and what it doesn't](docs/what-chronos-protects.md).
+Chronos DB 0.4.5 is a **public beta**. Use it with staging copies first. More detail: [What Chronos guarantees today](docs/guarantees.md) and [What it protects, and what it doesn't](docs/what-chronos-protects.md).
 
 **Project.** One maintainer. The storage engine has not had an outside review. No outside production use yet.
 

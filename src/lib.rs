@@ -5521,10 +5521,30 @@ impl Core {
             }
             false => vec![],
         };
+        // a row of a table held to the tenant through a foreign key has no column of the tenant's: its tenant is
+        // the one its foreign key leads to (see `sql::reached_tenant`), as it was, read in the parent now (left in
+        // conflict: where the world forked), and as the world has it, read in the world
+        let mut reached = HashMap::new();
+        if let Some(col) = declared.as_ref().and_then(|s| s["tenant"]["column"].as_str()) {
+            let at = |s: &State| View { born: child.born, s: s.clone(), ..parent_view.clone() };
+            let (forked, world) = (at(&base_state), at(&ours_state));
+            let conflicted: std::collections::HashSet<&str> = conflicts.iter().map(|c| c.key.as_str()).collect();
+            let lacks = |r: &Option<serde_json::Value>| r.as_ref().is_some_and(|r| r.get(col).is_none());
+            for d in merge_rows.iter().filter(|d| d.id.is_some() && (lacks(&d.before) || lacks(&d.after))) {
+                let id = d.key.strip_prefix(&format!("{}/", d.table)).unwrap_or(&d.key);
+                let tenant = |v: &View| -> Result<Option<serde_json::Value>> {
+                    let Some(raw) = v.get(&d.key)? else { return Ok(None) };
+                    sql::reached_tenant(v, &d.table, id, &raw, col)
+                        .map_err(|e| Error::Constraint { code: e.code, message: e.message })
+                };
+                let was = if conflicted.contains(d.key.as_str()) { &forked } else { &parent_view };
+                reached.insert(d.key.clone(), (tenant(was)?, tenant(&world)?));
+            }
+        }
         // (rows left in conflict apply nothing: they count against what it may change, not how many rows)
         let strayed = declared.as_ref().map_or(vec![], |s| {
             let applied: std::collections::HashSet<&str> = apply.iter().map(|c| c.key.as_str()).collect();
-            scope::outside(s, &merge_rows, &applied)
+            scope::outside(s, &merge_rows, &applied, &reached)
         });
         // outside its scope, merged by anyone keeping to no merge policy: refused as it is
         if let (Some(s), None, false) = (&declared, &policy, strayed.is_empty() || dry) {

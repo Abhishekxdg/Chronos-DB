@@ -388,6 +388,40 @@ fn fk_link(t: &Table, fk: &Fk, parent: &Table) -> Option<(Vec<String>, Vec<Strin
     (!cols.is_empty() && cols.len() == refs.len()).then_some((cols, refs))
 }
 
+/// The tenant row `id` of `table`, stored as `raw` in `v`, is held to through its foreign keys (see `reach`): the
+/// value of the tenant's column `col` in the row they lead to, as JSON. None when they lead to no row (a key that is
+/// null, a parent not there, as the tenant's condition reads it: no tenant's), or the table reaches no table with the
+/// column. What a merge checks a world's change to such a row by (see `scope::outside`): the row has no column of
+/// the tenant's to compare.
+pub(crate) fn reached_tenant(v: &View, table: &str, id: &str, raw: &str, col: &str) -> Result<Option<Json>> {
+    let (mut table, mut id, mut raw) = (table.to_string(), id.to_string(), raw.to_string());
+    for _ in 0..=MOST_HOPS {
+        let Some(t) = load_world(v, &table)? else { return Ok(None) };
+        let vals = decode_raw(&t, &id, &raw, None)?;
+        if let Some(i) = t.cols.iter().position(|c| c.name == col) {
+            return Ok(Some(vals[i].to_json_as(t.cols[i].ty)).filter(|j| !j.is_null()));
+        }
+        let Some(Reach::Through { cols, parent, refs, .. }) = reach(v, &table, col)? else { return Ok(None) };
+        let Some(p) = load_world(v, &parent)? else { return Ok(None) };
+        let link = Some((cols, refs));
+        let Some(fk) = t.fks.iter().find(|f| f.table == parent && fk_link(&t, f, &p) == link) else { return Ok(None) };
+        let Some(x) = fk_vals(&t, fk, &vals) else { return Ok(None) };
+        let get = |k: &str| -> Result<Option<String>> { Ok(v.get(k)?.map(|x| x.to_string())) };
+        let Some(pid) = fk_parent_any(v, Some(&p), fk, &x, &get)? else { return Ok(None) };
+        // (a partitioned parent's row is in one of its partitions)
+        let mut found = None;
+        for leaf in hier::row_tables(v, &p)? {
+            if let Some(r) = v.get(&row_key(&leaf.name, &pid))? {
+                found = Some((leaf.name, r.to_string()));
+                break;
+            }
+        }
+        let Some((leaf, r)) = found else { return Ok(None) };
+        (table, id, raw) = (leaf, pid, r);
+    }
+    Ok(None)
+}
+
 /// How `table` stands to the running statement's agent's tenant (see `reach`); None: no tenant, or no such table.
 fn tenant_reach(v: &View, table: &str) -> Result<Option<Reach>> {
     let Some(cond) = tenant() else { return Ok(None) };

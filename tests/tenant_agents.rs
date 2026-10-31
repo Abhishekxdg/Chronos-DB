@@ -286,6 +286,98 @@ fn a_child_row_is_written_only_under_the_tenants_parent() {
     assert_eq!(w[0].rows[0][0].to_text(), "globex renewal,loose");
 }
 
+/// One column of every row of `sql` on main, joined.
+fn main_texts(db: &Db, sql: &str) -> String {
+    let out = run(db, MAIN, sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message)).pop().unwrap();
+    out.rows.iter().map(|r| r[0].to_text()).collect::<Vec<_>>().join(",")
+}
+
+#[test]
+fn a_world_changing_child_rows_of_its_tenant_merges() {
+    let db = Db::new();
+    setup_keys(&db);
+    let mut s = agent("run42");
+    s.run(&db, "create world w; use world w", &[]).unwrap();
+    s.run(
+        &db,
+        "insert into order_items values (14, 1, 'd');
+         insert into item_notes values (103, 14, 'new');
+         update item_notes set body = 'called' where id = 100;
+         update app.invoice_lines set cents = 600 where id = 1;
+         insert into shipment_events values (3, 1, 1);
+         delete from item_notes where id = 103;
+         insert into item_notes values (104, 11, 'b note')",
+        &[],
+    )
+    .unwrap();
+    // a child and its parent deleted together: the child's tenant is read where its parent still is
+    s.run(&db, "insert into order_items values (15, 2, 'gone'); insert into item_notes values (105, 15, 'x')", &[])
+        .unwrap();
+    s.run(&db, "use world main", &[]).unwrap();
+    s.run(&db, "merge world w", &[]).unwrap_or_else(|e| panic!("{}", e.message));
+    s.run(&db, "create world w2; use world w2", &[]).unwrap();
+    s.run(&db, "delete from item_notes where id = 105; delete from order_items where id = 15", &[]).unwrap();
+    s.run(&db, "use world main", &[]).unwrap();
+    s.run(&db, "merge world w2", &[]).unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(main_texts(&db, "select body from item_notes order by id"), "called,globex renewal,loose,b note");
+    assert_eq!(main_texts(&db, "select id from order_items order by id"), "10,11,12,13,14");
+    assert_eq!(main_texts(&db, "select cents from app.invoice_lines order by id"), "600,900");
+    assert_eq!(main_texts(&db, "select id from shipment_events order by id"), "1,2,3");
+}
+
+/// A world forked by the database's own user with `with`, `sql` run in it, then merged into main: the message
+/// it is refused with (None: merged).
+fn admin_attempt(db: &Db, w: &str, with: &str, sql: &str) -> Option<String> {
+    run(db, MAIN, &format!("create world {w} with ({with})"), &[]).unwrap();
+    run(db, w, sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+    match run(db, MAIN, &format!("merge world {w}"), &[]) {
+        Ok(_) => None,
+        Err(e) => {
+            assert_eq!(e.code, "42501", "{}", e.message);
+            Some(e.message)
+        }
+    }
+}
+
+#[test]
+fn a_tenant_scope_holds_child_rows_through_their_foreign_keys() {
+    let db = Db::new();
+    setup_keys(&db);
+    let tenant = "tenant = 'org_id = 42'";
+    // the database's own user writes what an agent held to the tenant couldn't: the merge is checked all the same
+    for (w, sql, row) in [
+        ("to_other", "insert into item_notes values (106, 12, 'x')", "item_notes/106"),
+        ("to_loose", "insert into order_items values (16, null, 'x')", "order_items/16"),
+        ("to_away", "update order_items set order_id = 3 where id = 10", "order_items/10"),
+        ("to_toward", "update order_items set order_id = 1 where id = 12", "order_items/12"),
+        ("to_theirs", "delete from item_notes where id = 101", "item_notes/101"),
+        ("to_deep", "update app.invoice_lines set cents = 1 where id = 2", "app.invoice_lines/2"),
+        ("to_pair", "insert into shipment_events values (4, 1, 2)", "shipment_events/4"),
+    ] {
+        let e = admin_attempt(&db, w, tenant, sql).unwrap_or_else(|| panic!("{w}: merged"));
+        assert!(e.contains("rows outside tenant org_id = 42"), "{w}: {e}");
+        assert!(e.contains(row), "{w}: {e}");
+    }
+    // its own tenant's children merge
+    assert_eq!(admin_attempt(&db, "mine", tenant, "update item_notes set body = 'ok' where id = 100"), None);
+    assert_eq!(main_texts(&db, "select body from item_notes where id = 100"), "ok");
+}
+
+#[test]
+fn a_child_rows_tenant_is_read_in_main_as_it_is_now() {
+    let db = Db::new();
+    setup_keys(&db);
+    let mut s = agent("run42");
+    s.run(&db, "create world w; use world w; update item_notes set body = 'mine?' where id = 100", &[]).unwrap();
+    // meanwhile the note's item moves to another tenant's order in main
+    run(&db, MAIN, "update order_items set order_id = 3 where id = 10", &[]).unwrap();
+    s.run(&db, "use world main", &[]).unwrap();
+    let e = s.run(&db, "merge world w", &[]).unwrap_err();
+    assert_eq!(e.code, "42501", "{}", e.message);
+    assert!(e.message.contains("item_notes rows outside tenant org_id = 42: item_notes/100"), "{}", e.message);
+    assert_eq!(main_texts(&db, "select body from item_notes where id = 100"), "call");
+}
+
 #[test]
 fn a_shared_table_is_read_only_for_a_tenant_agent() {
     let db = Db::new();
