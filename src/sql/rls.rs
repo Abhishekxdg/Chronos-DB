@@ -422,6 +422,89 @@ pub(crate) fn reached_tenant(v: &View, table: &str, id: &str, raw: &str, col: &s
     Ok(None)
 }
 
+/// Which rows of one view are one tenant's, as `reached_tenant` tells, for many rows at a time: each table's way to
+/// the tenant worked out once, and each parent row's tenant read once. For checking what a world read for its tenant
+/// against only that tenant's rows (see `stale`): a row no read of the tenant's could have found doesn't count.
+pub(crate) struct Tenants {
+    col: String,
+    value: Json,
+    /// by table: the table, and how it stands to the tenant (None: no such table)
+    tables: HashMap<String, Option<(std::rc::Rc<Table>, Reach)>>,
+    /// by a parent's row key: whether that row is the tenant's
+    parents: HashMap<String, bool>,
+}
+
+impl Tenants {
+    /// For tenant `tenant`, `{"column": c, "value": v}` (see `scope::tenant`).
+    pub(crate) fn new(tenant: &Json) -> Option<Tenants> {
+        let col = tenant["column"].as_str()?.to_string();
+        Some(Tenants { col, value: tenant["value"].clone(), tables: HashMap::new(), parents: HashMap::new() })
+    }
+
+    /// How table `table` of `v` stands to the tenant (see `reach`); None: no such table.
+    pub(crate) fn reach(&mut self, v: &View, table: &str) -> Result<Option<Reach>> {
+        Ok(self.table(v, table)?.map(|(_, r)| r))
+    }
+
+    fn table(&mut self, v: &View, table: &str) -> Result<Option<(std::rc::Rc<Table>, Reach)>> {
+        if let Some(t) = self.tables.get(table) {
+            return Ok(t.clone());
+        }
+        let found = match load_world(v, table)? {
+            Some(t) => reach(v, table, &self.col)?.map(|r| (std::rc::Rc::new(t), r)),
+            None => None,
+        };
+        self.tables.insert(table.to_string(), found.clone());
+        Ok(found)
+    }
+
+    /// Whether row `key` of `v` (`raw` as stored; None: no such row) is the tenant's: Some(false) for no row, a
+    /// foreign key that is null or leads to no row, or another tenant's. None when its table is shared by every
+    /// tenant, or isn't a table: every tenant reads it.
+    pub(crate) fn mine(&mut self, v: &View, key: &str, raw: Option<&str>) -> Result<Option<bool>> {
+        self.mine_within(v, key, raw, MOST_HOPS + 1)
+    }
+
+    fn mine_within(&mut self, v: &View, key: &str, raw: Option<&str>, hops: usize) -> Result<Option<bool>> {
+        let Some((table, id)) = key.split_once('/') else { return Ok(None) };
+        let Some((t, way)) = self.table(v, table)? else { return Ok(None) };
+        if way == Reach::Shared {
+            return Ok(None);
+        }
+        let Some(raw) = raw else { return Ok(Some(false)) };
+        let vals = decode_raw(&t, id, raw, None)?;
+        let Reach::Through { cols, parent, refs, .. } = way else {
+            let Some(i) = t.cols.iter().position(|c| c.name == self.col) else { return Ok(Some(false)) };
+            let got = vals[i].to_json_as(t.cols[i].ty);
+            return Ok(Some(!got.is_null() && crate::scope::same(&got, &self.value)));
+        };
+        if hops == 0 {
+            return Ok(Some(false));
+        }
+        let Some((p, _)) = self.table(v, &parent)? else { return Ok(Some(false)) };
+        let link = Some((cols, refs));
+        let Some(fk) = t.fks.iter().find(|f| f.table == parent && fk_link(&t, f, &p) == link) else {
+            return Ok(Some(false));
+        };
+        let Some(x) = fk_vals(&t, fk, &vals) else { return Ok(Some(false)) };
+        let get = |k: &str| -> Result<Option<String>> { Ok(v.get(k)?.map(|x| x.to_string())) };
+        let Some(pid) = fk_parent_any(v, Some(&p), fk, &x, &get)? else { return Ok(Some(false)) };
+        // (a partitioned parent's row is in one of its partitions)
+        for leaf in hier::row_tables(v, &p)? {
+            let pk = row_key(&leaf.name, &pid);
+            if let Some(&known) = self.parents.get(&pk) {
+                return Ok(Some(known));
+            }
+            if let Some(r) = v.get(&pk)? {
+                let mine = self.mine_within(v, &pk, Some(r.as_ref()), hops - 1)?.unwrap_or(false);
+                self.parents.insert(pk, mine);
+                return Ok(Some(mine));
+            }
+        }
+        Ok(Some(false))
+    }
+}
+
 /// How `table` stands to the running statement's agent's tenant (see `reach`); None: no tenant, or no such table.
 fn tenant_reach(v: &View, table: &str) -> Result<Option<Reach>> {
     let Some(cond) = tenant() else { return Ok(None) };

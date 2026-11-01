@@ -921,6 +921,82 @@ fn a_tenant_read_of_a_big_table_is_checked_by_the_rows_it_can_match() {
     drop_db(&name);
 }
 
+/// A tenant agent's read of a child table of more than 100,000 rows (held to its tenant through a foreign key) is
+/// checked against its tenant's rows alone, in Chronos and in Postgres: the app writing other tenants' rows doesn't
+/// hold its merge, a row of its own changed or added in Postgres does. A person merges it, as one approves a held run:
+/// the reads stay the tenant's.
+#[test]
+fn a_tenants_read_of_a_big_child_table_is_checked_by_its_tenants_rows() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("tenantchild") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    // tenant 42 has 20 of the 2,000 leads, and 1,200 of the 120,000 notes
+    pg.batch_execute(
+        "create table leads (id int primary key, org_id int not null, name text);
+         create table notes (id int primary key, lead_id int not null references leads (id), body text);
+         insert into leads select g, g % 100, 'lead ' || g from generate_series(1, 2000) g;
+         insert into notes select g, g % 2000 + 1, 'note ' || g from generate_series(1, 120000) g;",
+    )
+    .unwrap();
+    let dir = folder("tenantchild");
+    let (ok, out) = attach(&dir, &["--tables", "leads,notes", "--yes"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    let can = "read,fork,write_own,write_main,merge_own";
+    run(&db, MAIN, &format!("create agent run42 with (can = '{can}', tenant = 'org_id = 42')"), &[]).unwrap();
+    let agent = || {
+        let mut s = Session::new(MAIN);
+        s.agent = Some("run42".into());
+        s
+    };
+    let work = |w: &str| {
+        let sql = format!(
+            "create world {w} with (check_reads = true); use world {w}; select count(*) from notes;
+             update leads set name = '{w}' where id = 42; use world main"
+        );
+        let out = agent().run(&db, &sql, &[]).unwrap();
+        assert_eq!(out[2].rows[0][0].to_text(), "1200", "its tenant's notes");
+    };
+    let held = |pg: &mut postgres::Client, w: &str| {
+        let e = run(&db, MAIN, &format!("merge world {w}"), &[]).unwrap_err();
+        assert_eq!(e.code, "40001", "{}", e.message);
+        assert!(e.message.contains("changed in Postgres since it forked"), "{}", e.message);
+        assert!(!e.message.contains("more broadly"), "{}", e.message);
+        assert_ne!(pg_cell(pg, "select name from leads where id = 42"), w, "nothing written");
+        run(&db, MAIN, &format!("drop world {w}"), &[]).unwrap();
+    };
+
+    // the app changes and adds other tenants' notes: not held
+    work("others");
+    pg.batch_execute("update notes set body = 'app' where lead_id = 7; insert into notes values (200000, 7, 'new');")
+        .unwrap();
+    run(&db, MAIN, "merge world others", &[]).unwrap();
+    assert_eq!(pg_cell(&mut pg, "select name from leads where id = 42"), "others");
+
+    // every note of its own changed at once, as a bulk run does, while the app changes another tenant's: not held
+    let sql = "create world bulk with (check_reads = true); use world bulk;
+               update notes set body = body || ' (reviewed)'; use world main";
+    let out = agent().run(&db, sql, &[]).unwrap();
+    assert_eq!(out[2].tag, "UPDATE 1200");
+    pg.batch_execute("update notes set body = 'app again' where lead_id = 7").unwrap();
+    run(&db, MAIN, "merge world bulk", &[]).unwrap();
+    assert_eq!(pg_cell(&mut pg, "select count(*) from notes where body like '% (reviewed)'"), "1200");
+
+    // a note of its own changed in Postgres, or added there under its lead: held
+    work("changed");
+    pg.batch_execute("update notes set body = 'app' where id = 41").unwrap(); // lead 42's
+    held(&mut pg, "changed");
+    work("added");
+    pg.batch_execute("insert into notes values (200042, 142, 'new')").unwrap();
+    held(&mut pg, "added");
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
 #[test]
 fn refresh_brings_main_up_to_postgres() {
     let Some((mut pg, name, _url, _turn)) = throwaway("refresh") else {

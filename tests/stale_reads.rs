@@ -638,6 +638,87 @@ fn a_hold_is_lifted_when_the_read_gives_the_same_answer() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// An agent held to a tenant reads only its tenant's rows, of child tables through their foreign keys too: of a table
+/// it read whole, another tenant's rows may change without holding its merge; a row of its own, or one moved into its
+/// tenant, holds it. A read made in its world for no tenant (a person's) read every row: any change holds that.
+#[test]
+fn a_tenants_reads_are_held_only_by_its_tenants_rows() {
+    let db = Db::new();
+    run(
+        &db,
+        MAIN,
+        "create table leads (id int primary key, org_id int not null, stage text);
+         create table notes (id int primary key, lead_id int references leads (id), body text);
+         create table tasks (id int primary key, note_id int references notes (id), done bool);
+         insert into leads values (1, 42, 'new'), (2, 42, 'new'), (3, 7, 'new'), (4, 7, 'new');
+         insert into notes values (10, 1, 'a'), (11, 2, 'b'), (12, 3, 'c'), (13, 4, 'd');
+         insert into tasks values (100, 10, false), (101, 11, false), (102, 12, false), (103, 13, false)",
+        &[],
+    )
+    .unwrap();
+    let can = "read,fork,write_own,write_main,merge_own";
+    run(&db, MAIN, &format!("create agent run42 with (can = '{can}', tenant = 'org_id = 42')"), &[]).unwrap();
+    let mut bot = Session::new(MAIN);
+    bot.agent = Some("run42".into());
+    // reads notes and tasks whole (through its tenant's leads), and changes its own
+    let mut work = |w: &str| {
+        let sql = format!(
+            "create world {w} with (check_reads = true); use world {w};
+             select count(*) from notes; select count(*) from tasks where not done;
+             update leads set stage = 'called' where id = 1; use world main"
+        );
+        bot.run(&db, &sql, &[]).unwrap();
+    };
+    let merge = |w: &str| {
+        let mut bot = Session::new(MAIN);
+        bot.agent = Some("run42".into());
+        bot.run(&db, &format!("merge world {w}"), &[])
+    };
+    // (the row, or its table when the read covered the whole of it)
+    let held = |w: &str, row: &str| {
+        let e = merge(w).unwrap_err();
+        assert_eq!(e.code, "40001", "{}", e.message);
+        let table = row.split('/').next().unwrap();
+        assert!(
+            e.message.contains(&format!("changed since it forked: {row}"))
+                || e.message.contains(&format!("read {table}, which changed")),
+            "{row}: {}",
+            e.message
+        );
+        run(&db, MAIN, &format!("drop world {w}"), &[]).unwrap();
+    };
+
+    // another tenant's lead, notes and tasks change, and it gets a new note: not held
+    work("others");
+    run(
+        &db,
+        MAIN,
+        "update leads set stage = 'won' where id = 3; update notes set body = 'x' where id = 12;
+         update tasks set done = true where id = 103; insert into notes values (14, 4, 'e')",
+        &[],
+    )
+    .unwrap();
+    merge("others").unwrap();
+    assert_eq!(cell(&db, "select stage from leads where id = 1"), "called");
+
+    // a note of its own changes, a task of its own is added, a note moves under its lead: each holds
+    work("own");
+    run(&db, MAIN, "update notes set body = 'x' where id = 11", &[]).unwrap();
+    held("own", "notes/11");
+    work("added");
+    run(&db, MAIN, "insert into tasks values (104, 10, false)", &[]).unwrap();
+    held("added", "tasks/104");
+    work("moved");
+    run(&db, MAIN, "update notes set lead_id = 2 where id = 13", &[]).unwrap();
+    held("moved", "notes/13");
+
+    // a person read notes in its world too: every row counts
+    work("person");
+    run(&db, "person", "select count(*) from notes", &[]).unwrap();
+    run(&db, MAIN, "update notes set body = 'y' where id = 12", &[]).unwrap();
+    held("person", "notes/12");
+}
+
 fn cell(db: &Db, sql: &str) -> String {
     run(db, MAIN, sql, &[]).unwrap().pop().unwrap().rows[0][0].to_text()
 }

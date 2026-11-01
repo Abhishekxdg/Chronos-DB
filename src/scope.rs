@@ -323,7 +323,7 @@ pub(crate) fn outside(
 /// A tenant column's value in a row against the scope's: as JSON, or as exact decimals for a
 /// number kept as text (a numeric column's value) or the other way round. Never as floats: two
 /// ids past 2^53 would compare equal.
-fn same(row: &Json, want: &Json) -> bool {
+pub(crate) fn same(row: &Json, want: &Json) -> bool {
     row == want
         || match (row, want) {
             (Json::String(s), Json::Number(n)) | (Json::Number(n), Json::String(s)) => {

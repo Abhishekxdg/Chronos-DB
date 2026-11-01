@@ -1791,19 +1791,23 @@ const LIVE_ROWS: usize = 100_000;
 /// (`Core::stale_reasons`) runs on that. A table read only by keys has those rows compared as the write-back compares
 /// them; one read by a range, a filtered scan, whole, through an index or constraint, or by a key that found no row,
 /// is read whole from Postgres (at most `LIVE_ROWS` rows), so a row added there that the read would have found (an
-/// empty result included) counts. Read at READ COMMITTED with no predicate lock: a row Postgres takes between this
+/// empty result included) counts. A world whose reads were all made for one tenant (see `ReadSet::tenant`) found only
+/// that tenant's rows: of a table read whole, only the tenant's count, the fork point's as Chronos's tenant policy
+/// tells them (`sql::Tenants`) and Postgres's by the same condition in its SQL (`tenant_cond`), so the app writing
+/// other tenants' rows doesn't hold it, and `LIVE_ROWS` counts the tenant's rows. Read at READ COMMITTED with no predicate lock: a row Postgres takes between this
 /// and COMMIT comes after the merge in time, a serial order the world's decision holds in. The reasons, said as
 /// changed in Postgres; none: what it read is as Postgres has it.
 fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result<Vec<String>> {
-    let (read_tables, filters) = {
+    let (read_tables, filters, tenant) = {
         let set = r.set.lock().unwrap_or_else(|p| p.into_inner());
         let read_tables = set.by_table();
         let filters: HashMap<String, Vec<crate::sql::RowFilter>> =
             read_tables.keys().filter_map(|n| Some((n.clone(), set.only_filtered(n)?))).collect();
-        (read_tables, filters)
+        (read_tables, filters, set.tenant())
     };
     let tables = att.tables();
     let base = core.past_view(r.base);
+    let mut of = tenant.as_ref().and_then(crate::sql::Tenants::new);
     let mut live = r.base.clone();
     let (mut keys, mut out): (Vec<String>, Vec<String>) = (vec![], vec![]);
     let too_broad = |t: &Table| {
@@ -1863,12 +1867,22 @@ fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result
             }
         }
         let by_key: HashSet<&String> = read.iter().collect();
+        // read for one tenant: its rows alone, here and in Postgres (none: the table is shared, or can't be told so)
+        let mut mine = match (whole, &tenant, of.as_mut()) {
+            (true, Some(t), Some(of)) => tenant_cond(&base, of, att, &name, t, "t", 0)?.map(|c| (c, of)),
+            _ => None,
+        };
         if whole {
             rows.clear();
             let matches = narrow.as_ref().map(|(fs, _)| crate::sql::Filters::new(&base, fs));
             for kv in base.prefix(&format!("{name}/"))? {
                 let (k, v) = kv?;
                 if matches.as_ref().is_some_and(|m| !m.any(&k, &v)) && !by_key.contains(&k) {
+                    continue;
+                }
+                if let Some((_, of)) = mine.as_mut()
+                    && of.mine(&base, &k, Some(v.as_ref())).map_err(sql_err)? == Some(false)
+                {
                     continue;
                 }
                 if rows.len() == LIVE_ROWS {
@@ -1909,7 +1923,10 @@ fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result
         if whole {
             // and the rows Postgres has that the fork point didn't
             let back: Vec<String> = t.cols.iter().map(|c| format!("t.{}::text", q(&c.name))).collect();
-            let only = narrow.as_ref().map_or(String::new(), |(_, w)| format!("{w} and "));
+            let mut only = narrow.as_ref().map_or(String::new(), |(_, w)| format!("{w} and "));
+            if let Some((c, _)) = &mine {
+                only.push_str(&format!("{c} and "));
+            }
             let sql = format!(
                 "select {} from {} t where {only}not exists (select 1 from {} where {}) limit {}",
                 back.join(", "),
@@ -1961,6 +1978,55 @@ fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result
         _ => None,
     }));
     Ok(out)
+}
+
+/// The condition, in Postgres's SQL on alias `a`, that a row of attached table `name` meets when it is tenant
+/// `tenant`'s (`{"column": c, "value": v}`), as Chronos's tenant policy holds it (see `sql::Tenants`; `of` tells how
+/// tables of `v` stand to it): its column holds the value, or its foreign key's columns name such a row of its parent
+/// (`hops` the foreign keys followed so far). None when there's none here: a table every tenant reads, one not
+/// attached, or a parent that isn't.
+fn tenant_cond(
+    v: &crate::View,
+    of: &mut crate::sql::Tenants,
+    att: &Attached,
+    name: &str,
+    tenant: &Json,
+    a: &str,
+    hops: usize,
+) -> Result<Option<String>> {
+    use crate::sql::TenantReach;
+    let tables = att.tables();
+    let Some(t) = att.table(name).map(|i| &tables[i]) else { return Ok(None) };
+    match of.reach(v, name).map_err(sql_err)? {
+        Some(TenantReach::Column) => {
+            let col = tenant["column"].as_str().unwrap_or_default();
+            let Some(c) = t.cols.iter().find(|c| c.name == col) else { return Ok(None) };
+            const NUMBERS: [&str; 7] =
+                ["smallint", "integer", "bigint", "numeric", "real", "double precision", "decimal"];
+            let number = NUMBERS.iter().any(|n| c.ty == *n || c.ty.starts_with(&format!("{n}(")));
+            Ok(match &tenant["value"] {
+                Json::Number(n) if number => Some(format!("{a}.{} = {n}", q(&c.name))),
+                Json::Number(n) => Some(format!("{a}.{}::text = {}", q(&c.name), lit(&n.to_string()))),
+                Json::String(s) => Some(format!("{a}.{}::text = {}", q(&c.name), lit(s))),
+                Json::Bool(b) => Some(format!("{a}.{}::text = {}", q(&c.name), lit(&b.to_string()))),
+                _ => None,
+            })
+        }
+        Some(TenantReach::Through { cols, parent, refs, .. }) if hops < crate::sql::MOST_TENANT_HOPS => {
+            let p = format!("{a}p");
+            let Some(cond) = tenant_cond(v, of, att, &parent, tenant, &p, hops + 1)? else { return Ok(None) };
+            let Some(pt) = att.table(&parent).map(|i| &tables[i]) else { return Ok(None) };
+            let list =
+                |al: &str, cs: &[String]| cs.iter().map(|c| format!("{al}.{}", q(c))).collect::<Vec<_>>().join(", ");
+            Ok(Some(format!("({}) in (select {} from {} {p} where {cond})", list(a, &cols), list(&p, &refs), pt.pg)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// An error of Chronos's SQL, as the attach gives it.
+fn sql_err(e: crate::sql::SqlError) -> Error {
+    Error::Constraint { code: e.code, message: e.message }
 }
 
 /// Refuses a statement that wrote another number of rows than it was given: a trigger skipped some (BEFORE ...

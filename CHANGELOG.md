@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.4.6 (beta), 2026-11-01
+
+**A tenant's run is held only by its own tenant's rows.** A world read by an agent held to a tenant, as every gateway run is, was held whenever another tenant's rows changed in a table it read, and a child table of more than 100,000 rows couldn't be checked against Postgres at all, so such a run could only be approved past its read check. Now only the tenant's rows count, in Chronos and in Postgres.
+
+The macOS builds need **macOS 13 or later**, as for 0.2.0.
+
+**Fixed:**
+- **A tenant's reads are checked against its tenant's rows only.** A world read by an agent held to a tenant (as every gateway run is) was held by any change to a table it read whole: the app writing another tenant's rows, in main or in Postgres, held it, and a child table of more than 100,000 rows couldn't be checked against Postgres at all ("read lead_notes more broadly than can be checked against Postgres"), so the run could only be approved past its read check. The read set now keeps whom its reads were made for. When every read was made for one tenant, a changed row counts only if it's that tenant's, as it was or as it is, followed through foreign keys as the tenant policy follows them; against Postgres the table is read by the tenant's condition in Postgres's SQL, so the 100,000 rows counts the tenant's. Reads by anyone else (a person's `SELECT` in the world) still count every row.
+
 ## 0.4.5 (beta), 2026-10-31
 
 **A run held to a tenant can change child tables.** In 0.4.4 a tenant agent could write a table held to it through a foreign key, but the merge then took every such row for another tenant's: the change was held, and refused when approved. It merges now, and another tenant's child rows are still refused.

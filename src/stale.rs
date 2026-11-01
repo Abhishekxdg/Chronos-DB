@@ -114,6 +114,22 @@ pub(crate) struct ReadSet {
     /// a SELECT read and wasn't kept (it failed, or gave too many rows; too many were kept), or what was read before a
     /// restart isn't known: a hold can't be lifted by running the kept ones again
     loose: bool,
+    /// whom its reads were made for (see `Whose`)
+    whose: Whose,
+}
+
+/// Whom a world's reads were made for: what the reading agent's tenant was (see `sql::tenant_now`) as each was made.
+/// A read made for a tenant found only that tenant's rows, so when every read was, a row of another tenant's that
+/// changed changed nothing it read (see `Core::tenants`).
+#[derive(Clone, Default, PartialEq)]
+enum Whose {
+    /// nothing read yet
+    #[default]
+    None,
+    /// every read, for this tenant (its condition: `"org_id" = 42`)
+    One(Arc<str>),
+    /// some read for no tenant, or for another: any row counts
+    Any,
 }
 
 /// The group a key's read falls in: a table's rows (`orders/`) or, for the rows SQL keeps behind
@@ -136,6 +152,24 @@ impl ReadSet {
     /// For a world whose metadata is `meta`: kept since its fork (`complete`) or not.
     pub(crate) fn of(meta: &Map<String, Json>, complete: bool) -> ReadSet {
         ReadSet { complete, rerun: meta.contains_key(RERUN_READS), ..Default::default() }
+    }
+
+    /// A read made now: for the running statement's agent's tenant, or for none (see `Whose`).
+    fn made(&mut self) {
+        self.whose = match (std::mem::take(&mut self.whose), crate::sql::tenant_now()) {
+            (Whose::None, Some(t)) => Whose::One(t),
+            (Whose::One(had), Some(t)) if had == t => Whose::One(had),
+            _ => Whose::Any,
+        };
+    }
+
+    /// The tenant every read it made was made for, as `{"column": c, "value": v}` (see `Whose`); None when there's no
+    /// one such tenant.
+    pub(crate) fn tenant(&self) -> Option<Json> {
+        match &self.whose {
+            Whose::One(cond) => crate::scope::tenant(&Json::String(cond.to_string())).ok(),
+            _ => None,
+        }
     }
 
     /// Whether its SELECTs are kept to run again (see the module docs).
@@ -166,6 +200,7 @@ impl ReadSet {
     }
 
     pub(crate) fn key(&mut self, k: &str) {
+        self.made();
         if let Some(o) = self.apart() {
             o.key(k);
         }
@@ -181,6 +216,7 @@ impl ReadSet {
     }
 
     pub(crate) fn range(&mut self, prefix: &str, after: Option<&str>, upto: Option<&str>) {
+        self.made();
         if let Some(o) = self.apart() {
             o.range(prefix, after, upto);
         }
@@ -197,6 +233,7 @@ impl ReadSet {
 
     /// A search: it may have read any row of `table`.
     pub(crate) fn table(&mut self, table: &str) {
+        self.made();
         if let Some(o) = self.apart() {
             o.table(table);
         }
@@ -208,6 +245,7 @@ impl ReadSet {
 
     /// A scan of `table` whose rows `f` matches: any of them it may have read.
     pub(crate) fn filtered(&mut self, table: &str, f: crate::sql::RowFilter) {
+        self.made();
         if let Some(o) = self.apart() {
             o.filtered(table, f.clone());
         }
@@ -336,6 +374,11 @@ impl ReadSet {
             "columns": self.columns,
             // (the SELECTs kept to run again aren't written out: after a restart a hold stays as found)
             "rerun": self.rerun,
+            "tenant": match &self.whose {
+                Whose::One(t) => Json::String(t.to_string()),
+                Whose::None => json!(false),
+                Whose::Any => Json::Null,
+            },
         })
     }
 
@@ -380,6 +423,12 @@ impl ReadSet {
             kept: vec![],
             outside: None,
             loose: true,
+            // (kept by an older version: whom for is unknown, and any row counts)
+            whose: match &j["tenant"] {
+                Json::String(t) => Whose::One(t.as_str().into()),
+                Json::Bool(false) => Whose::None,
+                _ => Whose::Any,
+            },
         })
     }
 }
@@ -568,7 +617,7 @@ impl Core {
             changed.extend(in_range(prefix, after.as_deref(), upto.as_deref())?);
         }
         for g in &set.groups {
-            let found = in_range(g, None, None)?;
+            let found = self.tenants(set, base, now, in_range(g, None, None)?)?;
             if !found.is_empty() && !self.unused(set, base, now, found)?.is_empty() {
                 whole.push(g.clone());
             }
@@ -600,6 +649,7 @@ impl Core {
         }
         changed.sort();
         changed.dedup();
+        let changed = self.tenants(set, base, now, changed)?;
         let changed = self.unused(set, base, now, changed)?;
         // rows first, then what's behind indexes and constraints, which a row read usually covers
         let (rows, behind): (Vec<String>, Vec<String>) =
@@ -670,6 +720,36 @@ impl Core {
         let mut held = held;
         held.extend(changed);
         Ok(held)
+    }
+
+    /// Of `keys`, changed between `base` and `now`, those a world whose reads were all made for one tenant (see
+    /// `ReadSet::tenant`) could have found: the rows that are the tenant's as they were or as they are (see
+    /// `sql::Tenants`), what's behind indexes and constraints, and the rows of tables every tenant reads. Every key, for
+    /// any other world.
+    pub(crate) fn tenants(&self, set: &ReadSet, base: &State, now: &State, keys: Vec<String>) -> Result<Vec<String>> {
+        let Some(t) = set.tenant() else { return Ok(keys) };
+        let (Some(was), Some(is)) = (crate::sql::Tenants::new(&t), crate::sql::Tenants::new(&t)) else {
+            return Ok(keys);
+        };
+        let mut sides = [(self.past_view(base), was), (self.past_view(now), is)];
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            let mut counts = group(&k).is_none_or(|g| g[..g.len() - 1].contains('/')); // not a row: counts
+            for (v, of) in sides.iter_mut() {
+                if counts {
+                    break;
+                }
+                let raw = v.get(&k)?.map(|x| x.to_string());
+                let mine = of
+                    .mine(v, &k, raw.as_deref())
+                    .map_err(|e| Error::Constraint { code: e.code, message: e.message })?;
+                counts = mine != Some(false);
+            }
+            if counts {
+                out.push(k);
+            }
+        }
+        Ok(out)
     }
 
     /// Of `keys`, changed between `base` and `now`, those that count against what was read: all

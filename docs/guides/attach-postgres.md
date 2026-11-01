@@ -108,6 +108,12 @@ write-back also reads, for each attached table the world read:
 
 so a row added there that the read would have found counts, an empty result included.
 
+- **a world read by an agent held to a tenant:** every read it made found only that tenant's rows, so of a table read
+  whole only those are compared: the fork point's tenant rows, and Postgres's by the same condition in its SQL
+  (`org_id = 42`, or for a child table `lead_id in (select id from leads where org_id = 42)`, up to three foreign
+  keys, the parents attached too). The 100,000 rows counts the tenant's rows, so a tenant's read of a child table of
+  millions of rows is checked, and the app writing other tenants' rows doesn't hold it.
+
 Postgres's rows are put in the world's fork point, with the index entries they make, and checked as a read against
 main is. A row the read couldn't have found (another email) doesn't hold the merge. A read that changed holds it as
 any stale read: refused with `40001` and nothing written (`read rows that changed in Postgres since it forked:
