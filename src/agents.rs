@@ -516,12 +516,17 @@ impl Core {
     }
 }
 
+/// `1 row`, `2 rows`: a count of rows as a refusal says it.
+pub(crate) fn n_rows(n: u64) -> String {
+    format!("{n} {}", if n == 1 { "row" } else { "rows" })
+}
+
 /// A person's merge of world `b`, which deletes `deletes` rows, refused for want of the count merge policy `policy`
 /// asks for above `over` (`given`: the count given, if one was).
 pub(crate) fn count_refused(b: &str, deletes: u64, policy: &str, over: u64, given: Option<u64>) -> Error {
     let said = match given {
         Some(g) => format!("CONFIRM DELETES {g} doesn't match: it deletes {deletes}"),
-        None => format!("it deletes {deletes} rows"),
+        None => format!("it deletes {}", n_rows(deletes)),
     };
     Error::Constraint {
         code: "55000",
@@ -1492,12 +1497,14 @@ impl MergePolicy {
         let mut out = vec![];
         if let Some(n) = self.rows_per_hour.filter(|n| had_rows + rows > *n) {
             out.push(format!(
-                "changes {rows} rows, and {whose} changed {had_rows} in the last hour (at most {n} an hour)"
+                "changes {}, and {whose} changed {had_rows} in the last hour (at most {n} an hour)",
+                n_rows(rows)
             ));
         }
         if let Some(n) = self.deletes_per_hour.filter(|n| had_deletes + deletes > *n) {
             out.push(format!(
-                "deletes {deletes} rows, and {whose} deleted {had_deletes} in the last hour (at most {n} an hour)"
+                "deletes {}, and {whose} deleted {had_deletes} in the last hour (at most {n} an hour)",
+                n_rows(deletes)
             ));
         }
         if let Some(n) = self.effects_per_hour.filter(|n| had_effects + effects > *n) {
@@ -1571,16 +1578,16 @@ impl MergePolicy {
         let join = |s: BTreeSet<String>| s.into_iter().collect::<Vec<_>>().join(", ");
         let mut out = vec![];
         if let Some(n) = self.max_rows.filter(|n| rows > *n) {
-            out.push(format!("changes {rows} rows (at most {n})"));
+            out.push(format!("changes {} (at most {n})", n_rows(rows)));
         }
         if let Some(n) = self.max_deletes.filter(|n| deletes > *n) {
-            out.push(format!("deletes {deletes} rows (at most {n})"));
+            out.push(format!("deletes {} (at most {n})", n_rows(deletes)));
         }
         // (an agent can't give the count for itself: a person does, approving it)
         if let Some(n) =
             self.confirm_deletes_over.filter(|n| deletes > *n && self.max_deletes.is_none_or(|m| deletes <= m))
         {
-            out.push(format!("deletes {deletes} rows (over {n}: a person approves it by giving the count)"));
+            out.push(format!("deletes {} (over {n}: a person approves it by giving the count)", n_rows(deletes)));
         }
         if let Some(n) = self.max_effects.filter(|n| effects > *n) {
             out.push(format!("queues {effects} effects (at most {n})"));

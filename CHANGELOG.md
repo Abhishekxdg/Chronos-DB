@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Words:** a refusal or review counting one row says "1 row", not "1 rows".
+- **Dependencies:** rustls 0.23.46, for its security advisories (the worst: a session's Debug output could show its TLS secrets).
+
 ## 0.4.7 (beta), 2026-11-03
 
 **The Studio, in the look of chronos.2090.tech.** The same views and the same engine as 0.4.6; only the Studio's looks changed.

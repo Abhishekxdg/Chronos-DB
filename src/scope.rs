@@ -261,10 +261,10 @@ pub(crate) fn outside(
         let deletes = rows.clone().filter(|d| d.change == "delete").count() as u64;
         let rows = rows.count() as u64;
         if let Some(n) = max_rows.filter(|n| rows > *n) {
-            counted.push(format!("changes {rows} rows (it declared at most {n})"));
+            counted.push(format!("changes {} (it declared at most {n})", crate::agents::n_rows(rows)));
         }
         if let Some(n) = max_deletes.filter(|n| deletes > *n) {
-            counted.push(format!("deletes {deletes} rows (it declared at most {n})"));
+            counted.push(format!("deletes {} (it declared at most {n})", crate::agents::n_rows(deletes)));
         }
     }
     if targets.is_none() && tenant.is_none() {

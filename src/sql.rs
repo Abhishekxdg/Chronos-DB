@@ -30874,9 +30874,10 @@ fn plan_counts(rows: &[crate::Planned]) -> Vec<(String, Counts)> {
 /// The notice a dry run gives when the person merging must give the count of rows it deletes.
 fn confirm_line(b: &str, c: &crate::ConfirmDeletes) -> String {
     format!(
-        "{b} deletes {} rows, more than merge policy {} lets a person approve without giving the count (over {}): \
+        "{b} deletes {} {}, more than merge policy {} lets a person approve without giving the count (over {}): \
          MERGE WORLD {b} CONFIRM DELETES {} approves it",
         thousands(c.deletes as usize),
+        if c.deletes == 1 { "row" } else { "rows" },
         c.policy,
         c.over,
         c.deletes

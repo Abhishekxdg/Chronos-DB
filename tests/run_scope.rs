@@ -280,7 +280,7 @@ fn a_run_declares_how_many_rows_it_changes_and_deletes() {
     assert!(e.contains("may change leads, lists; at most 2 rows"), "{e}");
     // a whole table, but no deletes
     let e = attempt(&db, "del", "may_change = 'leads', max_deletes = 0", "delete from leads where id = 3").unwrap();
-    assert!(e.contains("deletes 1 rows (it declared at most 0)"), "{e}");
+    assert!(e.contains("deletes 1 row (it declared at most 0)"), "{e}");
     assert!(e.contains("no deletes"), "{e}");
     assert_eq!(
         attempt(&db, "ins", "may_change = 'leads', max_deletes = 0", "insert into leads values (9, 1, 'open', 'dee')"),
@@ -290,7 +290,7 @@ fn a_run_declares_how_many_rows_it_changes_and_deletes() {
     run(&db, MAIN, "create world zero with (max_rows = 0)", &[]).unwrap();
     run(&db, "zero", "update leads set owner = 'z' where id = 1", &[]).unwrap();
     let blocked = db.merge_preview("zero", &Default::default()).unwrap().blocked.unwrap_or_default();
-    assert!(blocked.contains("changes 1 rows (it declared at most 0)"), "{blocked}");
+    assert!(blocked.contains("changes 1 row (it declared at most 0)"), "{blocked}");
     // shown, and an admin can raise it
     let s = db.world("zero").unwrap().scope.unwrap();
     assert_eq!(s["max_rows"], 0);

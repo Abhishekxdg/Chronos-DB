@@ -157,7 +157,7 @@ export function ChangesView() {
         // (the merge itself says what's wrong)
       }
     }
-    const dels = confirm ? ` It deletes ${n(confirm.deletes)} rows: merge policy ${confirm.policy} asks you to type that number to approve it.` : '';
+    const dels = confirm ? ` It deletes ${plural(confirm.deletes, 'row')}: merge policy ${confirm.policy} asks you to type that number to approve it.` : '';
     const ok = await dlg.confirm(
       `Merge into ${parent}?`,
       `${counts ? plural(counts.total, 'change') : 'The changes'} from ${app.world} go into ${parent}${live}, and ${app.world} closes. You can undo the merge afterwards.${dels}`,

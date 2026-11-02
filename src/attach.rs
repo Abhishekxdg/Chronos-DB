@@ -2314,9 +2314,10 @@ fn conflict(n: usize, world: &str, source: &str, lines: &[String]) -> Error {
     Error::Constraint {
         code: "40001",
         message: format!(
-            "{n} rows {world} changes {CHANGED_IN_POSTGRES} (attached {source}); nothing was written to Postgres and \
+            "{} {world} changes {CHANGED_IN_POSTGRES} (attached {source}); nothing was written to Postgres and \
              nothing merged. main now holds Postgres's values for them: merge again, and settle them as any conflict \
              (OURS, THEIRS, or row by row).\n{}",
+            crate::agents::n_rows(n as u64),
             lines.join("\n")
         ),
     }

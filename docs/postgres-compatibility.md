@@ -8,7 +8,7 @@ Chronos 0.4 is a **beta**. It aims to run what an application written for Postgr
 
 | Measure | Result |
 |---|---|
-| Postgres 16's own regression suite (`src/test/regress`, 219 files run as scripts, output compared line by line with Postgres's expected output; measured 2026-10-22 against 16.15's files) | **86.24%** of the expected lines; **60 of 219** files exactly the same; of the files' **44,942** statements, **85.41%** give exactly Postgres's output, **87.29%** counting partial matches |
+| Postgres 16's own regression suite (`src/test/regress`, 219 files run as scripts, output compared line by line with Postgres's expected output; measured 2026-10-27 against 16.15's files) | **88.98%** of the expected lines; **66 of 219** files exactly the same. Counted by statement on the earlier run of 2026-10-22 (86.24% of lines): of the files' **44,942** statements, **85.41%** gave exactly Postgres's output, **87.29%** counting partial matches |
 | Real databases moved in during the trials (`chronos import` and `pg_dump` replay), checked table by table with row counts and row checksums | **7 of 7** with identical checksums: Chinook, Northwind, pgbench at 2M rows, Pagila (after 1 manual fix: `DISTINCT` inside a user-defined aggregate, since fixed), a synthetic schema of 50 constructs, a micro schema of 47 types, a Rails-style application, a multi-tenant schema with row-level security and `LISTEN`/`NOTIFY` |
 | Differential tests against a real Postgres 16 (`tests/pgdiff.rs`) | 468 tests, each statement giving the same rows or the same error class on both |
 | Speed, same machine, pgbench-style | point reads at about **0.5×** Postgres's rate; writes at a fraction of Postgres's rate. Not tuned yet; measure your own workload |

@@ -484,7 +484,7 @@ fn merge_policies_send_big_or_risky_merges_to_a_person() {
     // each rule broken: refused, queued, the world kept
     for (w, sql, why) in [
         ("big", "update orders set status = 'x'", "changes 4 rows (at most 2)"),
-        ("del", "delete from orders where id = 2", "deletes 1 rows (at most 0)"),
+        ("del", "delete from orders where id = 2", "deletes 1 row (at most 0)"),
         ("pay", "insert into payments values (1, 10)", "changes payments (always reviewed)"),
         ("ddl", "alter table orders add column note text", "changes the schema: table orders"),
     ] {
@@ -854,9 +854,9 @@ fn merge_checks_queue_agents_under_a_policy_and_refuse_everyone_else() {
         let _as = chronos::acting_as("bot");
         db.merge_preview("wipe", &Default::default()).unwrap().blocked.unwrap_or_default()
     };
-    assert!(blocked.contains("deletes 1 rows (at most 0); it breaks merge check"), "{blocked}");
+    assert!(blocked.contains("deletes 1 row (at most 0); it breaks merge check"), "{blocked}");
     let e = bot.run(&db, "merge world wipe", &[]).unwrap_err();
-    assert!(e.message.contains("deletes 1 rows (at most 0); it breaks merge check lists_keep_leads"), "{}", e.message);
+    assert!(e.message.contains("deletes 1 row (at most 0); it breaks merge check lists_keep_leads"), "{}", e.message);
     assert_eq!(db.reviews()[0].reasons.len(), 2, "the queue has both: {:?}", db.reviews()[0].reasons);
     run(&db, MAIN, "alter merge policy p set (max_deletes = null)", &[]).unwrap();
 
