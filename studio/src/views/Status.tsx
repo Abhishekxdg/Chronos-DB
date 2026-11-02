@@ -26,8 +26,8 @@ export function StatusView() {
   const up = c.uptime_seconds;
   const cards: [string, string, string?][] = s
     ? [
-        ['Version', s.version],
         ['Worlds', n(c.worlds)],
+        ['Version', s.version],
         ['On disk', bytes((c.pages_bytes || 0) + (c.log_bytes || 0) + (c.history_bytes || 0)), 'pages, log and history'],
         ['Pages', bytes(c.pages_bytes)],
         ['Log', bytes(c.log_bytes)],
@@ -48,8 +48,8 @@ export function StatusView() {
           <div className="sec">
             <h3 className="label">Database</h3>
             <div className="cards">
-              {cards.map(([k, v, title]) => (
-                <div className="card" key={k} title={title}>
+              {cards.map(([k, v, title], i) => (
+                <div className={i ? 'card' : 'card lead'} key={k} title={title}>
                   <div className="k">{k}</div>
                   <div className="v">{v}</div>
                 </div>

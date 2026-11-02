@@ -1,12 +1,12 @@
 // The Studio's window: the title bar (menus, the search that opens the command palette, the
 // active world and its one primary action), the icon rail of views, the explorer (the folder,
-// worlds as lineage, tables opening to their columns, the timeline and the outline), the pill
+// worlds as lineage, tables opening to their columns, the timeline and the outline), the
 // tabs over the canvas, the status bar, and the state they share. A world's hue marks it
-// everywhere it appears; main's is amber, the live data.
+// everywhere it appears; main's is blue, the live data.
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { api, errText, onConnection, onGate, onSignedOut, signIn, signOut, token, whoami, type ApiError, type HistoryWindow, type Table, type User, type Who, type World } from './api';
 import { ADMIN_ONLY, AppCtx, lineage, TABS, worldOf, type App as AppState, type Merged, type Prefs, type Tab } from './context';
-import { Icon, typeMark, type IconName } from './icons';
+import { Icon, Mark, typeMark, type IconName } from './icons';
 import { Palette, type Command } from './Palette';
 import { Worldline } from './Worldline';
 import { DialogHost, Popover, Toast, toast, useDialogs } from './ui';
@@ -92,7 +92,7 @@ function Studio() {
       /* a damaged value: defaults */
     }
     return {
-      theme: (store.get('chronos-studio-theme') as Theme) || 'system',
+      theme: (store.get('chronos-studio-theme') as Theme) || 'dark',
       explorer: store.get('chronos-studio-explorer') !== 'hidden',
       worldline: store.get('chronos-studio-worldline') !== 'hidden',
       density: 'comfortable',
@@ -428,11 +428,7 @@ function Studio() {
             <Icon name="menu" />
           </button>
           <span className="logo" aria-label="Chronos Studio" title="Chronos Studio">
-            <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
-              <rect x="3" y="3" width="15" height="4.5" rx="2.25" />
-              <rect x="7" y="9.75" width="14" height="4.5" rx="2.25" />
-              <rect x="3" y="16.5" width="10" height="4.5" rx="2.25" />
-            </svg>
+            <Mark />
           </span>
           <nav className="menus" aria-label="Menus">
             <span onMouseEnter={hoverMenu('file')}>
@@ -981,11 +977,7 @@ function SignIn({ onIn }: { onIn: (u: User) => void }) {
     <main className="signin">
       <form className="signin-card" onSubmit={submit} aria-label="Sign in">
         <span className="logo" aria-hidden="true">
-          <svg width="28" height="28" viewBox="0 0 24 24">
-            <rect x="3" y="3" width="15" height="4.5" rx="2.25" />
-            <rect x="7" y="9.75" width="14" height="4.5" rx="2.25" />
-            <rect x="3" y="16.5" width="10" height="4.5" rx="2.25" />
-          </svg>
+          <Mark size={32} />
         </span>
         <h1>Sign in to Chronos Studio</h1>
         <p className="note">With a database role that may log in and has a password. The Studio acts with that role’s privileges.</p>
@@ -1042,7 +1034,7 @@ function WorldTree({ worlds, active, merging, onPick }: { worlds: World[]; activ
       {rows.map(({ w, depth }) => {
         const title = [
           w.name,
-          `created ${fmtTime(w.created)}`,
+          w.created > 0 && `created ${fmtTime(w.created)}`,
           w.owner && `owner ${w.owner}`,
           w.expires && `expires ${fmtTime(w.expires)}`,
           w.flagged && 'open during a crash: its merge must be confirmed',

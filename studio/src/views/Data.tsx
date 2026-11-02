@@ -9,7 +9,7 @@ import { Inspector, rowId, type Inspect } from '../Inspector';
 import { Empty, ErrorBox, Popover, StatusSlot, toast, type Dialogs, useDialogs } from '../ui';
 import { Icon } from '../icons';
 import { importRows } from './Import';
-import { downloadCsv, historyStart, likeEsc, lit, momentOf, n, outsideHistory, qid, qtable, span, splitName, suggestName, when } from '../util';
+import { downloadCsv, historyStart, likeEsc, lit, momentOf, n, outsideHistory, plural, qid, qtable, span, splitName, suggestName, when } from '../util';
 
 export interface ColumnInfo {
   column_name: string;
@@ -413,7 +413,7 @@ function Toolbar(p: {
   return (
     <div className="toolbar">
       <span className="ident">{p.table}</span>
-      {p.total != null && <span className="rows">{n(p.total)} rows</span>}
+      {p.total != null && <span className="rows">{plural(p.total, 'row')}</span>}
       {p.json && (
         <span className="tag" title="Made by writing JSON rows: every field any row has is a column">
           JSON

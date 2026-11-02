@@ -35,7 +35,7 @@ interface Filter {
   f: string;
   v: string;
 }
-const HUES = ['var(--h1)', 'var(--h0)', 'var(--main)', 'var(--h2)', 'var(--h3)', 'var(--h4)', 'var(--h5)', 'var(--accent)'];
+const HUES = ['var(--main)', 'var(--h0)', 'var(--h1)', 'var(--h2)', 'var(--h3)', 'var(--h4)', 'var(--warn)', 'var(--accent)'];
 const PREFER_COLOR = /^(topic|category|type|kind|status|label|class|group|stage|source|industry)$/i;
 const PREFER_TITLE = /^(title|name|subject|label|headline|summary)$/i;
 

@@ -255,7 +255,7 @@ export function StatusSlot({ children }: { children: ReactNode }) {
   return slot ? createPortal(children, slot) : null;
 }
 
-/** A vector at a glance: its numbers folded into bars (accent above zero, amber below), and its size. */
+/** A vector at a glance: its numbers folded into bars (accent above zero, orange below), and its size. */
 export function VecStrip({ v, bins = 32, h = 14, dims = true }: { v: number[]; bins?: number; h?: number; dims?: boolean }) {
   const f = fold(v, bins);
   const max = Math.max(1e-9, ...f.map(Math.abs));

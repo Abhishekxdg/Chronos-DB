@@ -148,12 +148,12 @@ export const store = {
   },
 };
 
-/** A world's hue: amber for main (live data), else one of six, picked by its id so it never changes. */
+/** A world's hue: blue for main (live data), else one of five, picked by its id so it never changes. */
 export function hueOf(w: { name: string; id: string } | undefined): string {
   if (!w || w.name === 'main') return 'var(--main)';
   let h = 0;
   for (const ch of w.id) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
-  return `var(--h${h % 6})`;
+  return `var(--h${h % 5})`;
 }
 
 export const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;

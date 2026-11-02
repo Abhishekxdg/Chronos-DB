@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.4.7 (beta), 2026-11-03
+
+**The Studio, in the look of chronos.2090.tech.** The same views and the same engine as 0.4.6; only the Studio's looks changed.
+
+The macOS builds need **macOS 13 or later**, as for 0.2.0.
+
+- **Studio:** redrawn in Signal, the design system of chronos.2090.tech: near-black grounds, hairlines, hard corners and lime for the one thing that matters; Inter Tight, JetBrains Mono and Doto; the Chronos mark and a favicon; nothing under 12px. Dark by default (light, or following the system, in Settings). main is blue, not amber, and held changes are amber.
+- **Studio:** on a new database with only main, the worldline's labels no longer lie on top of each other, and now is at the right. A world's label no longer touches the line below it; the row count says "1 row"; a world's tooltip no longer says "created" with no date.
+
 ## 0.4.6 (beta), 2026-11-01
 
 **A tenant's run is held only by its own tenant's rows.** A world read by an agent held to a tenant, as every gateway run is, was held whenever another tenant's rows changed in a table it read, and a child table of more than 100,000 rows couldn't be checked against Postgres at all, so such a run could only be approved past its read check. Now only the tenant's rows count, in Chronos and in Postgres.

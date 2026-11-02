@@ -155,3 +155,16 @@ export function typeMark(t: string): string {
   if (/vector/.test(t)) return '⋮';
   return 'T';
 }
+
+/** The Chronos mark, as on the site: two traces making a C, chalk outside, the lit one inside. */
+export function Mark({ size = 24 }: { size?: number }) {
+  return (
+    <svg className="mark" width={size} height={size} viewBox="0 0 32 32" aria-hidden="true">
+      <rect className="tile" x=".5" y=".5" width="31" height="31" rx="4" />
+      <g fill="none" strokeWidth="3" strokeLinecap="square">
+        <path className="m" d="M23.5 7H17.5a9 9 0 0 0 0 18H23.5" />
+        <path className="n" d="M23.5 12.5H17.5a3.5 3.5 0 0 0 0 7H23.5" />
+      </g>
+    </svg>
+  );
+}

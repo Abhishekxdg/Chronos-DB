@@ -11,7 +11,10 @@ import { useApp } from './context';
 import { fmtTime, hueOf, n, plural, span as lasting } from './util';
 
 const PAD_L = 20;
-const PAD_R = 188; // room for the active world's label at the end of its lane
+const PAD_R = 244; // room for the active world's label at the end of its lane
+/** A point on a lane: a square, as every marker in Signal is. */
+const Node = ({ x, y, r, className }: { x: number; y: number; r: number; className?: string }) => <rect className={className} x={x - r} y={y - r} width={r * 2} height={r * 2} />;
+
 const TOP = 14; // main's lane
 const MERGES = 10; // the latest merges into main drawn
 
@@ -69,6 +72,8 @@ export function Worldline() {
   const stops = [...new Set([main.created, ...forks.map((x) => x.created), ...ghosts.map((g) => g.forkAt!), ...merges.map((m) => m.mergeAt), now])]
     .filter((v) => v > 0)
     .sort((a, b) => a - b);
+  // a database with nothing to mark yet (main's start isn't known, no forks): main still runs to now at the right
+  if (stops.length < 2) stops.unshift(now - 1);
   const span = Math.max(1, w - PAD_L - PAD_R);
   const step = span / Math.max(1, stops.length - 1);
   const x = (t: number) => {
@@ -81,12 +86,12 @@ export function Worldline() {
     const i = Math.min(stops.length - 2, Math.floor(f));
     return stops.length < 2 ? now : stops[i] + (f - i) * (stops[i + 1] - stops[i]);
   };
-  // lanes close up as worlds multiply, so the strip stays under ~80px
+  // lanes close up as worlds multiply, so the strip stays under ~90px
   const gap = Math.max(3, Math.min(8, 44 / Math.max(1, forks.length + ghosts.length)));
   const lane = new Map<string, number>([[main.name, TOP]]);
   forks.forEach((f, i) => lane.set(f.name, TOP + 14 + i * gap));
   const ghostY = (i: number) => TOP + 14 + (forks.length + i) * gap;
-  const H = Math.max(46, TOP + 14 + Math.max(0, forks.length + ghosts.length - 1) * gap + 14);
+  const H = Math.max(46, TOP + 14 + Math.max(0, forks.length + ghosts.length - 1) * gap + 23); // below the last lane: its label, then the axis line
   const names = new Set(worlds.map((x) => x.name));
   const ids = new Map(worlds.map((x) => [x.id, x.name]));
   const parentOf = (f: World) => (f.parent == null ? 'main' : names.has(f.parent) ? f.parent : (ids.get(f.parent) ?? 'main'));
@@ -161,11 +166,13 @@ export function Worldline() {
             </title>
           </rect>
         )}
+        {/* now, the one lit line */}
+        <line className="wl-now" x1={xNow} x2={xNow} y1={0} y2={H} />
         {/* main: the live data, from its start to now */}
         <g className={'lane main' + (app.world === 'main' ? ' on' : '')} style={{ '--hue': hueOf(main) } as CSSProperties} onClick={() => pick('main')}>
           <line className="hit" x1={PAD_L} x2={xNow} y1={TOP} y2={TOP} />
           <line className="ln" pathLength={1} x1={PAD_L} x2={xNow} y1={TOP} y2={TOP} />
-          <circle className="end" cx={xNow} cy={TOP} r="3.5" />
+          <Node className="end" x={xNow} y={TOP} r={3.5} />
           <title>main · the live data · since {fmtTime(main.created)}</title>
         </g>
         {ghosts.map((g, i) => {
@@ -187,7 +194,7 @@ export function Worldline() {
           return (
             <g key={'m' + m.name + m.mergeAt} className="merge" style={{ '--hue': w0 ? hueOf(w0) : 'var(--faint)' } as CSSProperties}>
               {y !== undefined && <path d={`M${xm} ${y}C${xm} ${y - 6} ${xm} ${TOP + 6} ${xm} ${TOP}`} />}
-              <circle cx={xm} cy={TOP} r="3.5" />
+              <Node x={xm} y={TOP} r={3.5} />
               <title>
                 {m.name} merged {plural(m.rows, 'row')} into main · {fmtTime(m.mergeAt)}
               </title>
@@ -205,8 +212,8 @@ export function Worldline() {
           >
             <path className="hit" d={path(f)} />
             <path className="ln" pathLength={1} d={path(f)} />
-            <circle className="fork" cx={x(f.created)} cy={lane.get(parentOf(f))} r="2.5" />
-            <circle className={'end' + (f.changes ? ' dirty' : '')} cx={xNow} cy={lane.get(f.name)} r={f.changes ? 3.5 : 2.5} />
+            <Node className="fork" x={x(f.created)} y={lane.get(parentOf(f))!} r={2.5} />
+            <Node className={'end' + (f.changes ? ' dirty' : '')} x={xNow} y={lane.get(f.name)!} r={f.changes ? 3.5 : 2.5} />
             <title>
               {f.name} · forked from {parentOf(f)} {fmtTime(f.created)}
               {f.owner ? ` · by ${f.owner}` : ''}
@@ -236,7 +243,7 @@ export function Worldline() {
         {scrub && (
           <g className={'scrub' + (kept !== null && scrub.t < kept ? ' gone' : '')}>
             <line x1={scrub.x} x2={scrub.x} y1={2} y2={H - 2} />
-            <rect x={scrub.x + (scrub.x + 160 > w ? -156 : 6)} y={H / 2 - 10} width={150} height={20} rx={6} />
+            <rect x={scrub.x + (scrub.x + 160 > w ? -156 : 6)} y={H / 2 - 10} width={150} height={20} rx={2} />
             <text x={scrub.x + (scrub.x + 160 > w ? -148 : 14)} y={H / 2} dy="0.35em">
               {kept !== null && scrub.t < kept ? 'before the history kept' : `as of ${fmtTime(scrub.t).slice(5)}`}
             </text>
