@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.4.8 (beta), 2026-11-03
+
+**Counts read right, and rustls with its security fixes.** No change to how merges, checks or storage work from 0.4.7.
+
+The macOS builds need **macOS 13 or later**, as for 0.2.0.
+
 - **Words:** a refusal or review counting one row says "1 row", not "1 rows".
 - **Dependencies:** rustls 0.23.46, for its security advisories (the worst: a session's Debug output could show its TLS secrets).
 
