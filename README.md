@@ -1,14 +1,12 @@
+<h1 align="center"><img src="docs/assets/readme/banner.png" alt="Chronos DB. Let AI agents write to your Postgres. Each run works on its own branch; your rules decide what lands." width="100%"></h1>
+
 <div align="center">
 
-# Chronos DB
-
-### Let AI agents write to your Postgres. Each run works on its own branch; your rules decide what lands.
-
-![release](https://img.shields.io/badge/release-v0.4.6%20beta-f59e0b?style=flat-square)
-![postgres wire](https://img.shields.io/badge/postgres-wire%20protocol-336791?style=flat-square&logo=postgresql&logoColor=white)
-![mcp](https://img.shields.io/badge/MCP-ready-7c3aed?style=flat-square)
-![rust](https://img.shields.io/badge/rust-1.90%2B-b7410e?style=flat-square&logo=rust&logoColor=white)
-![license](https://img.shields.io/badge/license-BUSL--1.1%20engine%20%2B%20MIT-64748b?style=flat-square)
+![release](https://img.shields.io/badge/release-v0.4.6%20beta-c8ff2e?style=flat-square&labelColor=050505)
+![postgres wire](https://img.shields.io/badge/postgres-wire%20protocol-2c2c2c?style=flat-square&labelColor=050505&logo=postgresql&logoColor=f2f2ee)
+![mcp](https://img.shields.io/badge/MCP-ready-2c2c2c?style=flat-square&labelColor=050505)
+![rust](https://img.shields.io/badge/rust-1.90%2B-2c2c2c?style=flat-square&labelColor=050505&logo=rust&logoColor=f2f2ee)
+![license](https://img.shields.io/badge/license-BUSL--1.1%20engine%20%2B%20MIT-2c2c2c?style=flat-square&labelColor=050505)
 
 [**Docs site**](https://chronosdb-docs.vercel.app/) ·
 [**Quickstart**](docs/quickstart.md) ·
@@ -61,6 +59,7 @@ If a merge keeps to every rule (no deletes, at most 500 rows, nothing in `paymen
 
 - [Install](#install)
 - [Quickstart: five minutes](#quickstart-five-minutes)
+- [Chronos Studio](#chronos-studio)
 - [How it works](#how-it-works)
 - [What it is good at](#what-it-is-good-at)
 - [Where it stands](#where-it-stands)
@@ -168,7 +167,30 @@ By default the agent can read, fork worlds, change only the worlds it forked, di
 
 To see the whole idea end to end, the [five-minute trial](examples/trial) runs an agent on a small CRM and shows four of its mistakes caught before they reach `main`.
 
+## Chronos Studio
+
+Read what an agent did, and merge it, in a browser. Every install has it, and it opens on 127.0.0.1 only:
+
+```bash
+chronos studio mydb
+```
+
+<table>
+<tr>
+<td width="50%" valign="top"><a href="docs/assets/readme/studio-changes.png"><img src="docs/assets/readme/studio-changes.png" alt="Chronos Studio's Changes view for world run_42: 95 changes to the leads table, 11 deleted and 84 updated, what reads those changes, a deleted row shown struck through, and the Merge into main button"></a><br><b>Changes.</b> What a world changed, row by row, what reads those rows, and the merge.</td>
+<td width="50%" valign="top"><a href="docs/assets/readme/studio-data.png"><img src="docs/assets/readme/studio-data.png" alt="Chronos Studio's Data view: the leads table in world run_42 as a grid, the list of worlds and tables on the left, and a line along the top drawing main and the worlds forked from it"></a><br><b>Data.</b> Any world's tables in a grid. The line along the top is main and its worlds; drag left to read the past.</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="docs/assets/readme/studio-search.png"><img src="docs/assets/readme/studio-search.png" alt="Chronos Studio's Search view: ranked notes on the left, and on the right a map of 240 vectors in four clusters by topic, with the nearest hits to one picked row lit"></a><br><b>Search.</b> Words, filters and vectors in one ranking, with the vectors on a map.</td>
+<td width="50%" valign="top"><a href="docs/assets/readme/studio-diagram.png"><img src="docs/assets/readme/studio-diagram.png" alt="Chronos Studio's Diagram view: the accounts, invoices, leads and notes tables as cards, with lines for their foreign keys"></a><br><b>Diagram.</b> Tables, their columns and their foreign keys.</td>
+</tr>
+</table>
+
+These pictures show a made-up CRM, in the look the Studio has on the main branch. The next release brings that look; 0.4.6 has the same views in the earlier one. More: [Studio](docs/studio.md).
+
 ## How it works
+
+<p align="center"><img src="docs/assets/readme/scene-db.png" alt="An isometric drawing of Chronos DB: the database as a stack of slabs, an hour of history above it as glass slices, and twelve worlds beside it, each forked from the database. One world has merged. Another is held for a person, because it deletes 657 rows and the rule says 0." width="820"></p>
 
 ### The words
 
@@ -185,6 +207,8 @@ To see the whole idea end to end, the [five-minute trial](examples/trial) runs a
 | **Attach** | Running beside an existing Postgres: merges into `main` are written back to it in one checked transaction. |
 
 ### The life of an agent run
+
+<p align="center"><img src="docs/assets/readme/agent-run.png" alt="A world leaves main at a fork, then works, diffs and reaches a merge. Inside the rules the merge lands on main, in an attached folder writing Postgres first. Outside them it waits for a person in SHOW REVIEWS. An undo can put the rows back within the history window." width="820"></p>
 
 1. **Fork.** The agent creates a world. It sees all of `main` as it was at that moment and nobody else sees its writes.
 2. **Work.** It reads and writes with ordinary SQL. It can write only the worlds it forked, unless you give it more.
@@ -269,9 +293,13 @@ Tool definitions for any LLM API with tool calling, and a parallel-agents exampl
 
 **Chronos Gateway** is a separate product built on this engine: a self-hosted service that lets your own product's agents change the Postgres your app already uses, one customer's rows at a time, through approved merges. It has its own releases at [chronos-gateway-releases](https://github.com/Abhishekxdg/chronos-gateway-releases).
 
+<p align="center"><img src="docs/assets/readme/scene-gateway.png" alt="An isometric drawing of Chronos Gateway between a product's agents and its Postgres: the agents reach a world per run, one tenant each, and hold no Postgres credential. Changes reach Postgres as a checked write, or ask the end user first. The product's app keeps talking to Postgres as it does today." width="820"></p>
+
 ## Benchmarks
 
 Engineering numbers from one machine, not a published benchmark. Unless noted: one GCP c2d-standard-32 (32 vCPU, 128 GB, Linux), every rival on the same machine, 2026-09-28. Methods, raw tables and every caveat: **[BENCHMARKS.md](BENCHMARKS.md)**.
+
+<p align="center"><img src="docs/assets/readme/benchmarks.png" alt="Two bar charts. Where it wins: 1,000 agents each fork, write 1,000 rows and merge, on disk with 64 workers: Chronos DB 713k to 716k rows per second, Dolt 2.3.5 28.3k, Postgres 17 template databases 9.8k. Where it loses: merge p50 with the same 1,000 agents on disk: Chronos DB with one thread per agent 714 to 718 ms, Postgres 17 with 25 workers 128 ms, Chronos DB with 25 workers 25 to 26 ms." width="820"></p>
 
 | Workload | Chronos DB | Rivals | |
 |---|---|---|---|
