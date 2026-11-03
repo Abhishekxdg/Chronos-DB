@@ -355,5 +355,5 @@ What changed in each release: [CHANGELOG.md](CHANGELOG.md). This release: [v0.4.
 
 ## License
 
-- **The engine** (`src/`, `tests/`, the Cargo build, `examples/*.rs`) **and the `chronos` binaries:** [Business Source License 1.1](LICENSE-ENGINE). You may use, change and redistribute it free of charge, including in production and inside commercial products. The one limit: you may not offer Chronos DB to others as a hosted or managed database service. Running it as your own application's database is fine. Each version becomes Apache 2.0 four years after it is published. It is source-available, not open source by the OSI's definition. Plain-language summary: [TERMS.md](TERMS.md).
-- **The Studio, the clients, the docs site and the guides' examples:** [MIT License](LICENSE).
+- **The engine** (`src/`, `tests/`, the Cargo build, `examples/*.rs`) **and the `chronos` binaries:** [Business Source License 1.1](LICENSE). You may use, change and redistribute it free of charge, including in production and inside commercial products. The one limit: you may not offer Chronos DB to others as a hosted or managed database service. Running it as your own application's database is fine. Each version becomes Apache 2.0 four years after it is published. It is source-available, not open source by the OSI's definition. Plain-language summary: [TERMS.md](TERMS.md).
+- **The Studio, the clients, the docs site and the guides' examples:** [MIT License](licenses/MIT.txt).

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **License files in the public repository:** the Business Source License is now `LICENSE` at the root (it was `LICENSE-ENGINE`), and the MIT License moved to `licenses/MIT.txt`, so GitHub no longer labels the whole repository MIT. No change to either license or to what each covers.
+
 ## 0.4.8 (beta), 2026-11-03
 
 **Counts read right, and rustls with its security fixes.** No change to how merges, checks or storage work from 0.4.7.

@@ -1,7 +1,7 @@
 # Chronos DB license, in plain words
 
 The `chronos` binaries in this repository's releases are built from the engine's source here, and
-both are under the [Business Source License 1.1](LICENSE-ENGINE). That file is what binds; this page
+both are under the [Business Source License 1.1](LICENSE). That file is what binds; this page
 says what it means in practice.
 
 - **You may** download, run, change and redistribute Chronos DB, free of charge, for any purpose,
@@ -15,6 +15,6 @@ says what it means in practice.
   Apache License 2.0, with no limit.
 - **No warranty:** as the license says, it is provided as is.
 
-The Studio, the clients, the docs site and the guides' examples are under the [MIT License](LICENSE).
+The Studio, the clients, the docs site and the guides' examples are under the [MIT License](licenses/MIT.txt).
 
 Questions about a use the limit might cover: open an issue.
