@@ -134,6 +134,98 @@ beside it (Postgres refuses only an exact duplicate of a unique key). Turn on `c
 merge policy with `check_reads`, plus `require_scope` if they must also declare what they change), or add a merge
 check (below) that finds the duplicates.
 
+### Writing as the end user (row-level security)
+
+By default the write-back runs as the role Chronos connects as (the attach role). That role must see every row, so
+Postgres's row-level security never judges what it writes. For an agent that works for one of your users, give it
+that user's Postgres role and session settings, and its writes are judged as that user's own:
+
+```sql
+create agent run_42 with (
+  can = 'read,fork,write_own,merge_own', tenant = 'org_id = 42',
+  pg_role = 'authenticated',
+  pg_settings = '{"request.jwt.claims": {"sub": "u-17", "role": "authenticated"}}'
+);
+```
+
+```sql
+grant authenticated to chronos_attach;  -- once: SET ROLE needs the attach role to be a member
+```
+
+- **How it runs.** In a write-back of a world this agent forked, rows are locked and compared as the attach role,
+  as always. Then `SET LOCAL ROLE authenticated` runs, and `set_config(name, value, true)` for each setting. The
+  inserts, updates, deletes and deferred triggers run as that role. `RESET ROLE` follows, and the counts, merge
+  checks and the merge's own row run as the attach role again. Everything is still one transaction.
+- **What Postgres judges.** Postgres judges each write with its own grants and policies, using the claims (Supabase's
+  `auth.uid()` reads `request.jwt.claims`). A row the policies hide from an update or delete is one the statement
+  doesn't write. A row their `WITH CHECK` refuses is an error. Either way the merge is refused with `42501`, which
+  names the role and the settings (never their values), and nothing is written.
+- **Who the merge runs as.** A person who merges or approves the world still writes as the end user. So do
+  `MERGE ... REHEARSE` and a merge by the agent itself. A world keeps whom it was forked for: changing or dropping
+  the agent's role later doesn't change worlds it already forked.
+- **Rules.** Only an admin sets `pg_role` and `pg_settings`. Settings must be custom ones (`prefix.name`, such as
+  `request.jwt.claims` or `app.user_id`), at most 32 of them. A value that isn't text is stored as its JSON text.
+  `pg_settings` need a `pg_role`, and `pg_role = ''` removes both. A superuser or `BYPASSRLS` role is refused,
+  since it reads past row-level security.
+- **Gateway.** Chronos Gateway sets these per run from `act_as` in `POST /v1/runs`.
+
+### Write-back rules (`writeback.json`)
+
+Every column is compared and written by default. To change that table by table, put a `writeback.json` in the
+attached folder (or point `CHRONOS_WRITEBACK_RULES` at the file) and keep it in git, reviewed like code. It is read
+again at every merge into main, so a change takes effect at the next merge. A file that doesn't parse, or a rule
+naming a column the table doesn't have, refuses merges (`write-back rules: ...`) rather than writing with rules
+nobody meant.
+
+```json
+{
+  "mode": "enforce",
+  "isolation": "read committed",
+  "tables": {
+    "inventory": { "delta": ["stock"], "ignore": ["seen_at"], "check": "stock >= 0" },
+    "leads":     { "keep_live": ["last_seen"] },
+    "notes":     { "procedure": "app.apply_notes", "outbox": "app.chronos_outbox" }
+  }
+}
+```
+
+| Rule | What it does | For |
+|---|---|---|
+| `delta` | Numeric columns written as increments: `stock = stock + (world's value - main's value)`. They are never compared, so the app changing them doesn't make merges conflict. Inside Chronos, a row both sides changed combines as `theirs + ours - base`. | Stock, balances, counters |
+| `ignore` | Columns not compared: the world's value is written whatever Postgres holds (last writer wins). | `updated_at`, notes |
+| `keep_live` | Columns not compared and not written by an update: Postgres's value stays. | `last_seen`, app-owned fields |
+| `check` | A condition every row the merge updates or inserts must meet in Postgres, after the writes and before `COMMIT`. Rows that break it hold the merge, as a merge check does. A NULL answer passes, as with a `CHECK` constraint. | Invariants nobody wrote as a constraint |
+| `writable` | A condition every row the merge updates or deletes must meet in Postgres as it is now, checked on the locked rows before any write. A row that doesn't refuses the merge with `42501`. | Closed deals, paid invoices |
+| `scope` | The rows a merge may reach, as any SQL condition (several columns, a subquery, `current_setting('app.org_id')` from the agent's `pg_settings`): checked on the rows it updates or deletes before the writes, and on the rows it leaves after them, so a merge can't reach past it or move a row out of it. | Tenancy that isn't one column |
+| `resolver` | Your function `f(main jsonb, world jsonb, postgres jsonb) returns jsonb` settles a row the world and Postgres both updated, instead of refusing the merge. The row it returns is written (columns it leaves out keep the world's values; null keeps Postgres's row), and main takes it. It can't change the key. | Rows the app and agents both edit |
+| `procedure` | Your function `f(changes jsonb) returns bigint` is called in place of the inserts, updates and deletes, after the rows are locked and compared. It must return how many changes it applied, and main then takes the table from Postgres. | Writes that must go through the app's own logic |
+| `outbox` | Each changed row is inserted into this table in the same transaction: `merge_id, world, table_name, op, key, before, after, at`. Your worker acts on it after `COMMIT`. | Emails, API calls, events |
+| `mode: "observe"` | Every write-back runs whole (locks, writes, checks), then rolls back. The merge is refused and says what it would have written. | The first weeks |
+| `isolation: "serializable"` | Write-backs run at `SERIALIZABLE`, so Postgres refuses one that forms write skew with a concurrent transaction. | Invariants across rows |
+
+`changes`, for a procedure and the outbox alike, is a list of
+`{"op": "insert"|"update"|"delete", "key": {...}, "before": {...}|null, "after": {...}|null}`, with each value as
+Postgres's text. The rules file is trusted like code: `check`, `procedure` and `outbox` run as the attach role.
+
+### Big merges: `IN CHUNKS OF n`
+
+One write-back holds every row's lock until `COMMIT`, and a merge is limited to 50,000 rows
+(`CHRONOS_ATTACH_MAX_ROWS`). `merge world backfill in chunks of 5000` merges 5,000 rows at a time, each chunk a merge
+and a write-back transaction of its own, until nothing is left, and then merges the world itself. A failure stops
+it with how far it got: the chunks already merged stay merged, and running the statement again carries on from
+there. Only people and admins may chunk a merge, since each chunk would otherwise pass an agent's policy
+`max_rows` on its own.
+
+### How many round trips a merge takes
+
+A write-back sends its statements in pipelines: several statements go in one write, and their answers are read
+after. A small merge into one or several tables takes five round trips to Postgres, whatever kinds of changes it
+makes: the start (with each table's shape and the counts), locking and comparing every row, the writes, the
+deferred triggers (with `RESET ROLE` and the counts), and the merge's row with `COMMIT`. Writing as the end user
+adds one. A write sends at most 16 KB, so a big chunk still goes a statement at a time, and a write can never wait
+on a server that is itself waiting to send answers. A rehearsal with `FAIL AT n` runs one statement at a time,
+since it stops after the nth.
+
 ### Merge checks against live Postgres
 
 A [merge check](../reference/worlds.md#merge-checks) runs first on main, Chronos's copy, as for any merge. A row added straight in
@@ -348,6 +440,27 @@ For an agent working for one of your customers, `create agent run_42 with (tenan
   REVIEWS`, `SHOW AUDIT` or the whole `SHOW HISTORY`; the row API is refused on tables the tenant limits (SQL
   applies it), and its writes on shared tables;
 - its token stops working once `valid_for` has passed.
+
+## Loading a tenant at a time (`--lazy-tenant`)
+
+A multi-tenant database is often too big to copy whole, and an agent only ever works for one tenant.
+`chronos attach shop --tables orgs,leads,notes --lazy-tenant org_id` copies the tables without an `org_id`
+column whole, and makes the others empty:
+
+- a table with the column starts empty;
+- so does a table without it whose foreign key points straight at one with it (`notes.lead_id` to `leads`):
+  its rows are loaded with their parent's. A table two foreign keys down is refused, naming the fix (add the
+  column, or leave it out);
+- the first time a world is forked from main for a tenant, main takes that tenant's rows from Postgres, and then the
+  world is made. This happens when an agent holds `tenant = 'org_id = 42'`, or a person runs
+  `create world w with (tenant = 'org_id = 42')`. It is one read (`REPEATABLE READ`, read only), and Postgres's
+  index on the column makes it quick. Later forks for the same tenant cost nothing more;
+- `chronos refresh shop --tenant 42` loads a tenant ahead of time;
+- refreshes and `serve --follow` read only the tenants loaded, and the folder's record keeps the list
+  (`attached.json`, `lazy.loaded`).
+
+A world forked for no tenant sees only the tenants loaded so far. A world forked from another world starts from
+that world's rows, so nothing is loaded for it.
 
 ## After a crash
 

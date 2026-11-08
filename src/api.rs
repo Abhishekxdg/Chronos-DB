@@ -567,6 +567,10 @@ fn agent(a: &chronos::Agent) -> Value {
         "world_ttl": a.world_ttl, "max_query_ms": a.max_query_ms, "max_concurrent": a.max_concurrent,
         "max_memory_mb": a.max_memory_mb, "max_idle_ms": a.max_idle_ms, "max_threads": a.max_threads, "priority": a.priority.name(), "created": a.created, "disabled": a.disabled, "policy": a.policy,
         "tenant": a.tenant_sql(), "expires": (a.expires > 0).then_some(a.expires),
+        // whom its worlds are written back to Postgres as: the role, and the settings' names (their values may be an
+        // end user's claims, shown to no one)
+        "pg_role": a.act_as.as_ref().and_then(|w| w["role"].as_str()),
+        "pg_settings": a.act_as.as_ref().map(|w| w["settings"].as_object().map_or(vec![], |o| o.keys().cloned().collect::<Vec<_>>())),
         // made before agents had SCRAM verifiers: one login over HTTP with its token makes it one (see `admit`)
         "needs_http_login": a.verifier().is_none(),
     })
@@ -613,6 +617,13 @@ fn agent_spec(a: &Value) -> Result<chronos::AgentSpec, Fail> {
         policy,
         tenant: a.get("tenant").cloned(),
         valid_for: num("valid_for"),
+        pg_role: match a.get("pg_role") {
+            None => None,
+            Some(Value::Null) => Some(String::new()), // none
+            Some(Value::String(r)) => Some(r.clone()),
+            Some(_) => return Err(bad("'pg_role' must be a Postgres role's name, or null for none")),
+        },
+        pg_settings: a.get("pg_settings").cloned(),
     })
 }
 

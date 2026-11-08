@@ -128,7 +128,7 @@ merge world fix_leads;         -- written to Postgres in one transaction, then h
 
 At `merge world`, Chronos runs its own checks, then opens one Postgres transaction. It locks each row the world changed and compares it with what Chronos last saw. If any row changed in Postgres meanwhile, nothing is written and the merge returns those rows as conflicts. Otherwise it applies the changes, runs your checks on the result, and commits. Values your Postgres triggers or defaults set come back into Chronos.
 
-Requirements and limits are under [Where it stands](#where-it-stands). The full guide, including refresh, undo and a restore drill: [Working beside your Postgres](docs/guides/attach-postgres.md).
+Requirements and limits are under [Where it stands](#where-it-stands). The full guide, including refresh, undo and a restore drill: [Working beside your Postgres](docs/guides/attach-postgres.md). For a big multi-tenant database, `--lazy-tenant org_id` copies a tenant's rows the first time a world is forked for it. MySQL 8.0+ and MariaDB 10.5+ work too: [Attach beside MySQL](docs/guides/attach-mysql.md).
 
 ### B. On its own (`chronos serve`)
 

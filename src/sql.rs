@@ -8735,6 +8735,9 @@ enum Stmt {
         into: Option<String>,
         only_tables: Vec<String>,
         only_keys: Vec<String>,
+        /// IN CHUNKS OF n: merged n rows at a time, each chunk its own merge (in an attached folder, its own
+        /// write-back transaction), until the world has nothing left to merge (see `Core::merge_in_chunks`)
+        chunks: Option<usize>,
     },
     Begin,
     /// BEGIN / START TRANSACTION with a mode given: READ ONLY or READ WRITE, an isolation level
@@ -10799,6 +10802,7 @@ struct Parser {
     peak: usize,                    // the deepest `depth` since it was last reset
     copied: std::cell::Cell<usize>, // tokens copied into the statement (see `spend`)
     stack: usize,                   // where the stack was when reading began (see `deeper`)
+    based: bool,                    // `stack` was taken inside the first statement's frame (see `stmt_plain`)
     inside: bool,                   // reading an expression that `expr` measures when it ends
     pins: Vec<Arc<str>>,            // the type names not looked up yet the statement names (see `Unresolved`)
     /// where each token starts in the text, and how long the text is, in characters (empty for a
@@ -10900,6 +10904,7 @@ impl Parser {
             peak: 0,
             copied: Default::default(),
             stack: stack_at(),
+            based: false,
             inside: false,
             pins: vec![],
             starts: vec![],
@@ -11712,6 +11717,13 @@ impl Parser {
     }
 
     fn stmt_plain(&mut self) -> Result<Stmt> {
+        // MAX_STACK counts from inside this frame, not from where the parser was made: the frame holds no nesting,
+        // and a debug build's is about 180 KB (psql's \dp then took 1.1 MB in all on arm64, and was refused). Once:
+        // a statement inside another (EXPLAIN, a function's body) counts from the first's.
+        if !self.based {
+            self.based = true;
+            self.stack = stack_at();
+        }
         let w = match self.peek() {
             Some(Tok::Word(w)) => w.clone(),
             Some(Tok::Sym("(")) => {
@@ -12792,6 +12804,7 @@ impl Parser {
                     into: c.into,
                     only_tables: c.only_tables,
                     only_keys: c.only_keys,
+                    chunks: c.chunks,
                 })
             }
             "rebase" if self.kw("world") || self.kw("branch") => {
@@ -12809,6 +12822,7 @@ impl Parser {
                     || c.target.is_some()
                     || !c.only_tables.is_empty()
                     || !c.only_keys.is_empty()
+                    || c.chunks.is_some()
                 {
                     return self.fail("REBASE WORLD takes USING, BY COLUMNS, RESOLVE and AT VERSION; not INTO, ONLY, CONFIRM or DRY RUN");
                 }
@@ -14674,6 +14688,14 @@ impl Parser {
             } else if self.kw("dry") {
                 self.expect_kw("run")?;
                 c.dry = true;
+            } else if self.kw("in") {
+                // IN CHUNKS OF n: merged n rows at a time, each its own merge (and write-back), until none are left
+                self.expect_kw("chunks")?;
+                self.expect_kw("of")?;
+                c.chunks = match self.next() {
+                    Some(Tok::Num(n)) if n.parse::<usize>().is_ok_and(|n| n > 0) => n.parse().ok(),
+                    _ => return self.fail("expected the rows per chunk (1, 2, ...) after IN CHUNKS OF"),
+                };
             } else if self.kw("rehearse") {
                 // REHEARSE [FAIL AT n]: a dry run whose write-back runs in Postgres and is rolled back (attached folders)
                 c.dry = true;
@@ -25042,6 +25064,15 @@ fn agent_spec(j: &Json) -> Result<crate::AgentSpec> {
                 spec.disabled = Some(v.as_bool().ok_or_else(|| bad("disabled must be true or false".into()))?)
             }
             "tenant" => spec.tenant = Some(v.clone()),
+            "pg_role" => {
+                spec.pg_role = Some(match v {
+                    Json::Null => String::new(), // none
+                    v => {
+                        v.as_str().ok_or_else(|| bad("pg_role must be a Postgres role's name, or null".into()))?.into()
+                    }
+                })
+            }
+            "pg_settings" => spec.pg_settings = Some(v.clone()),
             "valid_for" => {
                 spec.valid_for = Some(match v {
                     Json::String(s) => {
@@ -30651,6 +30682,8 @@ struct MergeClauses {
     into: Option<String>,
     only_tables: Vec<String>,
     only_keys: Vec<String>,
+    /// IN CHUNKS OF n (see `Stmt::MergeBranch`)
+    chunks: Option<usize>,
 }
 
 /// What an index read in ORDER BY's order gave (see `Exec::ordered`): the query's output, or the rows for it to run
@@ -38089,6 +38122,8 @@ impl Session {
             Stmt::CreateDatabase(_) | Stmt::DropDatabase { .. } => me.may_admin()?, // worlds with no owner
             Stmt::Simulate(_) | Stmt::Replay { .. } => {} // checked as it runs: its worlds are the agent's
             // (a rehearsal writes to Postgres, locking the rows, if only to roll back: as a merge's)
+            // chunks split one merge into many, each under the policy's max_rows: for those who may do anything
+            Stmt::MergeBranch { chunks: Some(_), .. } => me.may_admin()?,
             Stmt::MergeBranch { name, rehearse: Some(_), .. } => me.may_merge(&world(name))?,
             Stmt::MergeBranch { name, dry: true, .. } => me.may_see_changes(&world(name))?,
             Stmt::MergeBranch { name, into: Some(into), .. } => me.may_merge_into(&world(name), into)?,
@@ -42134,6 +42169,7 @@ impl Statement {
                     ("tenant", Type::Text),
                     ("expires", Type::TimestampTz),
                     ("priority", Type::Text),
+                    ("pg_role", Type::Text),
                 ]);
             }
             Stmt::ShowPolicies | Stmt::CreatePolicy { .. } | Stmt::AlterPolicy { .. } => {
@@ -42974,6 +43010,7 @@ impl Statement {
                 into,
                 only_tables,
                 only_keys,
+                chunks,
             } => {
                 let b = &db.world(name.as_deref().unwrap_or(branch))?.name;
                 let expected = match (version, confirm) {
@@ -42992,6 +43029,29 @@ impl Statement {
                     target: *target,
                     confirm_deletes: *confirm_deletes,
                 };
+                if let Some(n) = chunks {
+                    if *dry
+                        || o.into.is_some()
+                        || !o.only_tables.is_empty()
+                        || !o.only_keys.is_empty()
+                        || o.expected.is_some()
+                        || !o.picks.is_empty()
+                    {
+                        return Err(SqlError {
+                            code: "42601",
+                            message: "MERGE WORLD ... IN CHUNKS OF n takes USING and BY COLUMNS; not INTO, ONLY, \
+                                      RESOLVE, AT VERSION, CONFIRM or DRY RUN (each chunk is a merge of its own)"
+                                .into(),
+                            info: None,
+                        });
+                    }
+                    let done = db.merge_in_chunks(b, &o, *n)?;
+                    notice(
+                        "NOTICE",
+                        format!("{b}: {} rows merged in {} chunks of at most {n}", done.rows, done.chunks),
+                    );
+                    return Ok(Output::tag(format!("MERGE {}", done.rows)));
+                }
                 if !*dry {
                     let into = match &o.into {
                         Some(y) => y.clone(),
@@ -43476,6 +43536,11 @@ impl Statement {
                                 e => Value::TimestampTz(e as i64 * 1000),
                             },
                             Value::Text(a.priority.name().into()),
+                            // the Postgres role its worlds are written back as (its settings' values aren't shown)
+                            a.act_as
+                                .as_ref()
+                                .and_then(|w| w["role"].as_str())
+                                .map_or(Value::Null, |r| Value::Text(r.into())),
                         ]
                     })
                     .collect();

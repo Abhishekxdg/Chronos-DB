@@ -1168,3 +1168,65 @@ fn runs_are_recorded_and_undone_one_at_a_time() {
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// An agent can be given the Postgres role and settings its worlds are written back as (`pg_role`, `pg_settings`):
+/// custom settings only, none without a role, a non-text value kept as its JSON text; SHOW AGENTS shows the role, never
+/// the settings' values; no world can be given them by metadata; and `pg_role = ''` takes both away.
+#[test]
+fn an_agent_writes_back_as_a_postgres_role() {
+    use chronos::sql::run;
+    let db = Db::new();
+    let made = run(
+        &db,
+        MAIN,
+        r#"create agent run17 with (can = 'read,fork,write_own,merge_own', pg_role = 'authenticated',
+           pg_settings = '{"request.jwt.claims": {"sub": "u-17", "role": "authenticated"}, "app.user_id": "17"}')"#,
+        &[],
+    );
+    made.unwrap_or_else(|e| panic!("{}", e.message));
+    let a = db.agent("run17").unwrap();
+    let who = a.act_as.clone().unwrap();
+    assert_eq!(who["role"], "authenticated");
+    assert_eq!(who["settings"]["request.jwt.claims"], r#"{"role":"authenticated","sub":"u-17"}"#);
+    assert_eq!(who["settings"]["app.user_id"], "17");
+
+    let shown = run(&db, MAIN, "show agents", &[]).unwrap().pop().unwrap();
+    let at = shown.columns.as_ref().unwrap().iter().position(|(n, _)| n == "pg_role").unwrap();
+    assert_eq!(shown.rows[0][at].to_text(), "authenticated");
+    let all: Vec<String> = shown.rows[0].iter().map(|v| v.to_text()).collect();
+    assert!(!all.join(" ").contains("u-17"), "the settings' values aren't shown: {all:?}");
+
+    // Postgres's own settings, names that aren't settings', and settings with no role: refused
+    for bad in ["statement_timeout", "role", "search_path", "a..b", "1x.y", "app.user-id", "app.x; drop"] {
+        let sql = format!(r#"alter agent run17 set (pg_settings = '{{"{bad}": "1"}}')"#);
+        let e = run(&db, MAIN, &sql, &[]).unwrap_err();
+        assert_eq!(e.code, "22023", "{bad}: {}", e.message);
+    }
+    let e = run(&db, MAIN, r#"create agent loose with (pg_settings = '{"app.user_id": "1"}')"#, &[]).unwrap_err();
+    assert!(e.message.contains("need a pg_role"), "{}", e.message);
+    let e = run(&db, MAIN, &format!("alter agent run17 set (pg_role = '{}')", "r".repeat(64)), &[]).unwrap_err();
+    assert_eq!(e.code, "22023", "{}", e.message);
+    assert_eq!(db.agent("run17").unwrap().act_as, Some(who.clone()), "unchanged by what was refused");
+
+    // its worlds carry it (not in the metadata anyone reads), and no world can be given it by metadata
+    let me = db.as_agent("run17").unwrap();
+    let w = me.fork(MAIN, "w", serde_json::json!({"task": 1})).unwrap();
+    assert_eq!(w.meta, serde_json::json!({"task": 1}));
+    drop(me);
+    assert!(db.fork_with(MAIN, "sneaky", serde_json::json!({"_sonos_act_as": {"role": "postgres"}})).is_err());
+    assert!(db.set_meta("w", serde_json::json!({"_sonos_act_as": {"role": "postgres"}})).is_err());
+
+    // the agent can't change whom it writes as
+    let mut s = chronos::sql::Session::new(MAIN);
+    s.agent = Some("run17".into());
+    let e = s.run(&db, "alter agent run17 set (pg_role = 'postgres')", &[]).unwrap_err();
+    assert_eq!(e.code, "42501", "{}", e.message);
+    assert_eq!(db.agent("run17").unwrap().act_as, Some(who.clone()));
+
+    // settings changed alone keep the role; the role taken away takes the settings too
+    run(&db, MAIN, r#"alter agent run17 set (pg_settings = '{"app.user_id": "18"}')"#, &[]).unwrap();
+    let a = db.agent("run17").unwrap().act_as.unwrap();
+    assert_eq!((a["role"].as_str(), a["settings"].as_object().unwrap().len()), (Some("authenticated"), 1));
+    run(&db, MAIN, "alter agent run17 set (pg_role = '')", &[]).unwrap();
+    assert_eq!(db.agent("run17").unwrap().act_as, None);
+}

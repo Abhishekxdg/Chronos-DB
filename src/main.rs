@@ -182,6 +182,8 @@ fn main() {
     let pg_listen = flag(&["--pg"]).unwrap_or_else(|| "127.0.0.1:5433".into());
     let schema = flag(&["--schema"]);
     let attach_tables = flag(&["--tables"]);
+    let lazy_tenant = flag(&["--lazy-tenant"]);
+    let load_tenant = flag(&["--tenant"]);
     let source_file = flag(&["--source-file"]);
     let refresh_every = flag(&["--refresh-every"]);
     let port = flag(&["--port"]);
@@ -265,7 +267,21 @@ fn main() {
         let split = |v: &Option<String>| -> Vec<String> {
             v.iter().flat_map(|s| s.split(',')).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
         };
-        if let Err(e) = pgimport::attach(&args[1], &opts, &split(&attach_tables), &split(&schema), yes) {
+        let lazy = lazy_tenant.as_deref().map(str::trim).filter(|c| !c.is_empty());
+        // a MySQL (or MariaDB) source: its own attach (see chronos::attach's mysql module)
+        if chronos::attach::source_text().is_ok_and(|u| chronos::myclient::is_mysql(&u)) {
+            let out = match (&schema, lazy) {
+                (Some(_), _) => Err("--schema is for Postgres: name MySQL's tables with --tables a,b".to_string()),
+                (_, Some(_)) => Err("--lazy-tenant works with a Postgres source only for now".to_string()),
+                _ => chronos::attach::attach_mysql(&args[1], &opts, &split(&attach_tables), yes),
+            };
+            if let Err(e) = out {
+                eprintln!("chronos attach: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        if let Err(e) = pgimport::attach(&args[1], &opts, &split(&attach_tables), &split(&schema), lazy, yes) {
             eprintln!("chronos attach: {e}");
             std::process::exit(1);
         }
@@ -274,7 +290,10 @@ fn main() {
     // chronos refresh <attached folder>: main takes Postgres's rows as they are now (see chronos::attach::refresh)
     if args[0] == "refresh" {
         if args.len() != 2 {
-            eprintln!("usage: chronos refresh <attached folder> [--unfollow]   (CHRONOS_SOURCE_URL, or --source-file)");
+            eprintln!(
+                "usage: chronos refresh <attached folder> [--unfollow | --tenant <value>]   (CHRONOS_SOURCE_URL, or \
+                 --source-file)"
+            );
             std::process::exit(2);
         }
         let opts = chronos::Open {
@@ -296,6 +315,26 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        // --tenant 42: main takes that tenant's rows now, in a folder attached with --lazy-tenant (a fork for the
+        // tenant does it too: see chronos::attach::load_tenant)
+        if let Some(v) = &load_tenant {
+            let code = match chronos::attach::load_tenant(&db, v.trim()) {
+                Ok(0) => {
+                    println!("tenant {v}: main has its rows already");
+                    0
+                }
+                Ok(n) => {
+                    println!("tenant {v}: main took {n} rows from Postgres");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("chronos refresh --tenant: {e}");
+                    1
+                }
+            };
+            let _ = db.close();
+            std::process::exit(code);
+        }
         if unfollow {
             let code = match chronos::attach::unfollow(&db) {
                 Ok(true) => {

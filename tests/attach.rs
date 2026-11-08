@@ -997,6 +997,343 @@ fn a_tenants_read_of_a_big_child_table_is_checked_by_its_tenants_rows() {
     drop_db(&name);
 }
 
+/// An agent given an end user's Postgres role and claims (`pg_role`, `pg_settings`) has its worlds written back as
+/// that role: Postgres's own row-level security judges each write with the claims, so a row of the end user's is
+/// written, and one of another user's (an update the policy hides, an insert it refuses) refuses the merge, saying
+/// whose rights it was written with, and nothing is written. It is the same when a person merges the world. A role
+/// that reads past row-level security (a superuser) is refused, as it would judge nothing.
+#[test]
+fn an_agent_writes_back_as_the_end_users_role() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("actas") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    // roles are the server's, not the database's: made once, kept
+    pg.batch_execute(
+        "do $$ begin create role chronos_test_end_user nologin; exception when duplicate_object then null; end $$;
+         create table leads (id int primary key, owner text not null, name text);
+         insert into leads values (1, 'u-17', 'mine'), (2, 'u-99', 'theirs');
+         grant chronos_test_end_user to current_user;
+         grant select, insert, update, delete on leads to chronos_test_end_user;
+         alter table leads enable row level security;
+         create policy own on leads to chronos_test_end_user
+             using (owner = current_setting('request.jwt.claims', true)::json ->> 'sub')
+             with check (owner = current_setting('request.jwt.claims', true)::json ->> 'sub');",
+    )
+    .unwrap();
+    let dir = folder("actas");
+    let (ok, out) = attach(&dir, &["--tables", "leads", "--yes"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    let sql = r#"create agent run17 with (can = 'read,fork,write_own,merge_own', pg_role = 'chronos_test_end_user',
+                 pg_settings = '{"request.jwt.claims": {"sub": "u-17"}}')"#;
+    run(&db, MAIN, sql, &[]).unwrap_or_else(|e| panic!("{}", e.message));
+    let agent = || {
+        let mut s = Session::new(MAIN);
+        s.agent = Some("run17".into());
+        s
+    };
+    let work = |w: &str, sql: &str| {
+        agent().run(&db, &format!("create world {w}; use world {w}; {sql}; use world main"), &[]).unwrap();
+    };
+    let refused = |pg: &mut postgres::Client, w: &str| {
+        let e = run(&db, MAIN, &format!("merge world {w}"), &[]).unwrap_err();
+        assert_eq!(e.code, "42501", "{}", e.message);
+        assert!(
+            e.message.contains("written as Postgres role chronos_test_end_user with request.jwt.claims"),
+            "{}",
+            e.message
+        );
+        assert!(!e.message.contains("u-17"), "the claims aren't shown: {}", e.message);
+        assert_eq!(
+            pg_cell(pg, "select string_agg(name, ',' order by id) from leads"),
+            "called,theirs",
+            "nothing written"
+        );
+        assert_eq!(pg_cell(pg, "select count(*) from leads"), "2");
+        run(&db, MAIN, &format!("drop world {w}"), &[]).unwrap();
+    };
+
+    // its end user's row: written (merged by a person, as one approves a held run: still as the end user)
+    work("mine", "update leads set name = 'called' where id = 1");
+    run(&db, MAIN, "merge world mine", &[]).unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(pg_cell(&mut pg, "select name from leads where id = 1"), "called");
+
+    // another user's row: the policy hides it from the update, which writes no row
+    work("others", "update leads set name = 'taken' where id = 2");
+    refused(&mut pg, "others");
+    // a row for another user: the policy refuses the insert
+    work("planted", "insert into leads values (3, 'u-99', 'planted')");
+    refused(&mut pg, "planted");
+    // and a delete of another user's row, among one of its own: nothing written
+    work("both", "update leads set name = 'again' where id = 1; delete from leads where id = 2");
+    refused(&mut pg, "both");
+
+    // a world forked before the agent changes is written as whom it was forked for
+    work("kept", "update leads set name = 'kept' where id = 2");
+    run(&db, MAIN, "alter agent run17 set (pg_role = '')", &[]).unwrap();
+    refused(&mut pg, "kept");
+
+    // a role that reads past row-level security judges nothing: refused (where the test's role is one)
+    let me = pg_cell(&mut pg, "select current_user");
+    if pg_cell(&mut pg, "select rolsuper or rolbypassrls from pg_roles where rolname = current_user") == "t" {
+        run(&db, MAIN, &format!("alter agent run17 set (pg_role = '{me}')"), &[]).unwrap();
+        work("past", "update leads set name = 'past' where id = 2");
+        let e = run(&db, MAIN, "merge world past", &[]).unwrap_err();
+        assert!(e.message.contains("superuser or has BYPASSRLS"), "{}", e.message);
+        assert_eq!(pg_cell(&mut pg, "select name from leads where id = 2"), "theirs");
+        run(&db, MAIN, "drop world past", &[]).unwrap();
+        run(&db, MAIN, "alter agent run17 set (pg_role = '')", &[]).unwrap();
+    }
+
+    // without a role, the attach role's, as before
+    work("plain", "update leads set name = 'plain' where id = 2");
+    run(&db, MAIN, "merge world plain", &[]).unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(pg_cell(&mut pg, "select name from leads where id = 2"), "plain");
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+/// Write-back rules (`writeback.json` in the folder) shape how merges reach Postgres, table by table: a delta column
+/// is written as an increment and never conflicts, an ignored column isn't compared, a check holds a merge whose rows
+/// break it, a procedure applies a table's changes through the app's own function, an outbox records each change in
+/// the same transaction, observe mode runs the write-back and rolls it back, and a file that isn't rules refuses
+/// merges. A world that changes many rows merges IN CHUNKS OF n, each chunk its own transaction.
+#[test]
+fn write_back_rules_shape_each_tables_writes() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("rules") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table inventory (id int primary key, sku text not null, stock int not null, seen text);
+         insert into inventory select g, 'sku ' || g, 10, 'then' from generate_series(1, 30) g;
+         create table notes (id int primary key, body text not null, source text);
+         create table deals (id int primary key, stage text not null, amount int not null);
+         insert into deals values (1, 'open', 100);
+         create function settle_deal(main jsonb, world jsonb, live jsonb) returns jsonb language sql as
+             $$ select live || jsonb_build_object('amount', world->>'amount') $$;
+         create table chronos_outbox (merge_id text, world text, table_name text, op text, key jsonb, before jsonb,
+                                      after jsonb, at timestamptz);
+         create function apply_notes(changes jsonb) returns bigint language plpgsql as $$
+         declare c jsonb; n bigint := 0;
+         begin
+           for c in select * from jsonb_array_elements(changes) loop
+             if c->>'op' = 'insert' then
+               insert into notes values ((c->'after'->>'id')::int, c->'after'->>'body', 'apply_notes');
+             elsif c->>'op' = 'update' then
+               update notes set body = c->'after'->>'body', source = 'apply_notes' where id = (c->'key'->>'id')::int;
+             else
+               delete from notes where id = (c->'key'->>'id')::int;
+             end if;
+             n := n + 1;
+           end loop;
+           return n;
+         end $$;",
+    )
+    .unwrap();
+    let dir = folder("rules");
+    let (ok, out) = attach(&dir, &["--tables", "inventory,notes,deals", "--yes"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    let rules = |r: &str| std::fs::write(dir.join("writeback.json"), r).unwrap();
+    rules(
+        r#"{"tables": {
+             "inventory": {"delta": ["stock"], "ignore": ["seen"], "check": "stock >= 0", "writable": "sku <> 'gone'"},
+             "notes": {"procedure": "apply_notes", "outbox": "chronos_outbox"},
+             "deals": {"resolver": "settle_deal"}}}"#,
+    );
+
+    // the app sells 2 while the world sells 3: both count, no conflict
+    run(&db, MAIN, "create world sell", &[]).unwrap();
+    run(&db, "sell", "update inventory set stock = stock - 3, seen = 'world' where id = 1", &[]).unwrap();
+    pg.batch_execute("update inventory set stock = stock - 2, seen = 'app' where id = 1").unwrap();
+    run(&db, MAIN, "merge world sell", &[]).unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(pg_cell(&mut pg, "select stock || ' ' || seen from inventory where id = 1"), "5 world");
+    assert_eq!(cell(&db, MAIN, "select stock from inventory where id = 1"), "5", "main takes Postgres's count");
+
+    // the same, with main already holding the app's sale (a refresh): combined inside Chronos as theirs + ours - base
+    run(&db, MAIN, "create world again", &[]).unwrap();
+    run(&db, "again", "update inventory set stock = stock - 1 where id = 2", &[]).unwrap();
+    pg.batch_execute("update inventory set stock = stock - 4 where id = 2").unwrap();
+    chronos::attach::refresh(&db).unwrap();
+    run(&db, MAIN, "merge world again", &[]).unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(pg_cell(&mut pg, "select stock from inventory where id = 2"), "5");
+
+    // selling more than is left breaks the check, in Postgres: held, nothing written
+    run(&db, MAIN, "create world oversell", &[]).unwrap();
+    run(&db, "oversell", "update inventory set stock = stock - 4 where id = 1", &[]).unwrap();
+    pg.batch_execute("update inventory set stock = stock - 3 where id = 1").unwrap();
+    let e = run(&db, MAIN, "merge world oversell", &[]).unwrap_err();
+    assert!(e.message.contains("tables.inventory.check"), "{}", e.message);
+    assert_eq!(pg_cell(&mut pg, "select stock from inventory where id = 1"), "2", "nothing written");
+    run(&db, MAIN, "drop world oversell", &[]).unwrap();
+
+    // a row the rules say is settled (writable): refused before anything is written
+    pg.batch_execute("update inventory set sku = 'gone' where id = 4").unwrap();
+    chronos::attach::refresh(&db).unwrap(); // (main holds it too: no conflict, the rule alone refuses)
+    run(&db, MAIN, "create world touch", &[]).unwrap();
+    run(&db, "touch", "update inventory set stock = 9 where id = 4", &[]).unwrap();
+    let e = run(&db, MAIN, "merge world touch", &[]).unwrap_err();
+    assert_eq!(e.code, "42501", "{}", e.message);
+    assert!(e.message.contains("tables.inventory.writable"), "{}", e.message);
+    assert_eq!(pg_cell(&mut pg, "select stock from inventory where id = 4"), "10");
+    run(&db, MAIN, "drop world touch", &[]).unwrap();
+
+    // both sides changed a deal's stage: the resolver keeps Postgres's stage and the world's amount, main takes it
+    run(&db, MAIN, "create world deal", &[]).unwrap();
+    run(&db, "deal", "update deals set stage = 'won', amount = 200 where id = 1", &[]).unwrap();
+    pg.batch_execute("update deals set stage = 'lost' where id = 1").unwrap();
+    run(&db, MAIN, "merge world deal", &[]).unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(pg_cell(&mut pg, "select stage || ' ' || amount from deals where id = 1"), "lost 200");
+    assert_eq!(cell(&db, MAIN, "select stage || ' ' || amount from deals where id = 1"), "lost 200");
+
+    // notes go through apply_notes, and each change is in the outbox, in the same transaction
+    run(&db, MAIN, "create world note", &[]).unwrap();
+    run(&db, "note", "insert into notes (id, body) values (1, 'call back'), (2, 'sent quote')", &[]).unwrap();
+    run(&db, MAIN, "merge world note", &[]).unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(pg_cell(&mut pg, "select count(*) from notes where source = 'apply_notes'"), "2");
+    assert_eq!(cell(&db, MAIN, "select source from notes where id = 1"), "apply_notes", "main takes the table");
+    assert_eq!(
+        pg_cell(&mut pg, "select string_agg(op || ' ' || (key->>'id'), ',' order by key->>'id') from chronos_outbox"),
+        "insert 1,insert 2"
+    );
+
+    // a scope: a row the merge would leave outside it is refused, nothing written
+    rules(r#"{"tables": {"deals": {"scope": "id < 100"}}}"#);
+    run(&db, MAIN, "create world far", &[]).unwrap();
+    run(&db, "far", "insert into deals values (500, 'open', 1)", &[]).unwrap();
+    let e = run(&db, MAIN, "merge world far", &[]).unwrap_err();
+    assert!(e.message.contains("tables.deals.check or .scope (id < 100)"), "{}", e.message);
+    assert_eq!(pg_cell(&mut pg, "select count(*) from deals where id = 500"), "0");
+    run(&db, MAIN, "drop world far", &[]).unwrap();
+
+    // observe mode: run whole, rolled back, said so
+    rules(r#"{"mode": "observe", "tables": {"inventory": {"delta": ["stock"]}}}"#);
+    run(&db, MAIN, "create world watch", &[]).unwrap();
+    run(&db, "watch", "update inventory set stock = 0 where id = 3", &[]).unwrap();
+    let e = run(&db, MAIN, "merge world watch", &[]).unwrap_err();
+    assert!(e.message.contains("observe mode") && e.message.contains("inventory: 1 updated"), "{}", e.message);
+    assert_eq!(pg_cell(&mut pg, "select stock from inventory where id = 3"), "10");
+
+    // a file that isn't rules, or a rule naming a column the table hasn't: refused, nothing written
+    rules(r#"{"tables": {"inventory": {"delta": "stock"}}}"#);
+    let e = run(&db, MAIN, "merge world watch", &[]).unwrap_err();
+    assert!(e.message.contains("write-back rules"), "{}", e.message);
+    rules(r#"{"tables": {"inventory": {"delta": ["stok"]}}}"#);
+    let e = run(&db, MAIN, "merge world watch", &[]).unwrap_err();
+    assert!(e.message.contains("names column stok"), "{}", e.message);
+    run(&db, MAIN, "drop world watch", &[]).unwrap();
+    std::fs::remove_file(dir.join("writeback.json")).unwrap();
+
+    // 25 rows in chunks of 10: three merges, every row written
+    run(&db, MAIN, "create world restock", &[]).unwrap();
+    run(&db, "restock", "update inventory set stock = 100 where id > 5", &[]).unwrap();
+    let out = run(&db, MAIN, "merge world restock in chunks of 10", &[]).unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(out[0].tag, "MERGE 25");
+    assert_eq!(pg_cell(&mut pg, "select count(*) from inventory where stock = 100"), "25");
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+/// `chronos attach --lazy-tenant org_id`: tables with the column (and their children through a foreign key) start
+/// empty, and main takes a tenant's rows the first time a world is forked for it (a person's WITH (tenant), an agent
+/// held to the tenant, or chronos refresh --tenant); refreshes then read only the tenants loaded. Tables without the
+/// column are copied whole; one two foreign keys down is refused, as is a column no table has.
+#[test]
+fn a_lazy_tenant_attach_loads_a_tenant_at_its_first_fork() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("lazy") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    // 50 tenants of 6 leads each, a note per lead, and plans shared by all
+    pg.batch_execute(
+        "create table plans (id int primary key, name text not null);
+         insert into plans values (1, 'free'), (2, 'team');
+         create table leads (id int primary key, org_id int not null, name text);
+         create index on leads (org_id);
+         insert into leads select g, g % 50, 'lead ' || g from generate_series(1, 300) g;
+         create table notes (id int primary key, lead_id int not null references leads (id), body text);
+         insert into notes select g, g, 'note ' || g from generate_series(1, 300) g;
+         create table tags (id int primary key, note_id int not null references notes (id));",
+    )
+    .unwrap();
+    let dir = folder("lazy");
+    let (ok, out) = attach(&dir, &["--tables", "plans,leads,notes", "--lazy-tenant", "org_id"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("a tenant at a time"), "{out}");
+    let db = Db::open(&dir).unwrap();
+    assert_eq!(cell(&db, MAIN, "select count(*) from plans"), "2", "copied whole");
+    assert_eq!(cell(&db, MAIN, "select count(*) from leads"), "0");
+    assert_eq!(cell(&db, MAIN, "select count(*) from notes"), "0");
+
+    // a person's world for tenant 42: main takes its leads and their notes first, and the world starts with them
+    run(&db, MAIN, "create world w with (tenant = 'org_id = 42')", &[]).unwrap();
+    assert_eq!(cell(&db, MAIN, "select count(*) from leads"), "6");
+    assert_eq!(cell(&db, MAIN, "select count(*) from notes"), "6");
+    assert_eq!(cell(&db, "w", "select count(*) from leads where org_id = 42"), "6");
+    run(&db, "w", "update leads set name = 'called' where id = 42; update notes set body = 'n' where id = 92", &[])
+        .unwrap();
+    run(&db, MAIN, "merge world w", &[]).unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(pg_cell(&mut pg, "select name from leads where id = 42"), "called");
+    assert_eq!(pg_cell(&mut pg, "select body from notes where id = 92"), "n");
+
+    // a refresh reads only the tenants loaded: tenant 42's new lead comes over, tenant 7's doesn't
+    pg.batch_execute(
+        "insert into leads values (1042, 42, 'new'), (1007, 7, 'new');
+         insert into notes values (1042, 1042, 'new'), (1007, 1007, 'new');
+         update leads set name = 'app' where id = 7;",
+    )
+    .unwrap();
+    let r = chronos::attach::refresh(&db).unwrap();
+    assert_eq!(cell(&db, MAIN, "select count(*) from leads"), "7", "{r:?}");
+    assert_eq!(cell(&db, MAIN, "select count(*) from notes"), "7", "{r:?}");
+    assert_eq!(cell(&db, MAIN, "select count(*) from leads where org_id = 7"), "0");
+
+    // an agent held to tenant 7: its first fork loads it, as Postgres has it now
+    run(&db, MAIN, "create agent bot with (can = 'read,fork,write_own,merge_own', tenant = 'org_id = 7')", &[])
+        .unwrap();
+    let mut s = chronos::sql::Session::new(MAIN);
+    s.agent = Some("bot".into());
+    s.run(&db, "create world mine", &[]).unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(cell(&db, MAIN, "select count(*) from leads where org_id = 7"), "7");
+    assert_eq!(cell(&db, MAIN, "select name from leads where id = 7"), "app");
+    assert_eq!(cell(&db, MAIN, "select count(*) from notes"), "14", "its tenant's notes, through the foreign key");
+    assert_eq!(
+        cell(&db, MAIN, "select count(*) from notes n join leads l on l.id = n.lead_id where l.org_id = 7"),
+        "7",
+        "tenant 7's notes came with its leads"
+    );
+
+    // loaded once: a second load takes nothing; and the folder remembers which tenants it holds
+    assert!(chronos::attach::load_tenant(&db, "9").unwrap() > 0);
+    assert_eq!(chronos::attach::load_tenant(&db, "9").unwrap(), 0);
+    drop(s);
+    drop(db);
+    let db = Db::open(&dir).unwrap();
+    let loaded = db.attached().unwrap().lazy().unwrap().loaded();
+    assert_eq!(loaded, vec!["42".to_string(), "7".into(), "9".into()]);
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // two foreign keys down, and a column no table has: refused, nothing left behind
+    let (ok, out) = attach(&dir, &["--tables", "leads,notes,tags", "--lazy-tenant", "org_id"]);
+    assert!(!ok && out.contains("two levels down"), "{out}");
+    assert!(!dir.exists());
+    let (ok, out) = attach(&dir, &["--tables", "plans", "--lazy-tenant", "org_id"]);
+    assert!(!ok && out.contains("no table attached has a column"), "{out}");
+    assert!(!dir.exists());
+
+    drop(pg);
+    drop_db(&name);
+}
+
 #[test]
 fn refresh_brings_main_up_to_postgres() {
     let Some((mut pg, name, _url, _turn)) = throwaway("refresh") else {
@@ -1531,6 +1868,41 @@ fn rows_triggers_write_to_other_tables_come_into_main_with_the_merge() {
     assert!(change(&db, "w3", "update accounts set name = 'acme inc' where id = 1").is_none());
     assert_eq!(pg_cell(&mut pg, "select name || ' ' || lead_count from accounts where id = 1"), "acme inc 2");
     assert_eq!(chronos::attach::refresh(&db).unwrap().changed(), 0);
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+/// Postgres's counts of rows written hold a connection's earlier commits for up to a second: merges in quick
+/// succession aren't taken for triggers writing besides, so main doesn't refresh the table after each.
+#[test]
+fn merges_in_quick_succession_are_not_taken_for_trigger_writes() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("quick") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table leads (id int primary key, owner text);
+         insert into leads values (1, 'bo'), (2, 'bo');",
+    )
+    .unwrap();
+    let dir = folder("quick");
+    let (ok, out) = attach(&dir, &["--tables", "leads"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+
+    // a row changed in Postgres alone, that nothing here says to take
+    pg.batch_execute("update leads set owner = 'zed' where id = 2").unwrap();
+    for i in 0..6 {
+        assert!(change(&db, &format!("w{i}"), &format!("update leads set owner = 'o{i}' where id = 1")).is_none());
+        assert_eq!(cell(&db, MAIN, "select owner from leads where id = 2"), "bo", "after merge {i}");
+    }
+    assert_eq!(pg_cell(&mut pg, "select owner from leads where id = 1"), "o5");
+    // a refresh still takes it
+    assert_eq!(chronos::attach::refresh(&db).unwrap().changed(), 1);
+    assert_eq!(cell(&db, MAIN, "select owner from leads where id = 2"), "zed");
 
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();

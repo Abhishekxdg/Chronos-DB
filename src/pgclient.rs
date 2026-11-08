@@ -152,7 +152,7 @@ pub fn text_array<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Stri
     out
 }
 
-trait Stream: Read + Write {}
+pub(crate) trait Stream: Read + Write {}
 impl<T: Read + Write> Stream for T {}
 
 /// A connection, logged in and ready for queries. Send: `chronos attach` keeps one between merges (see
@@ -195,6 +195,16 @@ pub fn pg_error(e: &io::Error) -> Option<&PgError> {
 
 /// A reply's rows, as text (None: NULL).
 pub type Rows = Vec<Vec<Option<String>>>;
+
+/// What `Client::pipeline` sends in one write at most (see there).
+const PIPELINE_BYTES: usize = 16 * 1024;
+
+/// A protocol message: its tag, length and body, added to `out`.
+fn message(out: &mut Vec<u8>, tag: u8, body: &[u8]) {
+    out.push(tag);
+    out.extend(((body.len() + 4) as u32).to_be_bytes());
+    out.extend(body);
+}
 
 /// Both halves of one stream: reads and writes share it (TLS state included).
 struct Shared(Arc<std::sync::Mutex<Box<dyn Stream + Send>>>);
@@ -317,10 +327,10 @@ pub fn roots(file: Option<&str>) -> io::Result<rustls::RootCertStore> {
 
 /// A stream to the server, and over TLS the tls-server-end-point channel binding data of its
 /// certificate (None where its signature has no hash of its own: see `scram::end_point`).
-type Connected = (Box<dyn Stream + Send>, Option<Vec<u8>>);
+pub(crate) type Connected = (Box<dyn Stream + Send>, Option<Vec<u8>>);
 
 /// A TLS stream to the server, its handshake done, and its certificate's channel binding data.
-fn tls(url: &Url, mut tcp: TcpStream) -> io::Result<Connected> {
+pub(crate) fn tls(url: &Url, mut tcp: TcpStream) -> io::Result<Connected> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -790,6 +800,153 @@ impl Client {
                     return failed.map_or(Ok(rows), Err);
                 }
                 _ => {} // ParseComplete, BindComplete, RowDescription, NoData, CommandComplete, notices
+            }
+        }
+    }
+
+    /// Runs statements in one round trip: `simple` first if given (a simple query: several statements, no
+    /// parameters, as `query`), then each of `stmts` (one statement with its text parameters, as `query_params`), all
+    /// sent before any answer is read, with one Sync after them. The rows of each, in order (`simple`'s first); the
+    /// server's first error, if one was, with the place of the statement that failed among them (the ones after it
+    /// aren't run: in a transaction it is aborted). Err: the connection failed, not the SQL (see `broken`).
+    #[allow(clippy::type_complexity)]
+    pub fn pipeline(
+        &mut self,
+        simple: Option<&str>,
+        stmts: &[(&str, &[String])],
+    ) -> io::Result<(Vec<Rows>, Option<(usize, io::Error)>)> {
+        let out = self.pipelined(simple, stmts);
+        self.note(out)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn pipelined(
+        &mut self,
+        simple: Option<&str>,
+        stmts: &[(&str, &[String])],
+    ) -> io::Result<(Vec<Rows>, Option<(usize, io::Error)>)> {
+        // each statement's Parse, Bind and Execute, as sent
+        let mut msgs: Vec<Vec<u8>> = Vec::with_capacity(stmts.len());
+        for (sql, params) in stmts {
+            if params.len() > u16::MAX as usize {
+                return Err(err(format!("{} parameters, more than one statement takes", params.len())));
+            }
+            let mut m = vec![];
+            let mut parse = vec![0];
+            parse.extend(sql.as_bytes());
+            parse.extend([0, 0, 0]);
+            message(&mut m, b'P', &parse);
+            let mut bind = vec![0, 0, 0, 0];
+            bind.extend((params.len() as u16).to_be_bytes());
+            for v in params.iter() {
+                bind.extend((v.len() as i32).to_be_bytes());
+                bind.extend(v.as_bytes());
+            }
+            bind.extend([0, 0]);
+            message(&mut m, b'B', &bind);
+            message(&mut m, b'E', &[0, 0, 0, 0, 0]);
+            msgs.push(m);
+        }
+        // sent in batches of at most PIPELINE_BYTES, each read before the next is sent: what one write sends always
+        // fits in the sockets' buffers, so it never waits on the server reading while the server waits on this
+        // reading its answers (a statement bigger than that goes alone, as `query_params` sends it)
+        let mut batches: Vec<std::ops::Range<usize>> = vec![];
+        let mut start = 0;
+        let mut size = simple.map_or(0, str::len);
+        for (i, m) in msgs.iter().enumerate() {
+            if i > start && size + m.len() > PIPELINE_BYTES {
+                batches.push(start..i);
+                start = i;
+                size = 0;
+            }
+            size += m.len();
+        }
+        if start < msgs.len() {
+            batches.push(start..msgs.len());
+        }
+        let mut all: Vec<Rows> = vec![];
+        let mut failed: Option<(usize, io::Error)> = None;
+        let first = usize::from(simple.is_some());
+        if let Some(sql) = simple {
+            let mut q = sql.as_bytes().to_vec();
+            q.push(0);
+            self.send(b'Q', &q)?;
+        }
+        if batches.is_empty() {
+            self.w.flush()?;
+        }
+        let mut read_simple = simple.is_some();
+        let mut at = first;
+        for (b, range) in batches.iter().enumerate() {
+            let last = b + 1 == batches.len();
+            for m in &msgs[range.clone()] {
+                self.w.write_all(m)?;
+            }
+            // Sync after the last; a Flush after the others, so their answers come now
+            self.send(if last { b'S' } else { b'H' }, &[])?;
+            self.w.flush()?;
+            if read_simple {
+                read_simple = false;
+                let rows = self.until_ready(&mut failed, 0)?;
+                if failed.is_none() {
+                    all.push(rows);
+                }
+            }
+            // this batch's answers: each statement's rows, to its CommandComplete; an error ends the batch
+            let mut left = range.len();
+            let mut rows = vec![];
+            while left > 0 || last {
+                let (tag, body) = self.recv()?;
+                match tag {
+                    b'D' => rows.push(data_row(&body)?),
+                    b'C' | b'I' => {
+                        if failed.is_none() {
+                            all.push(std::mem::take(&mut rows));
+                        }
+                        at += 1;
+                        left = left.saturating_sub(1);
+                    }
+                    b'E' => {
+                        failed = failed.or(Some((at, Self::error(&body))));
+                        if !last {
+                            // (the server skips everything until a Sync: one sent, and its ReadyForQuery awaited)
+                            self.send(b'S', &[])?;
+                            self.w.flush()?;
+                            self.until_ready(&mut failed, at)?;
+                            return Ok((all, failed));
+                        }
+                        left = 0;
+                    }
+                    b'Z' => {
+                        self.status = body.first().copied().unwrap_or(b'I');
+                        return Ok((all, failed));
+                    }
+                    _ => {} // ParseComplete, BindComplete, notices
+                }
+            }
+        }
+        if read_simple {
+            let rows = self.until_ready(&mut failed, 0)?;
+            if failed.is_none() {
+                all.push(rows);
+            }
+        }
+        Ok((all, failed))
+    }
+
+    /// The answers up to ReadyForQuery: their rows; an error noted in `failed` (as statement `at`) if none was yet.
+    fn until_ready(&mut self, failed: &mut Option<(usize, io::Error)>, at: usize) -> io::Result<Rows> {
+        let mut rows = vec![];
+        loop {
+            let (tag, body) = self.recv()?;
+            match tag {
+                b'D' => rows.push(data_row(&body)?),
+                b'E' if failed.is_none() => *failed = Some((at, Self::error(&body))),
+                b'Z' => {
+                    self.status = body.first().copied().unwrap_or(b'I');
+                    return Ok(rows);
+                }
+                _ => {}
             }
         }
     }

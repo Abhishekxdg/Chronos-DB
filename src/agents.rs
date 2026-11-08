@@ -51,6 +51,9 @@ pub(crate) const ACTIVE: &str = "_sonos_active";
 pub(crate) const REVIEW: &str = "_sonos_review";
 /// How often a world's merge was refused, by kind (see `Core::note_refusal`).
 pub(crate) const REFUSALS: &str = "_sonos_refusals";
+/// World metadata key: the Postgres role and settings its owner agent writes as (see `Agent::act_as`), copied from
+/// the agent when it forks the world, so the world's write-back is the end user's however the agent changes after.
+pub(crate) const ACT_AS: &str = "_sonos_act_as";
 
 /// Who `chronos serve` takes a client with the server token for (every client that isn't an agent
 /// or the admin token, with `--safe`): an agent with the default rights (read, fork, change the
@@ -195,6 +198,11 @@ pub struct Agent {
     pub expires: u64,
     /// when its token was last rotated (ms since 1970); 0: never rotated since it was created
     pub rotated: u64,
+    /// who it works for, in an attached Postgres: `{"role": r, "settings": {name: value}}`. A world it forks is
+    /// written back to Postgres as that role (`SET LOCAL ROLE`), with those settings (`set_config(name, value,
+    /// true)`, such as Supabase's `request.jwt.claims`), so Postgres's own grants and row-level security policies
+    /// judge its writes as they would the end user's (see `attach`). None: written as the attach role
+    pub act_as: Option<Json>,
     token_hash: String,
     /// its token's SCRAM-SHA-256 verifier (see `sql::scram`), made when the token was issued; None
     /// for an agent made before agents had one, until it logs in with its token (`upgrade_agent`)
@@ -222,6 +230,11 @@ pub struct AgentSpec {
     pub tenant: Option<Json>,
     /// how long from now its token works, in ms; 0: no end
     pub valid_for: Option<u64>,
+    /// the Postgres role its worlds are written back as (see `Agent::act_as`); "" takes it (and its settings) away
+    pub pg_role: Option<String>,
+    /// the settings its worlds are written back with, `{"request.jwt.claims": "..."}` (a JSON object, or its text);
+    /// null takes them away
+    pub pg_settings: Option<Json>,
 }
 
 impl Agent {
@@ -251,7 +264,7 @@ impl Agent {
             "priority": self.priority.name(),
             "created": self.created,
             "disabled": self.disabled, "policy": self.policy, "token_hash": self.token_hash, "scram": self.scram,
-            "tenant": self.tenant, "expires": self.expires, "rotated": self.rotated,
+            "tenant": self.tenant, "expires": self.expires, "rotated": self.rotated, "act_as": self.act_as,
         })
         .to_string()
     }
@@ -280,6 +293,7 @@ impl Agent {
             tenant: j.get("tenant").filter(|t| t.is_object()).cloned(),
             expires: n("expires"),
             rotated: n("rotated"),
+            act_as: j.get("act_as").filter(|t| t.is_object()).cloned(),
             token_hash: j["token_hash"].as_str()?.into(),
             scram: j["scram"].as_str().map(String::from),
         })
@@ -307,6 +321,7 @@ impl Agent {
             tenant: None,
             expires: 0,
             rotated: 0,
+            act_as: None,
             token_hash: String::new(), // matches no token
             scram: None,
         }
@@ -354,7 +369,86 @@ impl Agent {
             }
             Some(ms) => self.expires = disk::now_ms() + ms,
         }
+        self.act_as = act_as(self.act_as.take(), spec)?;
         Ok(())
+    }
+}
+
+/// The most settings an agent writes back with, and the most bytes of them all.
+const ACT_AS_SETTINGS: usize = 32;
+const ACT_AS_BYTES: usize = 16 << 10;
+
+/// Agent `was`'s `act_as` changed as `spec` says (see `Agent::act_as`), checked: a role name Postgres could have
+/// (1 to 63 bytes, no NUL), and settings that are custom ones only (`prefix.name`: letters, digits and `_`, at least
+/// one dot), so none can change how Postgres runs the write-back (`role`, `statement_timeout`, `search_path`, ...).
+/// A value that isn't text (`{"sub": "u-17"}`) is kept as its JSON text, which is what Postgres's settings hold.
+fn act_as(was: Option<Json>, spec: &AgentSpec) -> Result<Option<Json>> {
+    let mut role = was.as_ref().and_then(|a| a["role"].as_str()).map(String::from);
+    let mut settings = was.as_ref().and_then(|a| a["settings"].as_object()).cloned().unwrap_or_default();
+    if let Some(r) = &spec.pg_role {
+        if r.is_empty() {
+            role = None;
+            settings.clear();
+        } else if r.len() > 63 || r.contains('\0') {
+            return Err(bad(format!("pg_role {r:?} isn't a Postgres role name (1 to 63 bytes)")));
+        } else {
+            role = Some(r.clone());
+        }
+    }
+    match &spec.pg_settings {
+        None => {}
+        Some(Json::Null) => settings.clear(),
+        Some(v) => {
+            let parsed;
+            let v = match v {
+                Json::String(s) => {
+                    parsed = serde_json::from_str::<Json>(s)
+                        .map_err(|e| bad(format!("pg_settings must be a JSON object of settings: {e}")))?;
+                    &parsed
+                }
+                v => v,
+            };
+            let Some(o) = v.as_object() else {
+                return Err(bad("pg_settings must be a JSON object, like {\"request.jwt.claims\": \"...\"}".into()));
+            };
+            settings.clear();
+            for (k, v) in o {
+                let custom = k.contains('.')
+                    && k.split('.').all(|p| {
+                        !p.is_empty()
+                            && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                            && !p.as_bytes()[0].is_ascii_digit()
+                    });
+                if !custom {
+                    return Err(bad(format!(
+                        "pg_settings: {k:?} isn't a custom setting (prefix.name, as request.jwt.claims or \
+                         app.user_id): Postgres's own settings can't be set for the write-back"
+                    )));
+                }
+                let text = match v {
+                    Json::String(s) => s.clone(),
+                    Json::Null => return Err(bad(format!("pg_settings: {k} must have a value"))),
+                    v => v.to_string(),
+                };
+                if text.contains('\0') {
+                    return Err(bad(format!("pg_settings: {k}'s value can't hold a NUL")));
+                }
+                settings.insert(k.to_ascii_lowercase(), Json::String(text));
+            }
+            if settings.len() > ACT_AS_SETTINGS {
+                return Err(bad(format!("pg_settings: at most {ACT_AS_SETTINGS} settings")));
+            }
+            if Json::Object(settings.clone()).to_string().len() > ACT_AS_BYTES {
+                return Err(bad(format!("pg_settings: at most {ACT_AS_BYTES} bytes")));
+            }
+        }
+    }
+    match role {
+        Some(r) => Ok(Some(json!({"role": r, "settings": settings}))),
+        None if !settings.is_empty() => {
+            Err(bad("pg_settings need a pg_role: the role the write-back runs as, with them".into()))
+        }
+        None => Ok(None),
     }
 }
 
@@ -616,6 +710,7 @@ impl Core {
             tenant: None,
             expires: 0,
             rotated: 0,
+            act_as: None,
             token_hash: hash(&token),
             scram: Some(scram),
         };
@@ -2236,6 +2331,7 @@ impl Acting<'_> {
             )));
         }
         meta.extend(owner);
+        self.core.tenant_first(from, &meta)?;
         self.core.fork_owned(from, name, meta)
     }
 
@@ -2256,6 +2352,9 @@ impl Acting<'_> {
         }
         let mut meta = serde_json::Map::new();
         meta.insert(OWNER.into(), json!(a.name));
+        if let Some(who) = &a.act_as {
+            meta.insert(ACT_AS.into(), who.clone());
+        }
         if a.world_ttl > 0 {
             meta.insert(EXPIRES.into(), json!(disk::now_ms().saturating_add(a.world_ttl)));
         }

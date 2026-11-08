@@ -21,6 +21,7 @@ mod index;
 pub mod limits;
 pub mod metrics;
 mod migrate;
+pub mod myclient;
 pub mod obs;
 mod outbox;
 mod pages;
@@ -38,6 +39,7 @@ mod sync;
 mod tally;
 mod traced;
 mod wal_ship;
+pub mod writeback;
 
 use disk::Op;
 use imbl::{OrdMap, ordmap::DiffItem};
@@ -339,6 +341,8 @@ fn world_of(name: &str, e: &Entry) -> World {
             agents::OWNER => owner = v.as_str().map(String::from),
             agents::EXPIRES => expires = v.as_u64(),
             agents::PINNED => pinned = v.as_bool() == Some(true),
+            // whom it is written back to Postgres as: an end user's claims, maybe, shown to no one
+            agents::ACT_AS => {}
             scope::SCOPE => declared = Some(v.clone()),
             agents::CHECKPOINTS => {
                 checkpoints =
@@ -727,6 +731,27 @@ pub enum Pick {
     Theirs,
     /// this row, as a JSON object; None deletes it
     Row(Option<String>),
+}
+
+/// What a merge in chunks did (see `Core::merge_in_chunks`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Chunked {
+    pub chunks: usize,
+    pub rows: usize,
+}
+
+/// A chunked merge's failure, saying how far it got first.
+fn chunk_failed(e: Error, done: &Chunked) -> Error {
+    match e {
+        Error::Constraint { code, message } if done.chunks > 0 => Error::Constraint {
+            code,
+            message: format!(
+                "{message} (after {} chunks, {} rows, merged: they stay merged, the rest stays in the world)",
+                done.chunks, done.rows
+            ),
+        },
+        e => e,
+    }
 }
 
 /// How to merge (see `Core::merge_with`).
@@ -4594,9 +4619,33 @@ impl Core {
         reserved_keys(&meta)?;
         stale::from_meta(&mut meta)?; // `check_reads = true`: its reads are checked at merge
         scope::from_meta(self, from, &mut meta)?; // what it may change, held to at its merge
+        self.tenant_first(from, &meta)?;
         let info = Info { meta, ..Info::new() };
         self.fork_info(from, name, info)?;
         self.world(name)
+    }
+
+    /// Before a fork from main declared for one tenant, in a folder attached a tenant at a time (`chronos attach
+    /// --lazy-tenant`): main takes that tenant's rows from Postgres, if it hasn't yet, so the world starts with them
+    /// (see `attach::load_tenant`). Other folders and forks: nothing.
+    pub(crate) fn tenant_first(&self, from: &str, meta: &serde_json::Map<String, serde_json::Value>) -> Result<()> {
+        let Some(lazy) = self.attached.as_deref().and_then(attach::Attached::lazy) else { return Ok(()) };
+        if from != MAIN {
+            return Ok(()); // (a world forked from a world starts from that world's rows, not main's now)
+        }
+        let Some(t) = meta.get(scope::SCOPE).and_then(|s| s.get("tenant")) else { return Ok(()) };
+        if t["column"].as_str() != Some(lazy.column.as_str()) {
+            return Ok(());
+        }
+        let value = match &t["value"] {
+            serde_json::Value::String(v) => v.clone(),
+            serde_json::Value::Null => return Ok(()),
+            v => v.to_string(),
+        };
+        attach::load_tenant(self, &value).map(|_| ()).map_err(|e| Error::Constraint {
+            code: "55000",
+            message: format!("loading tenant {value}'s rows from Postgres before the fork: {e}"),
+        })
     }
 
     /// A world with no parent and nothing in it: what `CREATE DATABASE` makes. It merges into
@@ -4929,6 +4978,38 @@ impl Core {
         self.merge_kept(b, o).map(|(n, _)| n)
     }
 
+    /// `merge_with`, `chunk` rows at a time: each chunk the next rows the world changed (`only_keys`), merged as a
+    /// merge of its own (in an attached folder, its own write-back transaction, so no transaction holds more than
+    /// `chunk` rows' locks), then the rest (its schema, if it changed one) with the world itself. A failure stops
+    /// it where it is, saying how far it got: the chunks merged stay merged, and the world keeps the rest, so the
+    /// same statement goes on from there.
+    pub fn merge_in_chunks(&self, b: &str, o: &MergeOptions, chunk: usize) -> Result<Chunked> {
+        let chunk = chunk.max(1);
+        let mut done = Chunked::default();
+        let mut left_before = usize::MAX;
+        loop {
+            let keys: Vec<String> = self
+                .diff(b)?
+                .into_iter()
+                .map(|c| c.key)
+                .filter(|k| !reserved_table(k.split('/').next().unwrap_or(k)) && !sql::internal(k))
+                .collect();
+            if keys.len() <= chunk || keys.len() >= left_before {
+                // the last chunk with the world itself (schema, constraint rows), which drops it; or a chunk that
+                // merged nothing (rows only the whole world's merge can take), merged whole the same way
+                let n = self.merge_with(b, o).map_err(|e| chunk_failed(e, &done))?;
+                done.rows += n;
+                done.chunks += 1;
+                return Ok(done);
+            }
+            left_before = keys.len();
+            let part = MergeOptions { only_keys: keys[..chunk].to_vec(), ..o.clone() };
+            let n = self.merge_with(b, &part).map_err(|e| chunk_failed(e, &done))?;
+            done.rows += n;
+            done.chunks += 1;
+        }
+    }
+
     /// `merge_with`, and for a branch that stays open (merged in part, or into another world) its
     /// version as the merge left it, read under the merge's locks: what the caller merges at next,
     /// with no other writer's change in it.
@@ -5154,6 +5235,7 @@ impl Core {
         vals: [&Option<Val>; 3],
         how: Resolve,
         into: &View,
+        delta: &[String],
     ) -> Result<Option<(&'static str, Val, bool)>> {
         let [Some(b), Some(o), Some(t)] = vals else { return Ok(None) }; // an add or delete: not by columns
         let obj = |s: &State, v: &Val| json_object(&self.show(s, key, v.clone(), &mut HashMap::new()).ok()?);
@@ -5163,6 +5245,16 @@ impl Core {
         let differs = |x: &serde_json::Map<String, serde_json::Value>, k: &String| x.get(k) != bo.get(k);
         let keys: std::collections::BTreeSet<String> = bo.keys().chain(oo.keys()).chain(to.keys()).cloned().collect();
         let mine: Vec<&String> = keys.iter().filter(|k| differs(&oo, k)).collect();
+        // a delta column (an attached table's, see `writeback`) both changed: both increments, applied
+        let mut added: Vec<&String> = vec![];
+        let both_delta: Vec<&String> = mine.iter().copied().filter(|k| delta.contains(k) && differs(&to, k)).collect();
+        for k in both_delta {
+            let (Some(b), Some(o), Some(t)) = (bo.get(k), oo.get(k), to.get(k)) else { return Ok(None) };
+            let Some(sum) = writeback::add_deltas(b, o, t) else { return Ok(None) };
+            to.insert(k.clone(), sum);
+            added.push(k);
+        }
+        let mine: Vec<&String> = mine.into_iter().filter(|k| !added.contains(k)).collect();
         let both: Vec<&String> = mine.iter().copied().filter(|k| differs(&to, k)).collect();
         let what = match (both.is_empty(), how) {
             (true, _) => "by columns",
@@ -5361,6 +5453,12 @@ impl Core {
             && !RECOVERING.get();
         let mut overwrote = 0; // rows the parent changed since the fork that this merge overwrites
         let mut by_table: HashMap<String, bool> = HashMap::new(); // tables' merge_by_columns
+        // an attached folder's delta columns (see `writeback`), into main: rows both sides changed combine by
+        // columns, a delta column both changed as theirs + ours - base (rules that don't load refuse the write-back)
+        let rules = match self.attached.as_deref().filter(|_| attach::writes_back(self, &name, tx)) {
+            Some(att) => att.rules().unwrap_or_default(),
+            None => writeback::Rules::default(),
+        };
         // what the world was forked to change (see `scope`); not replaying the log: it was held then
         let declared = match tx || rebase || self.me.get().is_none() {
             true => None,
@@ -5415,8 +5513,9 @@ impl Core {
             // as the world merged into has it
             let t = ch.key.split_once('/').map_or("", |(t, _)| t);
             let clashed = schema_clash.iter().any(|k| k.strip_prefix("_sonos_tables/") == Some(t));
+            let delta = &rules.table(t).delta;
             let combine = !clashed
-                && (columns || {
+                && (columns || !delta.is_empty() || {
                     !reserved_table(t)
                         && *by_table.entry(t.to_string()).or_insert_with(|| sql::merges_by_columns(&parent_view, t))
                 });
@@ -5439,6 +5538,7 @@ impl Core {
                             [&ch.before, &ch.after, &theirs],
                             how,
                             &packing_view,
+                            delta,
                         )?
                         .map(|(what, v, over)| {
                             by_cols_overwrites = Some(over);
@@ -5661,7 +5761,8 @@ impl Core {
                         });
                     }
                     let reads = read_set.as_ref().map(|set| (set.clone(), base_state.clone(), wrote.clone()));
-                    Some(attach::Dry::new(self, att, b, &theirs_state, &ours_state, &written, reads))
+                    let who = attach::ActAs::of(&child.info.read().unwrap().meta);
+                    Some(attach::Dry::new(self, att, b, &theirs_state, &ours_state, &written, reads, who))
                 }
                 None => None,
             };
@@ -5885,6 +5986,7 @@ impl Core {
                 &written,
                 reads.as_ref(),
                 &checks,
+                attach::ActAs::of(&child.info.read().unwrap().meta).as_ref(),
             );
             match written {
                 Ok(None) => {}

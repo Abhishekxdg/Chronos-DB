@@ -190,6 +190,8 @@ struct Import<'a> {
     seqs_refused: BTreeSet<(String, String)>,
     /// for `chronos attach`: triggers and rules stay in Postgres (they run there when a merge is written)
     attach: bool,
+    /// for `chronos attach --lazy-tenant`: tables (by oid) made empty, their rows loaded a tenant at a time later
+    empty: BTreeSet<String>,
     /// the schemas Postgres keeps extensions Chronos has built in (Supabase: `extensions`), and the names of those
     /// extensions' types, functions and operator classes: written there as `extensions.vector(64)`, made here as
     /// `vector(64)` (see `unqualify`)
@@ -1263,6 +1265,9 @@ impl Import<'_> {
 
     /// The rows of `t`, streamed from Postgres's COPY into Chronos's, as one INSERT.
     fn rows(&mut self, t: &Table) -> Result<u64, String> {
+        if self.empty.contains(&t.oid) {
+            return Ok(0); // (loaded a tenant at a time: see chronos::attach::Lazy)
+        }
         let cols = t.copied.join(", ");
         // (a table others inherit from: its own rows, the others' being copied with them)
         let only = if t.only { "only " } else { "" };
@@ -1522,7 +1527,7 @@ pub fn import(
     let client = Client::connect(&url);
     wipe(&mut url.password);
     let client = client.map_err(|e| format!("Postgres at {}:{}: {e}", url.host, url.port))?;
-    import_with(db, client, &url.database, branch, dry, include, progress, echo, false).map(|(r, _)| r)
+    import_with(db, client, &url.database, branch, dry, include, progress, echo, false, BTreeSet::new()).map(|(r, _)| r)
 }
 
 /// `import` on a connection made already (`chronos attach` runs it inside its own transaction), which it gives back.
@@ -1538,6 +1543,7 @@ fn import_with(
     progress: Arc<Progress>,
     echo: bool,
     attach: bool,
+    empty: BTreeSet<String>,
 ) -> Result<(Report, Client), String> {
     let scratch = Db::new();
     let (db, branch) = match (dry, db) {
@@ -1561,6 +1567,7 @@ fn import_with(
         part_oids: vec![],
         seqs_refused: BTreeSet::new(),
         attach,
+        empty,
         ext_schemas: vec![],
         ext_names: Default::default(),
     };
@@ -1642,7 +1649,8 @@ fn import_with(
 
 /// `chronos attach`'s usage.
 pub fn attach_help() -> &'static str {
-    "usage: chronos attach <new folder> (--tables <schema.table>,... | --schema <schema>) [--yes]\n\n\
+    "usage: chronos attach <new folder> (--tables <schema.table>,... | --schema <schema>) [--lazy-tenant <column>] \
+     [--yes]\n\n\
      Works beside a Postgres database you already run: copies the tables named (or every table of a schema) into a\n\
      new folder, in one consistent read. Agents fork worlds and work there as anywhere; merging a world into main\n\
      writes its rows to Postgres first, in one transaction, after checking each row is still as main has it (a row\n\
@@ -1656,7 +1664,10 @@ pub fn attach_help() -> &'static str {
      tables keyed by a sequence or identity column are refused for now (updates and deletes go). Triggers stay in\n\
      Postgres and run as merges are written. Above 1,000,000 rows (Postgres's estimate) it asks for --yes.\n\
      Columns added, dropped, renamed or retyped in Postgres later come over at the next chronos refresh (or serve\n\
-     --refresh-every); a changed key or row-level security: attach again into a new folder."
+     --refresh-every); a changed key or row-level security: attach again into a new folder.\n\n\
+     --lazy-tenant org_id: tables with that column (and those whose foreign key points straight at one) start empty;\n\
+     a tenant's rows are loaded the first time a world is forked for it, or by chronos refresh <dir> --tenant <value>.\n\
+     A mysql:// CHRONOS_SOURCE_URL attaches beside MySQL 8.0+ or MariaDB 10.5+ (--tables only)."
 }
 
 /// What attach reads of a table before copying it: its name, kind, what Chronos's attach refuses in it, and its
@@ -1675,7 +1686,14 @@ struct Source {
 
 /// `chronos attach <dir>`: see `attach_help`. Prints what it did; Err when it couldn't, with nothing left behind
 /// (the folder is removed again).
-pub fn attach(dir: &str, opts: &chronos::Open, tables: &[String], schemas: &[String], yes: bool) -> Result<(), String> {
+pub fn attach(
+    dir: &str,
+    opts: &chronos::Open,
+    tables: &[String],
+    schemas: &[String],
+    lazy: Option<&str>,
+    yes: bool,
+) -> Result<(), String> {
     let path = std::path::Path::new(dir);
     if path.exists() {
         return Err(format!("{dir} exists: attach makes a new folder (to attach again, give another)"));
@@ -1762,11 +1780,26 @@ pub fn attach(dir: &str, opts: &chronos::Open, tables: &[String], schemas: &[Str
         ));
     }
     let order = parents_first(&mut pg, &found)?;
+    // --lazy-tenant: which tables start empty, loaded a tenant at a time (see chronos::attach::Lazy)
+    let (empty, via) = match lazy {
+        None => (BTreeSet::new(), BTreeMap::new()),
+        Some(col) => lazy_tables(&mut pg, &found, col)?,
+    };
     let db = Db::open_with(dir, opts).map_err(|e| format!("{dir}: {e}"))?;
     let include: Vec<String> = found.iter().map(|s| format!("{}.{}", s.schema, s.name)).collect();
     let done = (|| -> Result<Attached, String> {
-        let (report, mut pg) =
-            import_with(Some(&db), pg, &url.database, chronos::MAIN, false, &include, Arc::default(), true, true)?;
+        let (report, mut pg) = import_with(
+            Some(&db),
+            pg,
+            &url.database,
+            chronos::MAIN,
+            false,
+            &include,
+            Arc::default(),
+            true,
+            true,
+            empty,
+        )?;
         pg.query("commit").map_err(|e| format!("ending the read: {e}"))?;
         let mut lost: Vec<String> =
             report.unenforced.iter().map(|u| format!("unique index {u} didn't come over")).collect();
@@ -1822,7 +1855,7 @@ pub fn attach(dir: &str, opts: &chronos::Open, tables: &[String], schemas: &[Str
                 }
             })
             .collect();
-        let att = Attached::new(path, &url, tables);
+        let att = Attached::new(path, &url, tables).with_lazy(lazy.map(|c| attach::Lazy::new(c, via.clone())));
         // the marker saying which Postgres this folder is a copy of, checked before every write-back
         pg.query_params(
             "insert into chronos.merges (id, at) values ($1, now())",
@@ -1857,6 +1890,14 @@ pub fn attach(dir: &str, opts: &chronos::Open, tables: &[String], schemas: &[Str
                 ),
             }
         }
+    }
+    if let Some(l) = att.lazy() {
+        println!(
+            "\nloaded a tenant at a time by {}: those tables are empty in main until a world is forked for a tenant \
+             (an agent with tenant = '{} = <value>', or WITH (tenant = ...)), or chronos refresh {dir} --tenant <value>",
+            attach::q(&l.column),
+            l.column
+        );
     }
     println!(
         "\nnext: chronos serve {dir} (with CHRONOS_SOURCE_URL set), fork a world, change rows there, and MERGE WORLD:\n\
@@ -1961,7 +2002,10 @@ fn read_sources(pg: &mut Client, named: &[String], schemas: &[String]) -> Result
         if s.key.is_empty() && s.refused.is_empty() {
             s.refused.push(
                 "no primary key, nor a unique index on NOT NULL columns to stand for one (a row written back must be \
-                 found by one)"
+                 found by one). Give it one without stopping writes: CREATE UNIQUE INDEX CONCURRENTLY on columns that \
+                 identify a row and are NOT NULL; or, when nothing does, ALTER TABLE ... ADD COLUMN id bigint \
+                 GENERATED ALWAYS AS IDENTITY PRIMARY KEY (this rewrites the table: run it when it's quiet). Then \
+                 attach again"
                     .into(),
             );
         }
@@ -1971,6 +2015,88 @@ fn read_sources(pg: &mut Client, named: &[String], schemas: &[String]) -> Result
 
 /// The order to write tables in, by position in `found`: a table after those its foreign keys refer to (a cycle is
 /// broken where it closes).
+/// For `attach --lazy-tenant <col>`: the tables that start empty (by oid) and how each one without the column is
+/// loaded, through its foreign key to one with it (by Chronos's table name). Err when no table has the column, or a
+/// table references one loaded through a foreign key itself (two levels down, not loaded yet), which would leave its
+/// rows pointing at none.
+#[allow(clippy::type_complexity)]
+fn lazy_tables(
+    pg: &mut Client,
+    found: &[Source],
+    col: &str,
+) -> Result<(BTreeSet<String>, BTreeMap<String, attach::Via>), String> {
+    let name = |s: &Source| if s.schema == "public" { s.name.clone() } else { format!("{}.{}", s.schema, s.name) };
+    let direct: Vec<usize> = (0..found.len()).filter(|&i| found[i].cols.iter().any(|c| c.name == col)).collect();
+    if direct.is_empty() {
+        return Err(format!(
+            "--lazy-tenant {col}: no table attached has a column {}, so none would load a tenant at a time",
+            attach::q(col)
+        ));
+    }
+    let oids = format!("({})", found.iter().map(|s| s.oid.as_str()).collect::<Vec<_>>().join(", "));
+    let refs = pg
+        .query(&format!(
+            "select conrelid::text, confrelid::text, array_to_string(conkey, ','), array_to_string(confkey, ',') \
+             from pg_constraint where contype = 'f' and conrelid in {oids} and confrelid in {oids} \
+             and conrelid <> confrelid order by conname"
+        ))
+        .map_err(|e| format!("reading Postgres: {e}"))?;
+    let at = |oid: &str| found.iter().position(|s| s.oid == oid);
+    let by_attnum = |s: &Source, nums: &str| -> Option<Vec<String>> {
+        nums.split(',')
+            .map(|n| {
+                let n: i16 = n.trim().parse().ok()?;
+                s.cols.iter().find(|c| c.attnum == n).map(|c| c.name.clone())
+            })
+            .collect()
+    };
+    let mut via = BTreeMap::new();
+    let mut empty: BTreeSet<String> = direct.iter().map(|&i| found[i].oid.clone()).collect();
+    let mut deeper = vec![];
+    for r in &refs {
+        let (Some(c), Some(p)) = (r[0].as_deref().and_then(at), r[1].as_deref().and_then(at)) else { continue };
+        if direct.contains(&c) {
+            continue;
+        }
+        let (child, parent) = (&found[c], &found[p]);
+        if direct.contains(&p) {
+            let (Some(cols), Some(refs)) = (
+                by_attnum(child, r[2].as_deref().unwrap_or_default()),
+                by_attnum(parent, r[3].as_deref().unwrap_or_default()),
+            ) else {
+                continue;
+            };
+            via.entry(name(child)).or_insert(attach::Via { parent: name(parent), cols, refs });
+            empty.insert(child.oid.clone());
+        } else {
+            deeper.push((c, p));
+        }
+    }
+    // a table without the column referencing one loaded through a foreign key (and no table with the column)
+    let refused: Vec<String> = deeper
+        .iter()
+        .filter(|(c, p)| !via.contains_key(&name(&found[*c])) && via.contains_key(&name(&found[*p])))
+        .map(|(c, p)| {
+            format!(
+                "  - {}: references {}, which is loaded a tenant at a time through its own foreign key; add the {} \
+                 column to {}, or leave it out of --tables",
+                name(&found[*c]),
+                name(&found[*p]),
+                attach::q(col),
+                name(&found[*c])
+            )
+        })
+        .collect();
+    if !refused.is_empty() {
+        return Err(format!(
+            "can't attach --lazy-tenant {col}, nothing was copied (a table is loaded a tenant at a time by the column, \
+             or by a foreign key straight to a table with it, not yet two levels down):\n{}",
+            refused.join("\n")
+        ));
+    }
+    Ok((empty, via))
+}
+
 fn parents_first(pg: &mut Client, found: &[Source]) -> Result<Vec<usize>, String> {
     let oids = format!("({})", found.iter().map(|s| s.oid.as_str()).collect::<Vec<_>>().join(", "));
     let refs = pg
