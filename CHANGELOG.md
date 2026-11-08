@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.4.9 (beta), 2026-11-09
+
+**Writes that fit the database you already run.** Agents can write as the end user's Postgres role, tables get
+write-back rules, big worlds merge in chunks, a multi-tenant database can be attached a tenant at a time, merges
+take fewer round trips, and attach works beside MySQL and MariaDB too.
+
+The macOS builds need **macOS 13 or later**, as for 0.2.0. While the build service is offline, this release was
+built on the maintainer's Mac with the release's own toolchain (Rust 1.95.0, zig 0.15.2 for every target) and
+signed as before, as the `chronos-release` service account.
+
 - **License files in the public repository:** the Business Source License is now `LICENSE` at the root (it was `LICENSE-ENGINE`), and the MIT License moved to `licenses/MIT.txt`, so GitHub no longer labels the whole repository MIT. No change to either license or to what each covers.
 - **Merges in quick succession no longer re-read whole tables:** an attached folder's merge looks for rows triggers wrote besides its own, from Postgres's counts on the connection. Those also hold the connection's earlier commits for up to a second, so a merge soon after another took them for trigger writes, and main refreshed the table. It now compares the counts before and after its writes. Main no longer picks up other rows changed in Postgres at that moment by chance: they arrive with a refresh, `--follow`, or a conflict.
 - **Agents write back as the end user:** an agent can be given a Postgres role and settings (`create agent ... with (pg_role = 'authenticated', pg_settings = '{"request.jwt.claims": {"sub": "u-17"}}')`). Worlds it forks are written to an attached Postgres as that role, with those settings: rows are still locked and compared as the attach role, but the inserts, updates and deletes run after `SET LOCAL ROLE`, so Postgres's own grants and row-level security policies judge them as they would the end user's own writes. A row the policies hide or refuse fails the merge with `42501`, and nothing is written. The same applies when a person merges the world, or rehearses the merge. Only custom settings (`prefix.name`) are accepted. The attach role must be a member of the role, and a superuser or `BYPASSRLS` role is refused. SHOW AGENTS shows the role, but never the settings' values.

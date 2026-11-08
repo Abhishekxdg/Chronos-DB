@@ -319,8 +319,18 @@ fn frames_that_make_no_sense_never_stop_the_server() {
     answers("before any frame");
     let mut r = Rng(seed() ^ 0xF0F0);
     for round in 0..rounds(400) {
-        let Ok(mut c) = TcpStream::connect(("127.0.0.1", port)) else {
-            panic!("seed {}, round {round}: the server stopped listening", seed());
+        // (tens of thousands of connections a second use up the client's local ports on macOS, whose 16,384 wait
+        // 30 s after closing: that's AddrNotAvailable here, not the server; wait for ports to come back)
+        let mut tries = 0;
+        let mut c = loop {
+            match TcpStream::connect(("127.0.0.1", port)) {
+                Ok(c) => break c,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable && tries < 60 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                Err(e) => panic!("seed {}, round {round}: the server stopped listening: {e}", seed()),
+            }
         };
         c.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         c.set_write_timeout(Some(Duration::from_millis(500))).unwrap();
