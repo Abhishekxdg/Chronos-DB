@@ -78,6 +78,23 @@ conflict even when they touch different elements.
 `chronos refresh shop` (or `serve --refresh-every`) reads each collection whole in one snapshot and gives main
 MongoDB's inserts, updates and deletes.
 
+## Follow changes as they happen
+
+From 0.5.1, `chronos serve shop --follow` reads a MongoDB change stream on each attached collection instead: it says which
+documents changed, and main takes just those as MongoDB has them now, a moment after they change, without reading
+the rest.
+
+- The first follow takes its place in each stream and refreshes every collection once. After that each follow
+  reads from the places the last one kept (`mongo-follow.json` in the folder).
+- A merge's own write comes back in the stream and takes nothing. A collection dropped or renamed is compared
+  whole, and followed on from a new place.
+- If the engine was away longer than MongoDB's oplog keeps, the place is gone: the next follow says so, takes a new
+  place and refreshes every collection.
+- MongoDB keeps nothing for a change stream, so there is no slot to drop. `chronos refresh shop --unfollow` forgets
+  the place: the next follow begins again with a refresh.
+- The user needs `changeStream` and `find` on the attached collections, and on no other (the built-in `read` role
+  has both). One stream a collection, so many attached collections mean as many small reads a second.
+
 ## Undo by merge id
 
 Each write-back keeps the documents it wrote, before and after, in `chronos_merge_rows`, in its transaction. A
@@ -112,10 +129,9 @@ Field names with a dot or a leading `$` can't be written by a merge.
 
 ## Not yet with MongoDB
 
-Each of these is refused with a message that says so: `serve --follow` (change streams), rehearsals, merge
-checks run in the source, `writeback.json`, `pg_role`, and `--lazy-tenant`. The HTTP API's
-[`attached`](../http-api.md) says `kind: "mongodb"`, `dry_run` and `check_reads` as true, and each other capability
-as false.
+Each of these is refused with a message that says so: rehearsals, merge checks run in the source,
+`writeback.json`, `pg_role`, and `--lazy-tenant`. The HTTP API's [`attached`](../http-api.md) says
+`kind: "mongodb"`, `follow`, `dry_run` and `check_reads` as true, and each other capability as false.
 
 ## The user it connects as
 

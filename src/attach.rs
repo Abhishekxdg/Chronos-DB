@@ -4029,6 +4029,11 @@ pub fn follow(core: &Core) -> std::result::Result<Refreshed, String> {
     if att.pending() {
         resolve(core).map_err(|e| format!("a merge written to Postgres before isn't settled yet: {e}"))?;
     }
+    att.src.follow(core, att)
+}
+
+/// `follow`, of Postgres, with the write-back lock held and no write-back left pending.
+fn pg_follow(core: &Core, att: &Attached) -> std::result::Result<Refreshed, String> {
     let slot = att.slot();
     let mut pg = att.lease()?;
     let status = "select coalesce(to_jsonb(s) ->> 'wal_status', '') from pg_replication_slots s where slot_name = $1";
@@ -4373,6 +4378,11 @@ pub fn unfollow(core: &Core) -> std::result::Result<bool, String> {
         return Err("this folder isn't attached to Postgres (chronos attach makes one that is)".into());
     };
     let _held = att.hold();
+    att.src.unfollow(att)
+}
+
+/// `unfollow`, of Postgres.
+fn pg_unfollow(att: &Attached) -> std::result::Result<bool, String> {
     let slot = att.slot();
     let mut pg = att.lease()?;
     let sql = "select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = $1";
@@ -4628,19 +4638,21 @@ fn settle(core: &Core, att: &Attached) -> Vec<String> {
 /// a pending write-back settled. A line to print either way; merges into main are refused while it fails.
 pub fn check(core: &Core) -> std::result::Result<String, String> {
     let Some(att) = core.attached.as_deref() else { return Ok(String::new()) };
-    let mut pg = att.lease()?;
-    let marker = att.marker();
-    let found = pg
-        .first(|pg| pg.query_params("select count(*) from chronos.merges where id = $1", &[Some(&marker)]))
-        .map_err(|e| format!("reading chronos.merges: {e}"))?;
-    if found.first().and_then(|r| r[0].as_deref()) != Some("1") {
-        return Err(format!(
-            "the Postgres CHRONOS_SOURCE_URL names isn't the one this folder was attached to ({}): merges into main \
-             are refused",
-            att.source()
-        ));
+    // (beside MySQL or MongoDB the marker is read by each write-back and refresh, on their own connection)
+    if att.kind() == SourceKind::Postgres {
+        let mut pg = att.lease()?;
+        let marker = att.marker();
+        let found = pg
+            .first(|pg| pg.query_params("select count(*) from chronos.merges where id = $1", &[Some(&marker)]))
+            .map_err(|e| format!("reading chronos.merges: {e}"))?;
+        if found.first().and_then(|r| r[0].as_deref()) != Some("1") {
+            return Err(format!(
+                "the Postgres CHRONOS_SOURCE_URL names isn't the one this folder was attached to ({}): merges into \
+                 main are refused",
+                att.source()
+            ));
+        }
     }
-    drop(pg);
     let (what, at) = match att.refreshed_at() {
         0 => ("copied", att.at),
         r => ("refreshed", r),

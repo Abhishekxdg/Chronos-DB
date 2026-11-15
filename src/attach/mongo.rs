@@ -15,7 +15,9 @@
 //! (a double stays a double); in a new field an integer is an int (a long past 32 bits) and a fraction a double.
 //! Arrays are one value: a changed array is written whole.
 //!
-//! Not yet for MongoDB (each refused, saying so): `serve --follow`, rehearsals, merge checks
+//! `serve --follow` reads a change stream (see `follow`).
+//!
+//! Not yet for MongoDB (each refused, saying so): rehearsals, merge checks
 //! run in the source, write-back rules, `pg_role`, `--lazy-tenant`, sharded clusters, views, time-series and capped
 //! collections.
 
@@ -989,6 +991,261 @@ pub(super) fn refresh(core: &Core, att: &Attached, only: Option<&[usize]>) -> st
     Ok(out)
 }
 
+// ---------------------------------------------------------------- following MongoDB's changes
+
+/// Changes a follow reads from the change streams at a time, shared out among the collections: the rest at the next.
+const FOLLOW_CHANGES: usize = 50_000;
+/// Documents of one collection a follow reads by `_id` at most: past it, the collection is refreshed whole.
+const FOLLOW_IDS: usize = 100_000;
+/// How long a follow lets MongoDB wait before saying a stream has no more for now (ms).
+const FOLLOW_WAIT: u64 = 20;
+
+type Token = mongodb::change_stream::event::ResumeToken;
+
+/// Where a follow's change streams are to resume, kept in the folder: for each attached collection, the token
+/// MongoDB gave after the last change main took.
+fn resume_file(att: &Attached) -> PathBuf {
+    att.dir.join("mongo-follow.json")
+}
+
+/// A token as it is kept: MongoDB's own bytes (a document `{token}`), in hex.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Place {
+    token: Token,
+}
+
+fn resume_read(att: &Attached) -> HashMap<String, Token> {
+    let Ok(text) = std::fs::read_to_string(resume_file(att)) else { return HashMap::new() };
+    let json: Json = serde_json::from_str(&text).unwrap_or_default();
+    let token = |hex: &str| -> Option<Token> {
+        if !hex.len().is_multiple_of(2) {
+            return None;
+        }
+        let bytes: Option<Vec<u8>> =
+            (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok()).collect();
+        bson::deserialize_from_slice::<Place>(&bytes?).ok().map(|p| p.token)
+    };
+    // (one that can't be read is as one never kept: that collection begins again)
+    json["tokens"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(coll, hex)| Some((coll.clone(), token(hex.as_str()?)?)))
+        .collect()
+}
+
+fn resume_write(att: &Attached, places: &HashMap<String, Token>) -> std::result::Result<(), String> {
+    let mut tokens = serde_json::Map::new();
+    for (coll, token) in places {
+        let bytes = bson::serialize_to_vec(&Place { token: token.clone() })
+            .map_err(|e| format!("keeping the change stream's place: {e}"))?;
+        tokens.insert(coll.clone(), Json::String(bytes.iter().map(|b| format!("{b:02x}")).collect()));
+    }
+    let text = json!({ "tokens": tokens, "at": crate::now_ms() }).to_string();
+    let (path, tmp) = (resume_file(att), att.dir.join("mongo-follow.json.tmp"));
+    std::fs::write(&tmp, text)
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .map_err(|e| format!("keeping the change streams' places in {}: {e}", path.display()))
+}
+
+/// Whether a stream can't go on from the place kept: MongoDB's log no longer reaches back to it, or the token
+/// isn't one it reads.
+fn place_lost(e: &mongodb::error::Error) -> bool {
+    match &*e.kind {
+        // ChangeStreamHistoryLost, ChangeStreamFatalError, InvalidResumeToken
+        mongodb::error::ErrorKind::Command(c) => matches!(c.code, 286 | 280 | 260),
+        _ => false,
+    }
+}
+
+/// `chronos serve --follow` beside MongoDB: main takes the documents MongoDB changed since the last follow, without
+/// a refresh's read of every document. A change stream on each attached collection says which (`_id`s), from the
+/// place the last follow kept for it (`mongo-follow.json` in the folder); those documents are then read as MongoDB
+/// has them now, in one snapshot, and compared with main's as a refresh compares them. A stream only says where to
+/// look: a change read twice, or a merge's own write coming back, takes nothing. A collection dropped or renamed, or
+/// with more than `FOLLOW_IDS` documents changed, is refreshed whole. A place moves on only once main took the
+/// changes, so a follow stopped partway reads them again. The first follow of a collection, and one whose place
+/// MongoDB's log no longer reaches (the engine was away longer than the oplog keeps), takes a place first and then
+/// refreshes the collection: changes before a place aren't in the stream. One stream a collection, not one on the
+/// database: the user then needs `find` and `changeStream` on the attached collections only.
+pub(super) fn follow(core: &Core, att: &Attached) -> std::result::Result<Refreshed, String> {
+    use mongodb::change_stream::event::OperationType as Op;
+    let (_, db) = client()?;
+    let tables = att.tables();
+    let kept = resume_read(att);
+    let mut places: HashMap<String, Token> = HashMap::new();
+    let at = crate::now_ms();
+    let mut ids: BTreeMap<usize, HashSet<String>> = BTreeMap::new();
+    // collections compared whole: those beginning (again) at a new place, and those a stream couldn't name documents of
+    let (mut whole, mut anew): (Vec<usize>, Vec<String>) = (vec![], vec![]);
+    // each collection's share of a follow's changes, so a busy one doesn't keep the others waiting; `more`: one
+    // had more than its share, and the rest of them come at the next follow
+    let share = (FOLLOW_CHANGES / tables.len().max(1)).max(1000);
+    let mut more = false;
+    for (ti, t) in tables.iter().enumerate() {
+        let mut read = 0;
+        let coll = db.collection::<Document>(&t.pg);
+        let watch = |from: Option<Token>| {
+            coll.watch().resume_after(from).max_await_time(std::time::Duration::from_millis(FOLLOW_WAIT)).run()
+        };
+        // the place first, then every document: a change between the two is read again, and takes nothing
+        let begin = |why: &str, places: &mut HashMap<String, Token>, anew: &mut Vec<String>| {
+            let stream = watch(None).map_err(|e| cant_follow(&e))?;
+            let token = stream.resume_token().ok_or_else(|| {
+                "MongoDB gave a change stream no place to resume from (MongoDB 4.2 or later gives one): nothing was \
+                 followed"
+                    .to_string()
+            })?;
+            places.insert(t.pg.clone(), token);
+            anew.push(format!("{} ({why})", t.name));
+            Ok::<(), String>(())
+        };
+        let Some(from) = kept.get(&t.pg).cloned() else {
+            begin("from now", &mut places, &mut anew)?;
+            whole.push(ti);
+            continue;
+        };
+        let lost = "again: MongoDB's log no longer reached the place kept";
+        let mut stream = match watch(Some(from.clone())) {
+            Ok(s) => s,
+            Err(e) if place_lost(&e) => {
+                begin(lost, &mut places, &mut anew)?;
+                whole.push(ti);
+                continue;
+            }
+            Err(e) => return Err(cant_follow(&e)),
+        };
+        let mut of: HashSet<String> = HashSet::new();
+        // (compared whole, and whether the stream is over: then a new place is taken)
+        let (mut all, mut ended) = (false, false);
+        while read < share {
+            let ev = match stream.next_if_any() {
+                Ok(Some(ev)) => ev,
+                Ok(None) => break,
+                Err(e) if place_lost(&e) => {
+                    (all, ended) = (true, true);
+                    break;
+                }
+                Err(e) => return Err(format!("MongoDB, reading the change stream of {}: {}", t.name, plain(&e))),
+            };
+            read += 1;
+            match ev.operation_type {
+                Op::Insert | Op::Update | Op::Replace | Op::Delete if !all => {
+                    match ev.document_key.as_ref().and_then(|k| k.get("_id")) {
+                        Some(id) => {
+                            of.insert(id_text(id));
+                            all = of.len() > FOLLOW_IDS;
+                        }
+                        None => all = true,
+                    }
+                }
+                Op::Insert | Op::Update | Op::Replace | Op::Delete => {}
+                // the collection dropped or renamed: MongoDB ends its stream there
+                Op::Invalidate => {
+                    (all, ended) = (true, true);
+                    break;
+                }
+                // (a drop or a rename, before the stream's end; or a kind of change this doesn't know)
+                _ => all = true,
+            }
+        }
+        more |= read >= share;
+        match (ended, stream.resume_token()) {
+            (true, _) => begin("again: its stream ended", &mut places, &mut anew)?,
+            (false, Some(token)) => {
+                places.insert(t.pg.clone(), token);
+            }
+            (false, None) => {
+                places.insert(t.pg.clone(), from);
+            }
+        }
+        if all {
+            whole.push(ti);
+        } else if !of.is_empty() {
+            ids.insert(ti, of);
+        }
+    }
+    let mut out = Refreshed { at, ..Default::default() };
+    if !ids.is_empty() {
+        let (db, mut session) = snapshot(att)?;
+        let main = core.view(MAIN).map_err(|e| e.to_string())?;
+        let mut rows = vec![];
+        for (&ti, of) in &ids {
+            let t = &tables[ti];
+            let keys: Vec<String> = of.iter().cloned().collect();
+            let mut theirs = by_ids(&db, &mut session, t, &keys)
+                .map_err(|e| format!("MongoDB, reading {}: {}", t.name, plain(&e)))?;
+            let (mut ins, mut upd, mut del) = (0, 0, 0);
+            for id in &keys {
+                let now = theirs.remove(id).map(|d| row_of(t, d));
+                let named = vec![(t.cols[t.key[0]].name.clone(), Some(id.clone()))];
+                let ours = match crate::sql::row_from_texts(&main, &t.name, &named) {
+                    Ok((mk, _)) => match core.val(&main.s, &mk).map_err(|e| e.to_string())? {
+                        Some(raw) => Some(texts(core, &main.s, t, &mk, &raw).map_err(|e| e.to_string())?),
+                        None => None,
+                    },
+                    Err(_) => None,
+                };
+                match (ours, now) {
+                    (None, None) => {}
+                    (None, Some(n)) => {
+                        ins += 1;
+                        rows.push(Stored { table: ti, key: vec![Some(id.clone())], row: Some(n) });
+                    }
+                    (Some(_), None) => {
+                        del += 1;
+                        rows.push(Stored { table: ti, key: vec![Some(id.clone())], row: None });
+                    }
+                    (Some(o), Some(n)) if !same_row(t, &o, &n) => {
+                        upd += 1;
+                        rows.push(Stored { table: ti, key: vec![Some(id.clone())], row: Some(n) });
+                    }
+                    (Some(_), Some(_)) => {}
+                }
+            }
+            out.tables.push((t.name.clone(), ins, upd, del));
+        }
+        store(core, att, &rows)?;
+    }
+    if !whole.is_empty() {
+        let r = refresh(core, att, Some(&whole))?;
+        out.tables.extend(r.tables);
+        out.skipped.extend(r.skipped);
+    }
+    resume_write(att, &places)?;
+    if !anew.is_empty() {
+        out.slot = Some(format!("a change stream on each collection of {}: {}", att.database, anew.join(", ")));
+    }
+    // (main is as MongoDB was when the streams were read; the record is written at most once a minute)
+    if !more && (out.changed() > 0 || at.saturating_sub(att.refreshed_at()) > 60_000) {
+        att.refreshed(at).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
+}
+
+/// Forgets the places a follow kept: the next one starts from then, with a refresh. Whether there were any. (MongoDB
+/// keeps nothing for a change stream: there is no slot to drop.)
+pub(super) fn unfollow(att: &Attached) -> std::result::Result<bool, String> {
+    match std::fs::remove_file(resume_file(att)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("{}: {e}", resume_file(att).display())),
+    }
+}
+
+/// Why MongoDB won't give a follow its change stream, and what does.
+fn cant_follow(e: &mongodb::error::Error) -> String {
+    let said = plain(e);
+    if said.contains("replica set") || said.contains("$changeStream") || said.contains("not authorized") {
+        return format!(
+            "MongoDB won't open a change stream ({said}): it takes a replica set, and a user who may run find and \
+             changeStream on each attached collection. Without it, main takes MongoDB's documents at each refresh \
+             (--refresh-every)"
+        );
+    }
+    format!("MongoDB, opening the change stream: {said}")
+}
+
 // ---------------------------------------------------------------- attach
 
 /// `chronos attach <dir>` with a MongoDB CHRONOS_SOURCE_URL: collections of the URL's database, copied in one
@@ -1116,7 +1373,8 @@ pub fn attach(
         .or_else(|e| if plain(&e).contains("already exists") { Ok(()) } else { Err(e) })
         .map_err(|e| {
             format!(
-                "{} can't make the collection {MERGES} in MongoDB ({}): give it readWrite on the database",
+                "the user of CHRONOS_SOURCE_URL can't make the collection {MERGES} in MongoDB's {} ({}): give it \
+                 readWrite on the database, or the privileges the guide lists",
                 db.name(),
                 plain(&e)
             )
@@ -1238,8 +1496,9 @@ pub fn attach(
     println!("\nattached {} collections of {} (MongoDB {version}) to {dir}", att.tables().len(), att.source());
     println!(
         "\nnext: chronos serve {dir} (with CHRONOS_SOURCE_URL set), fork a world, change documents there (each is a \
-         row: _id, and doc, its fields as jsonb), and MERGE WORLD: the change goes to MongoDB first. Not yet with \
-         MongoDB: serve --follow, rehearsals, merge checks, writeback.json and pg_role."
+         row: _id, and doc, its fields as jsonb), and MERGE WORLD: the change goes to MongoDB first. chronos serve --follow \
+         takes MongoDB's changes as they happen. Not yet with MongoDB: rehearsals, merge checks, writeback.json and \
+         pg_role."
     );
     Ok(())
 }

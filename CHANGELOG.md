@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.5.1 (beta), 2026-11-16
+
+**Follow MongoDB's changes as they happen, and a fix for least-privilege MySQL users.** `chronos serve --follow`
+now works beside MongoDB, through change streams. `chronos attach` beside MySQL or MariaDB no longer needs the
+right to create tables when an administrator has made Chronos's two tables: 0.5.0 failed there. Nothing changes
+for a folder attached to Postgres. Built and signed on the maintainer's Mac as 0.5.0 was.
+
+- Fixed: `chronos attach` beside MySQL or MariaDB failed for a user with no right to create tables ("can't make the
+  table chronos_merges"), even where an administrator had made Chronos's two tables from the statements attach
+  prints. Attach now uses the tables where they exist and makes them only where they don't.
+- **MongoDB: `serve --follow`.** Beside MongoDB, `chronos serve --follow` now reads a change stream on each attached
+  collection (the user needs `find` and `changeStream` on those, and on no other): main takes the
+  documents MongoDB changed a moment after they change, without a refresh's read of every document. The place in
+  the stream is kept in the folder (`mongo-follow.json`); the first follow, and one whose place the oplog no longer
+  reaches, begins with a refresh. `chronos refresh --unfollow` forgets the place. `attached` says `follow: true`
+  for MongoDB in a build with it.
+- Fixed: `chronos serve` on a folder attached to MySQL, MariaDB or MongoDB warned at each start that merges into
+  main were refused. They weren't; the warning is gone.
+
 ## 0.5.0 (beta), 2026-11-15
 
 **Attach beside MySQL, MariaDB and MongoDB, undo a merge by its id, and five security fixes.** `chronos attach` now

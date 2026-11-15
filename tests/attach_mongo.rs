@@ -73,7 +73,8 @@ fn merges_are_written_to_mongodb_first() {
     let db = Db::open(&dir).unwrap();
     let att = db.attached().unwrap();
     assert_eq!(att.kind().as_str(), "mongodb");
-    assert!(!att.capabilities().follow && att.capabilities().dry_run && att.capabilities().check_reads);
+    assert!(att.capabilities().follow && att.capabilities().dry_run && att.capabilities().check_reads);
+    assert!(!att.capabilities().act_as && !att.capabilities().lazy_tenant);
     assert_eq!(cell(&db, MAIN, "select count(*) from leads"), "3");
     // a document is a row: _id, the field kept as a column, and the rest as jsonb
     let hex = ada.to_hex();
@@ -300,6 +301,109 @@ fn reads_are_checked_against_mongodb() {
     assert!(e.message.contains("changed in MongoDB since it forked"), "{}", e.message);
     assert!(!e.message.contains("more broadly"), "{}", e.message);
     assert_eq!(email(), "others@x.com", "nothing written");
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+    mdb.drop().run().unwrap();
+}
+
+/// `serve --follow` beside MongoDB: a change stream says which documents changed, and main takes those as MongoDB
+/// has them, without reading the rest. The first follow takes its place and refreshes; a merge's own write coming
+/// back takes nothing; a collection dropped is compared whole; a place forgotten starts again.
+#[test]
+fn main_follows_mongodb_through_a_change_stream() {
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some((_client, mdb)) = throwaway("follow") else {
+        eprintln!("skipped: set CHRONOS_TEST_MONGO to a MongoDB URL");
+        return;
+    };
+    let leads = mdb.collection::<Document>("leads");
+    let notes = mdb.collection::<Document>("notes");
+    let other = mdb.collection::<Document>("other");
+    leads
+        .insert_many([
+            doc! { "_id": 1, "org_id": 42, "name": "Acme", "owner": "bo" },
+            doc! { "_id": "lead-2", "org_id": 42, "name": "Initech", "owner": "bo" },
+        ])
+        .run()
+        .unwrap();
+    notes.insert_one(doc! { "_id": 1, "org_id": 42, "body": "call" }).run().unwrap();
+    other.insert_one(doc! { "_id": 1, "x": 1 }).run().unwrap();
+    let dir = std::env::temp_dir().join(format!("chronos-attach-mongo-follow-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (ok, said) = attach(&dir, &["--tables", "leads,notes", "--fields", "org_id"]);
+    assert!(ok, "{said}");
+    let db = Db::open(&dir).unwrap();
+    let of = |r: &chronos::attach::Refreshed, t: &str| r.tables.iter().find(|x| x.0 == t).map(|x| (x.1, x.2, x.3));
+    let place = dir.join("mongo-follow.json");
+
+    // a change before the first follow: that follow takes its place, and refreshes
+    leads.update_one(doc! { "_id": 1 }, doc! { "$set": { "owner": "early" } }).run().unwrap();
+    assert!(!place.exists());
+    let first = chronos::attach::follow(&db).unwrap();
+    assert!(first.slot.as_deref().is_some_and(|s| s.contains("change stream")), "{first:?}");
+    assert_eq!(of(&first, "leads"), Some((0, 1, 0)), "{first:?}");
+    assert!(place.exists());
+    assert_eq!(cell(&db, MAIN, "select doc->>'owner' from leads where _id = '1'"), "early");
+    // nothing changed: nothing read, nothing taken
+    let none = chronos::attach::follow(&db).unwrap();
+    assert_eq!((none.changed(), none.tables.len(), none.slot.clone()), (0, 0, None), "{none:?}");
+
+    // inserts, updates and deletes, in two collections; a collection that isn't attached is nobody's
+    leads.insert_one(doc! { "_id": 20, "org_id": 42, "name": "twenty" }).run().unwrap();
+    leads.update_one(doc! { "_id": "lead-2" }, doc! { "$set": { "owner": "zed" } }).run().unwrap();
+    leads.update_one(doc! { "_id": "lead-2" }, doc! { "$set": { "owner": "zed2" } }).run().unwrap();
+    leads.delete_one(doc! { "_id": 1 }).run().unwrap();
+    notes.insert_one(doc! { "_id": 2, "org_id": 42, "body": "mail" }).run().unwrap();
+    // (added and removed between two follows: there neither before nor after)
+    notes.insert_one(doc! { "_id": 3, "org_id": 42, "body": "gone" }).run().unwrap();
+    notes.delete_one(doc! { "_id": 3 }).run().unwrap();
+    other.insert_one(doc! { "_id": 2, "x": 2 }).run().unwrap();
+    let r = chronos::attach::follow(&db).unwrap();
+    assert_eq!((of(&r, "leads"), of(&r, "notes")), (Some((1, 1, 1)), Some((1, 0, 0))), "{r:?}");
+    assert_eq!(cell(&db, MAIN, "select count(*) from leads"), "2");
+    assert_eq!(cell(&db, MAIN, "select doc->>'owner' from leads where _id = '\"lead-2\"'"), "zed2");
+    assert_eq!(cell(&db, MAIN, "select doc->>'name' from leads where _id = '20'"), "twenty");
+    assert_eq!(cell(&db, MAIN, "select count(*) from notes"), "2");
+    assert_eq!(chronos::attach::follow(&db).unwrap().changed(), 0);
+
+    // a merge's own write comes back in the stream, and takes nothing: main has it already
+    run(&db, MAIN, "create world w", &[]).unwrap();
+    run(&db, "w", "update leads set doc = jsonb_set(doc, '{owner}', '\"ada\"') where _id = '20'", &[]).unwrap();
+    run(&db, MAIN, "merge world w", &[]).unwrap_or_else(|e| panic!("{}", e.message));
+    assert_eq!(leads.find_one(doc! { "_id": 20 }).run().unwrap().unwrap().get_str("owner").ok(), Some("ada"));
+    let own = chronos::attach::follow(&db).unwrap();
+    assert_eq!(own.changed(), 0, "{own:?}");
+    // a world forked before a change followed since conflicts on that document, as after a refresh
+    run(&db, MAIN, "create world late", &[]).unwrap();
+    run(&db, "late", "update leads set doc = jsonb_set(doc, '{owner}', '\"mine\"') where _id = '20'", &[]).unwrap();
+    leads.update_one(doc! { "_id": 20 }, doc! { "$set": { "owner": "theirs" } }).run().unwrap();
+    assert_eq!(chronos::attach::follow(&db).unwrap().changed(), 1);
+    let e = run(&db, MAIN, "merge world late", &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    assert_eq!(leads.find_one(doc! { "_id": 20 }).run().unwrap().unwrap().get_str("owner").ok(), Some("theirs"));
+
+    // a collection dropped: compared whole (its documents are gone from main)
+    notes.drop().run().unwrap();
+    let dropped = chronos::attach::follow(&db).unwrap();
+    assert_eq!(of(&dropped, "notes"), Some((0, 0, 2)), "{dropped:?}");
+    assert_eq!(cell(&db, MAIN, "select count(*) from notes"), "0");
+    // (its stream ended there: it follows on from a new place, a collection of that name made again included)
+    assert!(dropped.slot.as_deref().is_some_and(|s| s.contains("notes (again")), "{dropped:?}");
+    notes.insert_one(doc! { "_id": 9, "org_id": 42, "body": "back" }).run().unwrap();
+    let back = chronos::attach::follow(&db).unwrap();
+    assert_eq!((of(&back, "notes"), back.slot.clone()), (Some((1, 0, 0)), None), "{back:?}");
+
+    // the place forgotten (`refresh --unfollow`): changes meanwhile are taken by the refresh the next follow begins with
+    assert!(chronos::attach::unfollow(&db).unwrap());
+    assert!(!chronos::attach::unfollow(&db).unwrap() && !place.exists());
+    leads.update_one(doc! { "_id": 20 }, doc! { "$set": { "owner": "while away" } }).run().unwrap();
+    let again = chronos::attach::follow(&db).unwrap();
+    assert!(again.slot.is_some() && of(&again, "leads") == Some((0, 1, 0)), "{again:?}");
+    // a place MongoDB can't read is begun again too, not an error for ever
+    std::fs::write(&place, r#"{"tokens":{"leads":"00"},"at":1}"#).unwrap();
+    assert!(chronos::attach::follow(&db).unwrap().slot.is_some());
+    assert_eq!(chronos::attach::follow(&db).unwrap().changed(), 0);
 
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);

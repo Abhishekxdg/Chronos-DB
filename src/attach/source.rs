@@ -120,6 +120,14 @@ pub(super) trait Source: Send + Sync + std::fmt::Debug {
 
     /// Main takes the source's rows as they are now, of the tables `only` names if given.
     fn refresh(&self, core: &Core, att: &Attached, only: Option<&[usize]>) -> std::result::Result<Refreshed, String>;
+
+    /// Main takes the rows the source changed since the last follow (see `follow` in the parent module), with the
+    /// write-back lock held.
+    fn follow(&self, core: &Core, att: &Attached) -> std::result::Result<Refreshed, String>;
+
+    /// What `follow` keeps to know where it was (a slot in the source, a place in its log) is dropped. Whether there
+    /// was any.
+    fn unfollow(&self, att: &Attached) -> std::result::Result<bool, String>;
 }
 
 /// The source a saved record names: `source` absent is Postgres (records made before there was another), `"mysql"`
@@ -191,6 +199,14 @@ impl Source for Postgres {
     fn refresh(&self, core: &Core, att: &Attached, only: Option<&[usize]>) -> std::result::Result<Refreshed, String> {
         super::pg_refresh(core, att, only)
     }
+
+    fn follow(&self, core: &Core, att: &Attached) -> std::result::Result<Refreshed, String> {
+        super::pg_follow(core, att)
+    }
+
+    fn unfollow(&self, att: &Attached) -> std::result::Result<bool, String> {
+        super::pg_unfollow(att)
+    }
 }
 
 /// MySQL 8.0 or later, or MariaDB 10.5 or later (`maria`): one path for both (see `mysql`).
@@ -260,6 +276,14 @@ impl Source for MySql {
     fn refresh(&self, core: &Core, att: &Attached, only: Option<&[usize]>) -> std::result::Result<Refreshed, String> {
         mysql::refresh(core, att, only)
     }
+
+    fn follow(&self, _core: &Core, _att: &Attached) -> std::result::Result<Refreshed, String> {
+        Err("serve --follow isn't done for MySQL yet: main takes MySQL's rows at each refresh (--refresh-every)".into())
+    }
+
+    fn unfollow(&self, _att: &Attached) -> std::result::Result<bool, String> {
+        Ok(false)
+    }
 }
 
 /// MongoDB 5.0 or later, a replica set (see `mongo`). In a build without the `mongo` feature every use says so.
@@ -277,7 +301,7 @@ impl Source for Mongo {
 
     fn capabilities(&self) -> Capabilities {
         let built = cfg!(feature = "mongo");
-        Capabilities { check_reads: built, dry_run: built, ..Capabilities::WRITE_BACK_ONLY }
+        Capabilities { check_reads: built, dry_run: built, follow: built, ..Capabilities::WRITE_BACK_ONLY }
     }
 
     #[allow(unused_variables)]
@@ -352,6 +376,22 @@ impl Source for Mongo {
     fn refresh(&self, core: &Core, att: &Attached, only: Option<&[usize]>) -> std::result::Result<Refreshed, String> {
         #[cfg(feature = "mongo")]
         return mongo::refresh(core, att, only);
+        #[cfg(not(feature = "mongo"))]
+        Err(NO_MONGO.into())
+    }
+
+    #[allow(unused_variables)]
+    fn follow(&self, core: &Core, att: &Attached) -> std::result::Result<Refreshed, String> {
+        #[cfg(feature = "mongo")]
+        return mongo::follow(core, att);
+        #[cfg(not(feature = "mongo"))]
+        Err(NO_MONGO.into())
+    }
+
+    #[allow(unused_variables)]
+    fn unfollow(&self, att: &Attached) -> std::result::Result<bool, String> {
+        #[cfg(feature = "mongo")]
+        return mongo::unfollow(att);
         #[cfg(not(feature = "mongo"))]
         Err(NO_MONGO.into())
     }

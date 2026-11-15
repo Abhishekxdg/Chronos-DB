@@ -44,12 +44,16 @@ const MERGE_ROWS: &str = "chronos_merge_rows";
 /// user (tried, and rolled back).
 pub(super) fn undo_ready() -> bool {
     let Ok(mut c) = url().and_then(|u| open(&u)) else { return false };
-    let _ = c.query(&format!(
-        "create table if not exists {MERGE_ROWS} (merge_id varchar(255) not null, n int not null, table_name \
+    // (tried only where the table isn't there: see the same for `MERGES` at attach)
+    let there = c.query(&format!("select 1 from {MERGE_ROWS} limit 0")).is_ok();
+    if !there {
+        let _ = c.query(&format!(
+            "create table if not exists {MERGE_ROWS} (merge_id varchar(255) not null, n int not null, table_name \
          varchar(255) not null, op varchar(10) not null, row_key json, before_row json, after_row json, at \
          datetime(6) not null default current_timestamp(6), primary key (merge_id, n), key {MERGE_ROWS}_at (at)) \
          engine = InnoDB"
-    ));
+        ));
+    }
     let tried = c.query_all(&format!(
         "start transaction; insert into {MERGE_ROWS} (merge_id, n, table_name, op) values ('probe', 0, '', '')"
     ));
@@ -1406,11 +1410,15 @@ pub fn attach(dir: &str, opts: &crate::Open, named: &[String], yes: bool) -> std
          insert, delete on {db}.{MERGE_ROWS} to <the user the URL names>;\n",
         db = mq(&url.database)
     );
-    c.query(&format!(
-        "create table if not exists {MERGES} (id varchar(255) primary key, at datetime(6) not null default \
-         current_timestamp(6)) engine = InnoDB"
-    ))
-    .map_err(|e| format!("{} can't make the table {MERGES} in MySQL ({e}){setup}", url.user))?;
+    // made here only where it isn't there: MySQL asks for the right to create a table even of one that exists, and
+    // the user an administrator set up (the statements above) has no such right, and needs none
+    if c.query(&format!("select 1 from {MERGES} limit 0")).is_err() {
+        c.query(&format!(
+            "create table if not exists {MERGES} (id varchar(255) primary key, at datetime(6) not null default \
+             current_timestamp(6)) engine = InnoDB"
+        ))
+        .map_err(|e| format!("{} can't make the table {MERGES} in MySQL ({e}){setup}", url.user))?;
+    }
     // one consistent read of everything from here on
     c.query("set transaction isolation level repeatable read; start transaction with consistent snapshot, read only")
         .map_err(|e| format!("starting the read: {e}"))?;

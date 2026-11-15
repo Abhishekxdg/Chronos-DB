@@ -565,3 +565,64 @@ fn merges_are_written_to_mysql_first() {
     let _ = std::fs::remove_dir_all(&dir);
     admin.query(&format!("drop database {name}")).unwrap();
 }
+
+/// A user with rights on the attached tables and on Chronos's two, and no right to create a table: what an
+/// administrator sets up from the statements attach prints. Attach, a merge and its undo go through, since the two
+/// tables are there (MySQL asks for the right to create even on `create table if not exists` of one that exists).
+#[test]
+fn a_user_who_cannot_create_tables_is_enough() {
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some((mut admin, mut my, name)) = throwaway("least") else {
+        eprintln!("skipped: set CHRONOS_TEST_MYSQL to a MySQL URL");
+        return;
+    };
+    let user = format!("chronos_least_{}", std::process::id());
+    my.query(&format!(
+        "create table leads (id int primary key, owner varchar(40)) engine = InnoDB;
+         insert into leads values (1, 'bo');
+         create table chronos_merges (id varchar(255) primary key, at datetime(6) not null default
+                                      current_timestamp(6)) engine = InnoDB;
+         create table chronos_merge_rows (merge_id varchar(255) not null, n int not null, table_name varchar(255)
+                                          not null, op varchar(10) not null, row_key json, before_row json,
+                                          after_row json, at datetime(6) not null default current_timestamp(6),
+                                          primary key (merge_id, n), key chronos_merge_rows_at (at)) engine = InnoDB;
+         drop user if exists '{user}'@'%';
+         create user '{user}'@'%' identified by 'least-pw';
+         grant select, insert, update, delete on {name}.leads to '{user}'@'%';
+         grant select, insert on {name}.chronos_merges to '{user}'@'%';
+         grant select, insert, delete on {name}.chronos_merge_rows to '{user}'@'%'"
+    ))
+    .unwrap();
+    let admin_url = std::env::var("CHRONOS_TEST_MYSQL").unwrap();
+    let host = admin_url.split_once('@').unwrap().1.split(['/', '?']).next().unwrap().to_string();
+    let query = admin_url.split_once('?').map(|(_, q)| format!("?{q}")).unwrap_or_default();
+    unsafe { std::env::set_var("CHRONOS_SOURCE_URL", format!("mysql://{user}:least-pw@{host}/{name}{query}")) };
+    let dir = std::env::temp_dir().join(format!("chronos-attach-mysql-least-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = Command::new(env!("CARGO_BIN_EXE_chronos"))
+        .arg("attach")
+        .arg(&dir)
+        .args(["--tables", "leads"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let db = Db::open(&dir).unwrap();
+    run(&db, MAIN, "create world w", &[]).unwrap();
+    run(&db, "w", "update leads set owner = 'ada' where id = 1", &[]).unwrap();
+    let _ = chronos::attach::take_merge_id();
+    run(&db, MAIN, "merge world w", &[]).unwrap_or_else(|e| panic!("merge: {}", e.message));
+    let id = chronos::attach::take_merge_id().expect("the merge's id");
+    assert_eq!(my_cell(&mut my, "select owner from leads where id = 1"), "ada");
+    let done = db
+        .undo_merges(
+            std::slice::from_ref(&id),
+            chronos::attach::UndoOptions { skip_changed: false, dry_run: false, ..Default::default() },
+        )
+        .unwrap();
+    assert_eq!((done.undone, done.skipped), (1, 0), "{done:?}");
+    assert_eq!(my_cell(&mut my, "select owner from leads where id = 1"), "bo");
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+    admin.query(&format!("drop user '{user}'@'%'; drop database {name}")).unwrap();
+}

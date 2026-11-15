@@ -361,6 +361,14 @@ fn main() {
         }
         if unfollow {
             let code = match chronos::attach::unfollow(&db) {
+                // (MongoDB: a place in its change stream, kept in the folder; nothing is kept there)
+                Ok(was) if db.attached().is_some_and(|a| a.kind() == chronos::attach::SourceKind::Mongo) => {
+                    match was {
+                        true => println!("forgot the change stream's place: the next follow begins with a refresh"),
+                        false => println!("no change stream's place to forget"),
+                    }
+                    0
+                }
                 Ok(true) => {
                     println!("dropped replication slot {}: Postgres keeps no WAL for this folder now", slot(&db));
                     0
@@ -778,20 +786,25 @@ fn main() {
                     match chronos::attach::follow(&db) {
                         Ok(r) => {
                             if failing.take().is_some() {
-                                eprintln!("chronos: following Postgres's changes again");
+                                eprintln!("chronos: following the database's changes again");
                             }
-                            if let Some(s) = &r.slot {
-                                eprintln!(
+                            match &r.slot {
+                                // (MongoDB: a change stream, which keeps nothing there)
+                                Some(s) if s.starts_with("a change stream") => {
+                                    eprintln!("chronos: following MongoDB's changes through {s}")
+                                }
+                                Some(s) => eprintln!(
                                     "chronos: following Postgres's changes through replication slot {s} (it keeps \
                                      Postgres's WAL until read: chronos refresh <folder> --unfollow drops it)"
-                                );
+                                ),
+                                None => {}
                             }
                             wait = FOLLOW_EVERY;
                             said(&r);
                         }
                         Err(e) => {
                             if failing.as_deref() != Some(e.as_str()) {
-                                eprintln!("chronos: following Postgres's changes failed (tried again): {e}");
+                                eprintln!("chronos: following the database's changes failed (tried again): {e}");
                                 failing = Some(e);
                             }
                             wait = (wait * 2).min(std::time::Duration::from_secs(60));
