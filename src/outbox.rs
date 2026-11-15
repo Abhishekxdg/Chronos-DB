@@ -23,6 +23,12 @@
 //!
 //! A lease running out never counts as leave to send again to a receiver that isn't idempotent:
 //! an ambiguous entry stays in SHOW OUTBOX, and no CLAIM returns it.
+//!
+//! An agent's merge under a merge policy with `effects_delay` lands its effects `delayed` until that time has passed
+//! (`not_before`): no CLAIM returns one before (and no NOTIFY says it landed: workers find it by claiming), and an
+//! UNDO MERGE of that merge meanwhile takes it out of the outbox unsent.
+//!
+//!   delayed ─effects_delay passes─> queued     delayed ─UNDO MERGE─> gone (cancelled)
 
 use crate::{Core, Error, MAIN, Result, disk};
 use serde_json::{Value as Json, json};
@@ -77,6 +83,17 @@ pub(crate) fn entry(key: &str) -> bool {
     key.starts_with(OUTBOX) && key.as_bytes().get(OUTBOX.len()) == Some(&b'/')
 }
 
+/// The effects of `apply` (a merge's changes) new to main, delayed `ms` from now: they can't be claimed until then
+/// (see the module docs).
+pub(crate) fn delay(apply: &mut [crate::Change], ms: u64) {
+    let until = disk::now_ms().saturating_add(ms);
+    for c in apply.iter_mut().filter(|c| entry(&c.key) && c.before.is_none()) {
+        let Some(mut j) = c.after.as_deref().and_then(|a| serde_json::from_str::<Json>(a).ok()) else { continue };
+        j["not_before"] = json!(until);
+        c.after = Some(j.to_string().into());
+    }
+}
+
 /// An entry's channel (see `entry`), from its stored value.
 pub(crate) fn channel_of(raw: &str) -> Option<String> {
     let j: Json = serde_json::from_str(raw).ok()?;
@@ -90,6 +107,9 @@ pub(crate) fn notes(landed: &[crate::Change]) -> Vec<(String, String)> {
         .filter(|c| entry(&c.key) && c.before.is_none()) // new to main: a claim's update isn't news
         .filter_map(|c| {
             let j: Json = serde_json::from_str(c.after.as_deref()?).ok()?;
+            if j["not_before"].is_u64() {
+                return None; // delayed: said when it may be claimed, by a worker claiming
+            }
             Some((j["channel"].as_str()?.to_string(), j["payload"].as_str().unwrap_or_default().to_string()))
         })
         .collect()
@@ -98,6 +118,7 @@ pub(crate) fn notes(landed: &[crate::Change]) -> Vec<(String, String)> {
 /// An entry's state at `now`, from its stored value (see the module docs).
 fn state(j: &Json, now: u64) -> &'static str {
     match j["state"].as_str() {
+        None | Some("queued") if j["not_before"].as_u64().is_some_and(|t| t > now) => "delayed",
         Some("claimed") if j["until"].as_u64().is_some_and(|u| u > now) => "claimed",
         Some("claimed") if j["idempotent"].as_bool() == Some(true) => "queued",
         Some("claimed") => "ambiguous",
@@ -215,6 +236,29 @@ impl Core {
                 j["idempotent"] = json!(idempotent);
                 out.extend(effect(&k[prefix.len()..], &j, now));
                 rows.push((k, Some(j.to_string())));
+            }
+            Ok::<_, Error>((rows, out))
+        })?;
+        Ok(out)
+    }
+
+    /// Takes effects `ids` out of main's outbox unsent, those of them still delayed (see the module docs): an UNDO
+    /// MERGE of the merge that landed them. Returns those taken.
+    pub(crate) fn cancel_delayed(&self, ids: &[String]) -> Result<Vec<String>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let (_, out) = self.batch_with(MAIN, |v| {
+            let now = disk::now_ms();
+            let (mut rows, mut out) = (vec![], vec![]);
+            for id in ids {
+                let k = format!("{OUTBOX}/{id}");
+                let Some(raw) = v.get(&k)? else { continue };
+                let Ok(j) = serde_json::from_str::<Json>(&raw) else { continue };
+                if state(&j, now) == "delayed" {
+                    rows.push((k, None));
+                    out.push(id.clone());
+                }
             }
             Ok::<_, Error>((rows, out))
         })?;

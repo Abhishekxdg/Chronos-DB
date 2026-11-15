@@ -75,8 +75,10 @@ print("   held for a person: it planned a follow-up for a deal that's already wo
 step("3. The agent cuts every proposal of Ben's by 1500, and one goes below zero")
 w = bot.fork("discounts")
 w.sql("update deals set amount = amount - 1500 where owner = 'ben' and stage = 'proposal'")
-refused(w.merge, "no_negative_amounts", "Hooli")
-print("   held: the merge check ran on the merged result and found the bad row")
+refused(w.merge, "no_negative_amounts", "which finds …")
+held = [r for r in rows(person, "show reviews") if r["world"] == "discounts"][0]
+assert "Hooli" in held["reasons"], held["reasons"]
+print(f"   held: the merge check found the bad row; the agent sees no values, you do: {held['reasons']}")
 
 step("4. The agent archives stale leads (a delete), and queues an email about it")
 w = bot.fork("cleanup")

@@ -1074,7 +1074,7 @@ fn mcp_merge_checks() {
         bot[0]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(tools.contains(&"merge_checks") && !tools.contains(&"set_merge_check"), "{tools:?}");
     assert!(
-        is_err(&bot[3]) && text(&bot[3]).contains("breaks merge check keep, which finds (id = 1)"),
+        is_err(&bot[3]) && text(&bot[3]).contains("breaks merge check keep, which finds …"),
         "{}",
         text(&bot[3])
     );

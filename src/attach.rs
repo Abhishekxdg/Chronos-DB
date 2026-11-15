@@ -41,8 +41,32 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "mongo")]
+mod mongo;
+#[cfg(feature = "mongo")]
+mod mongo_json;
 mod mysql;
+mod source;
+mod undo;
+pub use undo::{CASCADE, Record, UndoOptions, UndoRow, UndoneMerges, take_merge_id, window_days};
+
+impl Attached {
+    /// Whether merges keep the rows they write in the source, to be undone by (see `undo`): the table is there and
+    /// the role may write it.
+    pub fn keeps_undo(&self) -> bool {
+        undo::ready(self)
+    }
+}
+#[cfg(feature = "mongo")]
+pub use mongo::attach as attach_mongo;
 pub use mysql::attach as attach_mysql;
+
+/// Whether `url` names a MongoDB (`mongodb://`, `mongodb+srv://`).
+pub fn is_mongo_url(url: &str) -> bool {
+    url.starts_with("mongodb://") || url.starts_with("mongodb+srv://")
+}
+use source::Source;
+pub use source::{Capabilities, SourceKind};
 
 /// The folder's file saying it is attached, and to what (no secret in it).
 pub(crate) const FILE: &str = "attached";
@@ -124,6 +148,12 @@ pub struct Col {
     /// Postgres's `attnum`, which a rename keeps: how a refresh tells a column renamed from one dropped and another
     /// added (see `shape`). 0 in a record made before it was kept: the next refresh fills it in
     pub attnum: i16,
+    /// (MySQL) its default there is an expression only MySQL works out (`(uuid())`): a NULL in a row the merge
+    /// inserts is written as DEFAULT
+    pub fill: bool,
+    /// (MySQL) a generated column there, held here as a plain one: read and compared, never written (MySQL works it
+    /// out, and main takes its value back with the row)
+    pub computed: bool,
 }
 
 /// `t`'s columns that are written and compared: all but its generated ones (see `Col::generated`).
@@ -201,9 +231,9 @@ pub struct Attached {
     /// attached with `--lazy-tenant <column>`: its tables with that column (and their children through a foreign
     /// key) hold only the tenants loaded so far (see `Lazy`); None: every table is copied whole
     lazy: Option<Lazy>,
-    /// attached to MySQL (or MariaDB), not Postgres (see `mysql`): each table's `pg` is then its name in MySQL's SQL,
-    /// and each column's `ty` MySQL's COLUMN_TYPE
-    mysql: bool,
+    /// the database it is attached to (see `source`). For MySQL (or MariaDB), not Postgres (see `mysql`), each table's
+    /// `pg` is its name in MySQL's SQL, and each column's `ty` MySQL's COLUMN_TYPE
+    src: Box<dyn Source>,
     /// the connection to MySQL kept between write-backs and refreshes
     my: Mutex<Option<crate::myclient::Client>>,
 }
@@ -356,10 +386,11 @@ pub(crate) struct Lease {
 impl Attached {
     /// A connection to the source for one use (see `Lease`).
     fn lease(&self) -> std::result::Result<Lease, String> {
-        if self.mysql {
+        if self.kind() != SourceKind::Postgres {
             return Err(format!(
-                "this folder is attached to MySQL ({}), and this works with a Postgres source only for now (dry runs, \
-                 rehearsals, check_reads, follow, tenants loaded a tenant at a time)",
+                "this folder is attached to {} ({}), and this works with a Postgres source only for now (rehearsals, \
+                 follow, write-back rules, tenants loaded a tenant at a time)",
+                if self.kind() == SourceKind::Mongo { "MongoDB" } else { "MySQL" },
                 self.source()
             ));
         }
@@ -431,6 +462,16 @@ const IDS: &str = "attached.ids";
 /// Values reserved from a Postgres sequence at once (`nextval` in one statement), at least.
 const BLOCK: usize = 1000;
 
+/// What stands for a sequence in a MySQL folder's `Seq::pg`: MySQL gives an AUTO_INCREMENT column its value when the
+/// row is inserted, and no block of them can be reserved ahead. A row a world inserts gets a provisional id instead:
+/// a negative number no row of MySQL's has, one for the whole folder (so a value tells which row it stands for). The
+/// merge inserts the row without it, takes the id MySQL gave (LAST_INSERT_ID), and writes that wherever the
+/// provisional one stood: the row itself, and the rows that refer to it by a foreign key MySQL declares (see
+/// `mysql::transaction`).
+pub(crate) const PROVISIONAL: &str = "mysql:provisional";
+/// The first provisional id: far below any number a column is likely to hold for another reason.
+const PROVISIONAL_FROM: i64 = -1_000_000_001;
+
 /// Values reserved from Postgres's sequences: those not handed out yet, by counter (forgotten at a restart: a gap,
 /// as Postgres's own cache leaves), and every one ever reserved, by sequence, as runs (first value, step, count), kept
 /// in `IDS`.
@@ -459,6 +500,23 @@ impl Ids {
                 step != 0 && d % step == 0 && (0..n).contains(&(d / step))
             })
         })
+    }
+
+    /// `n` more provisional ids for `seq` (see `PROVISIONAL`): the next below every one given so far, kept as one
+    /// run counting down.
+    fn provisional(&mut self, seq: &str, n: usize) -> std::result::Result<Vec<i64>, String> {
+        let runs = self.runs.entry(seq.to_string()).or_default();
+        let next = runs.last().map_or(PROVISIONAL_FROM, |&(first, _, count)| first - count);
+        if next - (n as i64) < i64::from(i32::MIN) {
+            return Err("this folder has no provisional ids left for new rows of AUTO_INCREMENT tables: attach again \
+                        into a new folder"
+                .into());
+        }
+        match runs.last_mut() {
+            Some(run) => run.2 += n as i64,
+            None => runs.push((PROVISIONAL_FROM, -1, n as i64)),
+        }
+        Ok((0..n as i64).map(|i| next - i).collect())
     }
 
     /// `vals` (in the order Postgres gave them) as runs of one step each.
@@ -531,7 +589,7 @@ impl Table {
         json!({
             "name": self.name, "sql": self.sql, "pg": self.pg, "key": self.key,
             "seqs": self.seqs.iter().map(|q| json!({"col": q.col, "pg": q.pg, "counter": q.counter})).collect::<Vec<_>>(),
-            "cols": self.cols.iter().map(|c| json!({"name": c.name, "ty": c.ty, "always": c.always, "generated": c.generated, "attnum": c.attnum})).collect::<Vec<_>>(),
+            "cols": self.cols.iter().map(|c| json!({"name": c.name, "ty": c.ty, "always": c.always, "generated": c.generated, "attnum": c.attnum, "fill": c.fill, "computed": c.computed})).collect::<Vec<_>>(),
         })
     }
 
@@ -565,6 +623,8 @@ impl Table {
                         always: c["always"].as_bool().unwrap_or(false),
                         generated: c["generated"].as_bool().unwrap_or(false),
                         attnum: c["attnum"].as_i64().and_then(|n| i16::try_from(n).ok()).unwrap_or(0),
+                        fill: c["fill"].as_bool().unwrap_or(false),
+                        computed: c["computed"].as_bool().unwrap_or(false),
                     })
                 })
                 .collect::<Option<_>>()?,
@@ -589,13 +649,13 @@ impl Attached {
             unsettled: Mutex::default(),
             conn: Arc::default(),
             lazy: None,
-            mysql: false,
+            src: Box::new(source::Postgres),
             my: Mutex::default(),
         }
     }
 
-    /// `new`, for a MySQL database (see `mysql`).
-    pub(crate) fn new_mysql(dir: &Path, url: &crate::myclient::Url, tables: Vec<Table>) -> Attached {
+    /// `new`, for a MySQL database, or a MariaDB one (`maria`): see `mysql`.
+    pub(crate) fn new_mysql(dir: &Path, url: &crate::myclient::Url, tables: Vec<Table>, maria: bool) -> Attached {
         let pg = Url {
             host: url.host.clone(),
             port: url.port,
@@ -609,13 +669,43 @@ impl Attached {
             plain_password: false,
         };
         let mut a = Attached::new(dir, &pg, tables);
-        a.mysql = true;
+        a.src = Box::new(source::MySql { maria });
         a
     }
 
     /// Whether the source is MySQL (or MariaDB), not Postgres.
+    /// A folder attached to MongoDB (see `mongo`): each table is a collection, each row a document.
+    #[cfg(feature = "mongo")]
+    pub(crate) fn new_mongo(dir: &Path, host: &str, port: u16, database: &str, tables: Vec<Table>) -> Attached {
+        let pg = Url {
+            host: host.to_string(),
+            port,
+            user: String::new(),
+            password: None,
+            database: database.to_string(),
+            sslmode: String::new(),
+            sslrootcert: None,
+            channel_binding: String::new(),
+            connect_timeout: 0,
+            plain_password: false,
+        };
+        let mut a = Attached::new(dir, &pg, tables);
+        a.src = Box::new(source::Mongo);
+        a
+    }
+
     pub fn is_mysql(&self) -> bool {
-        self.mysql
+        self.src.kind() != SourceKind::Postgres
+    }
+
+    /// Which database the source is.
+    pub fn kind(&self) -> SourceKind {
+        self.src.kind()
+    }
+
+    /// What the source can do besides the write-back and the refresh (see `Capabilities`).
+    pub fn capabilities(&self) -> Capabilities {
+        self.src.capabilities()
     }
 
     /// The record, loading the tables `lazy` names a tenant at a time (see `Lazy`).
@@ -689,7 +779,7 @@ impl Attached {
                 None | Some(Json::Null) => None,
                 Some(l) => Some(Lazy::from_json(l).ok_or_else(bad)?),
             },
-            mysql: j["source"].as_str() == Some("mysql"),
+            src: source::from_saved(j["source"].as_str(), j["flavor"].as_str()),
             my: Mutex::default(),
         }))
     }
@@ -706,8 +796,15 @@ impl Attached {
         if let Some(l) = &self.lazy {
             j["lazy"] = l.to_json();
         }
-        if self.mysql {
-            j["source"] = "mysql".into();
+        // (Postgres is said by saying nothing, as records made before there was another source do)
+        match self.kind() {
+            SourceKind::Postgres => {}
+            SourceKind::MySql => j["source"] = "mysql".into(),
+            SourceKind::MariaDb => {
+                j["source"] = "mysql".into();
+                j["flavor"] = "mariadb".into();
+            }
+            SourceKind::Mongo => j["source"] = "mongo".into(),
         }
         crate::disk::write_file(&self.dir.join(FILE), serde_json::to_string_pretty(&j)?.as_bytes())
     }
@@ -788,8 +885,11 @@ pub fn setup_statements(role: &str) -> String {
     format!(
         "create schema if not exists chronos;\n\
          create table if not exists chronos.merges (id text primary key, at timestamptz not null default now());\n\
+         {};\n\
          grant usage on schema chronos to {r};\n\
-         grant select, insert on chronos.merges to {r};",
+         grant select, insert on chronos.merges to {r};\n\
+         grant select, insert, delete on chronos.merge_rows to {r};",
+        undo::CREATE.replace("; ", ";\n"),
         r = q(role)
     )
 }
@@ -799,9 +899,11 @@ pub fn setup_statements(role: &str) -> String {
 pub fn source_url() -> std::result::Result<Url, String> {
     let text = source_text()?;
     if crate::myclient::is_mysql(&text) {
-        return Err("CHRONOS_SOURCE_URL names a MySQL database, and this works with Postgres only for now (dry runs, \
-                    rehearsals, check_reads, follow, tenants loaded a tenant at a time)"
-            .into());
+        return Err(
+            "CHRONOS_SOURCE_URL names a MySQL database, and this works with Postgres only for now (rehearsals, \
+                    follow, write-back rules, tenants loaded a tenant at a time)"
+                .into(),
+        );
     }
     pgclient::parse(&text)
 }
@@ -911,6 +1013,16 @@ pub(crate) fn values(core: &Core, counter: &str, n: usize) -> Option<std::result
         .iter()
         .find_map(|t| t.seqs.iter().find(|sq| sq.counter.as_deref() == Some(counter)).map(|sq| (t, sq)))?;
     let Some(seq) = &sq.pg else {
+        if att.is_mysql() {
+            return Some(Err(format!(
+                "{}.{} is AUTO_INCREMENT in MySQL, of a type this folder gives no provisional ids for (it was attached \
+                 before they were, or the column is narrower than INT or is BIGINT UNSIGNED): rows can't be inserted \
+                 into {} here",
+                t.sql,
+                q(&t.cols[sq.col].name),
+                t.sql
+            )));
+        }
         return Some(Err(format!(
             "{}.{} takes its values from a sequence in Postgres this folder can't take values from (the role needs \
              USAGE on it): give rows of {} no new {} here",
@@ -929,8 +1041,14 @@ impl Attached {
         let mut ids = self.ids.lock().unwrap_or_else(|p| p.into_inner());
         let have = ids.pool.get(counter).map_or(0, |p| p.len());
         if have < n {
-            let got = reserve(self, seq, (n - have).max(BLOCK))?;
-            ids.add(seq, &got);
+            let got = match self.is_mysql() {
+                true => ids.provisional(seq, (n - have).max(BLOCK))?,
+                false => {
+                    let got = reserve(self, seq, (n - have).max(BLOCK))?;
+                    ids.add(seq, &got);
+                    got
+                }
+            };
             let runs = serde_json::to_string(&ids.runs).map_err(|e| e.to_string())?;
             // on disk before any is handed out: a merge after a restart still knows them
             crate::disk::write_file(&self.dir.join(IDS), runs.as_bytes()).map_err(|e| format!("{IDS}: {e}"))?;
@@ -938,6 +1056,11 @@ impl Attached {
         }
         let pool = ids.pool.get_mut(counter).expect("filled above");
         Ok(pool.drain(..n).collect())
+    }
+
+    /// Whether `v` is a provisional id this folder gave a new row of a MySQL table (see `PROVISIONAL`).
+    pub(crate) fn provisional(&self, v: i64) -> bool {
+        self.is_mysql() && self.reserved(PROVISIONAL, v)
     }
 
     /// Whether `v` is a value this folder reserved from Postgres's sequence `seq`.
@@ -973,10 +1096,22 @@ fn check_ids(
     after: Option<&[Option<String>]>,
 ) -> Result<()> {
     let Some(after) = after else { return Ok(()) };
+    if undo::restoring() {
+        return Ok(()); // (an undo puts a row back under the id the source once gave it)
+    }
     for sq in &t.seqs {
         let new = after[sq.col].as_deref();
         let Some(v) = new.filter(|_| before.is_none_or(|b| b[sq.col].as_deref() != new)) else { continue };
         let ok = sq.pg.as_deref().is_some_and(|seq| v.parse::<i64>().is_ok_and(|v| att.reserved(seq, v)));
+        if !ok && att.is_mysql() {
+            return Err(refused(format!(
+                "{world} gives {}.{} the value {v}, and the column is AUTO_INCREMENT in MySQL: MySQL gives it its \
+                 value when the row is written. Leave the column to its default (a provisional id here, MySQL's own \
+                 at the merge); nothing was merged",
+                t.sql,
+                q(&t.cols[sq.col].name)
+            )));
+        }
         if !ok {
             let col = &t.cols[sq.col].name;
             return Err(refused(format!(
@@ -1190,11 +1325,25 @@ pub(crate) fn write_back(
         return Ok(None);
     }
     let rules = att.rules().map_err(|e| refused(format!("write-back rules: {e}; nothing was merged")))?;
-    if att.mysql {
-        return mysql::write_back(att, world, world_id, &rows, reads, checks, who, &rules);
-    }
+    undo::effects(apply);
+    att.src.write_back(core, att, world, world_id, &rows, reads, checks, who, &rules)
+}
+
+/// `write_back`'s rows, written to Postgres.
+#[allow(clippy::too_many_arguments)]
+fn pg_write_back(
+    core: &Core,
+    att: &Attached,
+    world: &str,
+    world_id: &str,
+    rows: &[Row],
+    reads: Option<&Reads>,
+    checks: &[crate::checks::MergeCheck],
+    who: Option<&ActAs>,
+    rules: &Rules,
+) -> Result<Option<Held>> {
     let mut pg = att.lease().map_err(|e| refused(format!("{e}; nothing was merged")))?;
-    let out = transaction(core, &mut pg, att, world, world_id, &rows, reads, checks, who, &rules);
+    let out = transaction(core, &mut pg, att, world, world_id, rows, reads, checks, who, rules);
     if out.is_err() {
         rollback(&mut pg);
     }
@@ -1212,9 +1361,13 @@ pub(crate) fn check_reads(
     base: &State,
     wrote: &HashSet<String>,
 ) -> std::result::Result<Vec<String>, String> {
+    att.src.check_reads(core, att, &Reads { set, base, wrote })
+}
+
+/// `check_reads`, against Postgres.
+fn pg_check_reads(core: &Core, att: &Attached, r: &Reads) -> std::result::Result<Vec<String>, String> {
     let mut pg = att.lease()?;
-    let r = Reads { set, base, wrote };
-    let out = begin(&mut pg, att, true).and_then(|()| live_reads(core, &mut pg, att, &r));
+    let out = begin(&mut pg, att, true).and_then(|()| live_reads(core, &mut PgLive(&mut pg), att, r));
     rollback(&mut pg);
     out.map_err(|e| e.to_string())
 }
@@ -1358,22 +1511,27 @@ pub(crate) fn dry_run(core: &Core, att: &Attached, dry: Dry) -> crate::LiveCheck
     if rows.is_empty() {
         return live; // writes nothing to Postgres: nothing there to check
     }
-    let mut pg = match att.lease() {
-        Ok(pg) => pg,
-        Err(e) => {
-            live.error = Some(e);
-            return live;
-        }
-    };
     let reads = dry.reads.as_ref().map(|(set, base, wrote)| Reads { set, base, wrote });
-    let out = dry_transaction(core, &mut pg, att, &rows, reads.as_ref(), &mut live);
-    rollback(&mut pg);
-    if let Err(e) = out {
+    if let Err(e) = att.src.dry_run(core, att, &rows, reads.as_ref(), &mut live) {
         live.rows.clear();
         live.stale_reads.clear();
-        live.error = Some(e.to_string());
+        live.error = Some(e);
     }
     live
+}
+
+/// `dry_run`'s read of Postgres.
+fn pg_dry_run(
+    core: &Core,
+    att: &Attached,
+    rows: &[Row],
+    reads: Option<&Reads>,
+    live: &mut crate::LiveCheck,
+) -> std::result::Result<(), String> {
+    let mut pg = att.lease()?;
+    let out = dry_transaction(core, &mut pg, att, rows, reads, live);
+    rollback(&mut pg);
+    out.map_err(|e| e.to_string())
 }
 
 fn dry_transaction(
@@ -1392,7 +1550,8 @@ fn dry_transaction(
         same_shape(pg, &tables[ti])?;
     }
     if let Some(r) = reads {
-        live.stale_reads = live_reads(core, pg, att, r)?;
+        live.stale_reads =
+            live_reads(core, &mut PgLive(pg), att, r)?.iter().map(|w| crate::agents::for_caller(w)).collect();
     }
     let rules = att.rules().map_err(|e| refused(format!("write-back rules: {e}")))?;
     for (&ti, rs) in &by_table {
@@ -1517,7 +1676,8 @@ fn rehearsal(
         same_shape(pg, &tables[ti])?;
     }
     if let Some(r) = reads {
-        live.stale_reads = live_reads(core, pg, att, r)?;
+        live.stale_reads =
+            live_reads(core, &mut PgLive(pg), att, r)?.iter().map(|w| crate::agents::for_caller(w)).collect();
         if !live.stale_reads.is_empty() {
             return Err(refused(
                 "what the world read changed in Postgres since its fork: a merge would be held here, \
@@ -1693,6 +1853,7 @@ fn transaction(
 ) -> Result<Option<Held>> {
     let tables = att.tables();
     let by_table = by_table(rows);
+    let keeps_undo = undo::ready(att);
     // the transaction begun, each table's shape read and the rows it wrote so far counted (none: see `others`), in
     // one round trip
     let mut then: Vec<(String, String, Vec<String>)> = by_table
@@ -1708,7 +1869,7 @@ fn transaction(
     }
     // what the world read, as Postgres has it now: before any row is locked or written
     if let Some(r) = reads {
-        let stale = live_reads(core, pg, att, r)?;
+        let stale = live_reads(core, &mut PgLive(pg), att, r)?;
         if !stale.is_empty() {
             rollback(pg);
             return Ok(Some(Held::Stale(stale)));
@@ -1808,6 +1969,16 @@ fn transaction(
         rollback(pg);
         return Err(observed(&tables, &by_table));
     }
+    // (an undo that would write rows besides its own is refused here; its dry run stops here)
+    let besides: Vec<String> = others.iter().map(|&ti| tables[ti].name.clone()).collect();
+    if let Err(e) = undo::before_commit(&besides) {
+        rollback(pg);
+        return Err(e);
+    }
+    // each row written, as it was and as Postgres stored it: what undoes this merge later (see `undo`)
+    if keeps_undo {
+        undo::pg_record(pg, &tables, rows, &sent_back, &merge_id)?;
+    }
     // what recovery needs should the commit's outcome be lost, then the merge's own row and COMMIT in one round trip
     let mut touched: BTreeMap<String, Vec<Vec<Option<String>>>> = BTreeMap::new();
     for (ti, keys) in &canon {
@@ -1867,6 +2038,10 @@ fn transaction(
     // tables this transaction wrote besides the merge's own rows: main takes them by a refresh of those tables alone,
     // on a connection of its own, once the merge is made (see `after_merge`); until it has, the pending record stays
     // and names them, so recovery does it after a crash (see `resolve`)
+    undo::merged(&merge_id);
+    if keeps_undo {
+        undo::pg_prune(pg);
+    }
     let refresh = others;
     AFTER.set(Some(After { rows: sent_back, committed: true, refresh }));
     Ok(None)
@@ -2403,7 +2578,7 @@ fn rule_checks(
             out.push(format!(
                 "breaks the write-back rule tables.{}.check or .scope ({check}) in Postgres, which finds {}{more}",
                 t.name,
-                found.join(", ")
+                crate::agents::value(found.join(", "))
             ));
         }
     }
@@ -2534,7 +2709,11 @@ fn live_checks(pg: &mut Client, checks: &[crate::checks::MergeCheck]) -> Vec<Str
                 if rows.len() > crate::checks::SHOWN {
                     shown.push("and more".into());
                 }
-                out.push(format!("breaks merge check {} in Postgres, which finds {}", c.name, shown.join(", ")));
+                out.push(format!(
+                    "breaks merge check {} in Postgres, which finds {}",
+                    c.name,
+                    crate::agents::value(shown.join(", "))
+                ));
             }
             Err(e) if pg_error(&e).is_some_and(|p| p.code == "57014") => {
                 out.push(format!(
@@ -2690,6 +2869,77 @@ fn compared(t: &Table, n: usize, found: pgclient::Rows) -> Vec<Compared> {
 /// the read is too broad to check there, and a person decides.
 const LIVE_ROWS: usize = 100_000;
 
+/// What `live_reads` asks of the source, inside the transaction it runs in.
+trait Live {
+    /// The source, as a reason names it.
+    fn name(&self) -> &'static str;
+
+    /// The condition, on the table as alias `t`, that the rows `filters` can match meet, in the source's SQL; None
+    /// when they can't be written as the source compares them, and the table is read whole.
+    fn narrow(&self, filters: &[crate::sql::RowFilter], types: &[(String, String)]) -> Option<String>;
+
+    /// The condition, on alias `t`, that a row of `name` meets when it is `tenant`'s (see `tenant_cond`).
+    fn tenant_cond(
+        &self,
+        v: &crate::View,
+        of: &mut crate::sql::Tenants,
+        att: &Attached,
+        name: &str,
+        tenant: &Json,
+    ) -> Result<Option<String>>;
+
+    /// Those of `rs` (rows of `t` as the fork point holds them) the source holds otherwise now: each one's place in
+    /// `rs`, and the source's row (None: no row there).
+    fn changed(&mut self, t: &Table, rs: &[&Row]) -> Result<Vec<(usize, Option<Texts>)>>;
+
+    /// The rows of `t` meeting every one of `only` (conditions on alias `t`) that aren't among `rs`: more than
+    /// `LIVE_ROWS` less `rs.len()` of them only to say there are too many.
+    fn added(&mut self, t: &Table, rs: &[&Row], only: &[String]) -> Result<Vec<Texts>>;
+}
+
+/// `Live`, of Postgres on the write-back's connection.
+struct PgLive<'a>(&'a mut Client);
+
+impl Live for PgLive<'_> {
+    fn name(&self) -> &'static str {
+        "Postgres"
+    }
+
+    fn narrow(&self, filters: &[crate::sql::RowFilter], types: &[(String, String)]) -> Option<String> {
+        let conds: Vec<String> = filters.iter().map(|f| f.to_postgres("t", types)).collect::<Option<_>>()?;
+        Some(any_of(&conds))
+    }
+
+    fn tenant_cond(
+        &self,
+        v: &crate::View,
+        of: &mut crate::sql::Tenants,
+        att: &Attached,
+        name: &str,
+        tenant: &Json,
+    ) -> Result<Option<String>> {
+        tenant_cond(v, of, att, name, tenant, "t", 0)
+    }
+
+    fn changed(&mut self, t: &Table, rs: &[&Row]) -> Result<Vec<(usize, Option<Texts>)>> {
+        Ok(compare(self.0, t, rs)?.into_iter().filter(|c| c.changed).map(|c| (c.at, c.now)).collect())
+    }
+
+    fn added(&mut self, t: &Table, rs: &[&Row], only: &[String]) -> Result<Vec<Texts>> {
+        let back: Vec<String> = t.cols.iter().map(|c| format!("t.{}::text", q(&c.name))).collect();
+        let only: String = only.iter().map(|c| format!("{c} and ")).collect();
+        let sql = format!(
+            "select {} from {} t where {only}not exists (select 1 from {} where {}) limit {}",
+            back.join(", "),
+            t.pg,
+            unnest(t, false, &[], 1),
+            key_match(t, "t"),
+            LIVE_ROWS + 1
+        );
+        run(self.0, &format!("reading rows of {} the copy hasn't", t.pg), &sql, &arrays(rs, t, false, &[], false))
+    }
+}
+
 /// What a world that checks its reads read of attached tables, checked against Postgres inside the write-back's
 /// transaction before anything is written (issue #28): within Chronos a read is checked against main, Chronos's copy,
 /// which a row changed straight in Postgres never reaches. Postgres's rows are put in place of the fork point's in a
@@ -2703,7 +2953,8 @@ const LIVE_ROWS: usize = 100_000;
 /// other tenants' rows doesn't hold it, and `LIVE_ROWS` counts the tenant's rows. Read at READ COMMITTED with no predicate lock: a row Postgres takes between this
 /// and COMMIT comes after the merge in time, a serial order the world's decision holds in. The reasons, said as
 /// changed in Postgres; none: what it read is as Postgres has it.
-fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result<Vec<String>> {
+fn live_reads(core: &Core, src: &mut dyn Live, att: &Attached, r: &Reads) -> Result<Vec<String>> {
+    let source = src.name();
     let (read_tables, filters, tenant) = {
         let set = r.set.lock().unwrap_or_else(|p| p.into_inner());
         let read_tables = set.by_table();
@@ -2718,7 +2969,7 @@ fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result
     let (mut keys, mut out): (Vec<String>, Vec<String>) = (vec![], vec![]);
     let too_broad = |t: &Table| {
         format!(
-            "read {} more broadly than can be checked against Postgres (more than {LIVE_ROWS} rows), and Postgres may \
+            "read {} more broadly than can be checked against {source} (more than {LIVE_ROWS} rows), and {source} may \
              have changed it since the copy",
             crate::sql::shown_name(&t.name)
         )
@@ -2730,7 +2981,7 @@ fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result
         // can't be compared with Postgres's rows as they are now
         if forked_before(core, r.base, &main.s, &tables[ti])? {
             out.push(format!(
-                "read {} before Postgres changed its columns (a refresh took that into main)",
+                "read {} before {source} changed its columns (a refresh took that into main)",
                 crate::sql::shown_name(&tables[ti].name)
             ));
             continue;
@@ -2759,8 +3010,8 @@ fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result
         // fork point's rows are, not for the table; written as Postgres compares them, else the table is read whole
         let types: Vec<(String, String)> = t.cols.iter().map(|c| (c.name.clone(), c.ty.clone())).collect();
         let mut narrow: Option<(Vec<&crate::sql::RowFilter>, String)> = filters.get(&name).and_then(|fs| {
-            let conds: Vec<String> = fs.iter().map(|f| f.to_postgres("t", &types)).collect::<Option<_>>()?;
-            Some((fs.iter().collect(), any_of(&conds)))
+            let cond = src.narrow(fs, &types)?;
+            Some((fs.iter().collect(), cond))
         });
         // a key looked up that found no row at the fork: Postgres may have that row now, with values no filter
         // matches, and its key as Postgres writes it isn't known here, so the table is read whole
@@ -2775,7 +3026,7 @@ fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result
         let by_key: HashSet<&String> = read.iter().collect();
         // read for one tenant: its rows alone, here and in Postgres (none: the table is shared, or can't be told so)
         let mut mine = match (whole, &tenant, of.as_mut()) {
-            (true, Some(t), Some(of)) => tenant_cond(&base, of, att, &name, t, "t", 0)?.map(|c| (c, of)),
+            (true, Some(t), Some(of)) => src.tenant_cond(&base, of, att, &name, t)?.map(|c| (c, of)),
             _ => None,
         };
         if whole {
@@ -2813,12 +3064,12 @@ fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result
         };
         let rs: Vec<&Row> = rows.iter().collect();
         if !rs.is_empty() {
-            for c in compare(pg, t, &rs)?.into_iter().filter(|c| c.changed) {
-                let key = &rs[c.at].key;
+            for (at, now) in src.changed(t, &rs)? {
+                let key = &rs[at].key;
                 if r.wrote.contains(key.as_str()) {
                     continue;
                 }
-                let now = match &c.now {
+                let now = match &now {
                     Some(row) => Some(crate::sql::row_from_texts(&base, &t.name, &named(row))?.1),
                     None => None,
                 };
@@ -2827,26 +3078,10 @@ fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result
             }
         }
         if whole {
-            // and the rows Postgres has that the fork point didn't
-            let back: Vec<String> = t.cols.iter().map(|c| format!("t.{}::text", q(&c.name))).collect();
-            let mut only = narrow.as_ref().map_or(String::new(), |(_, w)| format!("{w} and "));
-            if let Some((c, _)) = &mine {
-                only.push_str(&format!("{c} and "));
-            }
-            let sql = format!(
-                "select {} from {} t where {only}not exists (select 1 from {} where {}) limit {}",
-                back.join(", "),
-                t.pg,
-                unnest(t, false, &[], 1),
-                key_match(t, "t"),
-                LIVE_ROWS + 1
-            );
-            let added = run(
-                pg,
-                &format!("reading rows of {} the copy hasn't", t.pg),
-                &sql,
-                &arrays(&rs, t, false, &[], false),
-            )?;
+            // and the rows the source has that the fork point didn't
+            let mut only: Vec<String> = narrow.iter().map(|(_, w)| w.clone()).collect();
+            only.extend(mine.iter().map(|(c, _)| c.clone()));
+            let added = src.added(t, &rs, &only)?;
             if rows.len() + added.len() > LIVE_ROWS {
                 out.push(too_broad(t));
                 continue;
@@ -2871,15 +3106,15 @@ fn live_reads(core: &Core, pg: &mut Client, att: &Attached, r: &Reads) -> Result
                 live.set(&k, v);
             }
         }
-        Err(e) => out.push(format!("read rows Postgres changed in a way that can't be checked here ({})", e.message)),
+        Err(e) => out.push(format!("read rows {source} changed in a way that can't be checked here ({})", e.message)),
     }
     // (SELECTs kept to run again run on Postgres's rows: see `stale`)
     let stale = core.stale_reasons(r.set, crate::MAIN, r.base, &live, r.wrote)?;
     // (reads lost in a restart are main's check's to report: it held the merge already)
     out.extend(stale.into_iter().filter_map(|s| match s.strip_suffix(" now") {
-        Some(read) if s.starts_with("read `") => Some(format!("{read} in Postgres now")),
+        Some(read) if s.starts_with("read `") => Some(format!("{read} in {source} now")),
         _ if s.contains("changed since it forked") => {
-            Some(s.replace("changed since it forked", "changed in Postgres since it forked"))
+            Some(s.replace("changed since it forked", &format!("changed in {source} since it forked")))
         }
         _ => None,
     }));
@@ -3129,7 +3364,7 @@ fn shape_of(t: &Table, rows: &pgclient::Rows) -> Result<Shape> {
         // (see `settle`): a column added NULL, filled, then made NOT NULL in Postgres has no default to fill it here
         let default = r[6].clone().filter(|e| !crate::sql::default_refused(e));
         let not_null = r[5].as_deref() == Some("t");
-        let col = Col { name, ty, always: false, generated: false, attnum: attnum(r) };
+        let col = Col { name, ty, always: false, generated: false, attnum: attnum(r), fill: false, computed: false };
         re.added.push(Added { col, default, not_null });
     }
     if !diffs.is_empty() {
@@ -3230,6 +3465,9 @@ pub(crate) fn after_merge(core: &Core) {
 const CHANGED_IN_POSTGRES: &str = "changed in Postgres since main last had them";
 /// What a merge's conflict with MySQL says (see `mysql`).
 const CHANGED_IN_MYSQL: &str = "changed in MySQL since main last had them";
+/// What a merge's conflict with MongoDB says (see `mongo`).
+#[cfg_attr(not(feature = "mongo"), allow(dead_code))]
+const CHANGED_IN_MONGO: &str = "changed in MongoDB since main last had them";
 
 /// A merge's conflict with Postgres: `n` rows `world` changes changed there since main last had them, a line each.
 fn conflict(n: usize, world: &str, source: &str, lines: &[String]) -> Error {
@@ -3248,7 +3486,8 @@ fn conflict(n: usize, world: &str, source: &str, lines: &[String]) -> Error {
 /// Whether `e` is a merge's conflict with Postgres (see `conflict`).
 pub(crate) fn is_conflict(e: &Error) -> bool {
     matches!(e, Error::Constraint { code: "40001", message }
-        if message.contains(CHANGED_IN_POSTGRES) || message.contains(CHANGED_IN_MYSQL))
+        if message.contains(CHANGED_IN_POSTGRES) || message.contains(CHANGED_IN_MYSQL)
+            || message.contains(CHANGED_IN_MONGO))
 }
 
 /// After a merge that failed: on a conflict with Postgres, main takes Postgres's rows for the conflicting ones (the
@@ -3356,11 +3595,7 @@ pub fn resolve(core: &Core) -> std::result::Result<Option<String>, String> {
     let p: Json = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", att.pending_path().display()))?;
     let (merge_id, world, world_id) =
         (p["merge"].as_str().unwrap_or_default(), p["world"].as_str().unwrap_or_default(), p["world_id"].as_str());
-    let committed = match att.mysql {
-        true => mysql::committed(merge_id),
-        false => committed(merge_id),
-    };
-    if !committed? {
+    if !att.src.committed(merge_id)? {
         std::fs::remove_file(att.pending_path()).map_err(|e| e.to_string())?;
         return Ok(Some(format!(
             "the merge of {world} written to Postgres before a crash didn't commit there: nothing of it is in Postgres, \
@@ -3383,16 +3618,17 @@ pub fn resolve(core: &Core) -> std::result::Result<Option<String>, String> {
             )),
         }
     }
-    // main takes every row it touched as Postgres has it (what triggers set too)
+    // main takes every row it touched as the source has it (what triggers set too)
+    att.src.take_touched(core, att, &p, &mut said)?;
+    std::fs::remove_file(att.pending_path()).map_err(|e| e.to_string())?;
+    Ok(Some(said))
+}
+
+/// `resolve`'s last step for Postgres: main takes the rows the merge touched, and the tables its triggers wrote.
+fn pg_take_touched(core: &Core, att: &Attached, p: &Json, said: &mut String) -> std::result::Result<(), String> {
     let mut rows = vec![];
     let touched = p["rows"].as_object().cloned().unwrap_or_default();
     let tables = att.tables();
-    if att.mysql {
-        let rows = mysql::reread(att, &touched)?;
-        store(core, att, &rows)?;
-        std::fs::remove_file(att.pending_path()).map_err(|e| e.to_string())?;
-        return Ok(Some(said));
-    }
     let mut pg = connect()?;
     pg.query(&format!("begin read only; {SETTINGS}")).map_err(|e| e.to_string())?;
     for (name, keys) in touched {
@@ -3418,8 +3654,7 @@ pub fn resolve(core: &Core) -> std::result::Result<Option<String>, String> {
         let names: Vec<&str> = besides.iter().map(|&ti| tables[ti].name.as_str()).collect();
         said.push_str(&format!("; main took what its triggers wrote in {} from Postgres", names.join(", ")));
     }
-    std::fs::remove_file(att.pending_path()).map_err(|e| e.to_string())?;
-    Ok(Some(said))
+    Ok(())
 }
 
 /// Rows of `t` with keys `keys` (as Postgres writes them), by key.
@@ -3513,9 +3748,11 @@ fn refresh_with(core: &Core, only: Option<&[usize]>) -> std::result::Result<Refr
 
 /// `refresh_with`, with the write-back lock held and no write-back left pending (or settling one: see `resolve`).
 fn refresh_now(core: &Core, att: &Attached, only: Option<&[usize]>) -> std::result::Result<Refreshed, String> {
-    if att.mysql {
-        return mysql::refresh(core, att, only);
-    }
+    att.src.refresh(core, att, only)
+}
+
+/// `refresh_now`, from Postgres.
+fn pg_refresh(core: &Core, att: &Attached, only: Option<&[usize]>) -> std::result::Result<Refreshed, String> {
     let mut pg = att.lease()?;
     let out = refresh_read(core, att, &mut pg, only);
     rollback(&mut pg);
@@ -4451,8 +4688,24 @@ mod tests {
             sql: "\"app\".\"orders\"".into(),
             pg: "\"app\".\"orders\"".into(),
             cols: vec![
-                Col { name: "id".into(), ty: "uuid".into(), always: false, generated: false, attnum: 0 },
-                Col { name: "total".into(), ty: "numeric(10,2)".into(), always: false, generated: false, attnum: 0 },
+                Col {
+                    name: "id".into(),
+                    ty: "uuid".into(),
+                    always: false,
+                    generated: false,
+                    attnum: 0,
+                    fill: false,
+                    computed: false,
+                },
+                Col {
+                    name: "total".into(),
+                    ty: "numeric(10,2)".into(),
+                    always: false,
+                    generated: false,
+                    attnum: 0,
+                    fill: false,
+                    computed: false,
+                },
             ],
             key: vec![0],
             seqs: vec![],
@@ -4484,8 +4737,24 @@ mod tests {
             sql: "\"t\"".into(),
             pg: "\"public\".\"t\"".into(),
             cols: vec![
-                Col { name: "a".into(), ty: "integer".into(), always: false, generated: false, attnum: 0 },
-                Col { name: "b".into(), ty: "text".into(), always: false, generated: false, attnum: 0 },
+                Col {
+                    name: "a".into(),
+                    ty: "integer".into(),
+                    always: false,
+                    generated: false,
+                    attnum: 0,
+                    fill: false,
+                    computed: false,
+                },
+                Col {
+                    name: "b".into(),
+                    ty: "text".into(),
+                    always: false,
+                    generated: false,
+                    attnum: 0,
+                    fill: false,
+                    computed: false,
+                },
             ],
             key: vec![0],
             seqs: vec![],
@@ -4525,7 +4794,15 @@ mod tests {
     /// changed the key (both keys), a partition's rows as its table's, and the whole table where a line names no key.
     #[test]
     fn follow_reads_the_keys_test_decoding_writes() {
-        let col = |n: &str| Col { name: n.into(), ty: "text".into(), always: false, generated: false, attnum: 0 };
+        let col = |n: &str| Col {
+            name: n.into(),
+            ty: "text".into(),
+            always: false,
+            generated: false,
+            attnum: 0,
+            fill: false,
+            computed: false,
+        };
         let t = |name: &str, cols: &[&str], key: Vec<usize>| Table {
             name: name.into(),
             sql: q(name),

@@ -1993,6 +1993,8 @@ fn read_sources(pg: &mut Client, named: &[String], schemas: &[String]) -> Result
             always: v(3) == "a",
             generated: !v(4).is_empty(),
             attnum: v(9).parse().unwrap_or(0),
+            fill: false,
+            computed: false,
         });
     }
     for s in &mut out {

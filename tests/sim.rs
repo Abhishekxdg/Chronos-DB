@@ -72,16 +72,25 @@ fn scenario() {
     assert_eq!(reopened, live, "replaying the log did not rebuild the live state");
 }
 
+/// Shuttle's tasks run on stacks of their own, 32 KiB unless told: too small for a merge's frames (a merge policy's
+/// judging), which overflowed them into SIGBUS. An OS thread gets 2 MiB or more, so 512 KiB still finds no more room
+/// than a real thread has.
+fn runner<S: shuttle::scheduler::Scheduler + 'static>(s: S) -> shuttle::Runner<S> {
+    let mut config = shuttle::Config::new();
+    config.stack_size = 0x80000;
+    shuttle::Runner::new(s, config)
+}
+
 #[test]
 fn random_schedules() {
-    shuttle::check_random(scenario, iters());
+    runner(shuttle::scheduler::RandomScheduler::new(iters())).run(scenario);
 }
 
 /// PCT picks a few priority-change points per run: good at bugs that need a handful of
 /// specific context switches, which purely random schedules rarely hit.
 #[test]
 fn pct_schedules() {
-    shuttle::check_pct(scenario, iters(), 3);
+    runner(shuttle::scheduler::PctScheduler::new(3, iters())).run(scenario);
 }
 
 /// The tests above run side by side on two OS threads, so a `static` of shuttle's types (a

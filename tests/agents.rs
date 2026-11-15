@@ -842,8 +842,9 @@ fn merge_checks_queue_agents_under_a_policy_and_refuse_everyone_else() {
     let e = bot.run(&db, "merge world wipe", &[]).unwrap_err();
     assert_eq!(e.code, "42501", "{}", e.message);
     assert!(
-        e.message.contains("breaks merge check lists_keep_leads, which finds (id = 2)")
-            && e.message.contains("SHOW REVIEWS")
+        e.message.contains("breaks merge check lists_keep_leads, which finds …") && e.message.contains("SHOW REVIEWS"),
+        "an agent reads it values-free: {}",
+        e.message
     );
     let r = db.reviews();
     assert_eq!((r.len(), r[0].world.as_str(), r[0].policy.as_str()), (1, "wipe", "p"));

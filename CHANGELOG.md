@@ -2,6 +2,119 @@
 
 ## Unreleased
 
+## 0.5.0 (beta), 2026-11-15
+
+**Attach beside MySQL, MariaDB and MongoDB, undo a merge by its id, and five security fixes.** `chronos attach` now
+works beside MySQL 8.0 or later, MariaDB 10.5 or later and MongoDB 5.0 or later (a replica set), as it does beside
+Postgres: a merge is written to the database first, in one transaction, every row compared. A merge can be undone
+by its id for 30 days. The security fixes are below; upgrading is recommended for anyone with more than one role or
+agent.
+
+The released binaries have MongoDB in them. The macOS builds need **macOS 13 or later**, as for 0.2.0. While the
+build service is offline, this release was built on the maintainer's Mac with the release's own toolchain (Rust
+1.95.0, zig 0.15.2 for every target) and signed as before, as the `chronos-release` service account.
+
+Not yet beside MongoDB: following changes as they commit, sharded clusters, array elements changed one by one.
+Tested against MongoDB 5.0 and 7.0 run locally, not against Atlas.
+
+**Security fixes from a review of what a role or agent with little can do.** All need a login; none is reachable
+without one.
+
+- A rule (`CREATE RULE`, `DROP RULE`, `ALTER TABLE ... ENABLE / DISABLE RULE`) is its table's owner's to make, drop
+  and switch, as in Postgres. Any role could before, and a rule's actions run as whoever writes the table next.
+- `ALTER AGENT ... ROTATE TOKEN` is a superuser's, as the other agent statements are. Any role could run it, and it
+  answers with the agent's new token.
+- The MCP `diff` tool checks the world it compares against (`to`) as well as the branch, as `POST /v1/diff` and SQL's
+  `DIFF` do; `check_merge_policy` asks for the right to see the world's changes. An agent held to a tenant could read
+  other tenants' rows of main through a diff from a world it forked.
+- A role dropped, renamed or given another password while its login is under way is refused (28P01). It was logged
+  in as a name that is no role, which is a superuser.
+- An agent held to a tenant may not drop or rename the tenant's column of a table in its world, nor drop the
+  foreign key a table is held to the tenant through: the table then counted as shared by every tenant, and showed
+  their rows.
+- The HTTP API's `attached` says which database a folder is attached to (`kind`: `postgres`, `mysql` or `mariadb`)
+  and what that source can do besides the write-back and the refresh (`capabilities`: `follow`, `dry_run`,
+  `check_reads`, `act_as`, `lazy_tenant`, `source_checks`), so a program can ask rather than learn from a refusal.
+  Each table's name in the source's SQL is `source_table` (`postgres` still holds it too). A folder attached to
+  MariaDB from this release on says `mariadb`; one attached earlier says `mysql`, and works the same.
+- A world that checks its reads has them checked against MySQL or MariaDB too, inside the write-back and by
+  `CHECK READS`, as against Postgres: what it read that changed there since its fork holds the merge, and nothing is
+  written. Before, `check_reads` beside MySQL refused every merge. A table read by a filtered scan is read whole from
+  MySQL to check it (for the world's tenant, when it read for one). `attached` says `check_reads: true` for MySQL.
+- `MERGE WORLD x DRY RUN` works beside MySQL and MariaDB: each row the merge would write compared with the
+  database's in one snapshot, the world's reads checked, the tables' triggers named, nothing written. `attached`
+  says `dry_run: true` for MySQL. Rehearsals are still Postgres's only.
+- Rows can be inserted into `AUTO_INCREMENT` tables beside MySQL and MariaDB. A new row has a provisional id in its
+  world (negative, from -1,000,000,001 down); the merge inserts it without one, takes the id MySQL gives, and writes
+  that in the row and in every row that refers to it through a foreign key MySQL declares. A provisional id anywhere
+  else is refused with nothing written. Not for columns narrower than `INT` or `BIGINT UNSIGNED`, and not in a
+  folder attached before this (attach again). `attached` says `inserts` for each table.
+- Attach beside MySQL takes generated columns (read and compared, never written, MySQL's value taken back with the
+  row), and brings column defaults over: a constant or `CURRENT_TIMESTAMP` as the copy's own default, any other
+  expression written as `DEFAULT` at the merge. Before, a `NOT NULL` column with a default made every insert fail.
+- A merge written to an attached database can be undone by its id for 30 days (`CHRONOS_UNDO_WINDOW_DAYS`), not
+  only within the folder's history. Each write-back keeps the rows it wrote, before and after, in the database and
+  in its transaction (`chronos.merge_rows`; `chronos_merge_rows` in MySQL). HTTP `merge` answers the id (`merge`);
+  `undo_merge` with `ids` puts those merges' rows back through the database in one transaction, with `skip_changed`
+  and `dry_run`. `attached` says `undo: {ready, window_days}`. Works beside Postgres, MySQL and MariaDB.
+- An undo by merge id that would make Postgres change rows besides its own (an `ON DELETE CASCADE` under a row it
+  removes, a trigger) is refused (409, `2BP01`) unless it says `allow_cascade`. Its dry run now runs the writes in
+  the database and rolls them back: it names those tables (`cascades`) and finds rows changed only in the database.
+  The effects the merges queued are listed (`effects_not_undone`). Rows changed since answer 409 with `40001`, not
+  400. In SQL: `UNDO MERGE ID '...' [SKIP CHANGED] [ALLOW CASCADE] [DRY RUN]`. MySQL can't count cascades.
+- `chronos attach` works beside MongoDB 5.0 or later (a replica set, or Atlas), in a build with `--features mongo`.
+  A collection is a table (`_id`, the fields named by `--fields`, and `doc` as jsonb); a merge is written to MongoDB
+  first in one transaction, each document compared with main's; an update sends only the fields that changed
+  (`$set`/`$unset` by path), and a number keeps the type of the field it replaces. Refresh and undo by merge id
+  work. Not yet: follow. See [the guide](docs/guides/attach-mongodb.md).
+- **Attach beside MySQL 8 refused columns with an expression default:** `DEFAULT CURRENT_TIMESTAMP` and
+  `DEFAULT (expr)` were taken for generated columns (MySQL marks them `DEFAULT_GENERATED`) and the table refused.
+- Beside MongoDB, a merge's dry run compares each document with MongoDB's in one snapshot, and a world that checks
+  its reads (`check_reads`) has them checked against MongoDB: in the write-back's transaction and by `CHECK READS`.
+  A condition on a field inside `doc` counts as a read of the whole collection; one on a `--fields` column doesn't.
+- **`mongodb+srv://` URLs connect.** The MongoDB driver was built without its DNS seed-list support, so every
+  such URL (Atlas's usual one) was refused before any connection. Not tested against Atlas.
+
+## 0.4.10 (beta), 2026-11-10
+
+**Rules for agents that run on their own.** Merge policies gain rules on values, a breaker for a fleet, a guard
+against prompt injection, and a reviewer agent that can decide every merge without being able to approve what only a
+person should.
+
+The macOS builds need **macOS 13 or later**, as for 0.2.0. While the build service is offline, this release was
+built on the maintainer's Mac with the release's own toolchain (Rust 1.95.0, zig 0.15.2 for every target) and
+signed as before, as the `chronos-release` service account.
+
+- **`row_rules`:** conditions on the rows a merge changes, over `old.col` and `new.col`, read as a CHECK
+  (`'payments: new.amount >= -50; prices: new.price <= old.price * 1.2'`). Reasons name rows by key, never values.
+- **`max_nulled`:** most values one merge may empty.
+- **`all_rows_per_hour`, `all_deletes_per_hour`, `all_effects_per_hour`:** limits on every merge into main by any
+  agent keeping to a policy, together, a reviewer's approvals included.
+- **`untrusted_columns`, `untrusted_guards`:** a world that may have read text from outside (`tickets.body`) and
+  changes a guarded table waits for a person. The policy's worlds keep their reads without holding for stale ones.
+- **`spot_check`:** one merge in n, at random, waits for a person.
+- **`review_every`:** every merge waits for review, so a reviewer agent decides each one.
+- **`person_only`:** the rules whose holds a reviewer agent may not approve (by default deletes, schema, untrusted
+  reads, the fleet limits and spot checks); an admin's agent can't merge those either. `SHOW REVIEWS` has a
+  `needs_person` column.
+- **Holds notify `chronos_review_held`**, so a reviewer listens instead of polling.
+- **`untrusted_columns = '*'` and `trusted_columns`:** every text column untrusted by default, with exceptions.
+  `'tickets.*'` takes every text column of one table.
+- **Tainted rows:** rows a merge writes after its world read untrusted text are tainted, and reading one counts as
+  reading untrusted text. Kept in the `tallies` file; a person's own merge or a delete clears a row.
+- **Reasons without values for agents:** row keys that are text, what a merge check found and what a SELECT gave show
+  as `…` to agents, a reviewer among them, in refusals, `SHOW REVIEWS`, `CHECK READS` and `check_merge_policy`.
+  People see them as they are.
+- **`watch_totals`, `max_shift`:** scalar queries run before and after a merge; one that moves more than `max_shift`
+  percent (10 by default) holds it, for a person by default.
+- **`max_unusual`:** a merge far bigger than the policy's usual (the median of its last 50) waits: drift.
+- **`canary`, `canary_wait`:** a big merge lands a few rows first (`55000`), the rest after the wait.
+- **`effects_delay`:** effects an agent's merge lands are `delayed`: no claim, no `NOTIFY`, and `UNDO MERGE`
+  meanwhile takes them back unsent.
+- **A run's own `row_rules`:** `CREATE WORLD ... WITH (row_rules = '...')` adds conditions on top of the policy's.
+- **Changed:** another agent with no policy can't merge a world held for person-only rules, but the world's own agent
+  whose policy an admin removed still can.
+
 ## 0.4.9 (beta), 2026-11-09
 
 **Writes that fit the database you already run.** Agents can write as the end user's Postgres role, tables get

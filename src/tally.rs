@@ -10,6 +10,9 @@
 //!
 //! Kept beside the log, not in it (saved by the background worker and at close), as `reads` is:
 //! a restart keeps what was saved.
+//!
+//! Kept with them: the rows tainted by untrusted text (see `Taint`), and the sizes of each merge policy's recent
+//! merges (see `Core::usual_rows`), for `max_unusual`.
 
 use crate::{Core, disk};
 use serde_json::{Value as Json, json};
@@ -24,9 +27,32 @@ pub(crate) const HOUR: u64 = 60 * 60 * 1000;
 #[derive(Default)]
 pub(crate) struct Tallies {
     by: HashMap<String, VecDeque<(u64, u64, u64, u64)>>,
+    /// rows tainted by untrusted text, per table (see `Taint`)
+    taint: HashMap<String, Taint>,
+    /// rows each merge policy's last merges into main changed, oldest first (at most `USUAL_KEPT`)
+    sizes: HashMap<String, VecDeque<u64>>,
     /// changed since last saved
     dirty: bool,
 }
+
+/// Rows of one table an agent's merge wrote into main after its world read text outsiders write (a merge policy's
+/// `untrusted_columns`), or other tainted rows: what they hold may be what planted instructions asked for. A world
+/// whose policy lists `untrusted_columns` and reads one is judged as if it read untrusted text. A row leaves when it's
+/// deleted, or a person's own merge (no agent's, no policy's hold) writes it.
+#[derive(Default, Clone)]
+pub(crate) struct Taint {
+    /// the rows' keys, at most `MOST_TAINTED`
+    keys: std::collections::BTreeSet<String>,
+    /// more than `MOST_TAINTED` were: any row of the table counts
+    all: bool,
+}
+
+/// Tainted rows kept one by one per table, past which the whole table counts.
+const MOST_TAINTED: usize = 10_000;
+/// Merge sizes kept per policy for `max_unusual`.
+pub(crate) const USUAL_KEPT: usize = 50;
+/// Merges a policy needs before `max_unusual` judges by them.
+pub(crate) const USUAL_FEWEST: usize = 10;
 
 impl Tallies {
     fn prune(&mut self, now: u64) {
@@ -76,10 +102,21 @@ pub(crate) fn load(dir: &Path, crypt: Option<&crate::crypt::Crypt>) -> Tallies {
             return Tallies::default();
         }
     };
+    let mut taint = HashMap::new();
+    let mut sizes = HashMap::new();
+    for (k, v) in j.as_object().into_iter().flatten() {
+        if let Some(table) = k.strip_prefix(TAINT_KEY) {
+            let keys = v["keys"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from));
+            taint.insert(table.to_string(), Taint { keys: keys.collect(), all: v["all"].as_bool().unwrap_or(false) });
+        } else if let Some(policy) = k.strip_prefix(SIZES_KEY) {
+            sizes.insert(policy.to_string(), v.as_array().into_iter().flatten().filter_map(Json::as_u64).collect());
+        }
+    }
     let by = j
         .as_object()
         .into_iter()
         .flatten()
+        .filter(|(k, _)| !k.starts_with(TAINT_KEY) && !k.starts_with(SIZES_KEY))
         .map(|(agent, merges)| {
             let merges = merges
                 .as_array()
@@ -91,9 +128,21 @@ pub(crate) fn load(dir: &Path, crypt: Option<&crate::crypt::Crypt>) -> Tallies {
             (agent.clone(), merges)
         })
         .collect();
-    let mut t = Tallies { by, dirty: false };
+    let mut t = Tallies { by, taint, sizes, dirty: false };
     t.prune(disk::now_ms());
     t
+}
+
+/// Where the file keeps a table's tainted rows, and a policy's merge sizes: words no agent's name or tally key starts
+/// with (no agent's name has a space).
+const TAINT_KEY: &str = "taint ";
+const SIZES_KEY: &str = "sizes ";
+
+/// The tally every agent keeping to merge policy `policy` shares, for its `all_rows_per_hour`, `all_deletes_per_hour`
+/// and `all_effects_per_hour`: one count however many agents, runs or tenants, so a fault every one of them repeats
+/// stops at the limit. (No agent's name has a space, and `tenant ` keys are another word: it is never theirs.)
+pub(crate) fn policy_key(policy: &str) -> String {
+    format!("policy {policy}")
 }
 
 impl Core {
@@ -115,8 +164,15 @@ impl Core {
     /// docs) go into its tenant's, once, as the database opens: an agent that used its hour just before an upgrade
     /// keeps it used. The agents are read from main, so this runs after the log is replayed.
     pub(crate) fn migrate_tallies(&self) {
-        let keys: Vec<String> =
-            self.tallies.lock().unwrap().by.keys().filter(|k| !k.starts_with("tenant ")).cloned().collect();
+        let keys: Vec<String> = self
+            .tallies
+            .lock()
+            .unwrap()
+            .by
+            .keys()
+            .filter(|k| !k.starts_with("tenant ") && !k.starts_with("policy "))
+            .cloned()
+            .collect();
         let moves: Vec<(String, String)> = keys
             .into_iter()
             .filter_map(|k| {
@@ -141,10 +197,14 @@ impl Core {
     /// Rows, deletes and effects agent `agent`'s merges (or its tenant's: see `tally_of`) brought
     /// into main in the last hour.
     pub(crate) fn hourly(&self, agent: &str) -> (u64, u64, u64) {
+        self.hourly_key(&self.tally_of(agent).0)
+    }
+
+    /// Rows, deletes and effects the merges counted under tally `key` brought into main in the last hour.
+    pub(crate) fn hourly_key(&self, key: &str) -> (u64, u64, u64) {
         let now = disk::now_ms();
-        let key = self.tally_of(agent).0;
         let t = self.tallies.lock().unwrap();
-        t.by.get(&key)
+        t.by.get(key)
             .into_iter()
             .flatten()
             .filter(|m| m.0 + HOUR > now)
@@ -165,6 +225,83 @@ impl Core {
         t.dirty = true;
     }
 
+    /// Rows `wrote` (keys of rows a merge into main wrote) are tainted, and rows `cleared` aren't any more (see
+    /// `Taint`).
+    pub(crate) fn taint_rows(&self, wrote: &[String], cleared: &[String]) {
+        if wrote.is_empty() && cleared.is_empty() {
+            return;
+        }
+        let mut t = self.tallies.lock().unwrap();
+        for k in cleared {
+            let Some((table, _)) = k.split_once('/') else { continue };
+            if let Some(taint) = t.taint.get_mut(table)
+                && taint.keys.remove(k)
+                && taint.keys.is_empty()
+                && !taint.all
+            {
+                t.taint.remove(table);
+            }
+        }
+        for k in wrote {
+            let Some((table, _)) = k.split_once('/') else { continue };
+            let taint = t.taint.entry(table.to_string()).or_default();
+            if taint.all {
+                continue;
+            }
+            taint.keys.insert(k.clone());
+            if taint.keys.len() > MOST_TAINTED {
+                *taint = Taint { keys: Default::default(), all: true };
+            }
+        }
+        t.dirty = true;
+    }
+
+    /// The tainted rows (see `Taint`) a world that read `set` may have read, as reasons show them: its keys, or the
+    /// table's name where it read more of it than rows one by one (a scan) or the table's are past counting.
+    pub(crate) fn tainted_read(&self, set: &crate::stale::ReadSet) -> Vec<String> {
+        let t = self.tallies.lock().unwrap();
+        if t.taint.is_empty() {
+            return vec![];
+        }
+        let read = set.by_table();
+        let mut out = vec![];
+        for (table, taint) in &t.taint {
+            // not all it read is known (a restart since the fork): any tainted table counts
+            let Some((keys, wider)) = read.get(table).cloned().or_else(|| (!set.complete).then(Default::default))
+            else {
+                continue;
+            };
+            if wider || taint.all || !set.complete {
+                out.push(format!("rows of {table}"));
+                continue;
+            }
+            out.extend(keys.iter().filter(|k| taint.keys.contains(*k)).map(|k| crate::agents::shown_key(k)));
+        }
+        out.sort();
+        out
+    }
+
+    /// How many rows merge policy `policy`'s merges into main usually change: the median of its last `USUAL_KEPT`,
+    /// with how many that is; None before `USUAL_FEWEST`. For `max_unusual`.
+    pub(crate) fn usual_rows(&self, policy: &str) -> Option<(u64, usize)> {
+        let t = self.tallies.lock().unwrap();
+        let sizes = t.sizes.get(policy).filter(|s| s.len() >= USUAL_FEWEST)?;
+        let mut sorted: Vec<u64> = sizes.iter().copied().collect();
+        sorted.sort_unstable();
+        Some((sorted[sorted.len() / 2], sorted.len()))
+    }
+
+    /// A merge into main under merge policy `policy` changed `rows` rows: kept for `usual_rows`.
+    pub(crate) fn note_size(&self, policy: &str, rows: u64) {
+        let mut t = self.tallies.lock().unwrap();
+        let sizes = t.sizes.entry(policy.to_string()).or_default();
+        sizes.push_back(rows);
+        while sizes.len() > USUAL_KEPT {
+            sizes.pop_front();
+        }
+        t.dirty = true;
+    }
+
     /// Writes the tallies to the folder if they changed (an in-memory database keeps them only
     /// in memory). Called by the background worker and at close.
     pub(crate) fn save_tallies(&self) -> io::Result<()> {
@@ -174,10 +311,16 @@ impl Core {
             return Ok(());
         }
         t.prune(disk::now_ms());
-        let j: serde_json::Map<String, Json> =
+        let mut j: serde_json::Map<String, Json> =
             t.by.iter()
                 .map(|(a, ms)| (a.clone(), Json::Array(ms.iter().map(|m| json!([m.0, m.1, m.2, m.3])).collect())))
                 .collect();
+        for (table, taint) in &t.taint {
+            j.insert(format!("{TAINT_KEY}{table}"), json!({ "keys": taint.keys, "all": taint.all }));
+        }
+        for (policy, sizes) in &t.sizes {
+            j.insert(format!("{SIZES_KEY}{policy}"), json!(sizes));
+        }
         let bytes = Json::Object(j).to_string().into_bytes();
         let bytes = match &log.crypt {
             Some(c) => c.seal_file(&bytes),

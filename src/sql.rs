@@ -73,6 +73,7 @@ mod reloptions;
 mod rewrite;
 mod rls;
 mod roles;
+mod rowrules;
 mod rules;
 mod safe;
 pub mod scram;
@@ -111,6 +112,7 @@ pub(crate) use opt::stats::merged as relstats_merged;
 pub(crate) use rls::{
     MOST_HOPS as MOST_TENANT_HOPS, Reach as TenantReach, Tenants, reached_tenant, tenant as tenant_now,
 };
+pub(crate) use rowrules::{row_rule_parses, row_rule_reasons, text_columns};
 pub use safe::Reach;
 pub(crate) use tablespace::FILENODES;
 pub use time::Interval;
@@ -4025,12 +4027,21 @@ fn undone_notices(u: &crate::Undone) {
     if u.skipped > 0 {
         notice("NOTICE", format!("{} rows changed since were left as they are", u.skipped));
     }
-    if u.effects.is_empty() {
+    let cancelled: Vec<String> =
+        u.effects.iter().filter(|e| e.state == "cancelled").map(|e| format!("{} {}", e.channel, e.id)).collect();
+    if !cancelled.is_empty() {
+        notice(
+            "NOTICE",
+            format!("{} effects still delayed were taken back unsent: {}", cancelled.len(), cancelled.join(", ")),
+        );
+    }
+    if u.effects.iter().all(|e| e.state == "cancelled") {
         return;
     }
     let each: Vec<String> = u
         .effects
         .iter()
+        .filter(|e| e.state != "cancelled")
         .map(|e| match e.state {
             "queued" => format!("{} {} (queued, not sent yet: ACK OUTBOX '{}' drops it)", e.channel, e.id, e.id),
             "sent" => format!("{} {} (sent)", e.channel, e.id),
@@ -8640,6 +8651,14 @@ enum Stmt {
         world: String,
         skip_changed: bool,
     },
+    /// UNDO MERGE ID 'merge:...' [, ...] [SKIP CHANGED] [ALLOW CASCADE] [DRY RUN]: merges written to an attached
+    /// database, by the ids they answered (see `attach::undo`)
+    UndoMergeIds {
+        ids: Vec<String>,
+        skip_changed: bool,
+        allow_cascade: bool,
+        dry_run: bool,
+    },
     /// REVIEW WORLD w APPROVE | REJECT | PASS [REASON 'why']: a merge policy's reviewer decides a held merge
     ReviewWorld {
         world: String,
@@ -12658,6 +12677,47 @@ impl Parser {
             }
             "undo" => {
                 self.expect_kw("merge")?;
+                // (by id: a string follows. A world named `id` is undone as any other)
+                if self.kw("id") {
+                    match self.next() {
+                        Some(Tok::Str(first)) => {
+                            let mut ids = vec![first];
+                            while self.sym(",") {
+                                match self.next() {
+                                    Some(Tok::Str(s)) => ids.push(s),
+                                    t => {
+                                        self.put_back(t);
+                                        return self.fail("expected a merge's id as a string after the comma");
+                                    }
+                                }
+                            }
+                            let (mut skip_changed, mut allow_cascade, mut dry_run) = (false, false, false);
+                            loop {
+                                if self.kw("skip") {
+                                    self.expect_kw("changed")?;
+                                    skip_changed = true;
+                                } else if self.kw("allow") {
+                                    self.expect_kw("cascade")?;
+                                    allow_cascade = true;
+                                } else if self.kw("dry") {
+                                    self.expect_kw("run")?;
+                                    dry_run = true;
+                                } else {
+                                    break;
+                                }
+                            }
+                            return Ok(Stmt::UndoMergeIds { ids, skip_changed, allow_cascade, dry_run });
+                        }
+                        t => {
+                            self.put_back(t);
+                            let skip_changed = self.kw("skip");
+                            if skip_changed {
+                                self.expect_kw("changed")?;
+                            }
+                            return Ok(Stmt::UndoMerge { world: "id".into(), skip_changed });
+                        }
+                    }
+                }
                 self.kw("of");
                 let _ = self.kw("world") || self.kw("branch");
                 let world = self.branch_name()?;
@@ -38135,7 +38195,9 @@ impl Session {
             Stmt::Checkpoint { world, .. } if world.is_empty() => me.may_admin()?,
             Stmt::Checkpoint { world, .. } => me.may_manage(world)?,
             Stmt::Restore { world, .. } => me.may_restore(world)?,
-            Stmt::UndoMerge { .. } | Stmt::UndoAgent { .. } | Stmt::UndoDiff { .. } => me.may_undo()?,
+            Stmt::UndoMerge { .. } | Stmt::UndoMergeIds { .. } | Stmt::UndoAgent { .. } | Stmt::UndoDiff { .. } => {
+                me.may_undo()?
+            }
             Stmt::ReviewWorld { .. } => {} // checked as it runs: the policy's reviewer, or an admin
             // checked as they run: 'outbox' or 'admin', policy or not
             Stmt::AckOutbox(_) | Stmt::RetryOutbox(_) | Stmt::ClaimOutbox { .. } => {}
@@ -38434,6 +38496,19 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// `log_in` for a login that proved role `user`'s own password, `proved` being the stored password it was
+    /// checked against (read before the exchange, see `role_password`): 28P01 unless `user` is, now that it is
+    /// logged in, a role with that same password that hasn't expired. A role dropped or renamed while its login was
+    /// under way would otherwise be a name that is no role, which `log_in` makes a superuser; one given another
+    /// password meanwhile proved a password that is no longer its own.
+    pub fn log_in_role(&mut self, db: &Db, user: &str, proved: &str) -> Result<()> {
+        self.log_in(db, user)?;
+        match roles::password(&db.core, user)? {
+            Some((Some(p), false)) if p == proved => Ok(()),
+            _ => err("28P01", format!("password authentication failed for user \"{user}\"")),
+        }
     }
 
     /// What a Postgres client logging in as `user` proves it knows: None if `user` is no role made
@@ -40876,6 +40951,7 @@ impl Session {
             | Stmt::AlterWorld { .. }
             | Stmt::Restore { .. }
             | Stmt::UndoMerge { .. }
+            | Stmt::UndoMergeIds { .. }
             | Stmt::UndoAgent { .. }
             | Stmt::UndoDiff { .. }
             | Stmt::ReviewWorld { .. }
@@ -42195,6 +42271,23 @@ impl Statement {
                     ("confirm_deletes_over", Type::BigInt),
                     ("reviewer", Type::Text),
                     ("rerun_reads", Type::Bool),
+                    ("row_rules", Type::Text),
+                    ("all_rows_per_hour", Type::BigInt),
+                    ("all_deletes_per_hour", Type::BigInt),
+                    ("all_effects_per_hour", Type::BigInt),
+                    ("spot_check", Type::BigInt),
+                    ("max_nulled", Type::BigInt),
+                    ("untrusted_columns", Type::Text),
+                    ("untrusted_guards", Type::Text),
+                    ("review_every", Type::Bool),
+                    ("person_only", Type::Text),
+                    ("trusted_columns", Type::Text),
+                    ("watch_totals", Type::Text),
+                    ("max_shift", Type::BigInt),
+                    ("canary", Type::BigInt),
+                    ("canary_wait", Type::Interval),
+                    ("effects_delay", Type::Interval),
+                    ("max_unusual", Type::BigInt),
                 ]);
             }
             Stmt::ShowChecks | Stmt::CreateCheck { .. } => {
@@ -42267,6 +42360,7 @@ impl Statement {
                     ("effects", Type::Text),
                     ("run", Type::Json),
                     ("reviewer", Type::Text),
+                    ("needs_person", Type::Text),
                 ]);
             }
             Stmt::ShowMergeOutcomes { by_policy } => return fixed(&outcome_columns(*by_policy)),
@@ -43208,6 +43302,46 @@ impl Statement {
                 undone_notices(&u);
                 Ok(Output::tag(format!("UNDO MERGE {}", u.rows)))
             }
+            Stmt::UndoMergeIds { ids, skip_changed, allow_cascade, dry_run } => {
+                let o = crate::attach::UndoOptions {
+                    skip_changed: *skip_changed,
+                    dry_run: *dry_run,
+                    allow_cascade: *allow_cascade,
+                };
+                let u = db.undo_merges(ids, o)?;
+                let changed: Vec<String> = u
+                    .rows
+                    .iter()
+                    .filter(|r| r.status == "changed")
+                    .take(10)
+                    .map(|r| format!("{} {}", r.table, r.key))
+                    .collect();
+                if u.skipped > 0 {
+                    let does = if u.dry_run { "would be left" } else { "were left" };
+                    notice(
+                        "NOTICE",
+                        format!("{} rows changed since {does} as they are: {}", u.skipped, changed.join(", ")),
+                    );
+                }
+                if let Some(c) = u.cascades.as_ref().filter(|c| !c.is_empty()) {
+                    notice(
+                        "WARNING",
+                        format!(
+                            "the database would also change rows of {} (a cascade or a trigger): the undo needs ALLOW \
+                             CASCADE",
+                            c.join(", ")
+                        ),
+                    );
+                }
+                undone_notices(&crate::Undone {
+                    parent: crate::MAIN.into(),
+                    at: 0,
+                    rows: u.undone,
+                    skipped: 0,
+                    effects: u.effects.clone(),
+                });
+                Ok(Output::tag(format!("UNDO MERGE {}{}", if u.dry_run { "DRY RUN " } else { "" }, u.undone)))
+            }
             Stmt::UndoDiff { from, to, except, skip_changed } => {
                 let w = db.world(branch)?.name;
                 let (n, skipped) = db.undo_diff(&w, from, to, *skip_changed, except)?;
@@ -43297,7 +43431,7 @@ impl Statement {
                     .into_iter()
                     .map(|p| {
                         vec![
-                            Value::Text(p.name),
+                            Value::Text(p.name.clone()),
                             limit(p.max_rows),
                             limit(p.max_deletes),
                             Value::Text(crate::agents::listed(&p.tables)),
@@ -43316,8 +43450,25 @@ impl Statement {
                             limit(p.effects_per_hour),
                             Value::Text(crate::agents::listed(&p.review_channels)),
                             limit(p.confirm_deletes_over),
-                            p.reviewer.map_or(Value::Null, Value::Text),
+                            p.reviewer.clone().map_or(Value::Null, Value::Text),
                             Value::Bool(p.rerun_reads),
+                            Value::Text(p.row_rules_listed()),
+                            limit(p.all_rows_per_hour),
+                            limit(p.all_deletes_per_hour),
+                            limit(p.all_effects_per_hour),
+                            limit(p.spot_check),
+                            limit(p.max_nulled),
+                            Value::Text(crate::agents::listed_columns(&p.untrusted_columns)),
+                            Value::Text(crate::agents::listed(&p.untrusted_guards)),
+                            Value::Bool(p.review_every),
+                            Value::Text(p.person_only_listed()),
+                            Value::Text(crate::agents::listed_columns(&p.trusted_columns)),
+                            Value::Text(p.watch_totals.join("; ")),
+                            limit(p.max_shift),
+                            limit(p.canary),
+                            p.canary_wait.map_or(Value::Null, interval_of),
+                            p.effects_delay.map_or(Value::Null, interval_of),
+                            limit(p.max_unusual),
                         ]
                     })
                     .collect();
@@ -43487,6 +43638,11 @@ impl Statement {
                                     true => format!("{} by {who}", v.name()),
                                     false => format!("{} by {who}: {why}", v.name()),
                                 }),
+                            },
+                            // the reasons only a person may approve: a reviewer agent's approval is refused
+                            match r.person.is_empty() {
+                                true => Value::Null,
+                                false => Value::Text(r.person.join("; ")),
                             },
                         ]
                     })
@@ -44440,6 +44596,8 @@ impl Statement {
             Stmt::Alter { table, changes, if_exists, only } => {
                 let (kind, owner) = {
                     let v = x.view()?;
+                    // (an agent held to a tenant: not a change that lets go of the tenant, see `rls::keeps_hold`)
+                    rls::keeps_hold(&v, table, changes)?;
                     let kind = relation_kind(&v, table)?;
                     (kind, if kind.is_none() { index_owner(&v, table)? } else { None })
                 };

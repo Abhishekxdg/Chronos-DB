@@ -257,3 +257,33 @@ fn mcp_over_http_bounds_messages_and_pages() {
     }
     assert!(!tool(port, me, "history", json!({ "branch": "main", "limit": 1000 })).1);
 }
+
+/// A diff against another world shows that world's rows too. An agent held to a tenant sees the changes of the
+/// worlds it forked and no other's, so its diff against main (other tenants' rows since it forked) is refused, as
+/// POST /v1/diff and SQL's DIFF refuse it.
+#[test]
+fn a_tenants_agent_may_not_diff_against_a_world_it_may_not_see() {
+    let (_s, port) = start("diff-to", &["--safe", "--admin-token", ADMIN]);
+    let sql = |q: &str| post(port, Some(ADMIN), "sql", json!({ "sql": q }));
+    sql("create table leads (id int primary key, org_id int not null, name text)");
+    sql("insert into leads values (1, 42, 'acme')");
+    let made = sql("create agent t42 with (can = 'read,fork,write_own', tenant = 'org_id = 42')");
+    let token = made["results"][0]["rows"][0]["token"].as_str().unwrap().to_string();
+    let me = Some(token.as_str());
+    let (out, err) = tool(port, me, "fork", json!({ "name": "mine" }));
+    assert!(!err, "{out}");
+    // another tenant's row reaches main after the fork
+    sql("insert into leads values (2, 7, 'globex')");
+    for args in [
+        json!({ "branch": "mine", "to": "main", "after": "", "limit": 100 }),
+        json!({ "branch": "mine", "to": "main", "count": true }),
+        json!({ "branch": "mine", "to": "main" }),
+    ] {
+        let (out, err) = tool(port, me, "diff", args.clone());
+        assert!(err, "{args}: {out}");
+        assert!(!out.contains("globex"), "{args}: {out}");
+    }
+    // its own world's changes are still its to see
+    let (out, err) = tool(port, me, "diff", json!({ "branch": "mine" }));
+    assert!(!err, "{out}");
+}

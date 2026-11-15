@@ -20,6 +20,9 @@ chronos serve ./crm
   it holds one read open on Postgres while it copies.
 - Attach makes one table in Postgres, `chronos.merges` (a row per merge written, and one naming this folder). If
   the role can't, attach prints the statements for an administrator.
+- The first merge makes a second, `chronos.merge_rows`: each row a merge wrote, as it was before and after, kept
+  to [undo the merge by its id](#undo-by-merge-id). If the role can't make it, merges go on without it and undo by
+  id isn't there until an administrator runs the same statements.
 
 ## Work
 
@@ -405,6 +408,35 @@ Updated rows get their old values, inserted rows are deleted, deleted rows come 
   brought into main, in a `WARNING` (HTTP `undo_merge`: `effects_not_undone`), with where it is: `sent` (a worker
   acknowledged it), `queued` (not sent yet: `ACK OUTBOX '<id>'` drops it), or `claimed` / `ambiguous` (it may have
   been sent). The undo itself leaves the outbox alone.
+
+### Undo by merge id
+
+`UNDO MERGE OF WORLD` rebuilds the merge from the folder's history, which a new folder keeps for an hour. For longer,
+each write-back also keeps the rows it wrote in Postgres, in `chronos.merge_rows`, in its own transaction: the row as
+main had it (checked equal to Postgres's under lock) and the row as Postgres stored it. They are kept 30 days
+(`CHRONOS_UNDO_WINDOW_DAYS`), whatever the history window, and outlive the folder.
+
+- A merge over HTTP answers its id: `{"merged": n, "merge": "merge:..."}`.
+- HTTP `undo_merge` with `ids: ["merge:...", ...]` puts back every row those merges wrote, newest merge first, in one
+  transaction, through Postgres as above. It answers `{undone, skipped, merge, rows}`: `merge` is the undo's own id,
+  and each of `rows` has its `table`, `key`, what the merge did (`op`), `before`, `after`, and `status` (`put_back`
+  or `changed`, with the row as main holds it `now`).
+- `skip_changed: true` leaves rows changed since and undoes the rest. Without it, any changed row refuses the undo
+  with nothing written.
+- `dry_run: true` answers the same list and writes nothing. It runs the undo's writes in Postgres as far as
+  `COMMIT` and rolls them back, so rows are locked for that moment: a row changed only in Postgres shows as
+  `changed`, and `cascades` names the tables Postgres would write rows of besides the undo's own.
+- **Cascades hold an undo.** Undoing an insert deletes the row; with `ON DELETE CASCADE` (or a trigger) Postgres
+  would also change rows other people added under it since. That refuses the undo (409, code `2BP01`, nothing
+  written) unless it says `allow_cascade: true`. Only attached tables are counted.
+- **Effects aren't undone.** The effects the merges queued are answered in `effects_not_undone`, each `sent`,
+  `queued`, `claimed` or `ambiguous`; ones still delayed are taken back unsent (`cancelled`).
+- In SQL: `UNDO MERGE ID 'merge:...' [, 'merge:...'] [SKIP CHANGED] [ALLOW CASCADE] [DRY RUN]`.
+- Rows changed since answer 409 with code `40001`.
+- An undo is a merge: it has its own records, and its rows obey `writeback.json` like any merge's.
+- An undone merge can't be undone twice: its rows are no longer as it left them.
+- `attached` says `undo: {ready, window_days}`. `ready` is false when the table is missing or the role can't insert
+  into it. Pruning past the window needs `DELETE` on it; without that, old records stay.
 
 ## Restore drill
 

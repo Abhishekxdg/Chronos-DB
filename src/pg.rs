@@ -932,6 +932,8 @@ impl Conn<'_> {
         // password is a credential the database's own user made on purpose (an agent, or a name that proves a token,
         // is what the guest stands in for)
         let role_login = !is_agent && matches!(&kept, Some((Some(_), false)));
+        // (what it proves: checked again once it has, see `Session::log_in_role`)
+        let proved = if role_login { kept.as_ref().and_then(|(p, _)| p.clone()) } else { None };
         let proof = match (&agent, kept) {
             // a disabled agent's exchange is doomed, as a wrong token's
             (Some(a), _) => match a.verifier() {
@@ -1040,11 +1042,16 @@ impl Conn<'_> {
         }
         // a role made with CREATE ROLE logs in with its own rights (a name that is no role is a
         // superuser, as every login was before roles); one that may not log in now is refused
-        if !user.is_empty()
-            && !is_agent
-            && let Err(e) = self.session.log_in(self.db, &user)
-        {
-            return self.refuse(&e);
+        if !user.is_empty() && !is_agent {
+            // a role that proved its own password must still be that role: one dropped, renamed or given another
+            // password while its login was under way is refused, never taken for a name that is no role
+            let logged = match &proved {
+                Some(p) => self.session.log_in_role(self.db, &user, p),
+                None => self.session.log_in(self.db, &user),
+            };
+            if let Err(e) = logged {
+                return self.refuse(&e);
+            }
         }
         if let Some(app) = opts.get("application_name") {
             self.session.set_var("application_name", app);

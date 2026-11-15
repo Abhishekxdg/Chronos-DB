@@ -31,7 +31,7 @@ fn a_reviewer_decides_before_a_person() {
         "create table leads (id int primary key, email text, status text);
          insert into leads select g, 'p' || g || '@x.com', 'open' from generate_series(1, 5) g;
          alter table leads alter column email set masked;
-         create merge policy careful with (max_deletes = 0, reviewer = 'critic')",
+         create merge policy careful with (max_deletes = 0, reviewer = 'critic', person_only = 'none')",
         &[],
     )
     .unwrap();
@@ -39,6 +39,7 @@ fn a_reviewer_decides_before_a_person() {
     let mut bot = agent(&db, "bot", &writer, Some("careful"));
     let mut critic = agent(&db, "critic", &[Can::Read], None);
     let mut other = agent(&db, "other", &[Can::Read], None);
+    // (person_only = 'none': the reviewer may approve deletes too, which by default only a person may)
     let shown = run(&db, MAIN, "show merge policies", &[]).unwrap().pop().unwrap();
     assert!(shown.rows[0].iter().any(|v| v.to_text() == "critic"));
 

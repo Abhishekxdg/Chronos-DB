@@ -434,7 +434,10 @@ impl Branch {
         if let Some(r) = self.reads.read().unwrap().as_ref() {
             return Some(r.clone());
         }
-        if !self.info.read().unwrap().meta.contains_key(stale::CHECK_READS) {
+        let watched = |m: &serde_json::Map<String, serde_json::Value>| {
+            m.contains_key(stale::CHECK_READS) || m.contains_key(stale::WATCH_READS)
+        };
+        if !watched(&self.info.read().unwrap().meta) {
             return None;
         }
         let meta = self.info.read().unwrap().meta.clone();
@@ -3646,14 +3649,17 @@ impl Core {
         let wrote: std::collections::HashSet<String> =
             self.state_diff(&base, &ours)?.into_iter().map(|c| c.key).collect();
         let now = self.branch(&parent)?.snapshot();
-        let mut out: Vec<(String, String)> =
-            self.stale_reasons(&set, &parent, &base, &now, &wrote)?.into_iter().map(|r| (parent.clone(), r)).collect();
+        let mut out: Vec<(String, String)> = self
+            .stale_reasons(&set, &parent, &base, &now, &wrote)?
+            .into_iter()
+            .map(|r| (parent.clone(), agents::for_caller(&r)))
+            .collect();
         if parent == MAIN
             && let Some(att) = self.attached.as_deref()
         {
             let against = format!("Postgres ({})", att.source());
             match attach::check_reads(self, att, &set, &base, &wrote) {
-                Ok(found) => out.extend(found.into_iter().map(|r| (against.clone(), r))),
+                Ok(found) => out.extend(found.into_iter().map(|r| (against.clone(), agents::for_caller(&r)))),
                 Err(e) => out.push((against, format!("couldn't be checked: {e}"))),
             }
         }
@@ -3951,6 +3957,16 @@ impl Core {
                 self.undo_through_postgres(&via, skip_changed, put)?
             }
         };
+        // effects it landed that are still delayed (its policy's `effects_delay`): taken back unsent
+        let delayed: Vec<String> = effects.iter().filter(|e| e.state == "delayed").map(|e| e.id.clone()).collect();
+        let cancelled = self.cancel_delayed(&delayed)?;
+        let effects = effects
+            .into_iter()
+            .map(|e| match cancelled.contains(&e.id) {
+                true => UndoneEffect { state: "cancelled", ..e },
+                false => e,
+            })
+            .collect();
         Ok(Undone { parent, at: when, rows, skipped, effects })
     }
 
@@ -4784,7 +4800,10 @@ impl Core {
             // world's); replaying the log, a world's earlier reads aren't known (see `stale`)
             let reads = match name.starts_with("_tx_") {
                 true => src.recorder(),
-                false if info.meta.contains_key(stale::CHECK_READS) && self.me.get().is_some() => {
+                false
+                    if (info.meta.contains_key(stale::CHECK_READS) || info.meta.contains_key(stale::WATCH_READS))
+                        && self.me.get().is_some() =>
+                {
                     Some(Arc::new(Mutex::new(stale::ReadSet::of(&info.meta, true))))
                 }
                 false => None,
@@ -5019,6 +5038,7 @@ impl Core {
     /// (`attach::after_failed`), so a row whose two sides changed different columns combines, and only
     /// a column both changed is still a conflict.
     pub fn merge_kept(&self, b: &str, o: &MergeOptions) -> Result<(usize, Option<u64>)> {
+        self.canary(b, o)?; // a big merge lands a few rows first (see `MergePolicy::canary`)
         match self.merge_once(b, o) {
             Err(e) if o.columns && self.attached.is_some() && attach::is_conflict(&e) => self.merge_once(b, o),
             out => out,
@@ -5085,8 +5105,8 @@ impl Core {
         let (n, pos, notes, kept) = match merged {
             Merged::Done(n, pos, notes, kept) => (n, pos, notes, kept),
             Merged::Plan(..) => unreachable!("only a dry run plans"),
-            Merged::Review(p, reasons, version) => {
-                self.ask_review(b, &p, &reasons, version)?;
+            Merged::Review(p, reasons, person, version) => {
+                self.ask_review(b, &p, &reasons, &person, version)?;
                 return Err(agents::needs_review(b, &p, &reasons));
             }
         };
@@ -5386,6 +5406,10 @@ impl Core {
         // a world that checks its reads: what it read must be as it was when it forked (see `stale`)
         // (replaying the log: a merge that happened passed then, and earlier reads aren't known now)
         let read_set = if b.starts_with("_tx_") || self.me.get().is_none() { None } else { child.recorder() };
+        // a world that keeps what it reads only to tell whether it read text outsiders write (see `stale::WATCH_READS`)
+        // isn't held for its reads changing: only one that checks them is
+        let checks_reads = b.starts_with("_tx_") || child.info.read().unwrap().meta.contains_key(stale::CHECK_READS);
+        let stale_set = read_set.as_ref().filter(|_| checks_reads);
         let wrote: std::collections::HashSet<String> = match &read_set {
             Some(_) => diff.iter().map(|c| c.key.clone()).collect(),
             None => Default::default(),
@@ -5464,7 +5488,7 @@ impl Core {
             true => None,
             false => child.info.read().unwrap().meta.get(scope::SCOPE).cloned(),
         };
-        let columns_reviewed = policy.as_ref().is_some_and(|p| !p.review_columns.is_empty());
+        let columns_reviewed = policy.as_ref().is_some_and(|p| !p.review_columns.is_empty() || p.max_nulled.is_some());
         let mut counts = Settled::NONE;
         // tables' definitions first: a table both sides changed is known before its rows come (a row of it can't be
         // combined by columns, the merged table's columns being undecided)
@@ -5642,34 +5666,89 @@ impl Core {
             }
         }
         // (rows left in conflict apply nothing: they count against what it may change, not how many rows)
-        let strayed = declared.as_ref().map_or(vec![], |s| {
+        let mut strayed = declared.as_ref().map_or(vec![], |s| {
             let applied: std::collections::HashSet<&str> = apply.iter().map(|c| c.key.as_str()).collect();
             scope::outside(s, &merge_rows, &applied, &reached)
         });
+        // the conditions each row it changes must keep, on the row as the parent has it now and as it leaves it: its
+        // policy's (see below) and its run's own (its scope's `row_rules`)
+        let rule_rows = |rules: &[(String, String)]| -> Result<Vec<String>> {
+            let mut rows = vec![];
+            for c in apply.iter().filter(|c| shown(&c.key) && !reserved_table(&c.key)) {
+                let Some((t, id)) = c.key.split_once('/') else { continue };
+                if !rules.iter().any(|(rt, _)| rt == t) {
+                    continue;
+                }
+                let now = self.val(&theirs_state, &c.key)?.map(|v| v.to_string());
+                rows.push((t.to_string(), id.to_string(), now, c.after.as_ref().map(|v| v.to_string())));
+            }
+            Ok(sql::row_rule_reasons(&parent_view, rules, &rows))
+        };
+        if let Some(rules) = declared.as_ref().map(scope::row_rules).filter(|r| !r.is_empty()) {
+            strayed.extend(rule_rows(&rules)?);
+        }
         // outside its scope, merged by anyone keeping to no merge policy: refused as it is
         if let (Some(s), None, false) = (&declared, &policy, strayed.is_empty() || dry) {
             return Err(scope::refused(b, s, &strayed));
         }
         let mut broken = vec![];
+        // those of them only a person may approve the merge past, not its policy's reviewer (see `person_only`)
+        let mut person: Vec<String> = vec![];
         if let Some(p) = &policy {
             // the rows the merge would change in the parent: not those settled as the parent has them
-            broken = p.broken(&apply, overwrote);
-            broken.extend(strayed.iter().map(|r| format!("{r}, outside its declared scope")));
-            broken.extend(p.column_reviews(&merge_rows));
+            let mut judged: Vec<agents::Broke> = p.judged(&apply, overwrote);
+            judged.extend(strayed.iter().map(|r| ("scope", format!("{r}, outside its declared scope"))));
+            judged.extend(p.column_reviews(&merge_rows).map(|r| ("review_columns", r)));
+            // the conditions each row it changes must keep, on the row as the parent has it now and as it leaves it
+            if !p.row_rules.is_empty() {
+                judged.extend(rule_rows(&p.row_rules)?.into_iter().map(|r| ("row_rules", r)));
+            }
+            judged.extend(p.nulled_broken(&merge_rows).map(|r| ("max_nulled", r)));
+            // far more rows than the policy's merges usually change: drift (see `tally::usual_rows`)
+            if name == MAIN
+                && !tx
+                && let Some(times) = p.max_unusual
+                && let Some((usual, n)) = self.usual_rows(&p.name)
+            {
+                let rows = agents::counts(&apply).0;
+                if rows > usual.max(1).saturating_mul(times) {
+                    judged.push((
+                        "max_unusual",
+                        format!(
+                            "changes {rows} rows, more than {times} times what merge policy {}'s merges usually change ({usual}, the median of its last {n})",
+                            p.name
+                        ),
+                    ));
+                }
+            }
+            // text outsiders write, read on the way to changing what it guards (see `untrusted_columns`)
+            // and rows an agent wrote after reading such text (see `tally::Taint`)
+            if !p.untrusted_columns.is_empty() && !tx {
+                let (read, tainted) = match read_set.as_ref() {
+                    Some(set) => {
+                        let set = set.lock().unwrap();
+                        (self.untrusted_seen(p, &parent_view, &set), self.tainted_read(&set))
+                    }
+                    None => (None, vec![]),
+                };
+                judged.extend(p.untrusted_broken(read, &tainted, &apply).map(|r| ("untrusted", r)));
+            }
             // a world made some other way than a fork that declared one (simulate keeps worlds;
             // one forked before its policy asked): its merge says so, and a person looks
             let scoped = declared.as_ref().is_some_and(|s| s.get("may_change").is_some() || s.get("tenant").is_some());
             if p.require_scope && !tx && !scoped {
-                broken.push(format!(
-                    "declares no scope (merge policy {} has its agents say what a world may change)",
-                    p.name
+                judged.push((
+                    "require_scope",
+                    format!("declares no scope (merge policy {} has its agents say what a world may change)", p.name),
                 ));
             }
             // the world's age: the longer it's open, the older what its merge rests on
-            broken.extend(p.age_broken(child.info.read().unwrap().created, disk::now_ms()));
-            // and with the agent's other merges into main in the last hour (see `tally`)
+            judged.extend(p.age_broken(child.info.read().unwrap().created, disk::now_ms()).map(|r| ("max_age", r)));
+            // and with the agent's other merges into main in the last hour (see `tally`), and every agent's under
+            // the policy (see `tally::policy_key`)
             if name == MAIN {
-                broken.extend(p.hourly_broken(self, &disk::actor(), &apply));
+                judged.extend(p.hourly_broken(self, &disk::actor(), &apply));
+                judged.extend(p.all_hourly_broken(self, &apply));
             }
             // columns a reader marked critical reads (see `sql::impact`): a person looks first.
             // Readers are traced over rows as JSON, as diffs show them (what each row the merge
@@ -5678,8 +5757,10 @@ impl Core {
                 let rows = applied()?;
                 let why = sql::critical_reasons(self, &parent_view, &rows)
                     .map_err(|e| Error::Constraint { code: e.code, message: e.message })?;
-                broken.extend(why);
+                judged.extend(why.into_iter().map(|r| ("critical", r)));
             }
+            person = p.for_a_person(&judged);
+            broken = judged.into_iter().map(|(_, why)| why).collect();
         }
         // a merge its policy sends to a person is queued even if it couldn't merge as it is: with
         // the merge checks it breaks too when there's a result to check them on (see below)
@@ -5689,9 +5770,11 @@ impl Core {
                 self.attached.as_deref().map_or(String::new(), |a| a.source())
             ));
         }
-        let review = |why: Vec<String>| match (&policy, attached_review) {
-            (Some(p), _) if !dry && !why.is_empty() => Some(Merged::Review(p.name.clone(), why, actual)),
-            (None, true) if !dry && !why.is_empty() => Some(Merged::Review(ATTACHED_REVIEW.into(), why, actual)),
+        let review = |why: Vec<String>, person: Vec<String>| match (&policy, attached_review) {
+            (Some(p), _) if !dry && !why.is_empty() => Some(Merged::Review(p.name.clone(), why, person, actual)),
+            (None, true) if !dry && !why.is_empty() => {
+                Some(Merged::Review(ATTACHED_REVIEW.into(), why.clone(), why, actual))
+            }
             _ => None,
         };
         // B-tree index entries are never merged themselves: a row can win while its entries would
@@ -5700,7 +5783,7 @@ impl Core {
         conflicts.retain(|c| !sql::btree_entry(&c.key));
         // conflicts: no result to check, and the merge fails as it is
         if (!conflicts.is_empty() || !schema_clash.is_empty())
-            && let Some(r) = review(broken.clone())
+            && let Some(r) = review(broken.clone(), person.clone())
         {
             return Ok(r);
         }
@@ -5737,8 +5820,13 @@ impl Core {
                 let keys: Vec<String> = apply.iter().map(|c| c.key.clone()).collect();
                 broken.extend(self.failed_checks(&name, &merged, &keys)?);
             }
-            if let Some(set) = &read_set {
+            if let Some(set) = stale_set {
                 broken.extend(self.stale_reasons(set, &name, &base_state, &theirs_state, &wrote)?);
+            }
+            if let Some(p) = policy.as_ref().filter(|p| p.review_every && !tx && !rebase)
+                && broken.is_empty()
+            {
+                broken.push(format!("goes to {} first (review_every)", p.reviewer.as_deref().unwrap_or("a person")));
             }
             let refused = match (&policy, &declared) {
                 (None, Some(s)) if !strayed.is_empty() => Some(scope::refused(b, s, &strayed)),
@@ -5808,11 +5896,40 @@ impl Core {
         {
             return Err(agents::count_refused(b, c.deletes, &c.policy, c.over, o.confirm_deletes));
         }
+        // an agent keeping to no policy (an admin's) merging another agent's world held for rules only a person
+        // approves past: refused, as the policy's reviewer is (see `MergePolicy::person_only`); an agent under a
+        // policy is judged by its own rules above, and a world's own agent whose policy an admin took away by its
+        // rights alone
+        let actor = disk::actor();
+        if !tx && !rebase && policy.is_none() && !actor.is_empty() && !RECOVERING.get() {
+            let info = child.info.read().unwrap();
+            let meta = &info.meta;
+            let own = meta.get(agents::OWNER).and_then(|o| o.as_str()) == Some(actor.as_str());
+            let person: Vec<String> = meta
+                .get(agents::REVIEW)
+                .filter(|_| !own)
+                .and_then(|r| r["person"].as_array().cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect();
+            if !person.is_empty() {
+                return Err(agents::person_only_refused(b, &person));
+            }
+        }
         let n = apply.len();
         let keys: Vec<String> = apply.iter().map(|c| c.key.clone()).collect();
         if tx {
             // a transaction's COMMIT on main is a change made straight into it
             self.guard_main(&name, keys.iter().map(String::as_str))?;
+        }
+        // an agent's effects, delayed by its policy (see `outbox`): claimed only once that has passed
+        if name == MAIN
+            && !tx
+            && !rebase
+            && let Some(ms) = policy.as_ref().and_then(|p| p.effects_delay).filter(|ms| *ms > 0)
+        {
+            outbox::delay(&mut apply, ms);
         }
         let notes = if name == MAIN { outbox::notes(&apply) } else { vec![] };
         // the effects it lands in main, and who lets them through: kept once the merge is done (see `keep_landed`)
@@ -5827,6 +5944,70 @@ impl Core {
             let (rows, deletes, effects) = agents::counts(&apply);
             (self.tally_of(&disk::actor()).0, rows, deletes, effects)
         });
+        // and toward what its policy's merges usually change (see `max_unusual`)
+        let sized = match (&policy, name == MAIN && !tx && !rebase) {
+            (Some(p), true) => Some((p.name.clone(), agents::counts(&apply).0)),
+            _ => None,
+        };
+        // and into the count every agent under the policy shares (see `tally::policy_key`): an agent's merge, and one
+        // its reviewer or a person approved after the policy held it, so approvals can't go past the shared limits
+        let shared = if name == MAIN && !tx && !rebase {
+            let held = child
+                .info
+                .read()
+                .unwrap()
+                .meta
+                .get(agents::REVIEW)
+                .and_then(|r| r["policy"].as_str().map(String::from));
+            let p = match &policy {
+                Some(p) => Some(p.clone()),
+                None => held.and_then(|h| self.policy(&h).ok()),
+            };
+            p.filter(|p| {
+                p.all_rows_per_hour.is_some() || p.all_deletes_per_hour.is_some() || p.all_effects_per_hour.is_some()
+            })
+            .map(|p| {
+                let (rows, deletes, effects) = agents::counts(&apply);
+                (tally::policy_key(&p.name), rows, deletes, effects)
+            })
+        } else {
+            None
+        };
+        // the rows it writes into main, tainted when its world read text outsiders write or tainted rows (judged by
+        // its policy, or the one that held it: see `tally::Taint`); and those it deletes, or a person's own merge
+        // writes, not any more
+        let tainting = (name == MAIN && !tx && !rebase).then(|| {
+            let held = child
+                .info
+                .read()
+                .unwrap()
+                .meta
+                .get(agents::REVIEW)
+                .and_then(|r| r["policy"].as_str().map(String::from));
+            let rows = || {
+                apply
+                    .iter()
+                    .filter(|c| shown(&c.key) && !sql::internal(&c.key) && !outbox::entry(&c.key))
+                    .filter(|c| c.key.split_once('/').is_some_and(|(t, _)| !reserved_table(t)))
+            };
+            let deleted: Vec<String> = rows().filter(|c| c.after.is_none()).map(|c| c.key.clone()).collect();
+            let written: Vec<String> = rows().filter(|c| c.after.is_some()).map(|c| c.key.clone()).collect();
+            let p = policy.clone().or_else(|| held.as_ref().and_then(|h| self.policy(h).ok()));
+            let read_untrusted = p.filter(|p| !p.untrusted_columns.is_empty()).map(|p| match read_set.as_ref() {
+                Some(set) => {
+                    let set = set.lock().unwrap();
+                    self.untrusted_seen(&p, &parent_view, &set).is_none_or(|c| !c.is_empty())
+                        || !self.tainted_read(&set).is_empty()
+                }
+                None => true,
+            });
+            match read_untrusted {
+                Some(true) => (written, deleted),
+                // a person's own merge: what it writes is the person's
+                _ if held.is_none() && disk::actor().is_empty() => (vec![], [deleted, written].concat()),
+                _ => (vec![], deleted),
+            }
+        });
         for ch in apply {
             let v = relayout(&relayouts, &ch.key, ch.after);
             next.set(&ch.key, v);
@@ -5836,7 +6017,7 @@ impl Core {
         let entries = match sql::reindex(&after, &before, &keys) {
             Ok(entries) => entries,
             Err(e) => {
-                if let Some(r) = review(broken) {
+                if let Some(r) = review(broken, person) {
                     return Ok(r);
                 }
                 return Err(Error::Constraint { code: e.code, message: format!("{}; nothing was merged", e.message) });
@@ -5852,7 +6033,7 @@ impl Core {
         let unchanged = !stays && base_state.same(&theirs_state) && !child.rebased.load(Ordering::Relaxed);
         let merged = View { core: self, born: parent.born, s: next.clone(), branch: String::new(), reads: None };
         if let Err(e) = if unchanged { Ok(()) } else { sql::check_merge(&merged, &before, &keys) } {
-            if let Some(r) = review(broken) {
+            if let Some(r) = review(broken, person) {
                 return Ok(r);
             }
             return Err(Error::Constraint { code: e.code, message: format!("{}; nothing was merged", e.message) });
@@ -5860,12 +6041,43 @@ impl Core {
         // and the merge checks: queries that must find nothing on the merged result; what they
         // find joins the policy's broken rules
         let failed = if tx || rebase { vec![] } else { self.failed_checks(&name, &next, &keys)? };
-        let stale = match &read_set {
+        let stale = match stale_set {
             Some(set) => self.stale_reasons(set, &name, &base_state, &theirs_state, &wrote)?,
             None => vec![],
         };
         broken.extend(failed.iter().chain(&stale).cloned());
-        if let Some(r) = review(broken.clone()) {
+        if let Some(p) = &policy {
+            if p.person_needs("checks") {
+                person.extend(failed.iter().cloned());
+            }
+            if p.person_needs("stale_reads") {
+                person.extend(stale.iter().cloned());
+            }
+            // what the merge leaves, by the totals the policy watches (see `watch_totals`)
+            if name == MAIN && !tx && !rebase && !p.watch_totals.is_empty() {
+                let shifted = self.shifted_totals(p, &name, &theirs_state, &next);
+                if p.person_needs("max_shift") {
+                    person.extend(shifted.iter().cloned());
+                }
+                broken.extend(shifted);
+            }
+            // a merge that keeps every rule: a spot check picks one in so many for a person; else, with
+            // review_every, its reviewer decides it (a person, without one)
+            if broken.is_empty() && !tx && !rebase {
+                if let Some(why) = p.spot_picked() {
+                    if p.person_needs("spot_check") {
+                        person.push(why.clone());
+                    }
+                    broken.push(why);
+                } else if p.review_every {
+                    broken.push(match &p.reviewer {
+                        Some(r) => format!("goes to its reviewer {r} first (review_every)"),
+                        None => "waits for a person (review_every, and merge policy has no reviewer)".into(),
+                    });
+                }
+            }
+        }
+        if let Some(r) = review(broken.clone(), person.clone()) {
             return Ok(r);
         }
         if !failed.is_empty() {
@@ -5999,7 +6211,15 @@ impl Core {
                     let why = match &held {
                         attach::Held::Stale(w) | attach::Held::Checks(w) => w.clone(),
                     };
-                    if let Some(r) = review(why.clone()) {
+                    // as the same holds found here are: a person's alone when the policy says so
+                    let rule = match &held {
+                        attach::Held::Stale(_) => "stale_reads",
+                        attach::Held::Checks(_) => "checks",
+                    };
+                    if policy.as_ref().is_some_and(|p| p.person_needs(rule)) {
+                        person.extend(why.iter().cloned());
+                    }
+                    if let Some(r) = review(why.clone(), person) {
                         return Ok(r);
                     }
                     return Err(match held {
@@ -6035,8 +6255,14 @@ impl Core {
             let kept = child.version.load(Ordering::Relaxed); // under its writer lock: no write since
             parent.changed.fetch_add(n as u64, Ordering::Relaxed);
             let pos = self.append(rec);
-            if let Some((key, rows, deletes, effects)) = &counted {
+            for (key, rows, deletes, effects) in counted.iter().chain(&shared) {
                 self.count_merge(key, *rows, *deletes, *effects);
+            }
+            if let Some((wrote, cleared)) = &tainting {
+                self.taint_rows(wrote, cleared);
+            }
+            if let Some((p, rows)) = &sized {
+                self.note_size(p, *rows);
             }
             return Ok(Merged::Done(n, pos, notes, Some(kept)));
         }
@@ -6059,8 +6285,14 @@ impl Core {
         if !locked.is_empty() {
             self.keep_locks(&name, &parent, locked, at);
         }
-        if let Some((key, rows, deletes, effects)) = &counted {
+        for (key, rows, deletes, effects) in counted.iter().chain(&shared) {
             self.count_merge(key, *rows, *deletes, *effects);
+        }
+        if let Some((wrote, cleared)) = &tainting {
+            self.taint_rows(wrote, cleared);
+        }
+        if let Some((p, rows)) = &sized {
+            self.note_size(p, *rows);
         }
         Ok(Merged::Done(n, pos, notes, None))
     }
@@ -7038,8 +7270,9 @@ enum Merged {
     /// with, into main of a folder attached to Postgres, what to check there once the locks are let go
     Plan(Box<(MergePlan, Option<attach::Dry>)>),
     /// refused by the acting agent's merge policy: its name, the rules (and merge checks) broken,
-    /// and the branch's version they were checked at
-    Review(String, Vec<String>, u64),
+    /// those of them only a person may approve it past (see `MergePolicy::person_only`), and the branch's version
+    /// they were checked at
+    Review(String, Vec<String>, Vec<String>, u64),
 }
 
 /// What `merge_locked` does with what it works out.

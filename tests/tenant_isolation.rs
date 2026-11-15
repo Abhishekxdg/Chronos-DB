@@ -220,3 +220,27 @@ fn writes_reach_nothing_of_another_tenant() {
     let m = shown(&db, &mut Session::new(MAIN), "select * from leads where org_id = 7 order by id");
     assert_eq!(m, before, "main");
 }
+
+/// What holds a table to the tenant is its column (or a foreign key to a table that has it): the agent may not let
+/// go of it in a world it forked, where the table would then count as shared by every tenant and show their rows.
+#[test]
+fn the_agent_cannot_let_go_of_its_tenant_by_changing_a_table() {
+    let db = setup("ddl");
+    let mut s = agent();
+    s.run(&db, "create world w; use world w", &[]).unwrap();
+    for sql in [
+        "alter table leads rename column org_id to o",
+        "alter table leads drop column org_id",
+        "alter table leads drop column org_id cascade",
+        "alter table notes rename column org_id to o",
+    ] {
+        let out = shown(&db, &mut s, sql);
+        assert!(out.starts_with("ERROR 42501"), "{sql}: {out}");
+        no_secret(sql, &shown(&db, &mut s, "select * from leads"));
+        no_secret(sql, &shown(&db, &mut s, "select * from notes"));
+    }
+    // other changes to its world's tables are still its own to make
+    let out = shown(&db, &mut s, "alter table leads add column note text");
+    assert!(!out.starts_with("ERROR"), "{out}");
+    no_secret("after adding a column", &shown(&db, &mut s, "select * from leads"));
+}

@@ -16,8 +16,10 @@
 //! else a merge changes (views, functions, sequences, schemas) is out of any declared scope.
 //! `max_rows` and `max_deletes` say how many rows this run means to change (across every table),
 //! and how many of those it may delete (0: none), on top of any merge policy's limits: a run may
-//! declare tighter than its agent's policy, never looser. `intent` and `run` (a caller's own id for
-//! the run, such as a subagent's) are only shown.
+//! declare tighter than its agent's policy, never looser. `row_rules` (as a merge policy's: `payments:
+//! new.amount <= 100`) are conditions each row the run changes in those tables must keep, on top of its policy's: a
+//! row breaking one is outside the scope. `intent` and `run` (a caller's own id for the run, such as a subagent's) are
+//! only shown.
 
 use crate::sql::{self, Described};
 use crate::{Core, Error, Result, View};
@@ -27,7 +29,7 @@ use std::collections::{BTreeMap, HashMap};
 /// Metadata key holding a world's declared scope.
 pub(crate) const SCOPE: &str = "_sonos_scope";
 /// The metadata keys a scope is declared with.
-pub(crate) const KEYS: [&str; 6] = ["may_change", "tenant", "max_rows", "max_deletes", "intent", "run"];
+pub(crate) const KEYS: [&str; 7] = ["may_change", "tenant", "max_rows", "max_deletes", "row_rules", "intent", "run"];
 /// Rows a reason names before it says how many more.
 const SHOWN: usize = 5;
 
@@ -72,6 +74,10 @@ pub(crate) fn resolve(v: &View, old: &Map<String, Json>, patch: Map<String, Json
             ("max_rows" | "max_deletes", val) => {
                 let n = count(&val).ok_or_else(|| bad(format!("{k} must be a whole number of rows, 0 or more")))?;
                 s.insert(k, json!(n));
+            }
+            ("row_rules", val) => {
+                let rules = crate::agents::parse_row_rules(&val)?;
+                s.insert(k, json!(rules.iter().map(|(t, c)| json!([t, c])).collect::<Vec<_>>()));
             }
             ("intent" | "run", Json::String(t)) => {
                 s.insert(k, Json::String(t));
@@ -148,6 +154,16 @@ fn count(val: &Json) -> Option<u64> {
 }
 
 /// What `scope` declares a run will change at most, rows and then deletes (None: no limit).
+/// The scope's `row_rules`: (table, condition) pairs.
+pub(crate) fn row_rules(scope: &Json) -> Vec<(String, String)> {
+    scope["row_rules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| Some((p[0].as_str()?.to_string(), p[1].as_str()?.to_string())))
+        .collect()
+}
+
 pub(crate) fn limits(scope: &Json) -> (Option<u64>, Option<u64>) {
     (scope["max_rows"].as_u64(), scope["max_deletes"].as_u64())
 }
@@ -235,6 +251,11 @@ pub fn summary(scope: &Json) -> String {
         Some(n) => parts.push(format!("at most {n} deletes")),
         None => {}
     }
+    let rules = row_rules(scope);
+    if !rules.is_empty() {
+        let rules: Vec<String> = rules.iter().map(|(t, c)| format!("{t}: {c}")).collect();
+        parts.push(format!("row rules {}", rules.join("; ")));
+    }
     if parts.is_empty() {
         parts.push("no limits on what it changes".into());
     }
@@ -285,7 +306,7 @@ pub(crate) fn outside(
             }
             continue;
         }
-        let row = sql::show_key(&d.key).into_owned();
+        let row = crate::agents::shown_key(&d.key);
         let mut add = |what: String| strayed.entry(what).or_default().push(row.clone());
         match d.change {
             "update" => {
@@ -387,11 +408,11 @@ fn shown(ids: &[String]) -> String {
 pub(crate) fn refused(b: &str, scope: &Json, reasons: &[String]) -> Error {
     Error::Constraint {
         code: "42501",
-        message: format!(
+        message: crate::agents::for_caller(&format!(
             "merging {b} {}, outside the scope it was forked with ({}); nothing was merged: an admin can widen it (ALTER WORLD {b} SET (may_change = ...))",
             reasons.join("; it "),
             summary(scope)
-        ),
+        )),
     }
 }
 

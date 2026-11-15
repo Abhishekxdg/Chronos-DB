@@ -12,9 +12,11 @@
 //!      (the counts checked here; the pending record written)
 //!   3. COMMIT
 //!
-//! Not yet for MySQL (each refused, saying so): `serve --follow`, dry runs and rehearsals, CHECK READS and merge
-//! checks run in the source, write-back rules, `pg_role`, `--lazy-tenant`, binary, spatial and generated columns,
-//! and inserts into tables keyed by AUTO_INCREMENT (updates and deletes go).
+//! Not yet for MySQL (each refused, saying so): `serve --follow`, rehearsals, merge checks run in
+//! the source, write-back rules, `pg_role`, `--lazy-tenant`, binary and spatial columns.
+//!
+//! A row inserted into an AUTO_INCREMENT table has a provisional id here, and MySQL's own from the merge on: see
+//! `New`.
 
 use super::*;
 use crate::myclient::{self, Client as My, Done, lit, my_error, q as mq};
@@ -34,6 +36,40 @@ const SESSION: &str = "set session time_zone = '+00:00'; set session transaction
 const MERGES: &str = "chronos_merges";
 
 const CHANGED: &str = super::CHANGED_IN_MYSQL;
+
+/// The rows each merge wrote, kept to undo it by (see `super::undo`): `chronos.merge_rows` as MySQL holds it.
+const MERGE_ROWS: &str = "chronos_merge_rows";
+
+/// Whether write-backs keep undo records: the table is there (made now, if the user may) and takes a row from this
+/// user (tried, and rolled back).
+pub(super) fn undo_ready() -> bool {
+    let Ok(mut c) = url().and_then(|u| open(&u)) else { return false };
+    let _ = c.query(&format!(
+        "create table if not exists {MERGE_ROWS} (merge_id varchar(255) not null, n int not null, table_name \
+         varchar(255) not null, op varchar(10) not null, row_key json, before_row json, after_row json, at \
+         datetime(6) not null default current_timestamp(6), primary key (merge_id, n), key {MERGE_ROWS}_at (at)) \
+         engine = InnoDB"
+    ));
+    let tried = c.query_all(&format!(
+        "start transaction; insert into {MERGE_ROWS} (merge_id, n, table_name, op) values ('probe', 0, '', '')"
+    ));
+    let _ = c.query("rollback");
+    matches!(tried, Ok((_, None)))
+}
+
+/// The records of merge `id` as MySQL holds them, in the order it wrote them, and when it was (ms since 1970).
+pub(super) fn undo_read(id: &str) -> std::result::Result<(u64, Vec<super::undo::Raw>), String> {
+    let mut c = open(&url()?)?;
+    let sql = format!(
+        "select table_name, op, row_key, before_row, after_row, cast(unix_timestamp(at) * 1000 as unsigned) from \
+         {MERGE_ROWS} where merge_id = {} order by n",
+        lit(Some(id))
+    );
+    let rows: Vec<Texts> =
+        c.query(&sql).map_err(|e| format!("reading {MERGE_ROWS}: {e}"))?.into_iter().flat_map(|d| d.rows).collect();
+    let at = rows.first().and_then(|r| r[5].as_deref()).and_then(|v| v.parse().ok()).unwrap_or(0);
+    Ok((at, rows.into_iter().map(|r| [r[0].clone(), r[1].clone(), r[2].clone(), r[3].clone(), r[4].clone()]).collect()))
+}
 
 /// The source's connection string: a MySQL one, or Err saying the folder needs one.
 fn url() -> std::result::Result<myclient::Url, String> {
@@ -202,14 +238,15 @@ fn typed(t: &Table, i: usize, v: Option<&str>) -> String {
 
 /// `where` for the rows of `t` whose keys are `keys` (as main writes them).
 fn by_keys(t: &Table, keys: &[Vec<Option<String>>]) -> String {
+    let vals: Vec<Vec<String>> =
+        keys.iter().map(|k| t.key.iter().zip(k).map(|(&i, v)| typed(t, i, v.as_deref())).collect()).collect();
+    by_key_sql(t, &vals)
+}
+
+/// `by_keys`, of keys already written as SQL (a part may be a variable: see `New`).
+fn by_key_sql(t: &Table, keys: &[Vec<String>]) -> String {
     let cols: Vec<String> = t.key.iter().map(|&i| mq(&t.cols[i].name)).collect();
-    let vals: Vec<String> = keys
-        .iter()
-        .map(|k| {
-            let parts: Vec<String> = t.key.iter().zip(k).map(|(&i, v)| typed(t, i, v.as_deref())).collect();
-            format!("({})", parts.join(", "))
-        })
-        .collect();
+    let vals: Vec<String> = keys.iter().map(|k| format!("({})", k.join(", "))).collect();
     format!("({}) in ({})", cols.join(", "), vals.join(", "))
 }
 
@@ -245,6 +282,7 @@ fn send(c: &mut My, stmts: &[(String, String)]) -> Result<Vec<Done>> {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write_back(
+    core: &Core,
     att: &Attached,
     world: &str,
     world_id: &str,
@@ -267,24 +305,376 @@ pub(super) fn write_back(
     if rules.observe || rules.serializable || rules.has_tables() {
         return no("write-back rules (writeback.json)");
     }
-    if reads.is_some() {
-        return no("checking a world's reads against the source (check_reads)");
-    }
     if !checks.is_empty() {
         return no("running merge checks in the source");
     }
     let (mut c, kept) = lease(att).map_err(|e| refused(format!("{e}; nothing was merged")))?;
-    let out = transaction(att, &mut c, kept, world, world_id, rows);
+    let out = transaction(core, att, &mut c, kept, world, world_id, rows, reads);
     if out.is_err() && !c.broken && c.in_tx {
         let _ = c.query("rollback");
     }
     put(att, c);
-    out.map(|()| None)
+    out
 }
 
-fn transaction(att: &Attached, c: &mut My, kept: bool, world: &str, world_id: &str, rows: &[Row]) -> Result<()> {
+/// `super::check_reads`, against MySQL: what the world read, checked as the write-back checks it, outside any merge.
+pub(super) fn check_reads(core: &Core, att: &Attached, r: &Reads) -> std::result::Result<Vec<String>, String> {
+    let (mut c, _) = lease(att)?;
+    let out = c
+        .query("start transaction read only")
+        .map_err(|e| failed("starting the read", &e))
+        .and_then(|_| super::live_reads(core, &mut MyLive(&mut c), att, r));
+    put(att, c);
+    out.map_err(|e| e.to_string())
+}
+
+/// `super::dry_run`'s read of MySQL: one snapshot, no locks, rolled back. Each row the merge would write compared
+/// with MySQL's as the write-back compares it, the world's reads checked, and the tables' triggers named (not run).
+pub(super) fn dry_run(
+    core: &Core,
+    att: &Attached,
+    rows: &[Row],
+    reads: Option<&Reads>,
+    live: &mut crate::LiveCheck,
+) -> std::result::Result<(), String> {
+    let (mut c, _) = lease(att)?;
+    let out = dry_read(core, att, &mut c, rows, reads, live);
+    put(att, c);
+    out.map_err(|e| e.to_string())
+}
+
+fn dry_read(
+    core: &Core,
+    att: &Attached,
+    c: &mut My,
+    rows: &[Row],
+    reads: Option<&Reads>,
+    live: &mut crate::LiveCheck,
+) -> Result<()> {
+    let start =
+        "set transaction isolation level repeatable read; start transaction with consistent snapshot, read only";
+    let marker = format!("select count(*) from {MERGES} where id = {}", lit(Some(&att.marker())));
+    let got = send(c, &[("starting the read".into(), start.into()), ("reading chronos_merges".into(), marker)])?;
+    if got.last().and_then(|d| d.rows.first()).and_then(|r| r[0].as_deref()) != Some("1") {
+        return Err(refused(format!(
+            "the MySQL CHRONOS_SOURCE_URL names isn't the one this folder was attached to ({}): its chronos_merges \
+             has no row {}",
+            att.source(),
+            att.marker()
+        )));
+    }
+    live.at = crate::now_ms();
+    if let Some(r) = reads {
+        live.stale_reads =
+            super::live_reads(core, &mut MyLive(c), att, r)?.iter().map(|w| crate::agents::for_caller(w)).collect();
+    }
     let tables = att.tables();
     let by_table = by_table(rows);
+    for (&ti, rs) in &by_table {
+        let t = &tables[ti];
+        let changed: HashMap<usize, Option<Texts>> = MyLive(c).changed(t, rs)?.into_iter().collect();
+        for (at, r) in rs.iter().enumerate() {
+            live.rows.push(crate::LiveRow {
+                key: r.key.clone(),
+                changed: changed.contains_key(&at),
+                // (a row as main has it is MySQL's row, by the comparison)
+                postgres: match changed.get(&at) {
+                    Some(now) => now.as_ref().map(|n| row_json(t, n)),
+                    None => r.before.as_ref().map(|b| row_json(t, b)),
+                },
+            });
+        }
+    }
+    let names: Vec<String> = by_table.keys().map(|&ti| lit(Some(&tables[ti].name))).collect();
+    let sql = format!(
+        "select event_object_table, trigger_name from information_schema.triggers where event_object_schema = \
+         database() and event_object_table in ({}) order by 1, 2",
+        names.join(", ")
+    );
+    for d in send(c, &[("reading the tables' triggers".into(), sql)])? {
+        for r in d.rows {
+            live.triggers.push(format!("{}: {}", r[0].clone().unwrap_or_default(), r[1].clone().unwrap_or_default()));
+        }
+    }
+    let _ = c.query("rollback");
+    Ok(())
+}
+
+/// `super::Live`, of MySQL on the write-back's connection: rows compared here, by type (see `same`), and a table
+/// read more broadly than by keys read whole, for the world's tenant when it read for one.
+struct MyLive<'a>(&'a mut My);
+
+/// `super::tenant_cond`, in MySQL's SQL.
+fn tenant_cond(
+    v: &crate::View,
+    of: &mut crate::sql::Tenants,
+    att: &Attached,
+    name: &str,
+    tenant: &Json,
+    a: &str,
+    hops: usize,
+) -> Result<Option<String>> {
+    use crate::sql::TenantReach;
+    let sql_err = |e: crate::sql::SqlError| Error::Constraint { code: e.code, message: e.message };
+    let tables = att.tables();
+    let Some(t) = att.table(name).map(|i| &tables[i]) else { return Ok(None) };
+    match of.reach(v, name).map_err(sql_err)? {
+        Some(TenantReach::Column) => {
+            let col = tenant["column"].as_str().unwrap_or_default();
+            let Some(c) = t.cols.iter().find(|c| c.name == col) else { return Ok(None) };
+            let number = matches!(kind(&c.ty), Kind::Int | Kind::Unsigned | Kind::Decimal | Kind::Float);
+            let text = |s: &str| Some(format!("cast({a}.{} as char) = {}", mq(&c.name), lit(Some(s))));
+            Ok(match &tenant["value"] {
+                Json::Number(n) if number => Some(format!("{a}.{} = {n}", mq(&c.name))),
+                Json::Number(n) => text(&n.to_string()),
+                Json::String(s) => text(s),
+                Json::Bool(b) => text(&b.to_string()),
+                _ => None,
+            })
+        }
+        Some(TenantReach::Through { cols, parent, refs, .. }) if hops < crate::sql::MOST_TENANT_HOPS => {
+            let p = format!("{a}p");
+            let Some(cond) = tenant_cond(v, of, att, &parent, tenant, &p, hops + 1)? else { return Ok(None) };
+            let Some(pt) = att.table(&parent).map(|i| &tables[i]) else { return Ok(None) };
+            let list =
+                |al: &str, cs: &[String]| cs.iter().map(|c| format!("{al}.{}", mq(c))).collect::<Vec<_>>().join(", ");
+            Ok(Some(format!("({}) in (select {} from {} {p} where {cond})", list(a, &cols), list(&p, &refs), pt.pg)))
+        }
+        _ => Ok(None),
+    }
+}
+
+impl super::Live for MyLive<'_> {
+    fn name(&self) -> &'static str {
+        "MySQL"
+    }
+
+    /// (Filters aren't written in MySQL's SQL yet: a table read by a filtered scan is read whole.)
+    fn narrow(&self, _filters: &[crate::sql::RowFilter], _types: &[(String, String)]) -> Option<String> {
+        None
+    }
+
+    fn tenant_cond(
+        &self,
+        v: &crate::View,
+        of: &mut crate::sql::Tenants,
+        att: &Attached,
+        name: &str,
+        tenant: &Json,
+    ) -> Result<Option<String>> {
+        tenant_cond(v, of, att, name, tenant, "t", 0)
+    }
+
+    fn changed(&mut self, t: &Table, rs: &[&Row]) -> Result<Vec<(usize, Option<Texts>)>> {
+        let keys: Vec<Vec<Option<String>>> = rs.iter().map(|r| r.key_texts(t)).collect();
+        let mut now: HashMap<Vec<Option<String>>, Texts> = HashMap::new();
+        for part in keys.chunks(KEYS) {
+            let sql = format!("select {} from {} where {}", select_cols(t), t.pg, by_keys(t, part));
+            for d in send(self.0, &[(format!("reading rows of {}", t.name), sql)])? {
+                for r in d.rows {
+                    now.insert(key_of(t, &r), r);
+                }
+            }
+        }
+        let mut out = vec![];
+        for (at, (r, key)) in rs.iter().zip(&keys).enumerate() {
+            let theirs = now.get(&key_of_key(t, key));
+            let same_row = match (&r.before, theirs) {
+                (Some(b), Some(n)) => {
+                    t.cols.iter().enumerate().all(|(i, col)| same(&col.ty, b[i].as_deref(), n[i].as_deref()))
+                }
+                (None, None) => true,
+                _ => false,
+            };
+            if !same_row {
+                out.push((at, theirs.cloned()));
+            }
+        }
+        Ok(out)
+    }
+
+    fn added(&mut self, t: &Table, rs: &[&Row], only: &[String]) -> Result<Vec<Texts>> {
+        let known: HashSet<Vec<Option<String>>> = rs.iter().map(|r| key_of_key(t, &r.key_texts(t))).collect();
+        let cols: Vec<String> = t.cols.iter().map(|c| format!("t.{}", mq(&c.name))).collect();
+        let cond = match only.is_empty() {
+            true => String::new(),
+            false => format!(" where {}", only.join(" and ")),
+        };
+        // (one more than could be told apart from too many, counting those the fork point has)
+        let limit = super::LIVE_ROWS + known.len() + 1;
+        let sql = format!("select {} from {} t{cond} limit {limit}", cols.join(", "), t.pg);
+        let mut out = vec![];
+        for d in send(self.0, &[(format!("reading rows of {} the copy hasn't", t.name), sql)])? {
+            out.extend(d.rows.into_iter().filter(|r| !known.contains(&key_of(t, r))));
+        }
+        Ok(out)
+    }
+}
+
+/// The rows a merge inserts into AUTO_INCREMENT tables, each under a provisional id (see `super::PROVISIONAL`), and
+/// where those ids stand in the merge's other rows. MySQL gives each row its id as it is inserted; the write-back
+/// keeps it in a session variable (`@chr_p<n>`, from LAST_INSERT_ID), and writes the variable wherever the
+/// provisional id stood: only in a column MySQL declares a foreign key from, to the new row's own column. A
+/// provisional id anywhere else is refused: no number can be written there that would be right.
+struct New<'a> {
+    /// each new row: its table, the row, its AUTO_INCREMENT column, its provisional id
+    rows: Vec<(usize, &'a Row, usize, i64)>,
+    /// a provisional id's place in `rows`
+    at: HashMap<i64, usize>,
+    /// (table, column) MySQL declares a foreign key from, to the AUTO_INCREMENT column of this table
+    refs: HashMap<(usize, usize), usize>,
+}
+
+fn var(n: usize) -> String {
+    format!("@chr_p{n}")
+}
+
+impl<'a> New<'a> {
+    fn of(att: &Attached, tables: &[Table], rows: &'a [Row]) -> New<'a> {
+        let mut new = New { rows: vec![], at: HashMap::new(), refs: HashMap::new() };
+        for r in rows.iter().filter(|r| r.before.is_none()) {
+            let (t, Some(a)) = (&tables[r.table], &r.after) else { continue };
+            let found = t.seqs.iter().find_map(|sq| {
+                let v = a[sq.col].as_deref()?.trim().parse::<i64>().ok()?;
+                att.provisional(v).then_some((sq.col, v))
+            });
+            if let Some((col, v)) = found {
+                new.at.insert(v, new.rows.len());
+                new.rows.push((r.table, r, col, v));
+            }
+        }
+        new
+    }
+
+    /// The foreign keys MySQL declares to the new rows' tables, read on the write-back's connection.
+    fn fk_sql(&self, tables: &[Table]) -> String {
+        let mut names: Vec<String> = self.rows.iter().map(|(ti, ..)| lit(Some(&tables[*ti].name))).collect();
+        names.sort();
+        names.dedup();
+        format!(
+            "select table_name, column_name, referenced_table_name, referenced_column_name from \
+             information_schema.key_column_usage where table_schema = database() and referenced_table_schema = \
+             database() and referenced_table_name in ({})",
+            names.join(", ")
+        )
+    }
+
+    fn take_refs(&mut self, att: &Attached, tables: &[Table], found: &[Texts]) {
+        for r in found {
+            let name = |i: usize| r[i].as_deref().unwrap_or_default();
+            let (Some(child), Some(parent)) = (att.table(name(0)), att.table(name(2))) else { continue };
+            let Some(col) = tables[child].cols.iter().position(|c| c.name == name(1)) else { continue };
+            let to_seq = tables[parent].seqs.iter().any(|sq| tables[parent].cols[sq.col].name == name(3));
+            if to_seq {
+                self.refs.insert((child, col), parent);
+            }
+        }
+    }
+
+    /// The variable to write for column `i` of a row of table `ti` holding `v`, when `v` is a provisional id: Err
+    /// where no foreign key says whose id it is.
+    fn var_for(&self, att: &Attached, tables: &[Table], ti: usize, i: usize, v: Option<&str>) -> Result<Option<usize>> {
+        let t = &tables[ti];
+        if !matches!(kind(&t.cols[i].ty), Kind::Int | Kind::Unsigned | Kind::Decimal) {
+            return Ok(None);
+        }
+        let Some(id) = v.and_then(|v| v.trim().parse::<i64>().ok()).filter(|n| att.provisional(*n)) else {
+            return Ok(None);
+        };
+        let col = format!("{}.{}", t.name, t.cols[i].name);
+        match (self.refs.get(&(ti, i)), self.at.get(&id)) {
+            (Some(&parent), Some(&n)) if self.rows[n].0 == parent => Ok(Some(n)),
+            (_, Some(&n)) => {
+                let p = &tables[self.rows[n].0];
+                Err(refused(format!(
+                    "{col} holds {id}, the provisional id of a new row of {}, and MySQL declares no foreign key from \
+                     {col} to {}.{}: the id MySQL gives the row can't be put there. Declare the foreign key in MySQL \
+                     and attach again, or merge the new row of {} first and write its real id; nothing was merged",
+                    p.name, p.name, p.cols[self.rows[n].2].name, p.name
+                )))
+            }
+            (_, None) => Err(refused(format!(
+                "{col} holds {id}, a provisional id this folder gave a new row that this merge doesn't insert (it was \
+                 merged before, or never): read the row's id from main and write that; nothing was merged"
+            ))),
+        }
+    }
+
+    /// Each column of `r` (a row the merge writes) a variable stands in for, with the variable's number.
+    fn places(&self, att: &Attached, tables: &[Table], r: &Row) -> Result<Vec<(usize, usize)>> {
+        let Some(a) = &r.after else { return Ok(vec![]) };
+        let own = self.rows.iter().position(|(_, row, ..)| std::ptr::eq(*row, r));
+        let mut out = vec![];
+        for (i, v) in a.iter().enumerate() {
+            match own {
+                Some(n) if self.rows[n].2 == i => out.push((i, n)),
+                _ => out.extend(self.var_for(att, tables, r.table, i, v.as_deref())?.map(|n| (i, n))),
+            }
+        }
+        Ok(out)
+    }
+
+    /// `rows` in an order that inserts a row before any that refers to it.
+    fn order(&self, places: &HashMap<&str, Vec<(usize, usize)>>) -> Result<Vec<usize>> {
+        let mut left: Vec<usize> = (0..self.rows.len()).collect();
+        let mut done: HashSet<usize> = HashSet::new();
+        let mut out = vec![];
+        while !left.is_empty() {
+            let ready: Vec<usize> = left
+                .iter()
+                .copied()
+                .filter(|&n| places[self.rows[n].1.key.as_str()].iter().all(|&(_, m)| m == n || done.contains(&m)))
+                .collect();
+            // (a row whose own column, the AUTO_INCREMENT one, is its only variable depends on none)
+            let ready: Vec<usize> = ready
+                .into_iter()
+                .filter(|&n| !places[self.rows[n].1.key.as_str()].iter().any(|&(i, m)| m == n && i != self.rows[n].2))
+                .collect();
+            if ready.is_empty() {
+                return Err(refused(
+                    "new rows of AUTO_INCREMENT tables refer to each other in a circle (or one to itself), so none \
+                     can be inserted first: merge them in two steps; nothing was merged",
+                ));
+            }
+            // (in the order the world made them: each id is below the one before)
+            let mut ready = ready;
+            ready.sort_by_key(|&n| std::cmp::Reverse(self.rows[n].3));
+            left.retain(|n| !ready.contains(n));
+            done.extend(&ready);
+            out.extend(ready);
+        }
+        Ok(out)
+    }
+}
+
+/// What each statement of the write-back's second round trip must answer.
+enum Want {
+    /// rows affected, of that table, by what
+    Affected(usize, usize, &'static str),
+    /// rows of that table read back as MySQL stored them
+    Back(usize),
+    /// rows of that table read back by keys the merge didn't know (see `New`): that many
+    BackNew(usize, usize),
+    /// the ids MySQL gave those new rows
+    Ids(Vec<usize>),
+    Nothing,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transaction(
+    core: &Core,
+    att: &Attached,
+    c: &mut My,
+    kept: bool,
+    world: &str,
+    world_id: &str,
+    rows: &[Row],
+    read_set: Option<&Reads>,
+) -> Result<Option<Held>> {
+    let tables = att.tables();
+    let by_table = by_table(rows);
+    let keeps_undo = super::undo::ready(att);
+    let mut new = New::of(att, &tables, rows);
     // 1. the transaction, the folder's marker, and every row it writes locked and read (one round trip)
     let mut first = vec![
         ("starting the write-back".to_string(), "start transaction".to_string()),
@@ -293,10 +683,24 @@ fn transaction(att: &Attached, c: &mut My, kept: bool, world: &str, world_id: &s
             format!("select count(*) from {MERGES} where id = {}", lit(Some(&att.marker()))),
         ),
     ];
-    let mut reads: Vec<usize> = vec![]; // the table each read after the first two is of
+    if !new.rows.is_empty() {
+        first.push(("reading the tables' foreign keys".to_string(), new.fk_sql(&tables)));
+    }
+    let lead = first.len();
+    // a row inserted under a provisional id (its own, or its parent's in its key) has no row in MySQL to lock or
+    // compare: MySQL holds no such number
+    let unkeyed = |t: &Table, r: &Row| {
+        r.before.is_none()
+            && t.key.iter().any(|&i| {
+                let v = r.after.as_ref().and_then(|a| a[i].as_deref()).and_then(|v| v.trim().parse::<i64>().ok());
+                matches!(kind(&t.cols[i].ty), Kind::Int | Kind::Unsigned | Kind::Decimal)
+                    && v.is_some_and(|v| att.provisional(v))
+            })
+    };
+    let mut reads: Vec<usize> = vec![]; // the table each read after those is of
     for (&ti, rs) in &by_table {
         let t = &tables[ti];
-        let keys: Vec<Vec<Option<String>>> = rs.iter().map(|r| r.key_texts(t)).collect();
+        let keys: Vec<Vec<Option<String>>> = rs.iter().filter(|r| !unkeyed(t, r)).map(|r| r.key_texts(t)).collect();
         for part in keys.chunks(KEYS) {
             first.push((
                 format!("locking rows of {}", t.name),
@@ -321,8 +725,12 @@ fn transaction(att: &Attached, c: &mut My, kept: bool, world: &str, world_id: &s
             att.marker()
         )));
     }
+    if !new.rows.is_empty() {
+        new.take_refs(att, &tables, &got[2].rows);
+    }
+    let new = new;
     let mut now: HashMap<(usize, Vec<Option<String>>), Texts> = HashMap::new();
-    for (d, &ti) in got[2..].iter().zip(&reads) {
+    for (d, &ti) in got[lead..].iter().zip(&reads) {
         for r in &d.rows {
             now.insert((ti, key_of(&tables[ti], r)), r.clone());
         }
@@ -331,7 +739,7 @@ fn transaction(att: &Attached, c: &mut My, kept: bool, world: &str, world_id: &s
     let mut conflicts: Vec<(usize, &Row, Option<Texts>, Texts)> = vec![];
     for (&ti, rs) in &by_table {
         let t = &tables[ti];
-        for r in rs {
+        for r in rs.iter().filter(|r| !unkeyed(t, r)) {
             let key = r.key_texts(t);
             let theirs = now.get(&(ti, key_of_key(t, &key))).cloned();
             let changed = match (&r.before, &theirs) {
@@ -381,18 +789,79 @@ fn transaction(att: &Attached, c: &mut My, kept: bool, world: &str, world_id: &s
             ),
         });
     }
+    // what the world read, checked against MySQL before anything is written (see `super::live_reads`): changed,
+    // the merge is held for a person, and nothing is written
+    if let Some(r) = read_set {
+        let stale = super::live_reads(core, &mut MyLive(c), att, r)?;
+        if !stale.is_empty() {
+            let _ = c.query("rollback");
+            return Ok(Some(Held::Stale(stale)));
+        }
+    }
     // 2. the writes, the rows read back as MySQL stored them, and the merge's own row (one round trip)
     let merge_id = format!("merge:{}", random_id());
+    // where a variable stands for a provisional id, by row (see `New`)
+    let mut places: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
+    for r in rows {
+        places.insert(r.key.as_str(), new.places(att, &tables, r)?);
+    }
+    let value = |r: &Row, i: usize, v: Option<&str>| match places[r.key.as_str()].iter().find(|p| p.0 == i) {
+        Some(&(_, n)) => var(n),
+        None => lit(v),
+    };
+    // (in a row inserted: a column MySQL fills, left to it)
+    let put = |t: &Table, r: &Row, i: usize, v: Option<&str>| match v {
+        None if t.cols[i].fill => "default".to_string(),
+        v => value(r, i, v),
+    };
+    // a generated column is MySQL's to work out: a world that gave it a value of its own is refused
+    for r in rows {
+        let t = &tables[r.table];
+        let Some(a) = &r.after else { continue };
+        for i in (0..t.cols.len()).filter(|&i| t.cols[i].computed) {
+            let was = r.before.as_ref().and_then(|b| b[i].as_deref());
+            if !same(&t.cols[i].ty, was, a[i].as_deref()) {
+                let _ = c.query("rollback");
+                return Err(refused(format!(
+                    "{world} gives {}.{} a value, and MySQL generates that column: leave it as it is (main takes \
+                     MySQL's value with the row at the merge); nothing was merged",
+                    t.name, t.cols[i].name
+                )));
+            }
+        }
+    }
+    // (a row whose key holds a variable: read back, and kept by main, under the key MySQL gave)
+    let rekeyed = |t: &Table, r: &Row| places[r.key.as_str()].iter().any(|(i, _)| t.key.contains(i));
+    let own: HashMap<&str, usize> = new.rows.iter().enumerate().map(|(n, (_, r, ..))| (r.key.as_str(), n)).collect();
     let mut writes: Vec<(String, String)> = vec![];
-    // (what each statement's affected rows must be; None: a read back, of that table)
-    let mut expect: Vec<(Option<usize>, usize, &'static str)> = vec![];
+    let mut expect: Vec<Want> = vec![];
+    // the new rows of AUTO_INCREMENT tables first, a row before any that refers to it, each one's id kept
+    for n in new.order(&places)? {
+        let (ti, r, col, _) = new.rows[n];
+        let t = &tables[ti];
+        let a = r.after.as_ref().unwrap();
+        let cols: Vec<usize> =
+            (0..t.cols.len()).filter(|i| *i != col && !r.unseen.contains(i) && !t.cols[*i].computed).collect();
+        let names: Vec<String> = cols.iter().map(|&i| mq(&t.cols[i].name)).collect();
+        let vals: Vec<String> = cols.iter().map(|&i| put(t, r, i, a[i].as_deref())).collect();
+        writes.push((
+            format!("insert into {}", t.name),
+            format!("insert into {} ({}) values ({})", t.pg, names.join(", "), vals.join(", ")),
+        ));
+        expect.push(Want::Affected(1, ti, "inserted"));
+        writes.push((
+            format!("taking the id MySQL gave a row of {}", t.name),
+            format!("set {} = last_insert_id()", var(n)),
+        ));
+        expect.push(Want::Nothing);
+    }
     for (&ti, rs) in &by_table {
         let t = &tables[ti];
         for r in rs.iter().filter(|r| r.before.is_some() && r.after.is_some()) {
             let after = r.after.as_ref().unwrap();
             let sets: Vec<String> = (0..t.cols.len())
-                .filter(|i| !t.key.contains(i))
-                .map(|i| format!("{} = {}", mq(&t.cols[i].name), lit(after[i].as_deref())))
+                .filter(|i| !t.key.contains(i) && !t.cols[*i].computed)
+                .map(|i| format!("{} = {}", mq(&t.cols[i].name), value(r, i, after[i].as_deref())))
                 .collect();
             if sets.is_empty() {
                 continue;
@@ -401,25 +870,26 @@ fn transaction(att: &Attached, c: &mut My, kept: bool, world: &str, world_id: &s
                 format!("update {}", t.name),
                 format!("update {} set {} where {}", t.pg, sets.join(", "), by_keys(t, &[r.key_texts(t)])),
             ));
-            expect.push((Some(1), ti, "updated"));
+            expect.push(Want::Affected(1, ti, "updated"));
         }
-        let inserts: Vec<&&Row> = rs.iter().filter(|r| r.before.is_none()).collect();
+        let inserts: Vec<&&Row> =
+            rs.iter().filter(|r| r.before.is_none() && !own.contains_key(r.key.as_str())).collect();
         for part in inserts.chunks(KEYS) {
             let unseen = &part[0].unseen;
-            let cols: Vec<usize> = (0..t.cols.len()).filter(|i| !unseen.contains(i)).collect();
+            let cols: Vec<usize> = (0..t.cols.len()).filter(|i| !unseen.contains(i) && !t.cols[*i].computed).collect();
             let names: Vec<String> = cols.iter().map(|&i| mq(&t.cols[i].name)).collect();
             let vals: Vec<String> = part
                 .iter()
                 .map(|r| {
                     let a = r.after.as_ref().unwrap();
-                    format!("({})", cols.iter().map(|&i| lit(a[i].as_deref())).collect::<Vec<_>>().join(", "))
+                    format!("({})", cols.iter().map(|&i| put(t, r, i, a[i].as_deref())).collect::<Vec<_>>().join(", "))
                 })
                 .collect();
             writes.push((
                 format!("insert into {}", t.name),
                 format!("insert into {} ({}) values {}", t.pg, names.join(", "), vals.join(", ")),
             ));
-            expect.push((Some(part.len()), ti, "inserted"));
+            expect.push(Want::Affected(part.len(), ti, "inserted"));
         }
     }
     for (&ti, rs) in by_table.iter().rev() {
@@ -428,54 +898,175 @@ fn transaction(att: &Attached, c: &mut My, kept: bool, world: &str, world_id: &s
         for part in keys.chunks(KEYS) {
             writes
                 .push((format!("delete from {}", t.name), format!("delete from {} where {}", t.pg, by_keys(t, part))));
-            expect.push((Some(part.len()), ti, "deleted"));
+            expect.push(Want::Affected(part.len(), ti, "deleted"));
         }
     }
     // (MySQL has no RETURNING: the rows written read back, so main takes what defaults and triggers stored)
     for (&ti, rs) in &by_table {
         let t = &tables[ti];
-        let keys: Vec<Vec<Option<String>>> = rs.iter().filter(|r| r.after.is_some()).map(|r| r.after_key(t)).collect();
+        let keys: Vec<Vec<Option<String>>> =
+            rs.iter().filter(|r| r.after.is_some() && !rekeyed(t, r)).map(|r| r.after_key(t)).collect();
         for part in keys.chunks(KEYS) {
             writes.push((
                 format!("reading back rows of {}", t.name),
                 format!("select {} from {} where {}", select_cols(t), t.pg, by_keys(t, part)),
             ));
-            expect.push((None, ti, ""));
+            expect.push(Want::Back(ti));
+        }
+        let keys: Vec<Vec<String>> = rs
+            .iter()
+            .filter(|r| r.after.is_some() && rekeyed(t, r))
+            .map(|r| {
+                let a = r.after.as_ref().unwrap();
+                t.key
+                    .iter()
+                    .map(|&i| match places[r.key.as_str()].iter().find(|p| p.0 == i) {
+                        Some(&(_, n)) => var(n),
+                        None => typed(t, i, a[i].as_deref()),
+                    })
+                    .collect()
+            })
+            .collect();
+        for part in keys.chunks(KEYS) {
+            writes.push((
+                format!("reading back rows of {}", t.name),
+                format!("select {} from {} where {}", select_cols(t), t.pg, by_key_sql(t, part)),
+            ));
+            expect.push(Want::BackNew(ti, part.len()));
         }
     }
+    let all: Vec<usize> = (0..new.rows.len()).collect();
+    for part in all.chunks(KEYS) {
+        let vars: Vec<String> = part.iter().map(|&n| var(n)).collect();
+        writes.push(("reading the ids MySQL gave".into(), format!("select {}", vars.join(", "))));
+        expect.push(Want::Ids(part.to_vec()));
+    }
     writes.push(("recording the merge".into(), format!("insert into {MERGES} (id) values ({})", lit(Some(&merge_id)))));
-    expect.push((Some(1), usize::MAX, "recorded"));
+    expect.push(Want::Affected(1, usize::MAX, "recorded"));
     let done = send(c, &writes)?;
     let mut sent_back: Vec<Stored> = vec![];
-    for (d, (n, ti, what)) in done.iter().zip(&expect) {
-        match n {
-            Some(n) if d.affected as usize != *n => {
+    let mut real: Vec<Option<String>> = vec![None; new.rows.len()];
+    for (d, want) in done.iter().zip(&expect) {
+        match want {
+            Want::Affected(n, ti, what) if d.affected as usize != *n => {
                 let t = tables.get(*ti).map_or(MERGES, |t| t.name.as_str());
                 return Err(refused(format!(
                     "MySQL {what} {} rows of {t} where the merge sent {n}: nothing was merged",
                     d.affected
                 )));
             }
-            Some(_) => {}
-            None => {
+            Want::Affected(..) | Want::Nothing => {}
+            Want::Back(ti) | Want::BackNew(ti, _) => {
+                if let Want::BackNew(_, n) = want
+                    && d.rows.len() != *n
+                {
+                    return Err(refused(format!(
+                        "MySQL has {} of the {n} rows the merge just inserted into {} under the ids it gave them (a \
+                         trigger there gives ids of its own, or moves rows): nothing was merged",
+                        d.rows.len(),
+                        tables[*ti].name
+                    )));
+                }
                 for r in &d.rows {
                     let key = tables[*ti].key.iter().map(|&i| r[i].clone()).collect();
                     sent_back.push(Stored { table: *ti, key, row: Some(r.clone()) });
+                }
+            }
+            Want::Ids(ns) => {
+                let row = d.rows.first();
+                for (at, &n) in ns.iter().enumerate() {
+                    real[n] = row.and_then(|r| r[at].clone()).filter(|v| v != "0");
+                    if real[n].is_none() {
+                        return Err(refused(format!(
+                            "MySQL gave no id to a row the merge inserted into {}: nothing was merged",
+                            tables[new.rows[n].0].name
+                        )));
+                    }
                 }
             }
         }
     }
     for (&ti, rs) in &by_table {
         let t = &tables[ti];
-        for r in rs.iter().filter(|r| r.after.is_none()) {
-            sent_back.push(Stored { table: ti, key: r.key_texts(t), row: None });
+        // (and the row main holds under the provisional key goes: MySQL's is under its own)
+        for r in rs.iter().filter(|r| r.after.is_none() || rekeyed(t, r)) {
+            let key = match &r.after {
+                Some(a) => t.key.iter().map(|&i| a[i].clone()).collect(),
+                None => r.key_texts(t),
+            };
+            sent_back.push(Stored { table: ti, key, row: None });
         }
     }
     // what recovery needs should the commit's outcome be lost
     let mut touched: BTreeMap<String, Vec<Vec<Option<String>>>> = BTreeMap::new();
     for (&ti, rs) in &by_table {
         let t = &tables[ti];
-        touched.entry(t.name.clone()).or_default().extend(rs.iter().map(|r| r.key_texts(t)));
+        let keys = touched.entry(t.name.clone()).or_default();
+        for r in rs {
+            keys.push(r.key_texts(t));
+            // (and the key MySQL gave it, which recovery reads its row by)
+            if let (Some(a), true) = (&r.after, rekeyed(t, r)) {
+                let key = t.key.iter().map(|&i| match places[r.key.as_str()].iter().find(|p| p.0 == i) {
+                    Some(&(_, n)) => real[n].clone(),
+                    None => a[i].clone(),
+                });
+                keys.push(key.collect());
+            }
+        }
+    }
+    // (an undo's dry run stops here; what MySQL's cascades and triggers wrote besides isn't counted)
+    super::undo::before_commit(&[])?;
+    // each row written, as it was and as MySQL stored it: what undoes this merge later (see `super::undo`). One
+    // more round trip, in the transaction
+    if keeps_undo {
+        let back: HashMap<(usize, Vec<Option<String>>), &Texts> = sent_back
+            .iter()
+            .filter_map(|s| Some(((s.table, key_of_key(&tables[s.table], &s.key)), s.row.as_ref()?)))
+            .collect();
+        let landed = |r: &Row| {
+            let (t, a) = (&tables[r.table], r.after.as_ref()?);
+            // (under the key MySQL gave it, where a variable stood in its key)
+            let key: Vec<Option<String>> = t
+                .key
+                .iter()
+                .map(|&i| match places[r.key.as_str()].iter().find(|p| p.0 == i) {
+                    Some(&(_, n)) => real[n].clone(),
+                    None => a[i].clone(),
+                })
+                .collect();
+            back.get(&(r.table, key_of_key(t, &key))).map(|row| (*row).clone())
+        };
+        let recs = super::undo::records(&tables, rows, &landed);
+        let mut stmts = vec![];
+        for part in recs.chunks(200) {
+            let vals: Vec<String> = part
+                .iter()
+                .map(|j| {
+                    let text = |k: &str| match &j[k] {
+                        Json::Null => "null".to_string(),
+                        v => lit(Some(&v.to_string())),
+                    };
+                    format!(
+                        "({}, {}, {}, {}, {}, {}, {})",
+                        lit(Some(&merge_id)),
+                        j["n"],
+                        lit(j["table"].as_str()),
+                        lit(j["op"].as_str()),
+                        text("key"),
+                        text("before"),
+                        text("after")
+                    )
+                })
+                .collect();
+            stmts.push((
+                "recording the merge's rows for undo".to_string(),
+                format!(
+                    "insert into {MERGE_ROWS} (merge_id, n, table_name, op, row_key, before_row, after_row) values {}",
+                    vals.join(", ")
+                ),
+            ));
+        }
+        send(c, &stmts)?;
     }
     let pending = json!({"merge": merge_id, "world": world, "world_id": world_id, "rows": touched, "others": []});
     crate::disk::write_file(&att.pending_path(), pending.to_string().as_bytes()).map_err(Error::Io)?;
@@ -507,8 +1098,14 @@ fn transaction(att: &Attached, c: &mut My, kept: bool, world: &str, world_id: &s
             }
         },
     }
+    super::undo::merged(&merge_id);
+    if keeps_undo {
+        // (records past the undo window go, a batch at a time; a user who may not delete them leaves them)
+        let days = super::window_days();
+        let _ = c.query(&format!("delete from {MERGE_ROWS} where at < now(6) - interval {days} day limit 5000"));
+    }
     AFTER.set(Some(After { rows: sent_back, committed: true, refresh: vec![] }));
-    Ok(())
+    Ok(None)
 }
 
 impl Row {
@@ -726,6 +1323,48 @@ fn chronos_type(ty: &str) -> std::result::Result<String, String> {
     })
 }
 
+/// What the copy's column takes for MySQL's default of it.
+#[derive(Debug, PartialEq)]
+enum Dflt {
+    None,
+    /// the same default here, in Chronos's SQL: a row inserted in a world holds the value MySQL would give
+    Sql(String),
+    /// an expression only MySQL works out: NULL here, DEFAULT at the merge (see `Col::fill`)
+    Fill,
+}
+
+/// MySQL's default of a column of type `ty` (`information_schema.columns`' COLUMN_DEFAULT and EXTRA, which MySQL
+/// and MariaDB write differently: MariaDB as SQL, MySQL a literal's bare text).
+fn default_of(maria: bool, ty: &str, def: Option<&str>, extra: &str) -> Dflt {
+    let Some(def) = def else { return Dflt::None };
+    let low = def.to_ascii_lowercase();
+    let now = low.starts_with("current_timestamp") || low.starts_with("now(");
+    let text = match maria {
+        true if low == "null" => return Dflt::None,
+        true if now => None,
+        true if def.len() >= 2 && def.starts_with('\'') && def.ends_with('\'') => {
+            Some(def[1..def.len() - 1].replace("''", "'").replace("\\'", "'").replace("\\\\", "\\"))
+        }
+        true if def.trim().parse::<f64>().is_ok() => Some(def.trim().to_string()),
+        true => return Dflt::Fill,
+        false if extra.contains("default_generated") && !now => return Dflt::Fill,
+        false if now => None,
+        false => Some(def.to_string()),
+    };
+    match (kind(ty), text) {
+        (Kind::DateTime, None) => Dflt::Sql("current_timestamp".into()),
+        (_, None) => Dflt::Fill,
+        (Kind::Int | Kind::Unsigned | Kind::Decimal | Kind::Float, Some(v)) => match v.trim().parse::<f64>() {
+            Ok(_) => Dflt::Sql(v.trim().to_string()),
+            Err(_) => Dflt::Fill,
+        },
+        (Kind::Text, Some(v)) => Dflt::Sql(super::lit(&v)),
+        // (MySQL's zero date is no date here)
+        (Kind::Date | Kind::DateTime, Some(v)) if !v.starts_with("0000") => Dflt::Sql(super::lit(&v)),
+        _ => Dflt::Fill,
+    }
+}
+
 /// `chronos attach <dir>` with a MySQL CHRONOS_SOURCE_URL: tables of the URL's database, copied in one consistent
 /// snapshot into a new folder, then recorded (`chronos_merges`'s marker row and the folder's record).
 pub fn attach(dir: &str, opts: &crate::Open, named: &[String], yes: bool) -> std::result::Result<(), String> {
@@ -759,10 +1398,13 @@ pub fn attach(dir: &str, opts: &crate::Open, named: &[String], yes: bool) -> std
         })
         .collect::<std::result::Result<_, _>>()?;
     let setup = format!(
-        "\nan administrator runs, once:\n\n  create table {}.{MERGES} (id varchar(255) primary key, at datetime(6) not \
-         null default current_timestamp(6));\n  grant select, insert on {}.{MERGES} to <the user the URL names>;\n",
-        mq(&url.database),
-        mq(&url.database)
+        "\nan administrator runs, once:\n\n  create table {db}.{MERGES} (id varchar(255) primary key, at datetime(6) not \
+         null default current_timestamp(6));\n  grant select, insert on {db}.{MERGES} to <the user the URL names>;\n  \
+         create table {db}.{MERGE_ROWS} (merge_id varchar(255) not null, n int not null, table_name varchar(255) not \
+         null, op varchar(10) not null, row_key json, before_row json, after_row json, at datetime(6) not null \
+         default current_timestamp(6), primary key (merge_id, n), key {MERGE_ROWS}_at (at));\n  grant select, \
+         insert, delete on {db}.{MERGE_ROWS} to <the user the URL names>;\n",
+        db = mq(&url.database)
     );
     c.query(&format!(
         "create table if not exists {MERGES} (id varchar(255) primary key, at datetime(6) not null default \
@@ -791,7 +1433,7 @@ pub fn attach(dir: &str, opts: &crate::Open, named: &[String], yes: bool) -> std
     }
     let cols = c
         .query(&format!(
-            "select table_name, column_name, column_type, is_nullable, extra, ordinal_position from \
+            "select table_name, column_name, column_type, is_nullable, extra, ordinal_position, column_default from \
              information_schema.columns where table_schema = database() and table_name in ({list}) order by \
              table_name, ordinal_position"
         ))
@@ -842,23 +1484,42 @@ pub fn attach(dir: &str, opts: &crate::Open, named: &[String], yes: bool) -> std
         let mut defs = vec![];
         for col in &mine {
             let (cname, ty, nullable, extra) = (v(col, 1), v(col, 2), v(col, 3) == "YES", v(col, 4).to_lowercase());
-            if extra.contains("generated") {
-                refused_why.push(format!("  - {name}.{cname}: a generated column: not attached from MySQL yet"));
-                continue;
-            }
+            // (MySQL 8 says DEFAULT_GENERATED of a column whose default is an expression: not a generated column)
+            let computed = extra.contains("virtual") || extra.contains("stored") || extra.contains("persistent");
+            let auto = extra.contains("auto_increment");
+            let default = match computed || auto {
+                true => Dflt::None,
+                false => default_of(maria, &ty, col[6].as_deref(), &extra),
+            };
+            let fill = matches!(default, Dflt::Fill);
             match chronos_type(&ty) {
-                Ok(cty) => defs.push(format!("{} {cty}{}", q(&cname), if nullable { "" } else { " not null" })),
+                // (held as a plain column, which MySQL alone gives values: see `Col::computed`)
+                Ok(cty) if computed => defs.push(format!("{} {cty}", q(&cname))),
+                // (a new row's id here is a provisional one, till MySQL gives its own at the merge: see `New`)
+                Ok(cty) if auto && matches!(cty.as_str(), "integer" | "bigint") => {
+                    defs.push(format!("{} {cty} generated by default as identity", q(&cname)));
+                    t.seqs.push(Seq { col: t.cols.len(), pg: Some(super::PROVISIONAL.into()), counter: None });
+                }
+                Ok(cty) => {
+                    let d = match &default {
+                        Dflt::Sql(d) => format!(" default {d}"),
+                        _ => String::new(),
+                    };
+                    // (a column MySQL fills is NULL here till it does)
+                    let not_null = if nullable || fill { "" } else { " not null" };
+                    defs.push(format!("{} {cty}{d}{not_null}", q(&cname)));
+                    if auto {
+                        // (no provisional id fits a column this narrow, or is told from a BIGINT UNSIGNED's own)
+                        t.seqs.push(Seq { col: t.cols.len(), pg: None, counter: None });
+                    }
+                }
                 Err(e) => {
                     refused_why.push(format!("  - {name}.{cname}: {e}"));
                     continue;
                 }
             }
-            if extra.contains("auto_increment") {
-                // (values MySQL gives: no block of them can be reserved here, so the table takes no inserts)
-                t.seqs.push(Seq { col: t.cols.len(), pg: None, counter: None });
-            }
             let attnum = v(col, 5).parse::<i16>().unwrap_or(0);
-            t.cols.push(Col { name: cname, ty, always: false, generated: false, attnum });
+            t.cols.push(Col { name: cname, ty, always: false, generated: false, attnum, fill, computed });
         }
         t.key = key_names.iter().filter_map(|k| t.cols.iter().position(|c| &c.name == k)).collect();
         let rows: i64 = v(r, 3).parse().unwrap_or(0);
@@ -879,9 +1540,16 @@ pub fn attach(dir: &str, opts: &crate::Open, named: &[String], yes: bool) -> std
     }
     let db = crate::Db::open_with(dir, opts).map_err(|e| format!("{dir}: {e}"))?;
     let done = (|| -> std::result::Result<Attached, String> {
-        for (t, defs, _) in &made {
+        for (t, defs, _) in made.iter_mut() {
             crate::sql::run(&db, MAIN, &format!("create table {} ({})", t.sql, defs.join(", ")), &[])
                 .map_err(|e| format!("making {} here: {}", t.name, e.message))?;
+            for sq in t.seqs.iter_mut().filter(|sq| sq.pg.is_some()) {
+                sq.counter = crate::sql::column_counter(&db, &t.name, &t.cols[sq.col].name);
+                if sq.counter.is_none() {
+                    return Err(format!("making {} here: its AUTO_INCREMENT column has no counter", t.name));
+                }
+            }
+            let t = &*t;
             let mut batch: Vec<String> = vec![];
             let mut n = 0u64;
             let flush = |batch: &mut Vec<String>| -> std::result::Result<(), String> {
@@ -912,7 +1580,7 @@ pub fn attach(dir: &str, opts: &crate::Open, named: &[String], yes: bool) -> std
             println!("{}: {n} rows", t.name);
         }
         c.query("commit").map_err(|e| format!("ending the read: {e}"))?;
-        let att = Attached::new_mysql(path, &url, made.into_iter().map(|(t, _, _)| t).collect());
+        let att = Attached::new_mysql(path, &url, made.into_iter().map(|(t, _, _)| t).collect(), maria);
         c.query(&format!("insert into {MERGES} (id) values ({})", lit(Some(&att.marker()))))
             .map_err(|e| format!("recording the attach in {MERGES}: {e}{setup}"))?;
         att.save().map_err(|e| e.to_string())?;
@@ -928,16 +1596,17 @@ pub fn attach(dir: &str, opts: &crate::Open, named: &[String], yes: bool) -> std
     };
     println!("\nattached {} tables of {} (MySQL) to {dir}", att.tables().len(), att.source());
     for t in att.tables().iter() {
-        if !t.seqs.is_empty() {
+        if t.seqs.iter().any(|sq| sq.pg.is_none()) {
             println!(
-                "  {}: keyed by AUTO_INCREMENT, so rows can't be inserted here yet (updates and deletes go)",
+                "  {}: its AUTO_INCREMENT column is narrower than INT, or BIGINT UNSIGNED, so rows can't be inserted \
+                 here (updates and deletes go)",
                 t.name
             );
         }
     }
     println!(
         "\nnext: chronos serve {dir} (with CHRONOS_SOURCE_URL set), fork a world, change rows there, and MERGE WORLD:\n\
-         the change goes to MySQL first. Not yet with MySQL: serve --follow, dry runs, check_reads, merge checks, \
+         the change goes to MySQL first. Not yet with MySQL: serve --follow, rehearsals, merge checks, \
          writeback.json and pg_role."
     );
     Ok(())
@@ -960,6 +1629,29 @@ mod tests {
         assert!(!same("varchar(10)", Some("abc"), Some("ABC")), "text compares exactly, whatever the collation");
         assert!(!same("int", None, Some("0")));
         assert!(same("int", None, None));
+    }
+
+    #[test]
+    fn defaults_come_over_or_are_left_to_mysql() {
+        // MySQL: a literal's bare text; an expression marked DEFAULT_GENERATED
+        assert_eq!(default_of(false, "varchar(10)", Some("new"), ""), Dflt::Sql("'new'".into()));
+        assert_eq!(default_of(false, "int", Some("3"), ""), Dflt::Sql("3".into()));
+        assert_eq!(
+            default_of(false, "datetime", Some("CURRENT_TIMESTAMP"), "default_generated"),
+            Dflt::Sql("current_timestamp".into())
+        );
+        assert_eq!(default_of(false, "char(36)", Some("uuid()"), "default_generated"), Dflt::Fill);
+        assert_eq!(default_of(false, "datetime", Some("0000-00-00 00:00:00"), ""), Dflt::Fill);
+        assert_eq!(default_of(false, "int", None, ""), Dflt::None);
+        // MariaDB: SQL, and NULL for none
+        assert_eq!(default_of(true, "varchar(10)", Some("'it''s'"), ""), Dflt::Sql("'it''s'".into()));
+        assert_eq!(default_of(true, "int", Some("3"), ""), Dflt::Sql("3".into()));
+        assert_eq!(default_of(true, "int", Some("NULL"), ""), Dflt::None);
+        assert_eq!(
+            default_of(true, "datetime(6)", Some("current_timestamp(6)"), ""),
+            Dflt::Sql("current_timestamp".into())
+        );
+        assert_eq!(default_of(true, "char(36)", Some("uuid()"), ""), Dflt::Fill);
     }
 
     #[test]

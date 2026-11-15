@@ -1,6 +1,6 @@
 [package]
 name = "chronos"
-version = "0.4.9"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.90"
 description = "An embeddable database for AI agents: instant copy-on-write branches, merge, and fast search"
@@ -54,6 +54,7 @@ shuttle = { version = "0.9.4", optional = true }
 # RFC 3454's tables, for SASLprep of SCRAM passwords as Postgres does it (src/sql/scram.rs; its NFKC is icu_normalizer's)
 stringprep = "0.1.5"
 tokio = { version = "1.53.1", features = ["net", "rt", "time"], optional = true }
+mongodb = { version = "3.10.1", default-features = false, features = ["sync", "rustls-tls", "compat-3-3-0", "bson-3", "dns-resolver"], optional = true }
 
 # musl's malloc is slow under threads (it dominated a vector search profile on Linux), and glibc's
 # maps and unmaps a big query's batches on every run, so Linux builds use mimalloc (see src/main.rs)
@@ -77,6 +78,8 @@ tokio-rustls = { version = "0.26.5", default-features = false, features = ["ring
 # cloud storage for pages and the log (S3, GCS, R2, MinIO, ...): cargo build --features s3
 s3 = ["dep:object_store", "dep:tokio", "dep:futures"]
 shuttle = ["dep:shuttle"]
+# attach beside MongoDB (chronos attach with a mongodb:// URL): cargo build --features mongo
+mongo = ["dep:mongodb", "dep:tokio", "tokio/rt-multi-thread"]
 
 
 # its self-check (exactly 1,240 churners, any day) runs with cargo test

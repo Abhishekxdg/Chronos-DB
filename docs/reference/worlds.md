@@ -404,11 +404,12 @@ merge world close_stale;
 - **`may_change`:** a table named whole may be inserted into, deleted from, updated and altered. A column (`leads.status`) may only be updated. Names are read as SQL reads them (`"Leads"."Status"`), and each must be a table or column of the world it's forked from (42P01 otherwise). Leave it out to allow every table.
 - **`tenant`:** `'column = value'`, where the value is a number, `true`/`false`, or text in single quotes (`'region = ''eu'''`); or `{"org_id": 42}` in `META`. A row counts when the column holds the value before the change (updates, deletes) and after it (inserts, updates), so moving a row out of the tenant is outside too. A table without the column is outside; one named in `may_change` without it is refused at the fork.
 - **`max_rows`, `max_deletes`:** how many rows this run declares it changes (inserted, updated and deleted, across every table), and how many of those it may delete; `max_deletes = 0` lets a run that names a whole table in `may_change` insert into and update it but not delete from it. A whole number, or one as text. Broken: `changes 1204 rows (it declared at most 250)`. A merge policy's own `max_rows`/`max_deletes` still apply; an agent under one may declare less than its policy allows, never more (the fork is refused, 42501). Either may be declared alone, without `may_change` or `tenant`.
+- **`row_rules`:** conditions each row the run changes must keep, as a merge policy's `row_rules` (`'payments: new.amount <= 100'`), on top of any policy's: a row breaking one is outside the scope (`changes 1 row breaking row rule payments: new.amount <= 100 (payments/7)`). A condition that isn't SQL refuses the fork. A run can only add rules, so it can only be stricter.
 - **Everything else is outside:** views, functions, sequences, schemas, and a table's own changes when only its columns are listed or a tenant is set. `intent` and `run` are only shown.
 - **Checked on what the world changed:** its own rows, as the merge applies them (after `ONLY TABLES` / `ONLY KEYS`). Columns the parent changed and a `BY COLUMNS` merge combines in don't count against it.
 - **Refused or queued:** SQLSTATE `42501`; for an agent keeping to a merge policy, a broken rule (`..., outside its declared scope`), and the world waits in `SHOW REVIEWS`. `MERGE ... DRY RUN` shows it in its `blocked` row.
 - **Changing it:** `ALTER WORLD w SET (may_change = 'leads')` widens it, `= null` drops a part. Only the database's own users and admins may; the agent that forked the world can't (42501).
-- **Shown:** `SHOW WORLDS` and `SHOW REVIEWS` have a `scope` column (JSON: `may_change` as `[{"table": ..., "column": ...}]`, `tenant` as `{"column": ..., "value": ...}`, `max_rows`, `max_deletes`, `intent`, `run`); the world's owner is the agent that forked it. Over HTTP and MCP a world has a `scope` field.
+- **Shown:** `SHOW WORLDS` and `SHOW REVIEWS` have a `scope` column (JSON: `may_change` as `[{"table": ..., "column": ...}]`, `tenant` as `{"column": ..., "value": ...}`, `max_rows`, `max_deletes`, `row_rules` as `[[table, condition]]`, `intent`, `run`); the world's owner is the agent that forked it. Over HTTP and MCP a world has a `scope` field.
 - **Required:** a merge policy with `require_scope = true` refuses its agents' forks that declare neither `may_change` nor `tenant` (counts alone don't do).
 
 ## REBASE WORLD
@@ -707,12 +708,18 @@ SHOW MERGE POLICIES                                 -- name, max_rows, max_delet
                                                     -- schema, overwrite, critical, check_reads, require_scope,
                                                     -- rows_per_hour, deletes_per_hour, max_age, created,
                                                     -- max_effects, effects_per_hour, review_channels,
-                                                    -- confirm_deletes_over
+                                                    -- confirm_deletes_over, reviewer, rerun_reads, row_rules,
+                                                    -- all_rows_per_hour, all_deletes_per_hour, all_effects_per_hour,
+                                                    -- spot_check, max_nulled, untrusted_columns, untrusted_guards,
+                                                    -- review_every, person_only, trusted_columns, watch_totals,
+                                                    -- max_shift, canary, canary_wait, effects_delay, max_unusual
 SHOW REVIEWS                                        -- world, owner, policy, reasons, asked, version,
                                                     -- changed_since (written to, or partly merged, since the agent asked),
                                                     -- scope (what the world was forked to change),
                                                     -- changes (per table: deleted, updated, inserted; deletes first),
-                                                    -- effects (what its merge would send, per channel: email (2))
+                                                    -- effects (what its merge would send, per channel: email (2)),
+                                                    -- run, reviewer (its decision),
+                                                    -- needs_person (reasons a reviewer agent may not approve past)
 ALTER AGENT name SET (policy = 'name')              -- or policy = null
 ```
 
@@ -735,6 +742,25 @@ ALTER AGENT name SET (policy = 'name')              -- or policy = null
 | `critical` | `false` and it changes a column a reader marked critical reads (see [DIFF ... READERS](#diff--readers)) | `false` |
 | `check_reads` | `true`: its agents' worlds check their reads, and a merge that read rows changed since the fork waits (see [stale reads](#stale-reads-check_reads)) | `false` |
 | `require_scope` | `true`: its agents must declare `may_change` or `tenant` when forking (the fork is refused otherwise); a merge outside a world's declared scope waits whatever this says (see [declared scope](#declared-scope-may_change-tenant)) | `false` |
+| `row_rules` | a row it changes makes a condition false, read as a `CHECK` over `old.col` (the row in the world merged into, now; NULL for an insert) and `new.col` (as the merge leaves it; NULL for a delete): `'payments: new.amount >= -50; prices: new.price <= old.price * 1.2'` (semicolons between rules). NULL keeps the rule. The reason names rows by key, never values; a rule that can't be checked holds the merge. A condition that isn't SQL is refused (22023) when set | none |
+| `max_nulled` | it empties more values than this (an update setting a column that held a value to NULL) | `null` (no limit) |
+| `all_rows_per_hour`, `all_deletes_per_hour`, `all_effects_per_hour` | it's a merge into `main`, and with every merge into `main` in the last hour by any agent keeping to the policy (a reviewer's approvals included) it changes, deletes or queues more than this: a breaker for a fleet. Counted in the `tallies` file under `policy <name>` | `null` (no limit) |
+| `untrusted_columns` | its world may have read one of these columns (`'tickets.body'`; `'tickets.*'`: every text column of a table; `'*'`: every text column of every table, untrusted by default) or a tainted row, and it changes a table in `untrusted_guards`. Worlds forked by the policy's agents keep their reads (column-level, without holding for stale ones); a read that can't be pinned to columns counts as reading everything. Rows a merge into `main` writes after its world read such text are tainted (kept in the `tallies` file, at most 10,000 per table, past which the whole table counts); a row stops being tainted when it's deleted, or a person's own merge writes it | none |
+| `trusted_columns` | never itself: the columns `'*'` and `'table.*'` leave out (a status only the application sets) | none |
+| `untrusted_guards` | (with `untrusted_columns`) the guarded tables; empty: any table | any table |
+| `watch_totals` | a query here (`'select sum(amount) from payments; select count(*) from orders'`: each gives one number, and runs as a merge check does) moves more than `max_shift` percent between `main` now and `main` as the merge would leave it. A query that fails, runs past 1 s or gives no number holds it too | none |
+| `max_shift` | (with `watch_totals`) how far, in percent, a total may move in one merge; from 0 to anything counts as past it | `10` |
+| `max_unusual` | it changes more than this many times the rows the policy's merges into `main` usually change: the median of the last 50 (kept in the `tallies` file), once there are 10. Drift: an agent doing something far bigger than it ever did | `null` (none) |
+| `canary` | never itself: an agent's whole merge into `main` changing more rows than this lands only its first this many, as a merge of its own, and is refused with SQLSTATE `55000` saying so. Merged again before `canary_wait` has passed: refused (`55000`); after, the rest merges, judged as any merge. `UNDO MERGE` takes the canary back | `null` (none) |
+| `canary_wait` | how long a canary sits in `main` before the rest may merge (`'30 minutes'`) | `10 minutes` |
+| `effects_delay` | never itself: the effects an agent's merge lands in `main` are `delayed` this long (`'5 minutes'`): no `CLAIM OUTBOX` returns them, no `NOTIFY` says they landed, and an `UNDO MERGE` of the merge meanwhile takes them out unsent | `null` (none) |
+| `spot_check` | `n`: one merge in `n`, picked at random, waits even breaking no rule (`0` is refused) | `null` (none) |
+| `review_every` | `true`: every merge waits for review | `false` |
+| `person_only` | never itself: the rules (by name, plus `scope`, `checks`, `stale_reads`) whose holds the policy's `reviewer` may not approve: its `approve` is refused (42501) and the reasons show in `SHOW REVIEWS`' `needs_person`; another agent keeping to no policy (an admin's) merging it is refused too. `''` or `'none'`: the reviewer may approve past any; `null`: the default | `max_deletes, confirm_deletes_over, schema, untrusted, all_rows_per_hour, all_deletes_per_hour, all_effects_per_hour, spot_check, max_shift` |
+
+**Reasons without values for agents.** A hold's reasons can quote what's in rows: a row's key when it's text, what a merge check found, what a SELECT gave. People read them as they are. An agent, a policy's `reviewer` among them, reads `…` in their place: in its own refused merge, in `SHOW REVIEWS`, in `CHECK READS` and in `check_merge_policy`. A key that is only numbers (`leads/7`) stays. So text planted in a row can't reach a reviewer model through the reasons it decides on.
+
+Every hold notifies channel `chronos_review_held` with `{"world", "policy", "reviewer", "version", "person"}` (`person`: only a person may approve it), so a reviewer `LISTEN`s instead of polling `SHOW REVIEWS`.
 
 An agent keeping to a policy changes `main` only by merging: a direct write there, `RESTORE`,
 `UNDO MERGE` or `UNDO AGENT` is refused (42501), since it would skip the rules. Rules count the

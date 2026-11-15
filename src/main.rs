@@ -183,6 +183,8 @@ fn main() {
     let schema = flag(&["--schema"]);
     let attach_tables = flag(&["--tables"]);
     let lazy_tenant = flag(&["--lazy-tenant"]);
+    #[cfg_attr(not(feature = "mongo"), allow(unused_variables))]
+    let attach_fields = flag(&["--fields"]);
     let load_tenant = flag(&["--tenant"]);
     let source_file = flag(&["--source-file"]);
     let refresh_every = flag(&["--refresh-every"]);
@@ -268,6 +270,28 @@ fn main() {
             v.iter().flat_map(|s| s.split(',')).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
         };
         let lazy = lazy_tenant.as_deref().map(str::trim).filter(|c| !c.is_empty());
+        // a MongoDB source: its own attach (see chronos::attach's mongo module)
+        if chronos::attach::source_text().is_ok_and(|u| chronos::attach::is_mongo_url(&u)) {
+            #[cfg(feature = "mongo")]
+            let out = match (&schema, lazy) {
+                (Some(_), _) => {
+                    Err("--schema is for Postgres: name MongoDB's collections with --tables a,b".to_string())
+                }
+                (_, Some(_)) => Err("--lazy-tenant works with a Postgres source only for now".to_string()),
+                _ => {
+                    chronos::attach::attach_mongo(&args[1], &opts, &split(&attach_tables), &split(&attach_fields), yes)
+                }
+            };
+            #[cfg(not(feature = "mongo"))]
+            let out: Result<(), String> = Err(
+                "this chronos was built without MongoDB: use a build with it (cargo build --features mongo)".into(),
+            );
+            if let Err(e) = out {
+                eprintln!("chronos attach: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
         // a MySQL (or MariaDB) source: its own attach (see chronos::attach's mysql module)
         if chronos::attach::source_text().is_ok_and(|u| chronos::myclient::is_mysql(&u)) {
             let out = match (&schema, lazy) {

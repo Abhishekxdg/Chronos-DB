@@ -147,7 +147,16 @@ impl Guard {
             // run as SQL in a session acting as the agent: checked statement by statement
             "sql" | "undo_merge" | "checkpoint" | "rollback" => Ok(()),
             "simulate" | "replay" => Ok(()), // checked as they run; the worlds are its own
-            "merge_preview" | "diff" | "history" | "check_reads" | "review" => me.may_see_changes(branch),
+            // a diff against another world shows that world's rows too: both are checked, as POST /v1/diff and
+            // SQL's DIFF do
+            "diff" => me.may_see_changes(branch).and_then(|()| {
+                match a.get("to").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+                    Some(to) => me.may_see_changes(to),
+                    None => Ok(()),
+                }
+            }),
+            // (check_merge_policy judges the world's real changes: which tables it changed shows in the answer)
+            "merge_preview" | "history" | "check_reads" | "review" | "check_merge_policy" => me.may_see_changes(branch),
             "reviews" | "audit" => me.may_list_all(name),
             _ => me.may_read(branch),
         };
@@ -756,16 +765,17 @@ fn policy_sql(db: &chronos::Db, tool: &str, name: &str, a: &Value) -> Result<Str
     for (k, v) in &rules {
         if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(format!(
-                "'{k}' isn't a rule (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, rerun_reads, require_scope)"
+                "'{k}' isn't a rule (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, rerun_reads, require_scope, row_rules, all_rows_per_hour, all_deletes_per_hour, all_effects_per_hour, spot_check, max_nulled, untrusted_columns, trusted_columns, untrusted_guards, review_every, person_only, watch_totals, max_shift, canary, canary_wait, effects_delay, max_unusual)"
             ));
         }
         let v = match v {
             Value::String(s) => lit(s),
+            // row rules hold commas of their own: they're kept apart by semicolons
             Value::Array(xs) => lit(&xs
                 .iter()
-                .map(|x| x.as_str().ok_or_else(|| format!("{k} must be a list of table names")))
+                .map(|x| x.as_str().ok_or_else(|| format!("{k} must be a list of names")))
                 .collect::<Result<Vec<_>, _>>()?
-                .join(",")),
+                .join(if k == "row_rules" { "; " } else { "," })),
             Value::Object(_) => return Err(format!("{k} must be a number, true/false, null or a list of table names")),
             v => v.to_string(),
         };
@@ -979,8 +989,27 @@ fn tools(hidden: &[&str]) -> Value {
             "max_effects": { "type": ["integer", "null"], "description": "Most effects (NOTIFY ON MERGE: emails, webhooks) one merge may queue (null: no limit)" },
             "effects_per_hour": { "type": ["integer", "null"], "description": "Most effects one agent's merges into main may queue in an hour, together (null: no limit)" },
             "review_channels": { "type": "array", "items": { "type": "string" }, "description": "Channels every effect queued on needs a person, e.g. [\"payments\"]" },
+            "row_rules": { "type": "array", "items": { "type": "string" }, "description": "Conditions every row a merge changes in a table must keep, over old.col (now) and new.col (after), e.g. [\"payments: new.amount >= -50\", \"prices: new.price <= old.price * 1.2\"]; NULL keeps the rule, as a CHECK's does" },
+            "all_rows_per_hour": { "type": ["integer", "null"], "description": "Most rows all the policy's agents' merges into main may change in an hour, together: a circuit breaker across agents (null: no limit)" },
+            "all_deletes_per_hour": { "type": ["integer", "null"], "description": "Most rows all the policy's agents' merges into main may delete in an hour, together (null: no limit)" },
+            "all_effects_per_hour": { "type": ["integer", "null"], "description": "Most effects all the policy's agents' merges into main may queue in an hour, together (null: no limit)" },
+            "spot_check": { "type": ["integer", "null"], "description": "Hold one merge in this many at random for a person, even one breaking no rule (null: none)" },
+            "max_nulled": { "type": ["integer", "null"], "description": "Most values one merge may empty (an update setting a column that held something to NULL); null: no limit" },
+            "untrusted_columns": { "type": "array", "items": { "type": "string" }, "description": "Columns (table.column, table.* or * for every text column) holding text from outside (emails, tickets, web pages): a world that may have read one, or a row an agent wrote after reading one, needs a person to change an untrusted_guards table" },
+            "untrusted_guards": { "type": "array", "items": { "type": "string" }, "description": "Tables a world that read an untrusted column needs a person to change (empty: any table)" },
+            "review_every": { "type": "boolean", "description": "Every merge waits for review (the policy's reviewer, or a person): for a reviewer agent that decides each merge (default false)" },
+            "person_only": { "type": ["array", "null"], "items": { "type": "string" }, "description": "Rules whose holds a reviewer agent may not approve, only a person (null: the default list, max_deletes, confirm_deletes_over, schema, untrusted, the all_* limits, spot_check; [] lets the reviewer approve any)" },
         },
     });
+    // (more than one json! takes: added apart)
+    let mut rules = rules;
+    rules["properties"]["trusted_columns"] = json!({ "type": "array", "items": { "type": "string" }, "description": "Columns (table.column) that untrusted_columns' * and table.* leave out: those only people or the application write" });
+    rules["properties"]["watch_totals"] = json!({ "type": "array", "items": { "type": "string" }, "description": "Queries giving one number (select sum(amount) from payments), run before a merge and on what it would leave: a move past max_shift holds it" });
+    rules["properties"]["max_shift"] = json!({ "type": ["integer", "null"], "description": "How far, in percent, a watch_totals result may move in one merge (null: 10)" });
+    rules["properties"]["canary"] = json!({ "type": ["integer", "null"], "description": "A merge changing more rows lands only this many first; the rest merges after canary_wait (null: none)" });
+    rules["properties"]["canary_wait"] = json!({ "type": ["string", "null"], "description": "How long a canary's rows sit in main before the rest may merge, like '10 minutes' (null: 10 minutes)" });
+    rules["properties"]["effects_delay"] = json!({ "type": ["string", "null"], "description": "How long effects an agent's merge lands wait before a worker may claim them, like '5 minutes': UNDO MERGE meanwhile takes them back unsent (null: none)" });
+    rules["properties"]["max_unusual"] = json!({ "type": ["integer", "null"], "description": "A merge changing more than this many times the rows the policy's merges usually change waits for review (null: none)" });
     let tool = |name: &str, desc: &str, props: Value, required: &[&str]| {
         json!({
             "name": name,

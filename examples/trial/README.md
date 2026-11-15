@@ -42,7 +42,9 @@ four cases, printing what happens:
 
 == 3. The agent cuts every proposal of Ben's by 1500, and one goes below zero
    refused: merging discounts needs a person's review (merge policy careful: it breaks merge check
-   no_negative_amounts, which finds (id = 5, account = 'Hooli', amount = -500)); it's queued (SHOW REVIEWS)
+   no_negative_amounts, which finds …); it's queued (SHOW REVIEWS)
+   held: the merge check found the bad row; the agent sees no values, you do: breaks merge check
+   no_negative_amounts, which finds (id = 5, account = 'Hooli', amount = -500)
 
 == 4. The agent archives stale leads (a delete), and queues an email about it
    refused: merging cleanup needs a person's review (merge policy careful: it deletes 3 rows (at most 0)); ...

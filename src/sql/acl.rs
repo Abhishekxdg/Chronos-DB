@@ -1553,7 +1553,7 @@ fn superuser_only(st: &Stmt) -> Option<&'static str> {
         Stmt::Rebase { .. } => "REBASE WORLD",
         Stmt::AlterWorld { .. } => "ALTER WORLD",
         Stmt::Restore { .. } => "RESTORE WORLD",
-        Stmt::UndoMerge { .. } | Stmt::UndoAgent { .. } | Stmt::UndoDiff { .. } => "UNDO",
+        Stmt::UndoMerge { .. } | Stmt::UndoMergeIds { .. } | Stmt::UndoAgent { .. } | Stmt::UndoDiff { .. } => "UNDO",
         Stmt::ReviewWorld { .. } => "REVIEW",
         // (Postgres's own CHECKPOINT takes pg_checkpoint's privileges: see `Stmt::Checkpoint`)
         Stmt::Checkpoint { world, .. } if world.is_empty() => return None,
@@ -1565,7 +1565,12 @@ fn superuser_only(st: &Stmt) -> Option<&'static str> {
         Stmt::CheckReads(_) => "CHECK READS",
         Stmt::ShowMergeOutcomes { .. } => "SHOW MERGE OUTCOMES",
         Stmt::ShowOutbox | Stmt::AckOutbox(_) | Stmt::RetryOutbox(_) | Stmt::ClaimOutbox { .. } => "the outbox",
-        Stmt::CreateAgent { .. } | Stmt::AlterAgent { .. } | Stmt::DropAgent(_) | Stmt::ShowAgents => "agents",
+        // (ROTATE TOKEN hands back the agent's new token: whoever may run it becomes the agent)
+        Stmt::CreateAgent { .. }
+        | Stmt::AlterAgent { .. }
+        | Stmt::RotateAgentToken(_)
+        | Stmt::DropAgent(_)
+        | Stmt::ShowAgents => "agents",
         Stmt::ShowAgentPrivileges { .. } => "SHOW AGENT ... PRIVILEGES",
         Stmt::CreatePolicy { .. } | Stmt::AlterPolicy { .. } | Stmt::DropPolicy(..) | Stmt::ShowPolicies => {
             "merge policies"
@@ -1741,6 +1746,16 @@ fn ddl(v: &View, who: &Who, st: &Stmt) -> Result<()> {
                 format!("must be owner of event trigger {}", key.rsplit('/').next().unwrap_or_default()),
             );
         }
+        // rules: their table's owner's to make, replace, drop, enable and disable, as Postgres's DefineRule and
+        // RemoveRewriteRule ask (a rule's actions run as whoever writes the table, so one made by any role would run
+        // as the next superuser to write it). ALTER TABLE ... ENABLE / DISABLE RULE comes as a rule's key too.
+        Stmt::UserDef { tag: "CREATE RULE" | "DROP RULE" | "ALTER TABLE", key, .. } => {
+            if let Some(t) = super::rules::table_of(key) {
+                own_rel(t)?;
+            }
+        }
+        // (CREATE RULE "_RETURN" ... DO INSTEAD SELECT: the table becomes a view)
+        Stmt::TableToView { table, .. } => own_rel(table)?,
         // DROP OPERATOR CLASS ... CASCADE drops the partitioned tables hashing with the class (see
         // `userdefs::opclass_users`): only by a role that may drop each, as DROP TABLE asks
         Stmt::UserDef { tag: "DROP OPERATOR CLASS", key, cascade: true, .. } => {

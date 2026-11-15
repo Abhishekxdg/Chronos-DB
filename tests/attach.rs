@@ -210,6 +210,8 @@ fn merges_are_written_to_postgres_first() {
 
     let db = Db::open(&dir).unwrap();
     assert!(db.attached().is_some());
+    assert_eq!(db.attached().unwrap().kind().as_str(), "postgres");
+    assert!(db.attached().unwrap().capabilities().follow && db.attached().unwrap().capabilities().act_as);
     assert_eq!(cell(&db, MAIN, "select count(*) from leads"), "5");
     assert_eq!(cell(&db, MAIN, "select score from leads where who = 'ada'"), "99.50");
 
@@ -2065,6 +2067,211 @@ fn undo_of_a_merge_into_main_goes_back_through_postgres() {
     let e = run(&db, MAIN, "undo merge of world w2", &[]).unwrap_err();
     assert_eq!(e.code, "40001", "{}", e.message);
     assert_eq!(pg_cell(&mut pg, "select owner from leads where id = 1"), "pat");
+
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+/// Forks `w`, runs `sql` in it, merges it: the merge's id in the database.
+fn merge2(db: &Db, w: &str, sql: &str) -> String {
+    run(db, MAIN, &format!("create world {w}"), &[]).unwrap();
+    run(db, w, sql, &[]).unwrap();
+    let _ = chronos::attach::take_merge_id();
+    run(db, MAIN, &format!("merge world {w}"), &[]).unwrap();
+    chronos::attach::take_merge_id().expect("the merge's id")
+}
+
+/// A merge's rows are kept in Postgres with the merge (`chronos.merge_rows`), and undo it by its id: long after the
+/// folder's history has gone, several merges at once, a row changed since left (or the whole undo refused).
+#[test]
+fn a_merge_is_undone_by_its_id() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("undoid") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table leads (id serial primary key, owner text, score numeric(6,2), meta jsonb, seen timestamptz);
+         insert into leads (owner, score, meta, seen) values ('bo', 1.50, '{\"a\": 1}', '2026-10-01 10:00:00+00'),
+                                                             ('bo', 2.00, null, null), ('eve', 3.25, '[1, 2]', null);
+         create table notes (id serial primary key, lead_id int references leads (id), body text);
+         insert into notes (lead_id, body) values (3, 'call eve');",
+    )
+    .unwrap();
+    let dir = folder("undoid");
+    let (ok, out) = attach(&dir, &["--tables", "leads,notes"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    let merge = |w: &str, sql: &str| -> String {
+        run(&db, MAIN, &format!("create world {w}"), &[]).unwrap();
+        run(&db, w, sql, &[]).unwrap();
+        let _ = chronos::attach::take_merge_id();
+        run(&db, MAIN, &format!("merge world {w}"), &[]).unwrap();
+        chronos::attach::take_merge_id().expect("the merge's id")
+    };
+    let state = |pg: &mut postgres::Client| {
+        pg_cell(
+            pg,
+            "select (select string_agg(id || ':' || owner || ':' || score, ',' order by id) from leads) || ' / ' ||
+                    coalesce((select string_agg(lead_id || ':' || body, ',' order by id) from notes), '')",
+        )
+    };
+    let was = state(&mut pg);
+
+    // one merge of each kind of change, in two tables
+    let first = merge(
+        "w",
+        "update leads set owner = 'ada', score = 9.75 where owner = 'bo';
+         delete from notes where lead_id = 3; delete from leads where id = 3;
+         insert into leads (owner, score) values ('new', 4)",
+    );
+    assert!(first.starts_with("merge:"), "{first}");
+    assert_ne!(state(&mut pg), was);
+    assert_eq!(pg_cell(&mut pg, &format!("select count(*) from chronos.merge_rows where merge_id = '{first}'")), "5");
+    // a dry run says what would happen and writes nothing
+    let now = state(&mut pg);
+    let plan = db
+        .undo_merges(
+            std::slice::from_ref(&first),
+            chronos::attach::UndoOptions { skip_changed: false, dry_run: true, ..Default::default() },
+        )
+        .unwrap();
+    assert!(plan.dry_run && plan.merge.is_none(), "{plan:?}");
+    assert_eq!((plan.undone, plan.skipped, plan.rows.len()), (5, 0, 5), "{plan:?}");
+    assert_eq!(state(&mut pg), now);
+    // the undo: Postgres and main as they were, ids and values too
+    let done = db
+        .undo_merges(
+            std::slice::from_ref(&first),
+            chronos::attach::UndoOptions { skip_changed: false, dry_run: false, ..Default::default() },
+        )
+        .unwrap();
+    assert_eq!((done.undone, done.skipped), (5, 0), "{done:?}");
+    assert!(done.merge.as_deref().is_some_and(|m| m.starts_with("merge:") && m != first), "{done:?}");
+    assert_eq!(state(&mut pg), was);
+    assert_eq!(
+        pg_cell(&mut pg, "select meta::text || seen::text from leads where id = 1"),
+        "{\"a\": 1}2026-10-01 10:00:00+00"
+    );
+    assert_eq!(cell(&db, MAIN, "select count(*) from leads"), "3");
+    assert_eq!(chronos::attach::refresh(&db).unwrap().changed(), 0, "main is Postgres's");
+    // once undone, its rows aren't as it left them: a second undo is refused, nothing written
+    let e = db
+        .undo_merges(
+            std::slice::from_ref(&first),
+            chronos::attach::UndoOptions { skip_changed: false, dry_run: false, ..Default::default() },
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("changed again since"), "{e}");
+    assert_eq!(state(&mut pg), was);
+
+    // two merges undone at once, the later first: the row both wrote goes back to how it was before the first
+    let a = merge("a", "update leads set owner = 'one' where id = 1");
+    let b = merge("b", "update leads set owner = 'two' where id = 1; update leads set score = 0 where id = 2");
+    let done = db
+        .undo_merges(
+            &[a.clone(), b.clone()],
+            chronos::attach::UndoOptions { skip_changed: false, dry_run: false, ..Default::default() },
+        )
+        .unwrap();
+    assert_eq!((done.undone, done.skipped), (3, 0), "{done:?}");
+    assert_eq!(state(&mut pg), was);
+
+    // a row changed since, by a later merge and straight in Postgres: named and nothing undone, or left with
+    // skip_changed while the rest goes back
+    let c = merge("c", "update leads set owner = 'cy' where id in (1, 2, 3)");
+    merge("d", "update leads set owner = 'later' where id = 1");
+    pg.batch_execute("update leads set owner = 'pat' where id = 2").unwrap();
+    let e = db
+        .undo_merges(
+            std::slice::from_ref(&c),
+            chronos::attach::UndoOptions { skip_changed: false, dry_run: false, ..Default::default() },
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("changed again since") || e.to_string().contains("changed in Postgres"), "{e}");
+    assert_eq!(pg_cell(&mut pg, "select string_agg(owner, ',' order by id) from leads"), "later,pat,cy");
+    let done = db
+        .undo_merges(
+            std::slice::from_ref(&c),
+            chronos::attach::UndoOptions { skip_changed: true, dry_run: false, ..Default::default() },
+        )
+        .unwrap();
+    assert_eq!((done.undone, done.skipped), (1, 2), "{done:?}");
+    assert_eq!(pg_cell(&mut pg, "select string_agg(owner, ',' order by id) from leads"), "later,pat,eve");
+    let changed: Vec<_> = done.rows.iter().filter(|r| r.status == "changed").collect();
+    assert!(changed.iter().any(|r| r.now["owner"] == "pat"), "{done:?}");
+
+    // a cascade: the undo removes a lead the merge added, and Postgres would delete the tasks added under it since.
+    // The dry run names the table and writes nothing; the undo is refused until told ALLOW CASCADE
+    pg.batch_execute(
+        "create table tasks (id serial primary key, lead_id int references leads (id) on delete cascade, what text)",
+    )
+    .unwrap();
+    drop(db);
+    let dir2 = folder("undoid2");
+    let (ok, out) = attach(&dir2, &["--tables", "leads,tasks"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir2).unwrap();
+    run(&db, MAIN, "create world n", &[]).unwrap();
+    run(&db, "n", "insert into leads (owner, score) values ('fresh', 1)", &[]).unwrap();
+    let _ = chronos::attach::take_merge_id();
+    run(&db, MAIN, "merge world n", &[]).unwrap();
+    let n = chronos::attach::take_merge_id().expect("the merge's id");
+    let fresh = pg_cell(&mut pg, "select id from leads where owner = 'fresh'");
+    pg.batch_execute(&format!("insert into tasks (lead_id, what) values ({fresh}, 'call'), ({fresh}, 'mail')"))
+        .unwrap();
+    let dry = chronos::attach::UndoOptions { dry_run: true, ..Default::default() };
+    let plan = db.undo_merges(std::slice::from_ref(&n), dry).unwrap();
+    assert_eq!(plan.cascades.as_deref(), Some(&["tasks".to_string()][..]), "{plan:?}");
+    assert_eq!(pg_cell(&mut pg, "select count(*) from tasks"), "2", "a dry run writes nothing");
+    assert_eq!(pg_cell(&mut pg, "select count(*) from leads where owner = 'fresh'"), "1");
+    let e = db.undo_merges(std::slice::from_ref(&n), Default::default()).unwrap_err();
+    assert!(matches!(&e, chronos::Error::Constraint { code, .. } if *code == chronos::attach::CASCADE), "{e}");
+    assert_eq!(pg_cell(&mut pg, "select count(*) from tasks"), "2", "refused: nothing written");
+    // by the statement, allowed: the lead goes, and its tasks with it
+    let out = run(&db, MAIN, &format!("undo merge id '{n}' dry run"), &[]).unwrap();
+    assert!(format!("{:?}", out.last().unwrap().tag).contains("DRY RUN 1"), "{out:?}");
+    run(&db, MAIN, &format!("undo merge id '{n}' allow cascade"), &[]).unwrap();
+    assert_eq!(pg_cell(&mut pg, "select count(*) from leads where owner = 'fresh'"), "0");
+    assert_eq!(pg_cell(&mut pg, "select count(*) from tasks"), "0");
+    // a dry run with no cascade says none, and finds a row changed straight in Postgres
+    let p = merge2(&db, "p", "update leads set owner = 'pp' where id in (1, 2)");
+    pg.batch_execute("update leads set owner = 'straight' where id = 1").unwrap();
+    let plan = db.undo_merges(std::slice::from_ref(&p), dry).unwrap();
+    assert_eq!(plan.cascades.as_deref(), Some(&[][..]), "{plan:?}");
+    assert_eq!((plan.undone, plan.skipped), (1, 1), "{plan:?}");
+    assert_eq!(pg_cell(&mut pg, "select owner from leads where id = 2"), "pp", "a dry run writes nothing");
+    // effects the merge brought into main aren't undone: listed with where each is (one sent, one still queued)
+    run(&db, MAIN, "create world fx", &[]).unwrap();
+    run(
+        &db,
+        "fx",
+        "update leads set score = 7 where id = 3; notify on merge sync, 'lead 3'; notify on merge mail, 'hello'",
+        &[],
+    )
+    .unwrap();
+    let _ = chronos::attach::take_merge_id();
+    run(&db, MAIN, "merge world fx", &[]).unwrap();
+    let fx = chronos::attach::take_merge_id().expect("the merge's id");
+    let sync = db.outbox(MAIN).unwrap().into_iter().find(|e| e.channel == "sync").unwrap();
+    db.ack_outbox(std::slice::from_ref(&sync.id)).unwrap();
+    let done = db.undo_merges(std::slice::from_ref(&fx), Default::default()).unwrap();
+    let mut effects: Vec<(String, &str)> = done.effects.iter().map(|e| (e.channel.clone(), e.state)).collect();
+    effects.sort();
+    assert_eq!(effects, [("mail".to_string(), "queued"), ("sync".to_string(), "sent")], "{done:?}");
+    assert_eq!(done.undone, 1, "{done:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+    let dir = dir2;
+
+    // an id that isn't a merge's
+    let e = db
+        .undo_merges(
+            &["merge:nope".into()],
+            chronos::attach::UndoOptions { skip_changed: false, dry_run: false, ..Default::default() },
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("no undo record"), "{e}");
 
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();

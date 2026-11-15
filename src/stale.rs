@@ -60,6 +60,9 @@ thread_local! {
 pub(crate) const CHECK_READS: &str = "_sonos_check_reads";
 /// Metadata key marking a world whose SELECTs are run again at a merge their reads would hold.
 pub(crate) const RERUN_READS: &str = "_sonos_rerun_reads";
+/// A world whose merge policy lists `untrusted_columns`: what it reads is kept, as for `CHECK_READS`, to tell at its merge
+/// whether it read one of them; it isn't checked against what changed since (unless `CHECK_READS` is set too).
+pub(crate) const WATCH_READS: &str = "_sonos_watch_reads";
 /// Keys one world remembers before a table's reads count as the whole table.
 const MOST_KEYS: usize = 10_000;
 /// Key ranges likewise.
@@ -321,6 +324,34 @@ impl ReadSet {
         out
     }
 
+    /// The tables it read anything of (by their names as rows are keyed), what it read some other way too. For
+    /// `untrusted_columns = '*'`, which asks of every column of each.
+    pub(crate) fn tables_read(&self) -> std::collections::BTreeSet<String> {
+        let mut out: std::collections::BTreeSet<String> = self.by_table().into_keys().collect();
+        out.extend(self.columns.keys().filter_map(|g| g.strip_suffix('/')).map(String::from));
+        if let Some(o) = &self.outside {
+            out.extend(o.tables_read());
+        }
+        out
+    }
+
+    /// Whether column `col` of `table` (by its name as rows are keyed) may have been read: some read of the table used
+    /// it, or used every column (`*`, the row API, a function), or read the table where the columns used aren't known.
+    /// True also when what was read isn't all known (a restart since the fork). For `untrusted_columns`.
+    pub(crate) fn may_have_read(&self, table: &str, col: &str) -> bool {
+        if !self.complete || self.loose {
+            return true;
+        }
+        let g = format!("{table}/");
+        let read = self.by_table().contains_key(table) || self.columns.contains_key(&g);
+        let here = read
+            && match self.columns.get(&g) {
+                Some(Some(used)) => used.contains(col),
+                _ => true, // every column, or not known which
+            };
+        here || self.outside.as_ref().is_some_and(|o| o.may_have_read(table, col))
+    }
+
     /// The filtered scans of `table` (by its name as rows are keyed), when they and rows read one by one are all
     /// that was read of it: no key range, not the whole table, nothing behind its indexes or constraints. For
     /// checking reads against the Postgres an attached folder copies (see `attach`), which can then be asked for the
@@ -479,7 +510,10 @@ pub(crate) fn stale(b: &str, doing: &str, reasons: &[String]) -> Error {
     };
     Error::Constraint {
         code: "40001", // Postgres's serialization_failure: the same kind of refusal
-        message: format!("{doing} {b} {}; {after}{STALE_END}", reasons.join("; it ")),
+        message: format!(
+            "{}{STALE_END}",
+            crate::agents::for_caller(&format!("{doing} {b} {}; {after}", reasons.join("; it ")))
+        ),
     }
 }
 
@@ -655,7 +689,7 @@ impl Core {
         let (rows, behind): (Vec<String>, Vec<String>) =
             changed.into_iter().partition(|k| group(k).is_some_and(|g| !crate::reserved_table(&g[..g.len() - 1])));
         if !rows.is_empty() {
-            let shown: Vec<String> = rows.iter().take(SHOWN).map(|k| crate::sql::show_key(k).into_owned()).collect();
+            let shown: Vec<String> = rows.iter().take(SHOWN).map(|k| crate::agents::shown_key(k)).collect();
             let more = if rows.len() > SHOWN { format!(" and {} more", rows.len() - SHOWN) } else { String::new() };
             out.push(format!("read rows that changed since it forked: {}{more}", shown.join(", ")));
         }
@@ -711,7 +745,12 @@ impl Core {
                     s if s == k.shown => format!("{s}, not the same"),
                     s => s,
                 };
-                changed.push(format!("read `{text}`, which gave {} then and gives {now_shown} now", k.shown));
+                changed.push(format!(
+                    "read `{}`, which gave {} then and gives {} now",
+                    crate::agents::value(text),
+                    crate::agents::value(&k.shown),
+                    crate::agents::value(now_shown)
+                ));
             }
         }
         if changed.is_empty() {

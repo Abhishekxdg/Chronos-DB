@@ -842,6 +842,11 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                 json!({
                     "attached": true,
                     "source": att.source(),
+                    // which database that is, and what it can do besides the write-back and the refresh
+                    "kind": att.kind().as_str(),
+                    "capabilities": att.capabilities().to_json(),
+                    // whether each merge's rows are kept in the source to undo it by, and for how long
+                    "undo": {"ready": att.keeps_undo(), "window_days": chronos::attach::window_days()},
                     "copied_at": att.at,
                     "refreshed_at": att.refreshed_at(),
                     "as_of": att.as_of(),
@@ -849,7 +854,12 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                     "tables": att.tables().iter().map(|t| json!({
                         "name": t.name,
                         "sql": t.sql,
+                        // the table's name in the source's SQL ("postgres": the same, its name before MySQL)
+                        "source_table": t.pg,
                         "postgres": t.pg,
+                        // whether a world may insert rows (not where the source alone numbers them, in a way
+                        // this folder can't follow)
+                        "inserts": t.seqs.iter().all(|sq| sq.pg.is_some()),
                         "key": t.key.iter().map(|&i| t.cols[i].name.clone()).collect::<Vec<_>>(),
                         "columns": ({
                             // (masked ones with how: SET MASKED on main)
@@ -874,7 +884,45 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                 v => return Err(bad(format!("'verdict' must be approve, reject or pass, not '{v}'"))),
             };
             let n = db.decide_review(need("branch")?, verdict, s("reason").unwrap_or(""))?;
-            Ok(json!({ "ok": true, "merged": n }))
+            let mut out = json!({ "ok": true, "merged": n });
+            if let Some(id) = chronos::attach::take_merge_id() {
+                out["merge"] = json!(id);
+            }
+            Ok(out)
+        }
+        // by the merges' ids (a folder attached to a database): the rows each wrote, kept there, put back through it
+        "undo_merge" if a.get("ids").is_some() => {
+            let ids: Vec<String> = a["ids"]
+                .as_array()
+                .ok_or_else(|| bad("'ids' must be a list of merge ids"))?
+                .iter()
+                .map(|v| v.as_str().map(String::from).ok_or_else(|| bad("'ids' must be a list of merge ids")))
+                .collect::<Result<_, _>>()?;
+            let flag = |k: &str| a.get(k).and_then(Value::as_bool) == Some(true);
+            let o = chronos::attach::UndoOptions {
+                skip_changed: flag("skip_changed"),
+                dry_run: flag("dry_run"),
+                allow_cascade: flag("allow_cascade"),
+            };
+            // rows changed since (40001) and a cascade (2BP01) answer 409 with their code: a caller tells them apart
+            let u = db.undo_merges(&ids, o).map_err(|e| match &e {
+                Error::Constraint { code, message } if *code == "40001" || *code == chronos::attach::CASCADE => {
+                    Fail(409, json!({ "message": message, "code": code }))
+                }
+                _ => e.into(),
+            })?;
+            let effects: Vec<Value> =
+                u.effects.iter().map(|e| json!({ "id": e.id, "channel": e.channel, "state": e.state })).collect();
+            let rows: Vec<Value> = u
+                .rows
+                .iter()
+                .map(|r| {
+                    json!({ "merge": r.merge, "table": r.table, "op": r.op, "key": r.key, "before": r.before,
+                            "after": r.after, "status": r.status, "now": r.now })
+                })
+                .collect();
+            Ok(json!({ "ok": true, "dry_run": u.dry_run, "undone": u.undone, "skipped": u.skipped, "merge": u.merge,
+                       "rows": rows, "cascades": u.cascades, "effects_not_undone": effects }))
         }
         "undo_merge" => {
             let skip = a.get("skip_changed").and_then(Value::as_bool) == Some(true);
@@ -1149,6 +1197,10 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                     // the branch stays (merged in part, or into another world): its version as the merge
                     // left it, which a partial merge moved, for the next merge's "version"
                     let mut out = json!({ "merged": n });
+                    // (written to an attached database: the merge's id there, which undoes it later)
+                    if let Some(id) = chronos::attach::take_merge_id() {
+                        out["merge"] = json!(id);
+                    }
                     if let Some(v) = kept {
                         out["version"] = json!(v);
                     }

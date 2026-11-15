@@ -549,6 +549,41 @@ fn read_only(v: &View, table: &str) -> Result<()> {
     )
 }
 
+/// 42501 for an ALTER TABLE by an agent held to a tenant that would take `table` out of its tenant's hold (see
+/// `reach`): dropping or renaming the tenant's column, dropping a constraint of it with CASCADE (a key other tables
+/// are held through), or, of a table held through a foreign key, dropping a constraint or one of the key's columns.
+/// Without them the table (or one held through it) would count as shared by every tenant, and the agent would read
+/// every tenant's rows of it in its world.
+pub(super) fn keeps_hold(v: &View, table: &str, changes: &[Alter]) -> Result<()> {
+    let Some(cond) = tenant() else { return Ok(()) };
+    let col = tenant_column(&cond);
+    let loosens = match reach(v, table, &col)? {
+        Some(Reach::Column) => changes.iter().any(|c| match c {
+            Alter::DropColumn(n, ..) | Alter::RenameColumn(n, _) => *n == col,
+            Alter::DropConstraint(_, _, cascade) => *cascade,
+            _ => false,
+        }),
+        Some(Reach::Through { cols, .. }) => changes.iter().any(|c| match c {
+            Alter::DropConstraint(..) => true,
+            Alter::DropColumn(n, ..) => cols.contains(n),
+            _ => false,
+        }),
+        _ => false,
+    };
+    if !loosens {
+        return Ok(());
+    }
+    err(
+        "42501",
+        format!(
+            "an agent held to tenant {cond} may not make this change to table \"{}\": its rows are kept to the \
+             tenant by column {col} or a foreign key to a table that has it, and without that they would be every \
+             tenant's",
+            rel_part(table)
+        ),
+    )
+}
+
 /// The policies a read or write of `table` by `who` keeps to: the table's own, and, for an agent held to a tenant,
 /// its tenant's on top (one more that must hold where the table's own limit `who`; the only one where they don't).
 fn effective(v: &View, table: &str, who: &Who) -> Result<Vec<Policy>> {

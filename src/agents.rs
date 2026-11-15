@@ -49,6 +49,9 @@ pub(crate) const PINNED: &str = "_sonos_pinned";
 pub(crate) const ACTIVE: &str = "_sonos_active";
 /// Why a world's merge waits for a person (see `Core::reviews`).
 pub(crate) const REVIEW: &str = "_sonos_review";
+/// The channel a merge held for review is said on (LISTEN chronos_review_held): a JSON payload with the world, its
+/// policy, the policy's reviewer, the version it was held at, and whether a person must decide it.
+pub const REVIEW_CHANNEL: &str = "chronos_review_held";
 /// How often a world's merge was refused, by kind (see `Core::note_refusal`).
 pub(crate) const REFUSALS: &str = "_sonos_refusals";
 /// World metadata key: the Postgres role and settings its owner agent writes as (see `Agent::act_as`), copied from
@@ -634,10 +637,79 @@ pub(crate) fn count_refused(b: &str, deletes: u64, policy: &str, over: u64, give
 
 /// The error an agent's merge gets when its merge policy sends it to a person.
 pub(crate) fn needs_review(b: &str, policy: &str, reasons: &[String]) -> Error {
-    refused(format!(
+    refused(for_caller(&format!(
         "merging {b} needs a person's review (merge policy {policy}: it {}); it's queued (SHOW REVIEWS)",
         reasons.join("; it ")
-    ))
+    )))
+}
+
+/// Metadata key of a world whose merge landed a canary (see `Core::canary`): when, and how many rows.
+pub(crate) const CANARY: &str = "_sonos_canary";
+/// How long a canary waits when its policy doesn't say: ten minutes.
+const CANARY_WAIT: u64 = 10 * 60 * 1000;
+
+/// Marks around a value a reason shows (a row's key, what a merge check found, what a SELECT gave): text an outsider
+/// may have written. People see it as it is (`for_people`); an agent, a policy's reviewer among them, sees `…` in its
+/// place (`values_free`), so a reason can't carry instructions planted in a row to the model that decides on it.
+const VALUE_OPEN: char = '\u{E000}';
+const VALUE_CLOSE: char = '\u{E001}';
+
+/// `v`, marked as a value in a reason (see `VALUE_OPEN`).
+pub(crate) fn value(v: impl std::fmt::Display) -> String {
+    let v = v.to_string().replace([VALUE_OPEN, VALUE_CLOSE], "");
+    format!("{VALUE_OPEN}{v}{VALUE_CLOSE}")
+}
+
+/// Row key `key` as a reason shows it: readable (see `sql::show_key`), its id marked as a value unless it's only
+/// numbers (`leads/2`, `pairs/(1, 2)`), which carry no words.
+pub(crate) fn shown_key(key: &str) -> String {
+    let shown = crate::sql::show_key(key);
+    match shown.split_once('/') {
+        Some((_, id)) if id.chars().all(|c| c.is_ascii_digit() || "-.,() ".contains(c)) => shown.into_owned(),
+        Some((t, id)) => format!("{t}/{}", value(id)),
+        None => value(shown),
+    }
+}
+
+/// A reason as people read it: its values as they are.
+pub fn for_people(reason: &str) -> String {
+    reason.replace([VALUE_OPEN, VALUE_CLOSE], "")
+}
+
+/// A reason as an agent reads it: each value it shows replaced by `…`, what's around it (the rule, the table, the
+/// column, how many rows) kept.
+pub fn values_free(reason: &str) -> String {
+    let mut out = String::with_capacity(reason.len());
+    let mut inside = false;
+    for ch in reason.chars() {
+        match ch {
+            VALUE_OPEN if !inside => {
+                inside = true;
+                out.push('…');
+            }
+            VALUE_CLOSE => inside = false,
+            _ if inside => {}
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+/// A reason as whoever this thread acts for reads it: an agent, values-free; a person, as it is.
+pub(crate) fn for_caller(reason: &str) -> String {
+    match disk::actor().is_empty() {
+        true => for_people(reason),
+        false => values_free(reason),
+    }
+}
+
+/// An agent (one keeping to no policy: an admin's, say) merging world `b`, held for `person`, rules its policy keeps
+/// for a person (see `MergePolicy::person_only`): refused, as the policy's reviewer's approval is.
+pub(crate) fn person_only_refused(b: &str, person: &[String]) -> Error {
+    refused(for_caller(&format!(
+        "{b} waits for a person, not an agent: it {} (its merge policy's person_only rules)",
+        person.join("; it ")
+    )))
 }
 
 fn refused(message: String) -> Error {
@@ -1268,6 +1340,97 @@ impl Core {
     /// merge), not a hold (`REVIEW` records those), and not the other refusals sharing 40001 (a scope changed
     /// meanwhile, Postgres busy). A count that can't be written is let go: the merge's own error is what the caller
     /// gets.
+    /// An agent's whole merge of world `b` into main under a policy with `canary` (see `MergePolicy::canary`): one
+    /// changing more rows than that lands only that many now, as a merge of its own, and is refused (55000) saying
+    /// so; merged again before `canary_wait` has passed, refused; after, it merges as any merge (judged by its
+    /// policy). Ok: merge as usual.
+    pub(crate) fn canary(&self, b: &str, o: &crate::MergeOptions) -> Result<()> {
+        if b.starts_with("_tx_")
+            || o.into.is_some()
+            || !o.only_tables.is_empty()
+            || !o.only_keys.is_empty()
+            || disk::actor().is_empty()
+            || self.me.get().is_none()
+        {
+            return Ok(());
+        }
+        let Some(p) = self.acting_policy()?.filter(|p| p.canary.is_some()) else { return Ok(()) };
+        let w = self.world(b)?;
+        if w.parent.as_deref() != Some(MAIN) {
+            return Ok(());
+        }
+        let wait = p.canary_wait.unwrap_or(CANARY_WAIT);
+        if let Some(c) = w.meta.get(CANARY) {
+            let until = c["at"].as_u64().unwrap_or(0).saturating_add(wait);
+            let now = disk::now_ms();
+            if now < until {
+                return Err(Error::Constraint {
+                    code: "55000",
+                    message: format!(
+                        "the rest of {b} waits for its canary ({} rows merged; merge policy {}: canary_wait {}): merge it again in {}",
+                        c["rows"].as_u64().unwrap_or(0),
+                        p.name,
+                        words(wait),
+                        words(until - now)
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        let n = p.canary.unwrap_or(0) as usize;
+        let keys: Vec<String> = self
+            .diff(b)?
+            .into_iter()
+            .map(|c| c.key)
+            .filter(|k| !crate::reserved_table(k.split('/').next().unwrap_or(k)) && !crate::sql::internal(k))
+            .collect();
+        if keys.len() <= n {
+            return Ok(());
+        }
+        let part = crate::MergeOptions { only_keys: keys[..n].to_vec(), ..o.clone() };
+        let (landed, _) = self.merge_once(b, &part)?;
+        self.set_reserved(b, CANARY, Some(json!({ "at": disk::now_ms(), "rows": landed, "of": keys.len() })))?;
+        Err(Error::Constraint {
+            code: "55000",
+            message: format!(
+                "merged {landed} of {} rows of {b} as a canary (merge policy {}: canary = {n}); the rest merges when {b} is merged again, in {}: check the canary's rows meanwhile (UNDO MERGE {b} takes them back)",
+                keys.len(),
+                p.name,
+                words(wait)
+            ),
+        })
+    }
+
+    /// The columns `untrusted_columns` lists (`'*'` and `table.*` read as the text columns of each table, as `v`
+    /// defines it, less `trusted_columns`) a world that read `set` may have read: None when what it read isn't known
+    /// (a restart since the fork) and `'*'` asks of every table.
+    pub(crate) fn untrusted_seen(
+        &self,
+        p: &MergePolicy,
+        v: &crate::View,
+        set: &crate::stale::ReadSet,
+    ) -> Option<Vec<(String, String)>> {
+        let star = p.untrusted_columns.iter().any(|(t, _)| t == "*");
+        if star && !set.complete {
+            return None;
+        }
+        let mut cols: Vec<(String, String)> = vec![];
+        let text = |t: &str| -> Vec<(String, String)> {
+            crate::sql::text_columns(v, t).into_iter().map(|c| (t.to_string(), c)).collect()
+        };
+        for (t, c) in &p.untrusted_columns {
+            match (t.as_str(), c.as_str()) {
+                ("*", _) => cols.extend(set.tables_read().iter().flat_map(|t| text(t))),
+                (t, "*") => cols.extend(text(t)),
+                _ => cols.push((t.clone(), c.clone())),
+            }
+        }
+        cols.sort();
+        cols.dedup();
+        cols.retain(|(t, c)| !crate::reserved_table(t) && !p.trusted_columns.iter().any(|(tt, tc)| tt == t && tc == c));
+        Some(cols.into_iter().filter(|(t, c)| set.may_have_read(t, c)).collect())
+    }
+
     pub(crate) fn note_refusal(&self, b: &str, e: &Error) {
         let kind = match e {
             _ if b.starts_with("_tx_") => return,
@@ -1337,8 +1500,110 @@ pub struct MergePolicy {
     /// an agent (a reviewer model's) that looks at its held merges before a person: it approves (the merge goes
     /// through), rejects, or passes one on, with a reason (see `Core::decide_review`)
     pub reviewer: Option<String>,
+    /// conditions every row a merge changes in a table must keep, each `(table, condition)`: SQL over the row as it
+    /// was (`old.col`) and as the merge leaves it (`new.col`), as a CHECK reads its row (a NULL keeps it); a row that
+    /// makes one false waits for a person (see `rowrules`)
+    pub row_rules: Vec<(String, String)>,
+    /// most rows the merges of every agent keeping to this policy may change in main in an hour, this one's included:
+    /// one count for all of them, whatever agent or tenant (see `tally::policy_key`), so a fault every run repeats
+    /// (a model update, one trick that works for every customer) stops at the limit
+    pub all_rows_per_hour: Option<u64>,
+    /// most rows they may delete in an hour, together (as `all_rows_per_hour`)
+    pub all_deletes_per_hour: Option<u64>,
+    /// most effects they may queue in an hour, together (as `all_rows_per_hour`)
+    pub all_effects_per_hour: Option<u64>,
+    /// one merge in this many that keeps every rule waits for a person anyway, picked at random: a sample of what
+    /// goes through on its own
+    pub spot_check: Option<u64>,
+    /// most rows one merge may empty a value of (an update setting a column that held something to NULL): a wipe
+    /// that counts as an update otherwise
+    pub max_nulled: Option<u64>,
+    /// columns (table, column) holding text outsiders write (an order's notes, a ticket's body): a world whose agent
+    /// read one may have read instructions planted there, so its merge changing an `untrusted_guards` table waits
+    /// for a person (see `stale::ReadSet::may_have_read`). `("*", "*")` (set as `'*'`): every text column of every
+    /// table, untrusted by default; `(table, "*")`: every text column of one. Rows an agent's merge wrote after it read
+    /// such text are tainted (see `tally::Taint`), and reading one counts as reading untrusted text too
+    pub untrusted_columns: Vec<(String, String)>,
+    /// columns `untrusted_columns` leaves out (those only people or the application write: a status, a name the
+    /// application checks), for `'*'` and `table.*`
+    pub trusted_columns: Vec<(String, String)>,
+    /// tables a world that read an `untrusted_columns` column may not change on its own (empty: any table)
+    pub untrusted_guards: Vec<String>,
+    /// every merge goes to the reviewer first, not only those the rules hold: it decides each, a person what it
+    /// passes on (without a reviewer: a person decides each)
+    pub review_every: bool,
+    /// the rules whose break only a person may approve past, not the reviewer (see `PERSON_ONLY`); None: the default
+    pub person_only: Option<Vec<String>>,
+    /// scalar queries (`select sum(amount) from payments`) run on main before an agent's merge and on what it would
+    /// leave: one whose result moves more than `max_shift` percent holds it. Judges what a merge does, not only what
+    /// it changes
+    pub watch_totals: Vec<String>,
+    /// how far, in percent, a `watch_totals` result may move in one merge (None: 10)
+    pub max_shift: Option<u64>,
+    /// a merge changing more rows than this lands only its first this many, then waits `canary_wait` before the rest
+    /// may merge: a wrong job shows on a few rows first (see `Core::canary`)
+    pub canary: Option<u64>,
+    /// how long a canary's rows sit in main before the rest may merge, ms (None: 10 minutes)
+    pub canary_wait: Option<u64>,
+    /// how long the effects an agent's merge lands wait before a worker may claim them, ms: an UNDO MERGE meanwhile
+    /// takes them back unsent (see `outbox`)
+    pub effects_delay: Option<u64>,
+    /// a merge changing more than this many times the rows the policy's merges usually change (the median of its last
+    /// 50) waits for a review: drift, an agent doing something it never did (see `Core::usual_rows`)
+    pub max_unusual: Option<u64>,
     pub created: u64,
 }
+
+/// The rules a reviewer can't approve a merge past by default (see `MergePolicy::person_only`): deleting, changing
+/// the schema, a big delete's count, acting on text outsiders wrote, the limits every agent shares, and the spot
+/// checks people sample the reviewer's work with.
+pub const PERSON_ONLY: [&str; 9] = [
+    "max_deletes",
+    "confirm_deletes_over",
+    "schema",
+    "untrusted",
+    "all_rows_per_hour",
+    "all_deletes_per_hour",
+    "all_effects_per_hour",
+    "spot_check",
+    "max_shift",
+];
+
+/// Every rule a merge can break, by the name `person_only` takes (the settings', and `scope`, `checks` and
+/// `stale_reads` for a declared scope, merge checks and changed reads).
+pub const RULE_NAMES: [&str; 28] = [
+    "max_rows",
+    "max_deletes",
+    "confirm_deletes_over",
+    "rows_per_hour",
+    "deletes_per_hour",
+    "all_rows_per_hour",
+    "all_deletes_per_hour",
+    "all_effects_per_hour",
+    "max_age",
+    "max_effects",
+    "effects_per_hour",
+    "review_channels",
+    "tables",
+    "review_tables",
+    "review_columns",
+    "row_rules",
+    "max_nulled",
+    "untrusted",
+    "schema",
+    "overwrite",
+    "critical",
+    "require_scope",
+    "scope",
+    "checks",
+    "stale_reads",
+    "spot_check",
+    "max_shift",
+    "max_unusual",
+];
+
+/// A rule a merge broke: which (by its name in `RULE_NAMES`, or `review_every`), and why, in words.
+pub(crate) type Broke = (&'static str, String);
 
 /// What a reviewer decides about a held merge (see `Core::decide_review`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1387,6 +1652,9 @@ pub struct Review {
     pub run: Option<Json>,
     /// its policy's reviewer, before a person (see `MergePolicy::reviewer`): who, and what it decided (None: not yet)
     pub reviewer: Option<(String, Option<(Verdict, String)>)>,
+    /// the reasons only a person may approve it past (see `MergePolicy::person_only`): a reviewer's approval is
+    /// refused while there are any
+    pub person: Vec<String>,
 }
 
 impl Review {
@@ -1444,6 +1712,24 @@ impl MergePolicy {
                 "max_effects" => self.max_effects = limit()?,
                 "effects_per_hour" => self.effects_per_hour = limit()?,
                 "review_channels" => self.review_channels = list(k, v)?,
+                "canary_wait" => self.canary_wait = duration(k, v)?,
+                "effects_delay" => self.effects_delay = duration(k, v)?,
+                "watch_totals" => self.watch_totals = totals(v)?,
+                "max_shift" => self.max_shift = limit()?,
+                "canary" => {
+                    self.canary = limit()?;
+                    if self.canary == Some(0) {
+                        return Err(bad("canary is how many rows land first (10: ten), or null for none".into()));
+                    }
+                }
+                "max_unusual" => {
+                    self.max_unusual = limit()?;
+                    if self.max_unusual == Some(0) {
+                        return Err(
+                            bad("max_unusual is how many times the usual rows (5: five times), or null".into()),
+                        );
+                    }
+                }
                 "max_age" => {
                     self.max_age = match v {
                         Json::Null => None,
@@ -1457,7 +1743,30 @@ impl MergePolicy {
                 }
                 "tables" => self.tables = list(k, v)?,
                 "review_tables" => self.review_tables = list(k, v)?,
-                "review_columns" => self.review_columns = columns(v)?,
+                "review_columns" => self.review_columns = columns(k, v)?,
+                "row_rules" => self.row_rules = row_rules(v)?,
+                "all_rows_per_hour" => self.all_rows_per_hour = limit()?,
+                "all_deletes_per_hour" => self.all_deletes_per_hour = limit()?,
+                "all_effects_per_hour" => self.all_effects_per_hour = limit()?,
+                "spot_check" => {
+                    self.spot_check = limit()?;
+                    if self.spot_check == Some(0) {
+                        return Err(
+                            bad("spot_check is one merge in how many (50: one in 50), or null for none".into()),
+                        );
+                    }
+                }
+                "max_nulled" => self.max_nulled = limit()?,
+                "untrusted_columns" => {
+                    self.untrusted_columns = match v {
+                        Json::String(s) if s.trim() == "*" => vec![("*".into(), "*".into())],
+                        v => columns(k, v)?,
+                    }
+                }
+                "trusted_columns" => self.trusted_columns = columns(k, v)?,
+                "untrusted_guards" => self.untrusted_guards = list(k, v)?,
+                "review_every" => self.review_every = flag()?,
+                "person_only" => self.person_only = person_only(v)?,
                 "schema" => self.schema = flag()?,
                 "overwrite" => self.overwrite = flag()?,
                 "critical" => self.critical = flag()?,
@@ -1473,7 +1782,7 @@ impl MergePolicy {
                 }
                 k => {
                     return Err(bad(format!(
-                        "merge policies have no setting {k} (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, rerun_reads, require_scope, reviewer)"
+                        "merge policies have no setting {k} (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, all_rows_per_hour, all_deletes_per_hour, all_effects_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, row_rules, max_nulled, untrusted_columns, trusted_columns, untrusted_guards, spot_check, schema, overwrite, critical, check_reads, rerun_reads, require_scope, reviewer, review_every, person_only, watch_totals, max_shift, canary, canary_wait, effects_delay, max_unusual)"
                     )));
                 }
             }
@@ -1491,6 +1800,14 @@ impl MergePolicy {
             "review_tables": self.review_tables, "review_columns": self.review_columns, "schema": self.schema, "overwrite": self.overwrite,
             "critical": self.critical, "check_reads": self.check_reads, "rerun_reads": self.rerun_reads,
             "require_scope": self.require_scope, "reviewer": self.reviewer, "created": self.created,
+            "row_rules": self.row_rules, "all_rows_per_hour": self.all_rows_per_hour,
+            "all_deletes_per_hour": self.all_deletes_per_hour, "all_effects_per_hour": self.all_effects_per_hour,
+            "spot_check": self.spot_check, "max_nulled": self.max_nulled,
+            "untrusted_columns": self.untrusted_columns, "untrusted_guards": self.untrusted_guards,
+            "trusted_columns": self.trusted_columns, "watch_totals": self.watch_totals, "max_shift": self.max_shift,
+            "canary": self.canary, "canary_wait": self.canary_wait, "effects_delay": self.effects_delay,
+            "max_unusual": self.max_unusual,
+            "review_every": self.review_every, "person_only": self.person_only,
         })
         .to_string()
     }
@@ -1499,6 +1816,14 @@ impl MergePolicy {
         let j: Json = serde_json::from_str(raw).ok()?;
         let list =
             |k: &str| j[k].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(String::from)).collect();
+        // (table, column) and (table, condition) pairs, kept as two-element arrays
+        let pairs = |k: &str| -> Vec<(String, String)> {
+            j[k].as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|p| Some((p[0].as_str()?.to_string(), p[1].as_str()?.to_string())))
+                .collect()
+        };
         Some(MergePolicy {
             name: name.into(),
             max_rows: j["max_rows"].as_u64(),
@@ -1525,8 +1850,184 @@ impl MergePolicy {
             rerun_reads: j["rerun_reads"].as_bool().unwrap_or(false),
             require_scope: j["require_scope"].as_bool().unwrap_or(false),
             reviewer: j["reviewer"].as_str().map(String::from),
+            row_rules: pairs("row_rules"),
+            all_rows_per_hour: j["all_rows_per_hour"].as_u64(),
+            all_deletes_per_hour: j["all_deletes_per_hour"].as_u64(),
+            all_effects_per_hour: j["all_effects_per_hour"].as_u64(),
+            spot_check: j["spot_check"].as_u64().filter(|n| *n > 0),
+            max_nulled: j["max_nulled"].as_u64(),
+            untrusted_columns: pairs("untrusted_columns"),
+            trusted_columns: pairs("trusted_columns"),
+            watch_totals: list("watch_totals"),
+            max_shift: j["max_shift"].as_u64(),
+            canary: j["canary"].as_u64().filter(|n| *n > 0),
+            canary_wait: j["canary_wait"].as_u64(),
+            effects_delay: j["effects_delay"].as_u64(),
+            max_unusual: j["max_unusual"].as_u64().filter(|n| *n > 0),
+            untrusted_guards: list("untrusted_guards"),
+            review_every: j["review_every"].as_bool().unwrap_or(false),
+            person_only: j["person_only"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()),
             created: j["created"].as_u64().unwrap_or(0),
         })
+    }
+
+    /// Whether only a person may approve a merge past rule `rule` (see `person_only`, `PERSON_ONLY`).
+    pub(crate) fn person_needs(&self, rule: &str) -> bool {
+        match &self.person_only {
+            Some(rules) => rules.iter().any(|r| r == rule),
+            None => PERSON_ONLY.contains(&rule),
+        }
+    }
+
+    /// The reasons of `broke` only a person may approve past.
+    pub(crate) fn for_a_person(&self, broke: &[Broke]) -> Vec<String> {
+        broke.iter().filter(|(rule, _)| self.person_needs(rule)).map(|(_, why)| why.clone()).collect()
+    }
+
+    /// The `person_only` setting as SHOW MERGE POLICIES gives it: the rules, comma-separated (the default's too).
+    pub fn person_only_listed(&self) -> String {
+        match &self.person_only {
+            Some(rules) => rules.join(","),
+            None => PERSON_ONLY.join(","),
+        }
+    }
+
+    /// The `row_rules` setting as it's written: `payments: new.amount >= -50; prices: ...`.
+    pub fn row_rules_listed(&self) -> String {
+        self.row_rules
+            .iter()
+            .map(|(t, e)| format!("{}: {e}", listed(std::slice::from_ref(t))))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// The rows of `rows` (a merge's changes, as JSON: see `sql::describe`) whose update empties a value (a column
+    /// that held something set to NULL), past `max_nulled`, as one reason naming the columns and rows.
+    pub(crate) fn nulled_broken(&self, rows: &[crate::sql::Described]) -> Option<String> {
+        use std::collections::BTreeSet;
+        const SHOWN: usize = 5;
+        let most = self.max_nulled?;
+        let (mut cols, mut keys) = (BTreeSet::new(), vec![]);
+        for d in rows.iter().filter(|d| d.id.is_some() && d.change == "update") {
+            let (Some(before), Some(after)) = (&d.before, &d.after) else { continue };
+            let emptied: Vec<&String> =
+                d.columns.iter().filter(|c| !before[c.as_str()].is_null() && after[c.as_str()].is_null()).collect();
+            if !emptied.is_empty() {
+                cols.extend(emptied.into_iter().map(|c| format!("{}.{c}", d.table)));
+                keys.push(shown_key(&d.key));
+            }
+        }
+        if keys.len() as u64 <= most {
+            return None;
+        }
+        let more = if keys.len() > SHOWN { format!(", and {} more", keys.len() - SHOWN) } else { String::new() };
+        let cols: Vec<String> = cols.into_iter().collect();
+        Some(format!(
+            "empties {} in {} (at most {most}): {}{more}",
+            cols.join(", "),
+            n_rows(keys.len() as u64),
+            keys[..keys.len().min(SHOWN)].join(", ")
+        ))
+    }
+
+    /// Whether a merge changing the tables of `diff` acts on text outsiders wrote: its world read one of
+    /// `untrusted_columns` (`read`: a column of them it may have read, as `stale::ReadSet::may_have_read` tells; None
+    /// when what it read isn't known, which counts as read), and it changes an `untrusted_guards` table (any, with
+    /// none listed). The reason, in words.
+    pub(crate) fn untrusted_broken(
+        &self,
+        read: Option<Vec<(String, String)>>,
+        tainted: &[String],
+        diff: &[crate::Change],
+    ) -> Option<String> {
+        use std::collections::BTreeSet;
+        if self.untrusted_columns.is_empty() {
+            return None;
+        }
+        let changed: BTreeSet<String> = diff
+            .iter()
+            .filter(|c| !crate::sql::internal(&c.key) && !crate::outbox::entry(&c.key))
+            .filter_map(|c| c.key.split_once('/').map(|(t, _)| t.to_string()))
+            .filter(|t| !crate::reserved_table(t))
+            .filter(|t| self.untrusted_guards.is_empty() || self.untrusted_guards.contains(t))
+            .collect();
+        if changed.is_empty() {
+            return None;
+        }
+        let mut what = match read {
+            Some(cols) if cols.is_empty() && tainted.is_empty() => return None,
+            Some(cols) if cols.is_empty() => String::new(),
+            Some(cols) => {
+                listed_columns(&cols) + ", which outsiders write"
+            }
+            None => "rows without a record of which columns (it was forked before its policy listed untrusted_columns, or the database restarted since)".into(),
+        };
+        if !tainted.is_empty() {
+            const SHOWN: usize = 5;
+            let more =
+                if tainted.len() > SHOWN { format!(", and {} more", tainted.len() - SHOWN) } else { String::new() };
+            let rows = format!(
+                "rows an agent wrote after reading such text ({}{more})",
+                tainted[..tainted.len().min(SHOWN)].join(", ")
+            );
+            what = match what.is_empty() {
+                true => rows,
+                false => format!("{what}, and {rows}"),
+            };
+        }
+        let changed: Vec<String> = changed.into_iter().collect();
+        Some(format!(
+            "read {what}, and changes {} (untrusted reads: a person checks it wasn't told to)",
+            listed(&changed)
+        ))
+    }
+
+    /// The limits every agent keeping to this policy shares (`all_rows_per_hour`, ...) that a merge of `diff` into
+    /// main breaks, counted with all their merges into main in the last hour (see `tally::policy_key`).
+    pub(crate) fn all_hourly_broken(&self, core: &Core, diff: &[crate::Change]) -> Vec<Broke> {
+        if self.all_rows_per_hour.is_none()
+            && self.all_deletes_per_hour.is_none()
+            && self.all_effects_per_hour.is_none()
+        {
+            return vec![];
+        }
+        let (rows, deletes, effects) = counts(diff);
+        let (had_rows, had_deletes, had_effects) = core.hourly_key(&crate::tally::policy_key(&self.name));
+        let whose = format!("every agent under merge policy {}", self.name);
+        let mut out = vec![];
+        if let Some(n) = self.all_rows_per_hour.filter(|n| had_rows + rows > *n) {
+            out.push((
+                "all_rows_per_hour",
+                format!(
+                    "changes {}, and {whose} changed {had_rows} in the last hour (at most {n} an hour, together)",
+                    n_rows(rows)
+                ),
+            ));
+        }
+        if let Some(n) = self.all_deletes_per_hour.filter(|n| had_deletes + deletes > *n) {
+            out.push((
+                "all_deletes_per_hour",
+                format!(
+                    "deletes {}, and {whose} deleted {had_deletes} in the last hour (at most {n} an hour, together)",
+                    n_rows(deletes)
+                ),
+            ));
+        }
+        if let Some(n) = self.all_effects_per_hour.filter(|n| had_effects + effects > *n) {
+            out.push((
+                "all_effects_per_hour",
+                format!("queues {effects} effects, and {whose} queued {had_effects} in the last hour (at most {n} an hour, together)"),
+            ));
+        }
+        out
+    }
+
+    /// Whether this merge, which keeps every rule, is one `spot_check` picks for a person: one in that many, at random.
+    pub(crate) fn spot_picked(&self) -> Option<String> {
+        let n = self.spot_check?;
+        random().is_multiple_of(n).then(|| format!("picked for a spot check (one merge in {n} that keeps every rule)"))
     }
 
     /// The `review_columns` that `rows` (a world's own changes, as JSON: see `sql::describe`)
@@ -1553,7 +2054,7 @@ impl MergePolicy {
                 .collect();
             if !hit.is_empty() {
                 cols.extend(hit);
-                keys.push(crate::sql::show_key(&d.key).into_owned());
+                keys.push(shown_key(&d.key));
             }
         }
         if keys.is_empty() {
@@ -1578,7 +2079,7 @@ impl MergePolicy {
 
     /// The hourly limits a merge of `diff` into main by agent `agent` breaks, counted with the
     /// agent's other merges into main in the last hour (see `tally`), in words.
-    pub(crate) fn hourly_broken(&self, core: &Core, agent: &str, diff: &[crate::Change]) -> Vec<String> {
+    pub(crate) fn hourly_broken(&self, core: &Core, agent: &str, diff: &[crate::Change]) -> Vec<Broke> {
         if self.rows_per_hour.is_none() && self.deletes_per_hour.is_none() && self.effects_per_hour.is_none() {
             return vec![];
         }
@@ -1591,20 +2092,29 @@ impl MergePolicy {
         };
         let mut out = vec![];
         if let Some(n) = self.rows_per_hour.filter(|n| had_rows + rows > *n) {
-            out.push(format!(
-                "changes {}, and {whose} changed {had_rows} in the last hour (at most {n} an hour)",
-                n_rows(rows)
+            out.push((
+                "rows_per_hour",
+                format!(
+                    "changes {}, and {whose} changed {had_rows} in the last hour (at most {n} an hour)",
+                    n_rows(rows)
+                ),
             ));
         }
         if let Some(n) = self.deletes_per_hour.filter(|n| had_deletes + deletes > *n) {
-            out.push(format!(
-                "deletes {}, and {whose} deleted {had_deletes} in the last hour (at most {n} an hour)",
-                n_rows(deletes)
+            out.push((
+                "deletes_per_hour",
+                format!(
+                    "deletes {}, and {whose} deleted {had_deletes} in the last hour (at most {n} an hour)",
+                    n_rows(deletes)
+                ),
             ));
         }
         if let Some(n) = self.effects_per_hour.filter(|n| had_effects + effects > *n) {
-            out.push(format!(
-                "queues {effects} effects, and {whose} queued {had_effects} in the last hour (at most {n} an hour)"
+            out.push((
+                "effects_per_hour",
+                format!(
+                    "queues {effects} effects, and {whose} queued {had_effects} in the last hour (at most {n} an hour)"
+                ),
             ));
         }
         out
@@ -1613,6 +2123,11 @@ impl MergePolicy {
     /// The rules a merge of `diff` breaks, in words (none: it may go through). `overwrote`: rows
     /// it would overwrite that its parent changed since the fork.
     pub(crate) fn broken(&self, diff: &[crate::Change], overwrote: usize) -> Vec<String> {
+        self.judged(diff, overwrote).into_iter().map(|(_, why)| why).collect()
+    }
+
+    /// `broken`, each reason with the rule it's for (see `RULE_NAMES`).
+    pub(crate) fn judged(&self, diff: &[crate::Change], overwrote: usize) -> Vec<Broke> {
         use std::collections::BTreeSet;
         let (mut rows, mut deletes, mut effects, mut taken) = (0u64, 0u64, 0u64, 0u64);
         let (mut outside, mut review, mut schema) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
@@ -1673,37 +2188,43 @@ impl MergePolicy {
         let join = |s: BTreeSet<String>| s.into_iter().collect::<Vec<_>>().join(", ");
         let mut out = vec![];
         if let Some(n) = self.max_rows.filter(|n| rows > *n) {
-            out.push(format!("changes {} (at most {n})", n_rows(rows)));
+            out.push(("max_rows", format!("changes {} (at most {n})", n_rows(rows))));
         }
         if let Some(n) = self.max_deletes.filter(|n| deletes > *n) {
-            out.push(format!("deletes {} (at most {n})", n_rows(deletes)));
+            out.push(("max_deletes", format!("deletes {} (at most {n})", n_rows(deletes))));
         }
         // (an agent can't give the count for itself: a person does, approving it)
         if let Some(n) =
             self.confirm_deletes_over.filter(|n| deletes > *n && self.max_deletes.is_none_or(|m| deletes <= m))
         {
-            out.push(format!("deletes {} (over {n}: a person approves it by giving the count)", n_rows(deletes)));
+            out.push((
+                "confirm_deletes_over",
+                format!("deletes {} (over {n}: a person approves it by giving the count)", n_rows(deletes)),
+            ));
         }
         if let Some(n) = self.max_effects.filter(|n| effects > *n) {
-            out.push(format!("queues {effects} effects (at most {n})"));
+            out.push(("max_effects", format!("queues {effects} effects (at most {n})")));
         }
         if !channels.is_empty() {
-            out.push(format!("queues effects on {} (always reviewed)", join(channels)));
+            out.push(("review_channels", format!("queues effects on {} (always reviewed)", join(channels))));
         }
         if taken > 0 {
-            out.push(format!("takes back or changes {taken} effects already queued in its parent"));
+            out.push((
+                "review_channels",
+                format!("takes back or changes {taken} effects already queued in its parent"),
+            ));
         }
         if !outside.is_empty() {
-            out.push(format!("changes {} (only {})", join(outside), listed(&self.tables)));
+            out.push(("tables", format!("changes {} (only {})", join(outside), listed(&self.tables))));
         }
         if !review.is_empty() {
-            out.push(format!("changes {} (always reviewed)", join(review)));
+            out.push(("review_tables", format!("changes {} (always reviewed)", join(review))));
         }
         if !self.schema && !schema.is_empty() {
-            out.push(format!("changes the schema: {}", join(schema)));
+            out.push(("schema", format!("changes the schema: {}", join(schema))));
         }
         if !self.overwrite && overwrote > 0 {
-            out.push(format!("overwrites {overwrote} rows changed in its parent since the fork"));
+            out.push(("overwrite", format!("overwrites {overwrote} rows changed in its parent since the fork")));
         }
         out
     }
@@ -1739,10 +2260,11 @@ fn table_names(s: &str) -> Option<Vec<String>> {
 /// Table names as a policy's settings take them back: `orders,"Orders"`.
 /// `review_columns`' list: text like `'users.email, accounts."Owner"'` (names as SQL reads them),
 /// or an array of such names, one each; null for none.
-fn columns(v: &Json) -> Result<Vec<(String, String)>> {
+fn columns(k: &str, v: &Json) -> Result<Vec<(String, String)>> {
     let wrong = || {
-        bad("review_columns must be a list of columns like 'users.email,accounts.owner' (table.column, quoted as SQL does)"
-            .into())
+        bad(format!(
+            "{k} must be a list of columns like 'users.email,accounts.owner' (table.column, quoted as SQL does)"
+        ))
     };
     let items: Vec<String> = match v {
         Json::Null => return Ok(vec![]),
@@ -1764,10 +2286,143 @@ fn columns(v: &Json) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
+/// `row_rules`' list: text like `'payments: new.amount >= -50; prices: new.price <= old.price * 1.2'` (a table as SQL
+/// names it, a colon, and a condition; `;` between them, outside quotes), or an array of `table: condition` each; null
+/// for none. Each condition must parse as SQL; whether it binds to its table's columns is known at a merge (a rule
+/// that doesn't holds the merge for a person, saying why).
+/// A length of time setting (`canary_wait`, `effects_delay`): `'5 minutes'`, ms as a number, or null for none.
+fn duration(k: &str, v: &Json) -> Result<Option<u64>> {
+    match v {
+        Json::Null => Ok(None),
+        Json::String(s) => Ok(Some(
+            crate::sql::duration_ms(s)
+                .ok_or_else(|| bad(format!("{k} must be a length of time like '10 minutes' or '1h', not '{s}'")))?,
+        )),
+        v => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| bad(format!("{k} must be a length of time like '10 minutes', ms as a number, or null"))),
+    }
+}
+
+/// `watch_totals`: queries that each give one number, as text kept apart by semicolons, or a JSON array; each checked
+/// to be a SELECT.
+fn totals(v: &Json) -> Result<Vec<String>> {
+    let items: Vec<String> = match v {
+        Json::Null => return Ok(vec![]),
+        Json::String(s) => split_outside_quotes(s, ';'),
+        Json::Array(a) => a
+            .iter()
+            .map(|x| x.as_str().map(String::from))
+            .collect::<Option<_>>()
+            .ok_or_else(|| bad("watch_totals must be queries like 'select sum(amount) from payments'".into()))?,
+        _ => return Err(bad("watch_totals must be queries like 'select sum(amount) from payments'".into())),
+    };
+    let items: Vec<String> = items.iter().map(|i| i.trim().to_string()).filter(|i| !i.is_empty()).collect();
+    if let Some(q) = items.iter().find(|q| !q.to_ascii_lowercase().starts_with("select")) {
+        return Err(bad(format!(
+            "watch_totals takes queries that give one number, like 'select count(*) from orders', not '{q}'"
+        )));
+    }
+    Ok(items)
+}
+
+/// `row_rules` as a merge policy or a run's scope gives them: (table, condition) pairs, each condition checked to be SQL.
+pub(crate) fn parse_row_rules(v: &Json) -> Result<Vec<(String, String)>> {
+    row_rules(v)
+}
+
+fn row_rules(v: &Json) -> Result<Vec<(String, String)>> {
+    let wrong = |why: String| {
+        bad(format!(
+            "row_rules must be a list like 'payments: new.amount >= -50; prices: new.price <= old.price * 1.2' \
+             (a table, a colon, a condition over old.column and new.column){why}"
+        ))
+    };
+    let items: Vec<String> = match v {
+        Json::Null => return Ok(vec![]),
+        Json::String(s) => split_outside_quotes(s, ';'),
+        Json::Array(a) => {
+            a.iter().map(|x| x.as_str().map(String::from)).collect::<Option<_>>().ok_or_else(|| wrong(String::new()))?
+        }
+        _ => return Err(wrong(String::new())),
+    };
+    let mut out = vec![];
+    for item in items.iter().map(|i| i.trim()).filter(|i| !i.is_empty()) {
+        let (table, cond) = item.split_once(':').ok_or_else(|| wrong(format!(": '{item}' has no colon")))?;
+        let table = match table_names(table.trim()).as_deref() {
+            Some([one]) => one.clone(),
+            _ => return Err(wrong(format!(": '{}' isn't one table's name", table.trim()))),
+        };
+        let cond = cond.trim().to_string();
+        crate::sql::row_rule_parses(&cond).map_err(|e| wrong(format!(": '{cond}' isn't SQL ({e})")))?;
+        out.push((table, cond));
+    }
+    Ok(out)
+}
+
+/// `text` split at `sep` where it isn't inside a quoted string or name (`'...'`, `"..."`).
+fn split_outside_quotes(text: &str, sep: char) -> Vec<String> {
+    let (mut out, mut cur, mut quote) = (vec![], String::new(), None::<char>);
+    for c in text.chars() {
+        match (quote, c) {
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            (Some(q), c) if c == q => {
+                quote = None;
+                cur.push(c);
+            }
+            (None, c) if c == sep => out.push(std::mem::take(&mut cur)),
+            (_, c) => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// `person_only`'s list: rule names (see `RULE_NAMES`) as text `'max_deletes,schema'` or an array; an empty list
+/// lets the reviewer approve past every rule; null: the default (`PERSON_ONLY`).
+fn person_only(v: &Json) -> Result<Option<Vec<String>>> {
+    let wrong = |what: &str| {
+        bad(format!(
+            "person_only must be a list of rules like 'max_deletes,schema'{what}, or null for the default ({})",
+            PERSON_ONLY.join(", ")
+        ))
+    };
+    let items: Vec<String> = match v {
+        Json::Null => return Ok(None),
+        // 'none': the reviewer may approve past any rule (as '' does; for tools that read '' as unset)
+        Json::String(s) if s.trim().eq_ignore_ascii_case("none") => vec![],
+        Json::String(s) => s.split(',').map(|x| x.trim().to_lowercase()).filter(|x| !x.is_empty()).collect(),
+        Json::Array(a) => a
+            .iter()
+            .map(|x| x.as_str().map(|s| s.trim().to_lowercase()))
+            .collect::<Option<_>>()
+            .ok_or_else(|| wrong(""))?,
+        _ => return Err(wrong("")),
+    };
+    if let Some(r) = items.iter().find(|r| !RULE_NAMES.contains(&r.as_str())) {
+        return Err(wrong(&format!(": there's no rule {r} (the rules: {})", RULE_NAMES.join(", "))));
+    }
+    Ok(Some(items))
+}
+
+/// A number no one can guess ahead: for `spot_check`'s pick.
+fn random() -> u64 {
+    use std::hash::BuildHasher;
+    std::collections::hash_map::RandomState::new().hash_one((disk::now_ms(), std::thread::current().id()))
+}
+
 /// Columns as `review_columns` takes them back: `users.email,"Accounts"."Owner"`.
 pub fn listed_columns(cols: &[(String, String)]) -> String {
     cols.iter()
-        .map(|(t, c)| format!("{}.{}", listed(std::slice::from_ref(t)), listed(std::slice::from_ref(c))))
+        .map(|(t, c)| match (t.as_str(), c.as_str()) {
+            ("*", _) => "*".to_string(),
+            (_, "*") => format!("{}.*", listed(std::slice::from_ref(t))),
+            _ => format!("{}.{}", listed(std::slice::from_ref(t)), listed(std::slice::from_ref(c))),
+        })
         .collect::<Vec<_>>()
         .join(",")
 }
@@ -1896,7 +2551,7 @@ impl Core {
             p.apply(rules)?;
         }
         let br = self.branch(&self.world(b)?.name)?;
-        Ok(p.broken(&self.state_diff(&br.base(), &br.snapshot())?, 0))
+        Ok(p.broken(&self.state_diff(&br.base(), &br.snapshot())?, 0).iter().map(|r| for_caller(r)).collect())
     }
 
     /// The merge policy that asks a person merging world `b` to give the count of rows it deletes, and its
@@ -1941,9 +2596,23 @@ impl Core {
 
     /// Queues world `b`'s merge for a person: policy `p` refused it for `reasons`, checked at
     /// the world's `version` (a write since then shows as `changed_since`).
-    pub(crate) fn ask_review(&self, b: &str, p: &str, reasons: &[String], version: u64) -> Result<()> {
-        let v = json!({ "policy": p, "reasons": reasons, "at": disk::now_ms(), "version": version });
-        self.set_reserved(b, REVIEW, Some(v))
+    /// `person`: those of `reasons` only a person may approve it past (see `MergePolicy::person_only`).
+    pub(crate) fn ask_review(
+        &self,
+        b: &str,
+        p: &str,
+        reasons: &[String],
+        person: &[String],
+        version: u64,
+    ) -> Result<()> {
+        let v = json!({ "policy": p, "reasons": reasons, "person": person, "at": disk::now_ms(), "version": version });
+        self.set_reserved(b, REVIEW, Some(v))?;
+        // said on REVIEW_CHANNEL, so a reviewer (or a person's pager) hears of it now rather than at its next look
+        let reviewer = self.policy(p).ok().and_then(|p| p.reviewer);
+        let note =
+            json!({ "world": b, "policy": p, "reviewer": reviewer, "version": version, "person": !person.is_empty() });
+        crate::sql::deliver(self, crate::MAIN, 0, &[(REVIEW_CHANNEL.to_string(), note.to_string())]);
+        Ok(())
     }
 
     /// A reviewer's decision on world `b`'s held merge (see `MergePolicy::reviewer`), with its reason: kept with the
@@ -1970,6 +2639,17 @@ impl Core {
                     w.name
                 )));
             }
+        }
+        // rules only a person approves a merge past (see `MergePolicy::person_only`): not an agent, a reviewer or an
+        // admin agent, however sure it is; it may still reject or pass it on, with its reason
+        let person: Vec<String> =
+            r["person"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
+        if verdict == Verdict::Approve && !actor.is_empty() && !person.is_empty() {
+            return Err(refused(format!(
+                "{} waits for a person, not a reviewer: it {} (merge policy {policy}'s person_only rules)",
+                w.name,
+                person.join("; it ")
+            )));
         }
         let held = r["version"].as_u64().unwrap_or(0);
         if verdict == Verdict::Approve && (w.version != held || r["partly_merged"].as_bool() == Some(true)) {
@@ -2010,7 +2690,8 @@ impl Core {
                 let r = w.meta.get(REVIEW)?;
                 Some(Review {
                     policy: r["policy"].as_str().unwrap_or_default().into(),
-                    reasons: r["reasons"].as_array()?.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
+                    // values-free for an agent asking, a reviewer among them (see `values_free`)
+                    reasons: r["reasons"].as_array()?.iter().filter_map(|x| x.as_str().map(for_caller)).collect(),
                     at: r["at"].as_u64().unwrap_or(0),
                     version: r["version"].as_u64().unwrap_or(0),
                     partly_merged: r["partly_merged"].as_bool().unwrap_or(false),
@@ -2026,6 +2707,12 @@ impl Core {
                         let named = self.policy(r["policy"].as_str().unwrap_or_default()).ok().and_then(|p| p.reviewer);
                         by.or(named).map(|who| (who, decided))
                     },
+                    person: r["person"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|x| x.as_str().map(for_caller))
+                        .collect(),
                     world: w.name,
                 })
             })
@@ -2305,6 +2992,11 @@ impl Acting<'_> {
         }
         if policy.as_ref().is_some_and(|p| p.rerun_reads) {
             meta.insert(crate::stale::RERUN_READS.into(), Json::Bool(true)); // and runs its SELECTs again
+        }
+        if policy.as_ref().is_some_and(|p| !p.untrusted_columns.is_empty()) {
+            // which columns it reads is kept (not checked against changes, unless its policy checks reads): whether it
+            // read text outsiders write is known at its merge (see `MergePolicy::untrusted_broken`)
+            meta.insert(crate::stale::WATCH_READS.into(), Json::Bool(true));
         }
         // a run may declare tighter limits than its policy, never looser
         if let (Some(p), Some(s)) = (&policy, meta.get(crate::scope::SCOPE)) {

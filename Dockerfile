@@ -37,7 +37,7 @@ ARG JOBS
 WORKDIR /src
 COPY . .
 COPY --from=studio /src/studio/dist studio/dist
-RUN CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --release --locked ${JOBS:+-j "$JOBS"}
+RUN CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --release --locked --features mongo ${JOBS:+-j "$JOBS"}
 
 # --- what runs: Debian slim (glibc), tzdata for named time zones, CA certificates for
 # `chronos import` over TLS with sslmode=verify-full

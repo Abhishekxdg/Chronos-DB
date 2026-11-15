@@ -53,11 +53,16 @@ impl MergeCheck {
     }
 }
 
+/// How far a `watch_totals` result may move in one merge when the policy doesn't say, in percent.
+const DEFAULT_SHIFT: u64 = 10;
+/// How long each `watch_totals` query may take, ms: as long as a merge check by default.
+const TOTAL_TIMEOUT: u64 = 1000;
+
 /// The error a merge that breaks merge checks gets, when its agent keeps to no merge policy.
 pub(crate) fn broken(b: &str, reasons: &[String]) -> Error {
     Error::Constraint {
         code: "23514", // Postgres's check_violation
-        message: format!("merging {b} {}; nothing was merged", reasons.join("; it ")),
+        message: crate::agents::for_caller(&format!("merging {b} {}; nothing was merged", reasons.join("; it "))),
     }
 }
 
@@ -172,6 +177,19 @@ impl Core {
     /// Check `c`'s rows (SHOWN + 1 at most) in `state`, read as world `world` would be. It runs as
     /// the database's own, not the merging agent: an admin wrote it, and it only reads.
     fn run_check(&self, c: &MergeCheck, world: &str, state: &State) -> sql::Result<sql::Output> {
+        self.run_query(&c.query, c.timeout, world, state, SHOWN + 1)
+    }
+
+    /// `query`'s first `rows` rows in `state`, read as world `world` would be, within `timeout` ms: as the database's
+    /// own, as a merge check is.
+    fn run_query(
+        &self,
+        query: &str,
+        timeout: u64,
+        world: &str,
+        state: &State,
+        rows: usize,
+    ) -> sql::Result<sql::Output> {
         static RUNS: AtomicU64 = AtomicU64::new(0);
         let Some(db) = self.db() else {
             return Ok(sql::Output { typmods: vec![], columns: None, rows: vec![], tag: String::new() });
@@ -181,9 +199,58 @@ impl Core {
         self.merging.lock().unwrap().insert(at.clone(), state.clone());
         let out = {
             let _nobody = disk::acting_as("");
-            sql::merge_check(&db, &at, &c.query, c.timeout, SHOWN + 1)
+            sql::merge_check(&db, &at, query, timeout, rows)
         };
         self.merging.lock().unwrap().remove(&at);
+        out
+    }
+
+    /// The `watch_totals` of policy `p` that move more than its `max_shift` percent from `before` (world `world` now)
+    /// to `after` (as the merge would leave it), in words: what a merge does, judged by what it leaves (a sum of
+    /// payments ten times what it was), not only by what it changes. A query that fails or gives no number counts.
+    pub(crate) fn shifted_totals(
+        &self,
+        p: &crate::agents::MergePolicy,
+        world: &str,
+        before: &State,
+        after: &State,
+    ) -> Vec<String> {
+        use crate::agents::value;
+        if self.me.get().is_none() {
+            return vec![]; // replaying the log: the merge was judged when it happened
+        }
+        let most = p.max_shift.unwrap_or(DEFAULT_SHIFT);
+        let number = |s: &State, q: &str| -> std::result::Result<f64, String> {
+            match self.run_query(q, TOTAL_TIMEOUT, world, s, 2) {
+                Ok(o) => match o.rows.first().and_then(|r| r.first()) {
+                    None | Some(sql::Value::Null) => Ok(0.0),
+                    Some(v) => v.to_text().trim().parse::<f64>().map_err(|_| "gives no number".to_string()),
+                },
+                Err(e) if e.code == "57014" => Err(format!("didn't finish within {TOTAL_TIMEOUT} ms")),
+                Err(e) => Err(format!("failed ({})", value(&e.message))),
+            }
+        };
+        let mut out = vec![];
+        for q in &p.watch_totals {
+            match (number(before, q), number(after, q)) {
+                (Ok(b), Ok(a)) => {
+                    let shift = match b == 0.0 {
+                        true if a == 0.0 => 0.0,
+                        true => f64::INFINITY,
+                        false => ((a - b) / b).abs() * 100.0,
+                    };
+                    if shift > most as f64 {
+                        let by = if shift.is_finite() { format!("{shift:.0}%") } else { "from nothing".into() };
+                        out.push(format!(
+                            "moves watched total `{q}` from {} to {} ({by}, more than max_shift {most}%)",
+                            value(b),
+                            value(a)
+                        ));
+                    }
+                }
+                (Err(e), _) | (_, Err(e)) => out.push(format!("can't be judged by watched total `{q}`: it {e}")),
+            }
+        }
         out
     }
 
@@ -202,11 +269,15 @@ impl Core {
             }
             match self.run_check(&c, world, state) {
                 Ok(o) if o.rows.is_empty() => {}
-                Ok(o) => out.push(format!("breaks merge check {}, which finds {}", c.name, shown(&o))),
+                Ok(o) => {
+                    out.push(format!("breaks merge check {}, which finds {}", c.name, crate::agents::value(shown(&o))))
+                }
                 Err(e) if e.code == "57014" => {
                     out.push(format!("breaks merge check {}: it didn't finish within {} ms", c.name, c.timeout))
                 }
-                Err(e) => out.push(format!("breaks merge check {}: it failed ({})", c.name, e.message)),
+                Err(e) => {
+                    out.push(format!("breaks merge check {}: it failed ({})", c.name, crate::agents::value(&e.message)))
+                }
             }
         }
         Ok(out)
