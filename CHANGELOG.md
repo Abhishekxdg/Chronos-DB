@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.5.3 (beta), 2026-11-16
+
+**Faster undo of big merges, and faster analytical joins.** Undoing a merge by its id read the whole table for each
+row it checked: a 10,000-row undo beside Postgres took about a minute and now takes under 3 seconds. A join followed
+by `GROUP BY` no longer keeps every joined row before grouping: CH-benCHmark Q18 is 4.3 times faster on one core and
+Q3 twice. Answers are the same; nothing changes in how rows are stored or merges are written. Built and signed on
+the maintainer's Mac as 0.5.2 was.
+
+- **Undo by merge id is about 20 times faster on big merges.** Each row's check ("is it still as the merge left it")
+  read the whole table; it now finds the row by its key. Undoing a 10,000-row merge of a 20,000-row table beside
+  Postgres went from 57 s to 2.7 s (preview: 52 s to 2.8 s), measured through the gateway on an M2.
+- **Faster analytical joins.** A join followed by `GROUP BY` groups each joined row as its last table is joined instead of keeping every joined row first (each as wide as all the tables together), for `count`, `min`/`max` of a column and `sum`/`avg` of an integer or `numeric` column; a join on several whole-number columns keys on them without a list for each row; a joined table is read at the width the join holds. CH-benCHmark Q18 over one TPC-C warehouse went from 1,393 to 323 ms on one core and Q3 from 442 to 219 ms (Postgres 18 on two cores: 355 and 102 ms); the join reports of `examples/report.rs` are 18–30% faster on one core. Answers are unchanged. `cargo run --release --example ch` reruns Q3 and Q18 (BENCHMARKS.md, sections 4 and 16.2).
+
 ## 0.5.2 (beta), 2026-11-16
 
 **A merge undone in part can be undone again.** Beside Postgres, MySQL, MariaDB or MongoDB, an undo that left rows

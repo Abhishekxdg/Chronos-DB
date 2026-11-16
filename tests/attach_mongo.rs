@@ -157,8 +157,9 @@ fn merges_are_written_to_mongodb_first() {
             chronos::attach::UndoOptions { skip_changed: true, ..Default::default() },
         )
         .unwrap();
-    // (lead 3 comes back; Acme and lead-2 changed since, NewCo is gone)
-    assert_eq!((done.undone, done.skipped), (1, 3), "{done:?}");
+    // (lead 3 comes back; Acme and lead-2 changed since; NewCo, which the merge added, is gone already: nothing to
+    // undo there)
+    assert_eq!((done.undone, done.skipped, done.already), (1, 2, 1), "{done:?}");
     assert_eq!(leads.find_one(doc! { "_id": 3 }).run().unwrap().unwrap().get_str("owner").ok(), Some("eve"));
     assert_eq!(leads.find_one(doc! { "_id": 3 }).run().unwrap().unwrap().get("org_id"), Some(&Bson::Int32(7)));
 

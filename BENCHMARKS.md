@@ -6,6 +6,8 @@
 
 **The machine changed.** Earlier editions of this page ran on an 8 GB Apple M2 laptop (sections 1–7 and 9–12, often while other builds ran on it) and on a 4-vCPU, 32 GB GCP VM (section 8). Where a result changed, the old figure is given beside the new one. Numbers from different machines don't compare directly: one of these cores is slower than one of the M2's, and there are four times as many.
 
+**2026-11-16: the reports and CH Q3 and Q18, rerun on the laptop.** The GCP machines were off, so section 4's five reports and section 16's two analytical joins were rerun on an 8 GB Apple M2 (8 cores: 4 fast, 4 efficiency; macOS 26), before and after the join changes of that day: sections [4](#rerun-on-052-and-after-the-join-changes-2026-11-16) and [16.2](#162-ch-q3-and-q18-rerun-with-the-join-changes-2026-11-16). Postgres there is 18.7 in Docker, inside a Linux VM with 2 of the laptop's cores and 2 GB (colima), at its defaults. Those numbers don't compare with the 32-core ones. Nothing else on this page was rerun: every other number is as old as its section says.
+
 **Chronos build.** Most Chronos numbers are `0f1a19af`: `main` at `368410af` (which keeps query threads between queries, and uses mimalloc on Linux) plus one fix this rerun found (section 6). Runs marked `8db2f701` used `main` from before those changes. Section 4's joins and reports also show `cf1c9f3a`, which adds #22 (small tables split into more parts): it changes nothing at 200,000 rows, but a lot at 20,000 (the protocol join + `GROUP BY` went from 7.0 to 4.4 ms). The rivals' numbers don't depend on which Chronos build ran beside them.
 
 **Rivals.** Postgres 17.11 and 16.15, pgvector 0.8.6, pgvectorscale 0.9.1, SQLite (bundled with rusqlite), Dolt 2.3.5, DuckDB 1.5.5, Qdrant 1.19.1, Chroma 1.5.9, LanceDB 0.39, Milvus 3.0.1, Weaviate 1.39.7, Elasticsearch 9.5.4, OpenSearch 3.8.0 and Redis 8.10.2 (the last five in Docker). Each runs at its defaults unless a section says otherwise, and never tuned below them. Recall is always shown beside speed, because the defaults trade the two differently. Neon wasn't rerun (it needs an API key this run didn't have); its numbers are from 2026-09-27.
@@ -16,7 +18,10 @@
 
 | against | workload | Chronos DB | rival | section |
 |---|---|---|---|---|
-| **DuckDB 1.5.5** | analytics reports over 200,000-row tables | 2.8–25.4 ms | 0.4–8.3 ms: **2.2–7× faster** | [4](#4-sql-over-the-postgres-protocol) |
+| **Postgres 18** | three of five reports over 200,000-row tables, Chronos held to the 2 cores Postgres had (M2, 2026-11-16) | filtered count 12.0 ms, join + `GROUP BY` 70.8 ms, join + `LIKE` 46.8 ms | **7.7, 49.4, 29.1 ms: 1.4–1.6× faster** | [4](#rerun-on-052-and-after-the-join-changes-2026-11-16) |
+| **Postgres 18** | all five reports, Chronos on one core against Postgres's two (M2, 2026-11-16) | 10.0–138.6 ms | **7.1–49.4 ms: 1.4–3.0× faster** | [4](#rerun-on-052-and-after-the-join-changes-2026-11-16) |
+| **Postgres 18** | CH-benCHmark Q3, one warehouse, Chronos held to 2 cores (M2, 2026-11-16) | 136 ms (282 ms before) | **102 ms** | [16.2](#162-ch-q3-and-q18-rerun-with-the-join-changes-2026-11-16) |
+| **DuckDB 1.5.5** | analytics reports over 200,000-row tables (2026-09-28, not rerun) | 2.8–25.4 ms | 0.4–8.3 ms: **2.2–7× faster** | [4](#4-sql-over-the-postgres-protocol) |
 | **Postgres 17** | merge p50, 1,000 agents on disk, one thread per agent | 714–718 ms (1,231 ms before #23 and #29) | **128 ms** (25 workers) | [1](#1-forks-and-concurrent-writes-phase-1-kill-gate-10-postgres) |
 | **its own target** | vector search inside a fork, against main, 1M rows | 1.55× main (no filter), 1.12× (text) | target: within 1.1× | [3](#3-hybrid-search-inside-branches-phase-3-targets-p99--5-ms-at-1m-fork-within-10-of-main) |
 | **its own gate** | filtered vector search at 10%, 500k × 384, against tuned pgvector | 0.93 ms | 1.17–1.22 ms: only 1.3×, under the 5× gate | [2](#2-vector-search-vs-postgres--pgvector-phase-1-kill-gate-5-pgvector) |
@@ -28,10 +33,9 @@
 | **Postgres 17** | one order joined to its row by key, over the protocol | 52 µs | **50 µs** | [4](#4-sql-over-the-postgres-protocol) |
 | **Redis, Weaviate** | server memory after the 76k run | 1.14 GB (2.3 GB at its peak) | 1.05 GB, 1.10 GB | [6](#6-vector-search-vs-other-vector-databases-on-real-embeddings) |
 | **Doltgres 1.4.0** | BranchBench S4: dev worlds rebasing off a busy spine, W=5 | 663 s | **563 s** | [16](#16-branchbench-six-agent-workflows-against-doltgres-and-postgres-copies) |
-| **Postgres 18** | CH-benCHmark Q3 and Q18, W=1 | 0.32 s, 0.27 s | **0.08 s** each | [16](#16-branchbench-six-agent-workflows-against-doltgres-and-postgres-copies) |
 | **Doltgres, Postgres copies** | the spine's TPC-C throughput while BranchBench's agents work (S4) | 28 txn/s | **30, 73** txn/s | [16](#16-branchbench-six-agent-workflows-against-doltgres-and-postgres-copies) |
 
-The merge row's cause is found and its fix is being built (section 1, TODOS.md). No longer losses: server memory at 1M real embeddings, 7.7 GB after the run before and 3.1 GB since (section 6, "Memory at 1M"), under Milvus's 5.2 GB and Qdrant's 6.6 GB; unfiltered vector search at 1M, 4.69 ms before and 1.36 ms since (section 6, "Where the 1M search's time went"), now faster than every system that finds more than 75% of the true top 10; the 8.6 ms vector p99 of this rerun's first runs was a readiness bug, fixed in the same change (section 6); the protocol join + `GROUP BY` is 4.4 ms against Postgres's 6.9 ms since #22 (section 4); and the slow checkpoint and reopen at 100,000 worlds came from the loaded laptop (section 9).
+The merge row's cause is found and its fix is being built (section 1, TODOS.md). No longer losses: CH Q18, which was about 3× slower than Postgres 18 at two cores and is now 1.7× faster (212 ms against 355 ms on the M2, section 16.2; in October's run on the 16-core VM, with other rows, both Q3 and Q18 were 4× slower: 0.32 s and 0.27 s against 0.08 s); server memory at 1M real embeddings, 7.7 GB after the run before and 3.1 GB since (section 6, "Memory at 1M"), under Milvus's 5.2 GB and Qdrant's 6.6 GB; unfiltered vector search at 1M, 4.69 ms before and 1.36 ms since (section 6, "Where the 1M search's time went"), now faster than every system that finds more than 75% of the true top 10; the 8.6 ms vector p99 of this rerun's first runs was a readiness bug, fixed in the same change (section 6); the protocol join + `GROUP BY` is 4.4 ms against Postgres's 6.9 ms since #22 (section 4); and the slow checkpoint and reopen at 100,000 worlds came from the loaded laptop (section 9).
 
 ## 1. Forks and concurrent writes (Phase 1 kill gate: 10× Postgres)
 
@@ -326,6 +330,27 @@ On one thread (`CHRONOS_THREADS=1`, no helpers) nothing changes: 12.7 against 12
 | in process, 200,000 rows: join + `GROUP BY` (the other four within 0.2 ms too) | 25.5 ms | 25.3 ms |
 
 The protocol join + `GROUP BY` that started this, 11.5 ms against Postgres's 6.9 ms, now takes 4.4 ms.
+
+### Rerun on 0.5.2 and after the join changes (2026-11-16)
+
+The five reports of "Bigger reports" above, rerun on an 8 GB Apple M2 (the GCP machines were off): `cargo run --release --example report`, 200,000 rows a table, Chronos in process on disk, best of 3 runs of the example (each its best of 3 rounds of 5). "Before" is 0.5.2 (`a8da3867`), "after" is that plus the join changes below, the two builds run turn about. Postgres is 18.7 at its defaults (2 parallel workers a query) over local TCP, in Docker inside a Linux VM that has 2 of the laptop's cores and 2 GB (colima), so the fair column is Chronos on 2 threads. Milliseconds:
+
+| query | one core, before | one core, after | 2 cores, before | 2 cores, after | 8 cores, before | 8 cores, after | Postgres 18 (2 cores) |
+|---|---|---|---|---|---|---|---|
+| `count(*)` of orders | 10.2 | 10.0 | 5.4 | 5.3 | 2.3 | 2.3 | 7.1 |
+| `count(*)` of orders `WHERE amount > 500` | 23.6 | 23.3 | 12.2 | 12.0 | 4.8 | 4.7 | 7.7 |
+| `GROUP BY age` with `count(*)`, `max(name)` | 47.2 | 41.4 | 39.8 | 27.6 | 11.5 | 9.8 | 27.0 |
+| join of both tables, then `GROUP BY` with `sum` | 168.1 | 138.6 | 93.7 | 70.8 | 38.1 | 30.4 | 49.4 |
+| `count(*)` of the join `WHERE name LIKE 'user 1%'` | 125.9 | 88.1 | 73.7 | 46.8 | 27.7 | 20.3 | 29.1 |
+
+**Still losses.** On one core Chronos is slower than Postgres's two on all five (1.4× on the plain count, 1.5× on `GROUP BY`, 2.8–3.0× on the filtered count and both joins). On the same two cores it is slower on three: the filtered count (1.6×), the join + `GROUP BY` (1.4×) and the join + `LIKE` (1.6×); level on `GROUP BY`; ahead only on the plain count. With all 8 cores against Postgres's 2 it is ahead on all five (1.4–3.1×), which says what the 32-core table above says: these reports are won by cores, not by a core. DuckDB wasn't rerun.
+
+**What changed** (each in `Exec::join`, none in how rows are stored):
+- **Joined rows grouped as they are made.** A joined row is as wide as all its tables together. With `GROUP BY`, each part's joined rows were gathered in a batch, grouped, and dropped; now each is made in one row, over and over, and grouped at once. The joins are 18–30% faster on one core.
+- **A probe's key made in place.** The key a row is looked up by was a fresh list (and a fresh string for text) for each row; now one buffer serves a part. `GROUP BY`'s key the same.
+- **`max` and `min` of text** copy the winner into the text they hold instead of a new one: the `GROUP BY` report is 12% faster on one core and 30% on two.
+
+**Where one core's time goes now** (macOS `sample`, `CHRONOS_THREADS=1`): decoding stored rows is 25–35% of each report (a row is read field by field to reach a column), then the per-row call that evaluates a condition or an aggregate, then, for text, an allocation per value read. Postgres reads a fixed-width column at an offset. The cheaper fixes the DuckDB note above names (row counts kept in the tree, per-page minimum and maximum) would help the two counts, not the joins.
 
 **Why the macOS default is so much faster at commits:** it doesn't flush the drive's cache, so a power cut can lose commits it acknowledged. By default Chronos flushes the drive's cache (`F_FULLFSYNC`); `alter system set synchronous_commit = normal` makes it do what Postgres does there (a plain `fsync`), and `off` stops waiting for the disk at all. The Linux comparison is in section 8: it found a real gap (Chronos's log file grew on every commit), now closed.
 
@@ -1021,7 +1046,7 @@ BranchBench drives each database through one git-like API (branch, commit, diff,
 | #239 | `DIFF` missed a column's new size (`varchar(5)` to `varchar(10)`) | it shows, and `DIFF ... AS SQL` carries it |
 
 **Where Chronos still loses here.**
-- **Analytical joins are about 4× Postgres.** CH Q3 0.32 s and Q18 0.27 s at W=1, against 0.08 s each on Postgres 18 (same VM; Chronos held to 2 threads, Postgres at its defaults, so this flatters Postgres somewhat).
+- **Analytical joins were about 4× Postgres** in this run. CH Q3 0.32 s and Q18 0.27 s at W=1, against 0.08 s each on Postgres 18 (same VM; Chronos held to 2 threads, Postgres at its defaults, so this flatters Postgres somewhat). Since 2026-11-16 Q18 is faster than Postgres and Q3 is 1.3× slower, measured on other rows and another machine: see [16.2](#162-ch-q3-and-q18-rerun-with-the-join-changes-2026-11-16).
 - **Memory.** Chronos peaked at 23 GB RSS in S4 (eight CH queries at a time over W=5, before #244). Rows a query holds are decoded values, several times their size on disk; the limit now fails a runaway query alone, but doesn't make the others smaller.
 - **Diff and revert of many rows.** `diff` returns every changed row: 47 ms at 1,000 rows, 495 ms at 10,000. `revert` runs the engine's inverse statements one at a time: 211 ms at 1,000 rows, 2.05 s at 10,000.
 
@@ -1062,6 +1087,31 @@ Throughput (`run_throughput_bench.sh --sweep-proportional --mode sync`, 4 thread
 
 **Why the spine's TPC-C stays at about 30 transactions/s** (S4: 29.6/s, Doltgres 30, file_copy 73). Two CH queries the spine runs among its transactions, Q3 and Q18, took 4.2 and 4.0 s each (file_copy's Postgres: 0.8 and 1.6 s): 73% of the spine's time. It isn't the agents beside them. At W=1 six Q3s at once take 0.5 s each against 0.19 s alone, and a fair split of the helper threads between running queries (tried, #261) changed nothing. It's the data size: on a W=5 copy of the CH tables, Q3 takes 3.0 s and Q18 5.3 s alone, because their hash joins outgrow `CHRONOS_WORK_MEM` (256 MB) and go to disk. With `CHRONOS_WORK_MEM=4GB` they take 0.75 s and 1.3 s, but Q18 then holds 2.7 GB. The likely cause, not yet confirmed, is that joined rows are held at their tables' full width rather than only the columns the query reads; holding only those would be the fix, not done yet.
 
+### 16.2 CH Q3 and Q18, rerun with the join changes (2026-11-16)
+
+*8 GB Apple M2 (8 cores: 4 fast, 4 efficiency), macOS 26; the GCP VM of this section was off. `cargo run --release --example ch`: one TPC-C warehouse (30,000 customers, 30,000 orders, 9,000 new orders, 300,001 order lines, at TPC-C's column widths), Q3 and Q18 as BranchBench's spine runs them, every order after the queries' date. The rows are made by the example with `generate_series`, the same statements on both sides, not by chBenchmark's generator, so these times don't compare with the 0.32 s and 0.27 s above. Chronos in process, on disk, checkpointed; Postgres 18.7 over local TCP at its defaults (2 parallel workers, `work_mem` 4 MB, `shared_buffers` 128 MB), `VACUUM ANALYZE`d, in Docker inside a Linux VM with 2 of the laptop's cores and 2 GB (colima). Best of 3 runs of the example, each its best of 3 rounds of 5 after a warm-up; the two Chronos builds run turn about. Both builds and Postgres return the same 100 rows.*
+
+| query | Chronos threads | 0.5.2 (`a8da3867`) | with the join changes | Postgres 18 (2 cores) |
+|---|---|---:|---:|---:|
+| Q3 | 1 | 442 ms | 219 ms | 102 ms |
+| Q3 | 2 | 282 ms | 136 ms | 102 ms |
+| Q3 | 8 | 148 ms | **80 ms** | 102 ms |
+| Q18 | 1 | 1,393 ms | **323 ms** | 355 ms |
+| Q18 | 2 | 1,048 ms | **212 ms** | 355 ms |
+| Q18 | 8 | 788 ms | **137 ms** | 355 ms |
+
+(With `work_mem = 64MB` Postgres took 152 ms for Q3, a different plan, and 362 ms for Q18.)
+
+- **Still a loss: Q3 on the same cores.** 136 ms against 102 ms at two threads (1.3×), and 219 ms on one (2.1×). It was 2.8× and 4.3×.
+- **Q18 went from 3.0× slower to 1.7× faster** at two threads, and is ahead on one.
+- **Where the time was** (macOS `sample`, one thread, 0.5.2). Q18 joins customer, orders and order_line, 43 columns between them, and each of its 300,000 joined rows was held 43 values wide (about 2 KB, mostly nulls). Half the query was copying them: 25% putting the parts' rows end to end, 23% copying the left row for each match. Grouping was 14%, reading order_line 9%.
+- **What changed** (in `Exec::join`; the stored rows and every answer are the same):
+  - **The last table's joined rows are grouped as they are made** in one row, never kept, for aggregates that come out the same however the rows are split: `count`, `min` and `max` of a column, `sum` and `avg` of an integer or (new) a `numeric` column. A two-table join did this part by part since September, through a batch; a join of three or more kept every joined row first. Q18 on one thread: 1,393 to about 430 ms.
+  - **A join on several whole-number columns keys on them in place** (`(w, d, id)` was a list allocated for each row, on both sides), and doesn't work the equalities out again for each pair the key matched.
+  - **A joined table's rows are read at the width the join holds** (4 of order_line's 10 columns), not at the table's width and then narrowed; the first table is joined row by row as it is read rather than read into a batch first.
+- **Where the time goes now** (Q18, one thread): 46% probing and grouping the 300,000 order lines, 24% reading and decoding order_line, 9% building its hash index, 10% reading and joining customer and orders. Q3 reads all 300,000 order lines to join 9,000 orders' worth (28% reading them, 13% indexing them): Postgres does the same, and decodes them faster.
+- **Not done.** Memory at W=5 (the 2.7 GB Q18 of 16.1) wasn't remeasured; the joined rows it held are no longer kept when the query groups, which was the likely cause named there. Joined rows a query doesn't group (a plain join's output, or `count(DISTINCT ...)`) are still held at every table's width. The BranchBench scenarios weren't rerun.
+
 ## Rerun everything
 
 ```bash
@@ -1077,6 +1127,7 @@ SIM_ITERS=3000 cargo test --release --features shuttle --test sim   # own CARGO_
 JEPSEN_KILLS=20 cargo test --release --test jepsen -- --nocapture
 chronos serve /tmp/sqlbench & N=10000 cargo run --release --example sql   # needs Postgres on 127.0.0.1:5432
 N=200000 cargo run --release --example report                       # PG=off runs Chronos alone
+cargo run --release --example ch                                    # CH Q3 and Q18, one TPC-C warehouse (section 16.2); PG as for report
 ROWS=500000 AGENT=100000 OTHERS=50000 cargo run --release --example undo_agent
 CHRONOS_CACHE_MB=32 MB=500 cargo run --release --example big            # builds ~800 MB in a temp folder
 python bench/sql-subqueries/bench.py [--timeout 300]                # the CRM demo's slow SQL on 150,600 rows; needs psql

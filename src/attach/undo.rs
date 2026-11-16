@@ -525,7 +525,8 @@ impl Core {
                             None => format!("{} is null", q(&t.cols[i].name)),
                         })
                         .collect();
-                    format!("select count(*) from {} where {}", t.sql, conds.join(" and "))
+                    // (by its key first: without it each row's check read the whole table)
+                    format!("select count(*) from {} where {key} and {}", t.sql, conds.join(" and "))
                 }
             };
             // (written so far in this world: what later records of the same row are checked against)
@@ -566,7 +567,7 @@ impl Core {
                                 None => format!("{} is null", q(&t.cols[i].name)),
                             })
                             .collect();
-                        (format!("select count(*) from {} where {}", t.sql, conds.join(" and ")), "1")
+                        (format!("select count(*) from {} where {key} and {}", t.sql, conds.join(" and ")), "1")
                     }
                 };
                 if cell(&before.0)?.first().cloned().flatten().unwrap_or_default() == before.1 {

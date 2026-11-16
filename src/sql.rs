@@ -30406,13 +30406,98 @@ impl HashIndex {
         }
         std::iter::successors(first, |&at| Some(part.next[at]).filter(|&n| n != usize::MAX)).map(|at| part.rows[at])
     }
+
+    /// The rows whose key is `k`, in order.
+    fn get_ref(&self, k: &HKey) -> impl Iterator<Item = usize> + '_ {
+        let part = &self.parts[partition(k, self.parts.len())];
+        let first = part.head.get(k).copied();
+        std::iter::successors(first, |&at| Some(part.next[at]).filter(|&n| n != usize::MAX)).map(|at| part.rows[at])
+    }
+}
+
+/// A probe's key, made in the same place row after row (so a key of text, or of several columns, allocates
+/// once and not for each row).
+struct KeyBuf {
+    key: HKey,
+    parts: Vec<HKey>,
+}
+
+impl KeyBuf {
+    fn new() -> KeyBuf {
+        KeyBuf { key: HKey::Null, parts: vec![] }
+    }
+
+    /// Makes `key` the `vals_key` of what `keys` come to for `env`'s row; false if any is null (it matches nothing).
+    fn fill(&mut self, keys: &[&Expr], env: &Env) -> Result<bool> {
+        if let [one] = keys {
+            let x = ev(one, env)?;
+            if *x == Value::Null {
+                return Ok(false);
+            }
+            hkey_into(&x, &mut self.key);
+            return Ok(true);
+        }
+        self.parts.resize(keys.len(), HKey::Null);
+        let mut whole = keys.len() <= 4;
+        for (k, part) in keys.iter().zip(&mut self.parts) {
+            let x = ev(k, env)?;
+            if *x == Value::Null {
+                return Ok(false);
+            }
+            hkey_into(&x, part);
+            whole &= matches!(part, HKey::Int(_));
+        }
+        self.key = if whole {
+            let mut ints = [0i64; 4];
+            for (i, part) in ints.iter_mut().zip(&self.parts) {
+                let HKey::Int(n) = part else { unreachable!("checked above") };
+                *i = *n;
+            }
+            HKey::Ints(keys.len() as u8, ints)
+        } else {
+            HKey::Tuple(self.parts.clone())
+        };
+        Ok(true)
+    }
+}
+
+/// `*key = hkey(v)`, a text's bytes copied into the text `key` held before (a key reused row after row).
+fn hkey_into(v: &Value, key: &mut HKey) {
+    match (v, key) {
+        (Value::Text(s), HKey::Text(k)) => {
+            k.clear();
+            k.push_str(s);
+        }
+        (v, key) => *key = hkey(v),
+    }
 }
 
 /// The hash key of several values together: one value's own key, several as a tuple; None if
 /// any is null (a null matches nothing).
 fn vals_key<'a>(vals: impl IntoIterator<Item = &'a Value>) -> Option<HKey> {
-    let mut keys: Vec<HKey> = vals.into_iter().map(|v| (*v != Value::Null).then(|| hkey(v))).collect::<Option<_>>()?;
-    Some(if keys.len() == 1 { keys.pop().unwrap() } else { HKey::Tuple(keys) })
+    // whole numbers stay in `ints` (see `HKey::Ints`); the first value that isn't one moves them all to `rest`
+    let (mut ints, mut n, mut rest) = ([0i64; 4], 0, vec![]);
+    for v in vals {
+        if *v == Value::Null {
+            return None;
+        }
+        match hkey(v) {
+            HKey::Int(i) if rest.is_empty() && n < 4 => ints[n] = i,
+            k => {
+                if rest.is_empty() {
+                    rest.extend(ints[..n].iter().map(|&i| HKey::Int(i)));
+                }
+                rest.push(k);
+            }
+        }
+        n += 1;
+    }
+    Some(match (n, rest.len()) {
+        (1, 0) => HKey::Int(ints[0]),
+        (_, 0) => HKey::Ints(n as u8, ints),
+        (1, _) => rest.pop().unwrap(),
+        _ => HKey::Tuple(rest),
+    })
 }
 
 /// The equalities between columns of different tables that `conds` imply and don't state:
@@ -30495,7 +30580,19 @@ fn narrowed(b: Batch, cols: &[usize]) -> Batch {
 /// starting at `at`; the columns not held stay as they are (nulls).
 fn place(row: &mut [Value], at: usize, cols: &[usize], r: &[Value]) {
     for (x, &c) in r.iter().zip(cols) {
-        row[at + c].clone_from(x);
+        set_from(&mut row[at + c], Cow::Borrowed(x));
+    }
+}
+
+/// `*d = x`, a text's bytes copied into the text `d` held before: a value made over and over (a running max, a
+/// joined row's column) allocates once.
+fn set_from(d: &mut Value, x: Cow<Value>) {
+    match (d, x) {
+        (Value::Text(d), Cow::Borrowed(Value::Text(s))) => {
+            d.clear();
+            d.push_str(s);
+        }
+        (d, x) => *d = x.into_owned(),
     }
 }
 
@@ -30627,6 +30724,24 @@ impl<'a> Parts<'a> {
             }
             Ok(())
         })?;
+        Ok(out)
+    }
+
+    /// What `narrowed(self.read(i)?, held)` gives (rows of the table's own width, placed at 0), made at once: each
+    /// row with only the columns `held`, in that order, none of them first made as wide as the table.
+    fn read_held(&self, i: usize, held: &[usize]) -> Result<Batch> {
+        let mut out = Batch::new(held.len());
+        if self.conds.is_empty() {
+            out.vals.reserve(self.total / self.k * held.len());
+        }
+        self.visit(i, |buf| {
+            for &c in held {
+                out.vals.push(if self.keep[c] { std::mem::take(&mut buf[c]) } else { Value::Null });
+            }
+            out.len += 1;
+            Ok(())
+        })?;
+        out.note();
         Ok(out)
     }
 
@@ -54038,7 +54153,7 @@ impl Exec<'_> {
         let mut wave = 1; // the first part alone, to learn how big parts are
         while done < parts.k {
             let end = (done + wave).min(parts.k);
-            for b in par_run(end - done, |i, _| parts.read(done + i).map(|b| narrowed(b, held)))? {
+            for b in par_run(end - done, |i, _| parts.read_held(done + i, held))? {
                 bytes += spill::size_of(&b.vals);
                 kept.push(b);
             }
@@ -54062,7 +54177,7 @@ impl Exec<'_> {
                 }
                 while done < parts.k {
                     let end = (done + WAVE).min(parts.k);
-                    for b in par_run(end - done, |i, _| parts.read(done + i).map(|b| narrowed(b, held)))? {
+                    for b in par_run(end - done, |i, _| parts.read_held(done + i, held))? {
                         put(&b)?;
                     }
                     done = end;
@@ -56116,6 +56231,19 @@ impl Exec<'_> {
             };
             let key_cols: Vec<usize> = keys.iter().map(|(_, c)| *c).collect();
             let lkeys: Vec<&Expr> = keys.iter().map(|(e, _)| e).collect();
+            // an equality of two whole-number columns that the hash key holds is settled by the key (such
+            // numbers are equal exactly when their keys are): it isn't worked out again for every pair
+            let settled = |e: &Expr| {
+                link(e, k, &joined).is_some_and(|(x, c)| {
+                    let whole = |x: &Expr| matches!(*x, Expr::Idx(i) if p.cols[i].ty.whole());
+                    whole(&x)
+                        && p.cols[at + c].ty.whole()
+                        && keys
+                            .iter()
+                            .any(|(kx, kc)| *kc == c && matches!((kx, &x), (Expr::Idx(a), Expr::Idx(b)) if a == b))
+                })
+            };
+            let rest: Vec<&Expr> = rest.into_iter().filter(|e| !settled(e)).collect();
             // a hash join's other side, read within CHRONOS_WORK_MEM (`read_bounded`), holds only the columns
             // read after its own conditions, and its keys are found among those (see `narrowed`)
             let all_cols: Vec<usize> = (0..t.cols.len()).collect();
@@ -56137,22 +56265,20 @@ impl Exec<'_> {
                 })?;
                 Ok(right)
             };
-            // rows `range` of `left` joined to their matches in `right`, found by `index` from the
-            // value of `le`, where `rest` holds (no subqueries: this runs on any core); a LEFT
-            // join keeps unmatched rows, padded with nulls
-            let probe = |left: &Batch,
-                         range: std::ops::Range<usize>,
-                         lkeys: &[&Expr],
-                         right: &Batch,
-                         cols: &[usize],
-                         index: &HashIndex| {
-                let mut out = Batch::new(width);
-                for i in range {
-                    let l = left.row(i);
-                    let env = Env { cols: &p.cols, row: l, params: self.params, aggs: &[], sub: None };
-                    let xs = lkeys.iter().map(|le| ev(le, &env)).collect::<Result<Vec<_>>>()?;
-                    let mut matched = false;
-                    for j in index.get_key(vals_key(xs.iter().map(|x| &**x))) {
+            // one row joined to its matches in `right`, found by `index` from the values of `lkeys`, where
+            // `rest` holds (no subqueries: this runs on any core); a LEFT join keeps an unmatched row,
+            // padded with nulls
+            let probe_row = |l: &[Value],
+                             key: &mut KeyBuf,
+                             lkeys: &[&Expr],
+                             right: &Batch,
+                             cols: &[usize],
+                             index: &HashIndex,
+                             out: &mut Batch| {
+                let env = Env { cols: &p.cols, row: l, params: self.params, aggs: &[], sub: None };
+                let mut matched = false;
+                if key.fill(lkeys, &env)? {
+                    for j in index.get_ref(&key.key) {
                         let c = out.extend(l);
                         place(c, at, cols, right.row(j));
                         if holds(&rest, &p.cols, c, self.params)? {
@@ -56161,11 +56287,59 @@ impl Exec<'_> {
                             out.pop();
                         }
                     }
-                    if !matched && left_join {
-                        out.extend(l);
-                    }
+                }
+                if !matched && left_join {
+                    out.extend(l);
+                }
+                Ok::<_, SqlError>(())
+            };
+            // rows `range` of `left`, each joined as `probe_row` joins it
+            let probe = |left: &Batch,
+                         range: std::ops::Range<usize>,
+                         lkeys: &[&Expr],
+                         right: &Batch,
+                         cols: &[usize],
+                         index: &HashIndex| {
+                let (mut out, mut key) = (Batch::new(width), KeyBuf::new());
+                for i in range {
+                    probe_row(left.row(i), &mut key, lkeys, right, cols, index, &mut out)?;
                 }
                 Ok::<_, SqlError>(out)
+            };
+            // `probe_row`, each joined row grouped as it is made (in `c`, one row made over and over)
+            // rather than kept: the joined rows are the most a query holds, each as wide as every
+            // table together, and GROUP BY reads each once. Rows `now` fails are left out
+            let group_row = |l: &[Value],
+                             key: &mut KeyBuf,
+                             c: &mut Vec<Value>,
+                             lkeys: &[&Expr],
+                             right: &Batch,
+                             cols: &[usize],
+                             index: &HashIndex,
+                             group: &[Expr],
+                             g: &mut Groups| {
+                let env = Env { cols: &p.cols, row: l, params: self.params, aggs: &[], sub: None };
+                let (mut matched, mut fresh) = (false, true);
+                if key.fill(lkeys, &env)? {
+                    for j in index.get_ref(&key.key) {
+                        if std::mem::take(&mut fresh) {
+                            for (d, x) in c.iter_mut().zip(l) {
+                                set_from(d, Cow::Borrowed(x));
+                            }
+                        }
+                        place(c, at, cols, right.row(j));
+                        if holds(&rest, &p.cols, c, self.params)? {
+                            matched = true;
+                            if holds(&now, &p.cols, c, self.params)? {
+                                g.add(c, group, p, self.params, None)?;
+                            }
+                        }
+                    }
+                }
+                if !matched && left_join && holds(&now, &p.cols, l, self.params)? {
+                    g.add(l, group, p, self.params, None)?;
+                }
+                Ok::<_, SqlError>(())
             };
 
             if let Some(f) = first.take() {
@@ -56222,19 +56396,19 @@ impl Exec<'_> {
                         let head: Vec<std::sync::Mutex<Option<Batch>>> =
                             head.into_iter().map(std::sync::Mutex::new).collect();
                         let outs = par_run(parts.k, |i, _| {
+                            // a part not read yet is joined row by row as it is read, never held
                             let read = head[i].lock().unwrap_or_else(|e| e.into_inner()).take();
-                            let left = match read {
-                                Some(b) => b,
-                                None => parts.read(i)?,
-                            };
-                            let mut out = probe(&left, 0..left.len, &lkeys, &right, &hold, &index)?;
-                            let mut g = Groups::default();
-                            if let Some(group) = fold {
-                                out.retain(|r| holds(&now, &p.cols, r, self.params))?;
-                                for r in out.rows() {
-                                    g.add(r, group, p, self.params, None)?;
+                            let (mut g, mut out, mut key) = (Groups::default(), Batch::new(width), KeyBuf::new());
+                            let mut c = vec![Value::Null; if fold.is_some() { width } else { 0 }];
+                            let mut one = |l: &[Value]| match fold {
+                                Some(group) => {
+                                    group_row(l, &mut key, &mut c, &lkeys, &right, &hold, &index, group, &mut g)
                                 }
-                                out = Batch::new(width);
+                                None => probe_row(l, &mut key, &lkeys, &right, &hold, &index, &mut out),
+                            };
+                            match read {
+                                Some(b) => b.rows().try_for_each(&mut one)?,
+                                None => parts.each_row(i, &mut one)?,
                             }
                             Ok((out, g))
                         })?;
@@ -56374,9 +56548,39 @@ impl Exec<'_> {
                             if rows.len >= PAR_MIN && no_subs(std::iter::once(le).chain(rest.iter().copied())) =>
                         {
                             let index = HashIndex::on(&right, key_at)?;
-                            let parts =
-                                par_chunks(rows.len, |range| probe(&rows, range, &lkeys, &right, cols, &index))?;
-                            out = concat(width, parts);
+                            // the last table, then GROUP BY: each stretch of rows is grouped as it is
+                            // joined, in one row made over and over, so the joined rows (the most a
+                            // query holds, each as wide as every table together) are never kept.
+                            // For aggregates that come out the same however the rows are split (see
+                            // `exact`): the groups, their order and their first rows are the same
+                            let fold = p.group.as_ref().filter(|g| {
+                                step + 1 == n
+                                    && !left_join
+                                    && applied.iter().all(|a| *a)
+                                    && no_subs(g.iter().chain(&p.aggs))
+                                    && p.aggs.iter().all(|a| exact(a, &p.cols))
+                                    && self.agg_runner(p).is_none()
+                            });
+                            if let Some(group) = fold {
+                                let parts = par_chunks(rows.len, |range| {
+                                    let (mut g, mut key) = (Groups::default(), KeyBuf::new());
+                                    let mut c = vec![Value::Null; width];
+                                    for i in range {
+                                        let l = rows.row(i);
+                                        group_row(l, &mut key, &mut c, &lkeys, &right, cols, &index, group, &mut g)?;
+                                    }
+                                    Ok(g)
+                                })?;
+                                let mut all = Groups::default();
+                                for g in parts {
+                                    all.merge(g, &p.aggs)?;
+                                }
+                                grouped = Some(all);
+                            } else {
+                                let parts =
+                                    par_chunks(rows.len, |range| probe(&rows, range, &lkeys, &right, cols, &index))?;
+                                out = concat(width, parts);
+                            }
                         }
                         // ponytail: a hash join matches equal values of the same kind; text '5' won't meet 5
                         Some(_) => {
@@ -71869,6 +72073,10 @@ enum HKey {
     BigDec(String, u32), // a numeric past 128 bits: its mantissa's digits and scale (see `Dec::parts`)
     Day(i32),            // a date later than any timestamp
     Tuple(Vec<HKey>),    // several columns at once (a hash join on all of a join's equalities)
+    /// several columns that are all whole numbers, up to four (the first field says how many): what `Tuple` of
+    /// `Int`s would be, held in place, so a join on (w, d, id) makes no list for each row. `vals_key` and
+    /// `KeyBuf::fill`, which alone make keys of several columns, give this whenever they can and `Tuple` otherwise
+    Ints(u8, [i64; 4]),
     Net(u8, u8, u128),
 }
 
@@ -71927,15 +72135,16 @@ fn dec_key(d: &decimal::Dec) -> HKey {
 }
 
 /// Whether an aggregate comes out the same however its rows are split into parts and merged:
-/// not DISTINCT, summing or averaging only an integer column (summed wide, see `Acc`), and min
-/// or max only of a column.
+/// not DISTINCT, summing or averaging only an integer or numeric column (integers summed wide,
+/// see `Acc`), and min or max only of a column.
 // ponytail: float sums aren't split by table part; their last bits would follow where parts are cut
 fn exact(a: &Expr, cols: &[Col]) -> bool {
     let column = |x: &Expr, ok: &dyn Fn(Type) -> bool| matches!(*x, Expr::Idx(i) if ok(cols[i].ty));
     match a {
         Expr::Agg(_, _, true) => false,
         Expr::Agg(Agg::Count, ..) => true,
-        Expr::Agg(Agg::Sum | Agg::Avg, Some(x), _) => column(x, &|t| t.integral()),
+        // (a numeric's sum is exact too, at any length: `Dec::add` never rounds)
+        Expr::Agg(Agg::Sum | Agg::Avg, Some(x), _) => column(x, &|t| t.integral() || t == Type::Numeric),
         // a column's values are all of its type, which orders them one way; an expression may mix
         // kinds (text against a number compares as a number), and then the order they meet matters
         Expr::Agg(Agg::Min | Agg::Max, Some(x), _) => column(x, &|t| t != Type::Json),
@@ -71979,9 +72188,10 @@ impl Groups {
         let gi = if group.is_empty() && !self.list.is_empty() {
             0 // one group: nothing to look up
         } else {
-            self.key.clear();
-            for g in group {
-                self.key.push(hkey(ev(g, &env)?.as_ref()));
+            // (made in the last row's key: a text column's bytes go into the text that is there)
+            self.key.resize(group.len(), HKey::Null);
+            for (g, k) in group.iter().zip(&mut self.key) {
+                hkey_into(ev(g, &env)?.as_ref(), k);
             }
             match self.index.get(&self.key) {
                 Some(&i) => i,
@@ -72232,8 +72442,8 @@ impl Acc {
             Agg::List(..) => {}
             // min and max copy a value only when it wins (any_value: the first value, kept)
             _ if self.v == Value::Null => self.v = x.into_owned(),
-            Agg::Min if compare(&x, &self.v)? == Ordering::Less => self.v = x.into_owned(),
-            Agg::Max if compare(&x, &self.v)? == Ordering::Greater => self.v = x.into_owned(),
+            Agg::Min if compare(&x, &self.v)? == Ordering::Less => set_from(&mut self.v, x),
+            Agg::Max if compare(&x, &self.v)? == Ordering::Greater => set_from(&mut self.v, x),
             _ => {}
         }
         Ok(())
@@ -73625,6 +73835,40 @@ mod tests {
         let mut e = super::Batch::new(0);
         e.push();
         assert_eq!(e.rows().count(), 1);
+    }
+
+    /// A hash join's index is keyed by `vals_key` and probed by `KeyBuf::fill`: for any values they make one key,
+    /// whole numbers held in place and anything else as a list.
+    #[test]
+    fn join_keys_made_two_ways_are_one_key() {
+        use super::{Env, Expr, HKey, KeyBuf, vals_key};
+        let dec = |s: &str| super::coerce(Value::Text(s.into()), super::Type::Numeric).unwrap();
+        let rows: Vec<Vec<Value>> = vec![
+            vec![Value::Int(7)],
+            vec![Value::Text("seven".into())],
+            vec![Value::Int(1), Value::Int(2)],
+            vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)],
+            vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4), Value::Int(5)],
+            vec![Value::Int(1), Value::Text("b".into()), Value::Int(3)],
+            vec![Value::Text("a".into()), Value::Int(2)],
+            vec![Value::Int(1), dec("2.50")],
+            vec![Value::Int(1), dec("2.00")],
+            vec![Value::Int(1), Value::Null],
+            vec![Value::Null],
+        ];
+        let env = Env { cols: &[], row: &[], params: &[], aggs: &[], sub: None };
+        let mut buf = KeyBuf::new(); // one buffer for them all, as a probe has
+        for r in rows.iter().chain(rows.iter().rev()) {
+            let lits: Vec<Expr> = r.iter().map(|v| Expr::Lit(v.clone())).collect();
+            let keys: Vec<&Expr> = lits.iter().collect();
+            let made = buf.fill(&keys, &env).unwrap().then(|| buf.key.clone());
+            assert_eq!(made, vals_key(r.iter()), "{r:?}");
+        }
+        assert_eq!(vals_key([Value::Int(1), Value::Int(2)].iter()), Some(HKey::Ints(2, [1, 2, 0, 0])));
+        // equal numbers, one key: 2 and 2.00
+        assert_eq!(vals_key([Value::Int(1), dec("2.00")].iter()), vals_key([Value::Int(1), Value::Int(2)].iter()));
+        assert!(matches!(vals_key([Value::Int(1), dec("2.50")].iter()), Some(HKey::Tuple(_))));
+        assert_eq!(vals_key([Value::Int(1), Value::Null].iter()), None);
     }
 
     #[test]
