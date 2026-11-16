@@ -832,7 +832,7 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
         }
         // a folder attached to Postgres: main takes Postgres's rows as they are now (see chronos::attach::refresh)
         "refresh" => match db.attached() {
-            None => Err(fail(409, "this folder isn't attached to Postgres (chronos attach makes one that is)")),
+            None => Err(fail(409, "this folder isn't attached to a database (chronos attach makes one that is)")),
             Some(_) => chronos::attach::refresh(db).map(|r| r.to_json()).map_err(|e| fail(502, e)),
         },
         // what the folder is attached to, and how old main's rows are (no secret)
@@ -921,8 +921,10 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                             "after": r.after, "status": r.status, "now": r.now })
                 })
                 .collect();
-            Ok(json!({ "ok": true, "dry_run": u.dry_run, "undone": u.undone, "skipped": u.skipped, "merge": u.merge,
-                       "rows": rows, "cascades": u.cascades, "effects_not_undone": effects }))
+            Ok(
+                json!({ "ok": true, "dry_run": u.dry_run, "undone": u.undone, "skipped": u.skipped, "already": u.already, "merge": u.merge,
+                       "rows": rows, "cascades": u.cascades, "effects_not_undone": effects }),
+            )
         }
         "undo_merge" => {
             let skip = a.get("skip_changed").and_then(Value::as_bool) == Some(true);

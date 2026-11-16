@@ -326,7 +326,9 @@ pub struct UndoRow {
     /// the row before the merge, and as the merge left it (`{column: text}`; null: no row)
     pub before: Json,
     pub after: Json,
-    /// `put_back`, or `changed`: main no longer holds it as the merge left it, so it stays as it is
+    /// `put_back`; `changed`: main no longer holds it as the merge left it, so it stays as it is; or `already`:
+    /// main holds it as it was before the merge (an earlier undo put it back, or someone did), so there is nothing
+    /// to undo
     pub status: &'static str,
     /// a changed row as main holds it now (null: no row)
     pub now: Json,
@@ -338,6 +340,8 @@ pub struct UndoneMerges {
     pub rows: Vec<UndoRow>,
     pub undone: usize,
     pub skipped: usize,
+    /// rows main holds as they were before the merge already: neither undone nor skipped
+    pub already: usize,
     /// the undo's own merge id (None: a dry run, or nothing to put back)
     pub merge: Option<String>,
     pub dry_run: bool,
@@ -546,6 +550,31 @@ impl Core {
                 now: Json::Null,
             };
             if !as_left {
+                // as it was before the merge already (an undo that left other rows put this one back, or it was
+                // changed back by hand): nothing to undo, and nothing that stops the rest. (A row several of the
+                // merges wrote is judged merge by merge, so one put back whole reads as changed for the later ones.)
+                // Judged by main, as every row of an undo is: nothing is written for it, so the source isn't asked.
+                // A row put back and then changed straight in the source, which main hasn't taken yet, is that
+                // later change's and not this merge's to undo.
+                let before = match &rec.before {
+                    None => (format!("select count(*) from {} where {key}", t.sql), "0"),
+                    Some(b) => {
+                        let conds: Vec<String> = cols
+                            .iter()
+                            .map(|&i| match &b[i] {
+                                Some(v) => format!("{} is not distinct from {}", q(&t.cols[i].name), lit(v)),
+                                None => format!("{} is null", q(&t.cols[i].name)),
+                            })
+                            .collect();
+                        (format!("select count(*) from {} where {}", t.sql, conds.join(" and ")), "1")
+                    }
+                };
+                if cell(&before.0)?.first().cloned().flatten().unwrap_or_default() == before.1 {
+                    row.status = "already";
+                    out.already += 1;
+                    out.rows.push(row);
+                    continue;
+                }
                 let names: Vec<String> = t.cols.iter().map(|c| format!("{}::text", q(&c.name))).collect();
                 let now = cell(&format!("select {} from {} where {key}", names.join(", "), t.sql))?;
                 row.status = "changed";

@@ -117,7 +117,7 @@ A merge that would break a constraint, though each side was valid alone, fails w
 
 | Code | Meaning | Typical causes |
 |---|---|---|
-| 2BP01 | dependent objects still exist | dropping a world with forks of its own (merge or drop them, or `DROP WORLD ... CASCADE`); dropping a schema, function or other object something depends on without `CASCADE` |
+| 2BP01 | dependent objects still exist | dropping a world with forks of its own (merge or drop them, or `DROP WORLD ... CASCADE`); dropping a schema, function or other object something depends on without `CASCADE`; an undo by merge id that would make Postgres change rows besides its own (a cascade, a trigger), without `allow_cascade` |
 
 ### Class 40: transaction rollback
 
@@ -154,9 +154,9 @@ A merge that would break a constraint, though each side was valid alone, fails w
 
 | Code | Meaning | Typical causes |
 |---|---|---|
-| 53100 | disk full | a spill file couldn't be written (see `CHRONOS_SPILL_DIR` in [CLI](cli.md#environment-variables)) |
-| 53200 | out of memory | a query past its agent's `max_memory_mb`: narrow it or add a `LIMIT` |
-| 53300 | too many connections | an agent running `max_concurrent` statements already; a Postgres client past the server's 1000 connections (refused before login) |
+| 53100 | disk full | a spill file couldn't be written (see `CHRONOS_SPILL_DIR` in [CLI](cli.md#environment-variables)); a write, fork or spill that would take the folder past `CHRONOS_MAX_DISK_BYTES` |
+| 53200 | out of memory | a query past its agent's `max_memory_mb`: narrow it or add a `LIMIT`; a statement past `CHRONOS_QUERY_MEM`; any statement while the process holds more memory than `CHRONOS_MAX_MEMORY_BYTES` |
+| 53300 | too many connections | an agent running `max_concurrent` statements already; a Postgres client past the server's connection limit (1000, or `CHRONOS_MAX_CONNECTIONS`; refused before login) |
 | 53400 | configuration limit exceeded | **quota exceeded:** an agent past `writes_per_minute`; a fork past the database's `max_worlds` (see [database settings](cli.md#database-settings)) |
 
 ### Class 54: program limit exceeded
@@ -209,19 +209,22 @@ A merge conflict gives the rows (each with `key`, `base`, `ours`, `theirs` and `
 
 | Status | Meaning |
 |---|---|
-| 400 | bad input: a body that isn't JSON or lacks a field, an invalid value; merging `main`; for `sql`, any SQLSTATE not listed below (including 40001 and 57014) |
+| 202 | `POST /mcp` only: a notification, which has no reply (an empty body) |
+| 400 | bad input: a body that isn't JSON or lacks a field, an invalid value; merging `main`; a request that isn't HTTP (a bad request line, header or `Content-Length`); `check_reads` on a world that doesn't check its reads, and `review` on one that isn't waiting for review (55000); for `sql`, any SQLSTATE not listed below (including 40001 and 57014) |
 | 401 | missing or wrong token (a token no agent has, or a disabled or dropped agent's) |
 | 403 | an agent or the guest (a client with the server token) may not (42501); `_sonos` tables; `/metrics` with an agent's token, `merge_outcomes` with any but the admin token; any request with an `Origin` header (browsers); without a server token, a `Host` that isn't loopback |
-| 404 | no such world or row; for `sql`, 3D000 and 42P01; an unknown endpoint or operation |
+| 404 | no such world or row; for `sql`, 3D000 and 42P01; an unknown endpoint or operation; `/studio/api/<op>` on a server without `--studio-api` |
 | 405 | not `POST` (only `/v1/health` and `/metrics` take `GET`) |
-| 409 | merge conflicts; a world that already exists or has forks; a stale world (55000); a constraint violation (23xxx) |
+| 409 | merge conflicts; a world that already exists or has forks; a stale world (55000); a constraint violation (23xxx); `refresh` in a folder that isn't attached; `undo_merge` by ids when rows changed since (`code` 40001) or a cascade isn't allowed (`code` 2BP01) |
 | 411 | no `Content-Length` |
-| 413 | a body over 32 MB; a query past its agent's `max_memory_mb` (53200) |
+| 413 | a body over 32 MB (8 MB for `POST /mcp`); a query past its agent's `max_memory_mb`, or the process past `CHRONOS_MAX_MEMORY_BYTES` (53200) |
 | 415 | a body without `Content-Type: application/json` |
-| 429 | an agent writing too fast or running `max_concurrent` requests, or a fork past `max_worlds` (53400, 53300) |
+| 429 | an agent writing too fast or running `max_concurrent` requests, or a fork past `max_worlds` (53400, 53300); any token from an address that sent too many wrong ones lately, until it has waited (see [security](../security.md)) |
 | 431 | request headers too large |
 | 500 | storage error (58030; for `sql`, any 58xxx or XXxxx) |
-| 503 | the server already has 1000 connections |
+| 502 | `refresh` only: the database the folder is attached to (Postgres, MySQL, MariaDB or MongoDB) couldn't be read, or a merge written there earlier isn't settled yet; the message says why |
+| 503 | the server already has its most connections (1000, or `CHRONOS_MAX_CONNECTIONS`), HTTP and Postgres together |
+| 507 | the folder is at its cap (`CHRONOS_MAX_DISK_BYTES`), or a spill file couldn't be written (53100, also for `sql`). Reads, deletes, merges and discarding worlds still work at the cap |
 
 ## MCP
 

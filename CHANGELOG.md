@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 0.5.2 (beta), 2026-11-16
+
+**A merge undone in part can be undone again.** Beside Postgres, MySQL, MariaDB or MongoDB, an undo that left rows
+changed since could never be finished: the rows it had put back read as "changed since" themselves. They are now
+told apart, inside the undo's own transaction. `serve` and `refresh` name the database they work beside, and the
+help covers all four. Nothing changes in how merges are written. Built and signed on the maintainer's Mac as 0.5.1
+was.
+
+- **Undo knows rows already put back.** `undo_merges` (HTTP `undo_merge` with `ids`, `UNDO MERGE` by id) no longer
+  counts a row that is as it was before its merge as "changed since": it is `already`, neither undone nor skipped,
+  and never refuses the undo. So a merge undone but for rows changed since can be undone again for those rows once
+  they hold what the merge wrote, with the check still inside the undo's own transaction. The reply has `already`
+  (a count), and rows with `status: "already"`. Undoing a merge twice finds nothing to do instead of failing.
+- `serve` and `chronos refresh` name the database a folder is attached to ("refreshed from MongoDB", "column added
+  in MySQL") instead of always Postgres. `chronos` usage and `chronos attach` help cover MySQL, MariaDB, MongoDB,
+  `--follow`, `--refresh-every`, `--lazy-tenant` and `refresh --tenant`.
+- HTTP 500 and 502 answer with their own reason phrases ("Internal Server Error", "Bad Gateway"), not "Error".
+- Docs: the CLI reference gains `attach`, `refresh`, `studio`, their flags and the environment variables; the
+  security page documents `ALTER AGENT ... ROTATE TOKEN` (it said there was no rotation) and uses the admin token
+  in its examples; the HTTP API and errors pages cover MySQL, MariaDB and MongoDB, the `review` op, 502 and 507.
+
 ## 0.5.1 (beta), 2026-11-16
 
 **Follow MongoDB's changes as they happen, and a fix for least-privilege MySQL users.** `chronos serve --follow`

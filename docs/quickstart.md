@@ -1,6 +1,6 @@
 # Quickstart
 
-> **Beta.** Chronos 0.4 is a public beta for developers. It is not yet used in production anywhere, and it is not Postgres, though it speaks Postgres's protocol and much of its SQL: see [where it stands](postgres-compatibility.md#where-it-stands-beta) before you move real data.
+> **Beta.** Chronos 0.5 is a public beta for developers. It is not yet used in production anywhere, and it is not Postgres, though it speaks Postgres's protocol and much of its SQL: see [where it stands](postgres-compatibility.md#where-it-stands-beta) before you move real data.
 
 ## Install
 
@@ -38,6 +38,10 @@ to the folder. What attach doesn't do yet, before you rely on it:
 - **Your schema doesn't change through Chronos:** change tables in Postgres. A refresh picks up columns added, dropped, renamed or retyped there; a changed primary key needs a new attach.
 - **For staging copies first.** It's Stage 1: [the guide](guides/attach-postgres.md) has the details, the limits and
   what happens at a merge.
+
+Since 0.5 the same works beside MySQL 8.0+, MariaDB 10.5+ and MongoDB 5.0+ (a replica set), with a `mysql://` or
+`mongodb://` `CHRONOS_SOURCE_URL` and `--tables`: see [attach beside MySQL](guides/attach-mysql.md) and [attach beside
+MongoDB](guides/attach-mongodb.md).
 
 Moving the data into Chronos instead, or starting from nothing, is the rest of this page.
 

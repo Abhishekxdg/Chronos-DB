@@ -9,6 +9,8 @@ chronos mydb                                  # interactive shell (the folder is
 chronos mydb get users 1                      # one command, then exit
 CHRONOS_TOKEN=$(openssl rand -hex 24) chronos serve mydb   # HTTP on 127.0.0.1:7070, Postgres on 127.0.0.1:5433
 chronos mcp mydb                              # MCP server for AI agents, over stdio
+chronos studio mydb                           # a web UI for the database, on 127.0.0.1
+CHRONOS_SOURCE_URL=postgres://... chronos attach crm --tables public.leads   # work beside a database you already run
 ```
 
 ## Commands
@@ -18,20 +20,25 @@ chronos mcp mydb                              # MCP server for AI agents, over s
 | `chronos <folder>` | the interactive shell, when stdin is a terminal (see [shell commands](#shell-commands)) |
 | `chronos <folder> <command...>` | runs one shell command or SQL statement and exits |
 | `chronos <folder> < script.txt` | runs stdin, one command per line (SQL may span lines and ends with `;`) |
-| `chronos serve <folder>` | the HTTP JSON API and the Postgres protocol, until SIGTERM or Ctrl-C |
-| `chronos mcp <folder>` | an MCP server over stdio |
+| `chronos serve <folder>` | the HTTP JSON API and the Postgres protocol, until SIGTERM or Ctrl-C. On an attached folder, `--refresh-every` and `--follow` keep main up to date (see [attach, refresh and follow](#attach-refresh-and-follow)) |
+| `chronos mcp <folder> [--allow-merge \| --agent NAME] [--unmask]` | an MCP server over stdio (see [MCP](mcp.md)) |
+| `chronos studio <folder> [--port N] [--no-open]` | a web UI for the database on 127.0.0.1, beside a running `serve` too (see [Studio](../studio.md)) |
+| `chronos studio <folder> --login [--port N \| --listen ADDR:PORT] [--host NAME[:PORT]]... [--tls-cert cert.pem --tls-key key.pem \| --insecure-no-tls] [--no-open]` | the web UI, signed in with a database role and its password, acting with its privileges; any address but loopback needs TLS |
+| `chronos attach <new folder> (--tables a,b \| --schema s) [--lazy-tenant column] [--fields a,b] [--yes]` | works beside a database you already run (Postgres, MySQL, MariaDB or MongoDB, by the scheme of `CHRONOS_SOURCE_URL`): copies the tables named into a new folder; merges into main are written to that database first |
+| `chronos refresh <attached folder> [--unfollow \| --tenant <value>]` | main takes the source's rows as they are now; `--unfollow` drops what `serve --follow` keeps; `--tenant` loads one tenant's rows |
 | `chronos import <folder> postgres://user:password@host:port/database [--dry-run]` | a whole Postgres database, moved in one command (see [SQL](../sql.md#moving-from-postgres)) |
 | `chronos import <folder> <table> <data.csv> --schema <schema.csv>` | a copy of one Postgres table (see [SQL](../sql.md)) |
-| `chronos restore <backup> <new folder>` | starts a database from a backup folder, and verifies it |
+| `chronos restore <backup> <new folder>` | starts a database from a backup folder (one `backup` made), and verifies it. An encrypted backup needs its key (`CHRONOS_KEY`) |
 | `chronos init [--no-open]` | in a project folder: signs in to [Chronos Cloud](../cloud.md), finds or makes the project's database, and writes `.chronos/project.json`, `.mcp.json`, `.env` and the `CLAUDE.md` block |
 | `chronos cloud login\|logout\|list\|usage\|production on\|off` | Chronos Cloud's account and the folder's project (see [Chronos Cloud](../cloud.md)) |
-| `chronos keygen` | prints a new encryption key (see [encryption](../operations.md#encryption-at-rest)) |
+| `chronos keygen` | prints a new encryption key on stdout, 64 hex digits (see [encryption](../operations.md#encryption-at-rest)). `CHRONOS_KEY=<key> chronos <new folder>` makes an encrypted database |
 | `chronos -V`, `chronos --version` | prints `chronos <version>` |
 | `chronos`, `chronos -h`, `chronos --help` | usage and the shell's help, exit code 2 |
 
 - **Exit codes:** 0 on success; 1 when a command, statement or line of a script failed (a script runs on past a failed line), or the database can't be opened; 2 for bad usage or an unknown option.
 - **Unknown options:** any leftover `--x` fails with `chronos: unknown option --x; see chronos --help` (exit 2), rather than opening a database called `--x`.
-- **One folder, several processes:** a folder is open in one process at a time. When `chronos <folder>`, `chronos mcp` or `chronos import` finds another chronos process (a shell, `mcp`, or `serve`) holding it, it runs as a session inside that process instead. `serve` and `--remote` never do: they must own the folder.
+- **Flags for another command** are refused (exit 2) with a line that names the command they are for: `--tables` and `--yes` (`attach`), `--unfollow` (`refresh`), `--refresh-every` and `--follow` (`serve`), `--login` and `--host` (`studio`), `--dry-run` and `--allow-plaintext-password` (`import ... postgres://`).
+- **One folder, several processes:** a folder is open in one process at a time. When `chronos <folder>`, `chronos mcp`, `chronos studio` or `chronos import` finds another chronos process (a shell, `mcp`, or `serve`) holding it, it runs as a session inside that process instead. `serve` and `--remote` never do: they must own the folder.
 - **Stopping:** `serve`, `mcp` and the interactive shell close the database cleanly on SIGTERM or Ctrl-C (Ctrl-C at the shell prompt only clears the line being typed).
 
 ## Flags
@@ -41,24 +48,59 @@ Flags may go anywhere on the line. A flag that takes a value and has none prints
 | Flag | Default | Used by | Effect |
 |---|---|---|---|
 | `-b`, `--branch <name>` | `main` | shell, `mcp`, `import` | the world to start on (or import into); it must exist |
-| `--remote <url>` | none | all that open a folder | back the folder with object storage: `s3://bucket/prefix` (needs a build with `--features s3`) or `file:///dir`; see [cloud storage](../operations.md#cloud-storage---features-s3) |
+| `--remote <url>` | none | all that open a folder | back the folder with object storage: `s3://bucket/prefix` or `gs://bucket/prefix` (both need a build with `--features s3`) or `file:///dir`; see [cloud storage](../operations.md#cloud-storage---features-s3) |
 | `--takeover` | off | with `--remote` | replace a dead owner's lease on the prefix |
-| `--listen <addr>` | `127.0.0.1:7070` | `serve` | the HTTP API's address |
+| `--anchor <file>` | `CHRONOS_ANCHOR` | all that open a folder | refuse the folder if its files were rolled back to an older copy; see [rollback detection](../operations.md#rollback-detection-anchor) |
+| `--anchor-reset` | off (`CHRONOS_ANCHOR_RESET=1`) | with `--anchor` | accept the folder as it is and anchor it anew, after a restore from a backup |
+| `--listen <addr>` | `127.0.0.1:7070` | `serve`, `studio --login` | the HTTP API's address. For `studio --login`: where the Studio listens (127.0.0.1 at `--port` unless given; not with `--port`) |
 | `--pg <addr>\|off` | `127.0.0.1:5433` | `serve` | the Postgres protocol's address; `off` turns it off |
 | `--token <T>` | `CHRONOS_TOKEN` | `serve` | the server's bearer token (HTTP) and password (Postgres), at least 24 characters (`openssl rand -hex 24`; `change-me` is refused): a client that sends it is the agent `guest` (since 0.4; the database's own user with `--unsafe`). Needed for any address that isn't loopback: without one, `serve` refuses to start. Prefer the variable: a flag shows in `ps` |
 | `--admin-token <A>` | `CHRONOS_ADMIN_TOKEN` | `serve` | the token that is the database's own user over the network; at least 24 characters. Keep it away from agents |
 | `--safe` | off | `serve` | every client that isn't an agent or the admin token is the agent `guest`, loopback without a token too; see [security](../security.md) |
 | `--unsafe` | off | `serve` | the server token is the database's own user, as before 0.4; not with `--safe`. `serve` warns at start on an address other machines can reach unless `protect_main` is on |
-| `--tls-cert <file>` | `CHRONOS_TLS_CERT` | `serve` | PEM certificate; with `--tls-key`, HTTPS only and TLS on the Postgres port. One without the other fails: `TLS needs both --tls-cert and --tls-key`. Needed for any address that isn't loopback, unless `--insecure-no-tls` |
-| `--tls-key <file>` | `CHRONOS_TLS_KEY` | `serve` | PEM private key |
-| `--insecure-no-tls` | off | `serve` | listen on an address that isn't loopback without TLS (with a warning): only where something else encrypts the connection |
+| `--tls-cert <file>` | `CHRONOS_TLS_CERT` | `serve`, `studio --login` | PEM certificate; with `--tls-key`, HTTPS only and TLS on the Postgres port. One without the other fails: `TLS needs both --tls-cert and --tls-key`. Needed for any address that isn't loopback, unless `--insecure-no-tls` |
+| `--tls-key <file>` | `CHRONOS_TLS_KEY` | `serve`, `studio --login` | PEM private key |
+| `--studio-api` | off | `serve` | also serve the Studio's calls at `POST /studio/api/<op>`, to the admin token only; `serve` refuses to start with it and no admin token. See [Studio](../studio.md#behind-another-service-serve---studio-api) |
+| `--refresh-every <time>` | off | `serve` on an attached folder | main takes the source's rows on a timer: `60s`, `5m`, `1h` (a plain number is seconds; at least 1 second). A refresh that fails is said on stderr and tried again at the next turn |
+| `--follow` | off | `serve` on an attached folder | main takes the source's changes about a second after they commit. Beside Postgres through a logical replication slot (`wal_level = logical`); beside MongoDB through change streams (since 0.5.1). Not beside MySQL or MariaDB yet: use `--refresh-every` there |
+| `--port <N>` | a free port | `studio` | the Studio's port on 127.0.0.1 |
+| `--no-open` | off | `studio`, `init`, `cloud login` | don't open the browser |
+| `--login` | off | `studio` | people sign in with a database role and its password; needed for `--listen`, `--host`, `--tls-cert` and `--tls-key` on `studio` |
+| `--host <name[:port]>` | none | `studio --login` | a name the Studio answers to besides the address it listens on; may be repeated |
+| `--insecure-no-tls` | off | `serve`, `studio --login` | listen on an address that isn't loopback without TLS (with a warning): only where something else encrypts the connection |
 | `--allow-plaintext-password` | off | `import ... postgres://` | send the password to a source that asks for it in the clear or as MD5 over a connection that isn't TLS with the server's certificate checked for its name (`sslmode=verify-full`; refused otherwise) |
 | `--allow-merge` | off | `mcp` | lets the MCP client merge; without it agents change only worlds they fork, and a person merges |
 | `--agent <name>` | none | `mcp` | the MCP client acts as that agent (it must exist), with its permissions and limits |
+| `--unmask` | off | `mcp` | masked columns read as their values; without it an MCP session reads them masked, `--allow-merge` included (an `--agent` session reads as that agent does) |
+| `--tables <a,b>` | none | `attach` | the tables to copy, `schema.table` for Postgres; MySQL's tables or MongoDB's collections by name |
+| `--schema <schema>` | none | `attach` | every table of a Postgres schema (Postgres only) |
+| `--lazy-tenant <column>` | none | `attach` | tables with that column start empty; a tenant's rows are loaded at the first fork for it, or by `refresh --tenant` (Postgres only) |
+| `--fields <a,b>` | none | `attach` | MongoDB only: top-level fields kept as columns of their own |
+| `--yes` | off | `attach` | copy more than about 1,000,000 rows in all (the source's estimate); without it attach stops there and says so |
+| `--source-file <file>` | `CHRONOS_SOURCE_FILE` | `attach`, `refresh`, and `serve` on an attached folder | a file holding the source's connection string, readable by its owner only |
+| `--unfollow` | off | `refresh` | drop what `serve --follow` keeps: Postgres's replication slot (which holds its WAL until read), or the place in MongoDB's change streams |
+| `--tenant <value>` | none | `refresh` | in a folder attached with `--lazy-tenant`: main takes that tenant's rows now |
 | `--schema <schema.csv>` | none | `import` | the table's columns; required |
 | `--dry-run` | off | `import ... postgres://` | read Postgres and try every definition on an empty in-memory database: the report, and nothing written |
 
-An empty `--token`, `--admin-token`, `--tls-cert` or `--tls-key` (or its variable) counts as not given. The encryption key is never a flag, so it can't show in the process list: see `CHRONOS_KEY` below.
+An empty `--token`, `--admin-token`, `--anchor`, `--tls-cert` or `--tls-key` (or its variable) counts as not given. The encryption key is never a flag, so it can't show in the process list: see `CHRONOS_KEY` below.
+
+## Attach, refresh and follow
+
+```sh
+export CHRONOS_SOURCE_URL='postgres://agent_writer:...@db:5432/crm?sslmode=verify-full'
+chronos attach crm --tables public.leads,public.accounts    # or --schema app
+chronos serve crm --follow --refresh-every 1h                # main follows the source; a whole refresh each hour
+chronos refresh crm                                          # one refresh now (the folder must not be open in serve)
+chronos refresh crm --unfollow                               # drop the replication slot when the folder is no longer followed
+```
+
+- **The source** is named by `CHRONOS_SOURCE_URL` (or the file `CHRONOS_SOURCE_FILE` or `--source-file` names), never on the command line, and is written nowhere. Its scheme chooses the database: `postgres://` (Postgres 12 or later), `mysql://` or `mariadb://` (MySQL 8.0 or later, MariaDB 10.5 or later), `mongodb://` or `mongodb+srv://` (MongoDB 5.0 or later, a replica set; needs a build with MongoDB, which the released binaries are). `serve`, `refresh` and merges into main need it too.
+- **`attach` makes a new folder:** an existing one is refused. Beside MySQL, MariaDB and MongoDB it takes `--tables` only: `--schema` and `--lazy-tenant` are refused there.
+- **`refresh` opens the folder itself,** so it fails while `chronos serve` has it open: use `POST /v1/refresh` with the admin token, or `serve --refresh-every`. It prints, per table, the rows inserted, updated and deleted.
+- **What each source can do** besides the write-back and the refresh (`follow`, dry runs, checked reads and the rest) is what the HTTP API's [`attached`](../http-api.md#operations) answers as `capabilities`.
+
+Guides: [beside Postgres](../guides/attach-postgres.md), [beside MySQL](../guides/attach-mysql.md), [beside MongoDB](../guides/attach-mongodb.md).
 
 ## Environment variables
 
@@ -69,6 +111,24 @@ An empty `--token`, `--admin-token`, `--tls-cert` or `--tls-key` (or its variabl
 | `CHRONOS_TLS_CERT`, `CHRONOS_TLS_KEY` | none | `serve`'s `--tls-cert` and `--tls-key` |
 | `CHRONOS_KEY` | none | the database key, 64 hex digits (from `chronos keygen`). A new folder is encrypted with it; an encrypted one needs it to open. Also needed to `restore` an encrypted backup |
 | `CHRONOS_KEY_FILE` | none | a file holding the key; used when `CHRONOS_KEY` is unset or empty |
+| `CHRONOS_ANCHOR`, `CHRONOS_ANCHOR_RESET` | none | `--anchor`'s file; `CHRONOS_ANCHOR_RESET=1` is `--anchor-reset` |
+| `CHRONOS_PROTECT_MAIN` | on | `off`: a new folder `chronos serve` makes starts without `protect_main` (see [security](../security.md#protecting-main)) |
+| `CHRONOS_SOURCE_URL` | none | an attached folder's source: a `postgres://`, `mysql://`, `mariadb://`, `mongodb://` or `mongodb+srv://` connection string. Read by `attach`, `refresh`, `serve` and every merge into main; written nowhere |
+| `CHRONOS_SOURCE_FILE` | none | a file holding that connection string, readable by its owner only; used when `CHRONOS_SOURCE_URL` is unset or empty. `--source-file` sets it |
+| `PGPASSWORD`, `MYSQL_PWD` | none | the source's password, when the connection string has none (Postgres, MySQL or MariaDB) |
+| `CHRONOS_ATTACH_MAX_ROWS` | `50000` | the most rows one merge writes to an attached database, up to 1,000,000 |
+| `CHRONOS_UNDO_WINDOW_DAYS` | `30` | how many days a merge written to an attached database can be undone by its id |
+| `CHRONOS_WRITEBACK_RULES` | `writeback.json` in the folder | the file holding an attached folder's write-back rules |
+| `CHRONOS_MAX_CONNECTIONS` | `1000` | client connections served at once, HTTP and Postgres together; lowered to what the process's open-file limit holds. `SHOW max_connections` says it |
+| `CHRONOS_REQUEST_TIMEOUT` | `120` | seconds an HTTP request's headers and body may take to arrive |
+| `CHRONOS_LOGIN_TIMEOUT` | `60` | seconds a Postgres client may take to log in |
+| `CHRONOS_LOGIN_FREE_TRIES` | `10` | wrong passwords or tokens an address gets before it must wait (see [security](../security.md)) |
+| `CHRONOS_COPY_IDLE` | `60` | seconds a `COPY ... FROM STDIN` waits for its client's next data before the connection is dropped |
+| `CHRONOS_MAX_DISK_BYTES` | none | the most the folder may hold, in bytes; past it writes fail with 53100 (HTTP 507). See [operations](../operations.md#limits-the-operator-sets) |
+| `CHRONOS_MAX_MEMORY_BYTES` | none | resident memory past which the process refuses new statements with 53200, in bytes; a statement already running is not stopped |
+| `CHRONOS_LIMITS` | none | a file of ceilings on the database's own settings (`max_worlds`, `history_retention_ms`, `world_idle_ttl_ms`, `statement_timeout_ms`), one `key = integer` a line; `ALTER SYSTEM` can't go past them |
+| `CHRONOS_ALLOW_SERVER_COPY` | off | `1`: `COPY` to or from a server file, file_fdw, `lo_import` and `lo_export` work, for the roles Postgres lets (never with `serve --studio-api`). See [security](../security.md#server-files) |
+| `CHRONOS_WAL_SHIPPING`, `CHRONOS_WAL_SHIPPING_DELAY_MS` | none | override the `wal_shipping` and `wal_shipping_delay` settings [below](#database-settings) |
 | `CHRONOS_WORK_MEM` | `256MB` | memory a query may hold in one grouping or sort before it spills to disk: `512kB`, `64MB`, `2GB` (units `b`, `k`/`kb`, `m`/`mb`, `g`/`gb`, any case) or plain bytes. An agent's `max_memory_mb` lowers it to a quarter of that for its queries. See [memory and spilling to disk](../operations.md#memory-and-spilling-to-disk) |
 | `CHRONOS_QUERY_MEM` | a quarter of the machine's memory | working memory one statement may hold before it fails with 53200 (an agent's lower `max_memory_mb` wins); all statements together may hold twice it. `0` for no limit; units as for `CHRONOS_WORK_MEM`. See [memory and spilling to disk](../operations.md#memory-and-spilling-to-disk) |
 | `CHRONOS_SPILL_DIR` | the system's temporary folder | where query spill files go (`sonos-spill-<pid>-<random>`, `0600`, unlinked as soon as they're opened, sealed with the database's key if it has one) |
@@ -76,11 +136,21 @@ An empty `--token`, `--admin-token`, `--tls-cert` or `--tls-key` (or its variabl
 | `CHRONOS_THREADS` | the number of cores | threads queries may use together (the caller plus `CHRONOS_THREADS - 1` helpers, shared by all running queries) |
 | `CHRONOS_SCAN_WORDS` | `8388608` | how much a vector search compares exactly before it walks an HNSW graph instead: higher for recall, lower for speed. See [search](../search.md) |
 | `CHRONOS_VECTOR` | graphs on | `flat` turns HNSW graphs off (every vector search is exact), to compare |
+| `CHRONOS_VECTOR_FLOATS` | `67108864` | numbers a vector column keeps in memory as floats (256 MB); above it they are kept as 8-bit numbers. `0` keeps 8-bit numbers for every column |
+| `CHRONOS_RERANK` | `2` | candidates per row wanted that an index of 8-bit numbers proposes, ranked exactly from the rows; at least 1 |
+| `CHRONOS_TSEARCH_DATA` | none | folders (separated by `:`) where text search dictionary files are looked for, before the working directory |
+| `CHRONOS_PG_EXACT` | off | `1`: errors and notices say only what Postgres says (no hints on syntax errors, none of Chronos's own notices) |
+| `CHRONOS_TRACE` | off | anything but empty, `0`, `off`, `false` or `no` turns tracing on |
+| `TZDIR` | none | a time zone database folder, looked in before the system's (`/usr/share/zoneinfo` and the like) |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT`, `AWS_ALLOW_HTTP` | none | credentials and endpoint for `--remote s3://...`, read the usual AWS way (any `AWS_*` variable the S3 client knows). `AWS_ENDPOINT` for R2, MinIO, B2; `AWS_ALLOW_HTTP=true` for a local MinIO |
+| `CHRONOS_GCS_TOKEN_FILE` | none | for `--remote gs://...`: a file holding a bearer token that another process keeps fresh |
+| `CHRONOS_CLOUD_API` | Chronos Cloud's | the API `chronos init` and `chronos cloud` talk to |
+| `XDG_CONFIG_HOME`, `HOME` | `~/.config` | where `chronos init` and `chronos cloud` keep `chronos/cloud.toml` |
+| `SSL_CERT_FILE` | the system's | a PEM bundle of CA certificates for `chronos init` and `chronos cloud`'s TLS |
 | `HOSTNAME` | `this machine` | names the owner in a `--remote` lease, shown to a second folder that is refused |
-| `CHRONOS_CRASH_AT` | `0` | debug builds only (tests): aborts the process at the n-th crash point |
+| `CHRONOS_CRASH_AT`, `CHRONOS_ATTACH_CRASH`, `CHRONOS_FAIL_PAGE_WRITES` | none | debug builds only (tests): abort the process at a crash point, or fail page writes as a full disk would |
 
-The values of `CHRONOS_WORK_MEM`, `CHRONOS_CACHE_MB`, `CHRONOS_THREADS`, `CHRONOS_SCAN_WORDS` and `CHRONOS_VECTOR` are read once, when first needed; a value that doesn't parse is ignored (the default applies).
+The values of `CHRONOS_WORK_MEM`, `CHRONOS_CACHE_MB`, `CHRONOS_THREADS`, `CHRONOS_SCAN_WORDS`, `CHRONOS_VECTOR`, `CHRONOS_VECTOR_FLOATS`, `CHRONOS_RERANK`, `CHRONOS_MAX_CONNECTIONS` and the timeouts are read once, when first needed; a value that doesn't parse is ignored (the default applies). `CHRONOS_MAX_DISK_BYTES`, `CHRONOS_MAX_MEMORY_BYTES` and `CHRONOS_LIMITS` are read when the folder opens, and one that doesn't parse stops it from opening.
 
 ## Shell commands
 

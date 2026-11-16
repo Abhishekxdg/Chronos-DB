@@ -102,7 +102,7 @@ The guest can read `/metrics`, as its `read` right already gives it `SHOW METRIC
 
 - **Loopback** means every address the name resolves to is a loopback one (`127.x.x.x`, `::1`, `localhost`). Give numeric addresses to be sure.
 - **Pass tokens in the environment, not on the command line:** a token passed as `--token` shows in the process list (`ps`) to every user of the machine. `CHRONOS_TOKEN=$(openssl rand -hex 24) chronos serve ...`, or from a secrets file your service manager reads.
-- **The server and admin tokens** are whatever strings you choose, kept only in the process; the server refuses to start with one shorter than 24 characters, with `change-me` (the placeholder older examples used), or with the same string for both (the guest's token would be the database's own user's). Make each with `openssl rand -hex 24`. Changing one takes a restart.
+- **The server and admin tokens** are whatever strings you choose, kept only in the process; the server refuses to start with one shorter than 24 characters, with `change-me` (the placeholder older examples used), or with the same string for both (the guest's token would be the database's own user's). Make each with `openssl rand -hex 24`. Changing one takes a restart: to rotate the server or admin token, stop the server and start it with the new value (`CHRONOS_TOKEN`, `CHRONOS_ADMIN_TOKEN`). Agents' tokens are not touched by that, and are rotated one by one with `ALTER AGENT ... ROTATE TOKEN` ([below](#rotating-a-token)).
 
 #### Upgrading from 0.3: the server token
 
@@ -163,24 +163,31 @@ create agent bot with (can = 'read,fork,write_own', max_worlds = 10, world_ttl =
 -- name | id | token      the token is shown once: keep it
 alter agent bot set (writes_per_minute = 600, max_query_ms = 30000, max_concurrent = 4, max_memory_mb = 512);
 alter agent bot set (disabled = true);    -- its token stops working; false turns it back on
+alter agent bot rotate token;             -- name | id | token: a new token, shown once; the old one stops working at once
 show agents;                              -- name, id, can, quotas, world_ttl, created, disabled, limits
 drop agent bot;                           -- its token stops working; its worlds stay, still its own
 ```
 
-Over HTTP (needs the server token, the admin token, or an agent with `admin`):
+Over HTTP (needs the admin token, or the token of an agent with `admin`; the server token is the guest's and gets `403`, unless the server runs with `--unsafe`; a loopback server with no token at all takes no header):
 
 ```bash
-curl -s -H "Authorization: Bearer $CHRONOS_TOKEN" localhost:7070/v1/create_agent \
+H='Content-Type: application/json'
+curl -s -H "Authorization: Bearer $CHRONOS_ADMIN_TOKEN" -H "$H" localhost:7070/v1/create_agent \
   -d '{"name":"bot","can":["read","fork","write_own"],"max_worlds":10,"world_ttl":86400000}'
 # {"agent":{...},"token":"chronos_4f…"}
-curl -s -H "Authorization: Bearer $CHRONOS_TOKEN" localhost:7070/v1/alter_agent -d '{"name":"bot","disabled":true}'
-curl -s -H "Authorization: Bearer $CHRONOS_TOKEN" localhost:7070/v1/agents -d '{}'
-curl -s -H "Authorization: Bearer $CHRONOS_TOKEN" localhost:7070/v1/drop_agent -d '{"name":"bot"}'
+curl -s -H "Authorization: Bearer $CHRONOS_ADMIN_TOKEN" -H "$H" localhost:7070/v1/alter_agent -d '{"name":"bot","disabled":true}'
+curl -s -H "Authorization: Bearer $CHRONOS_ADMIN_TOKEN" -H "$H" localhost:7070/v1/agents -d '{}'
+curl -s -H "Authorization: Bearer $CHRONOS_ADMIN_TOKEN" -H "$H" localhost:7070/v1/sql -d '{"sql":"alter agent bot rotate token"}'
+# {"results":[{"command":"ALTER AGENT","columns":["name","id","token"],...}]}: the new token, shown once
+curl -s -H "Authorization: Bearer $CHRONOS_ADMIN_TOKEN" -H "$H" localhost:7070/v1/drop_agent -d '{"name":"bot"}'
 ```
+
+A body without `Content-Type: application/json` gets `415`.
 
 - **Names:** letters, digits, `_` and `-`. `guest` and `system` are the database's own (`22023`). A dropped agent's name can't be reused while it still owns worlds (`22023`): merge or drop them first, so a new agent never inherits them.
 - **Times:** in SQL, `world_ttl` and `max_query_ms` take an interval (`'1 day'`) or milliseconds; over HTTP, milliseconds.
-- **Tokens:** `chronos_` and 64 hex digits (32 bytes from `/dev/urandom`). Only the token's blake3 hash is stored, with a SCRAM-SHA-256 verifier of it for Postgres logins (as a role's password is kept), and an agent's ID (`a` and 16 hex digits) is derived from it. There's no rotation: disable the agent and make a new one.
+- **Tokens:** `chronos_` and 64 hex digits (32 bytes from `/dev/urandom`). Only the token's blake3 hash is stored, with a SCRAM-SHA-256 verifier of it for Postgres logins (as a role's password is kept), and an agent's ID (`a` and 16 hex digits) is derived from its first token and stays the same when the token is rotated. `valid_for` (`CREATE AGENT ... WITH (valid_for = '1 hour')`, HTTP `valid_for` in ms) makes a token that stops working after that long; `0` means no end.
+- <a id="rotating-a-token"></a>**Rotating a token:** `ALTER AGENT bot ROTATE TOKEN` gives the agent a new token and answers it once (`name`, `id`, `token`), as `CREATE AGENT` does. The old token stops working at once, over HTTP and for new Postgres logins. The agent's name, ID, rights, quotas, merge policy and worlds stay as they were. It is for whoever may manage agents (the database's own user, a superuser role, an agent with `admin`): the statement answers with the token, so whoever may run it can act as that agent. There is no HTTP op of its own: send the statement through `sql`. `guest` and `system` have no token to rotate (`22023`).
 - **Anyone who may read** can run `SHOW AGENTS` and `SHOW AUDIT` in SQL (they're reads: names, rights, quotas and actions, never tokens). The HTTP `agents` and `audit` ops need `admin`.
 
 ### What it may do
@@ -287,9 +294,9 @@ Set by the operator where the process starts, and not by anyone inside the datab
 
 Fixed and environment limits:
 
-- **Memory:** `CHRONOS_WORK_MEM` (default `256MB`) per grouping, sort or join before it spills; `CHRONOS_CACHE_MB` (default 256) for the page cache. There's no cap on the whole process, and a query's result is held whole before it's sent.
+- **Memory:** `CHRONOS_WORK_MEM` (default `256MB`) per grouping, sort or join before it spills; `CHRONOS_CACHE_MB` (default 256) for the page cache. `CHRONOS_MAX_MEMORY_BYTES` caps the whole process softly: while it holds more resident memory than that, new statements are refused (`53200`), and one already running is not stopped. A query's result is held whole before it's sent.
 - **HTTP:** request headers up to 64 KB (`431`), bodies up to 32 MB (`413`), sent with `Content-Length` (chunked bodies get `411`) and `Content-Type: application/json` (`415`); a request is checked (token, `Origin`, `Host`) from its headers before its body is read and must arrive within 2 minutes (`CHRONOS_REQUEST_TIMEOUT`, seconds); a connection idle for 60 seconds is closed. At most 1000 connections at once (`503`; `CHRONOS_MAX_CONNECTIONS`, lowered to what the process's open-file limit holds: about one connection per 8 descriptors after 256 for the server itself; the soft limit is raised to the hard one at start).
-- **Postgres:** messages up to 64 MB (a bigger one is read and dropped, and answered `54000` with the connection kept; past 1 GB, as Postgres, `08P01` and closed), and under 10 kB until login, which must finish within 60 seconds (`CHRONOS_LOGIN_TIMEOUT`, seconds). At most 1000 connections at once (`53300` `sorry, too many clients already`; `CHRONOS_MAX_CONNECTIONS`, per listener, lowered to what the process's open-file limit holds, which `SHOW max_connections` says); no idle timeout after login unless the session sets `idle_in_transaction_session_timeout` (FATAL `25P03`) or `idle_session_timeout` (FATAL `57P05`), as in Postgres, except inside `COPY ... FROM STDIN`, which holds its world's writes while it reads: a client that sends no data for 60 seconds is dropped and its COPY undone (`CHRONOS_COPY_IDLE`, seconds).
+- **Postgres:** messages up to 64 MB (a bigger one is read and dropped, and answered `54000` with the connection kept; past 1 GB, as Postgres, `08P01` and closed), and under 10 kB until login, which must finish within 60 seconds (`CHRONOS_LOGIN_TIMEOUT`, seconds). At most 1000 connections at once (`53300` `sorry, too many clients already`; `CHRONOS_MAX_CONNECTIONS`, counted with the HTTP API's connections, lowered to what the process's open-file limit holds, which `SHOW max_connections` says); no idle timeout after login unless the session sets `idle_in_transaction_session_timeout` (FATAL `25P03`) or `idle_session_timeout` (FATAL `57P05`), as in Postgres, except inside `COPY ... FROM STDIN`, which holds its world's writes while it reads: a client that sends no data for 60 seconds is dropped and its COPY undone (`CHRONOS_COPY_IDLE`, seconds).
 - **Browsers:** HTTP refuses any request with an `Origin` header (`403`), and a server without a token answers only loopback `Host` names, so web pages can't reach it (no CSRF or DNS rebinding).
 - **Simulations:** at most 1,048,576 worlds, and within `max_worlds`.
 - **Functions and triggers** nest at most 40 deep (`54001`); `WITH RECURSIVE` stops at a round or row cap (`54001`); a regular expression that backtracks too long stops (`54001`).
@@ -347,7 +354,9 @@ Spill files are created new (never reusing a file already there) and readable by
 
 ## Audit trail
 
-There's no dedicated security log. What's recorded:
+What's recorded:
+
+- **`SHOW SECURITY AUDIT [LIMIT n]`** (the database's own user, or an agent with `admin`): privileged actions since the server started, newest first: `at`, `actor` (`owner` for the database's own user), `action` (`create agent`, `alter agent`, `rotate token`, `drop agent`, `create merge policy`, `alter merge policy`, `drop merge policy`, `alter system`) and `target`. It is kept in memory (the newest 1000 events), so a restart empties it; each event is also written to the server's log as a `security` line.
 
 - **`SHOW AUDIT [FOR AGENT name] [LIMIT n]`** (HTTP `audit`, admin only): what agents, the guest and `system` did, newest first: `at`, `agent`, `world`, `action` (`write`, `fork from …`, `merge into …`, `merge part into …`, `discard`, `metadata`) and `rows`. It's read from the log, so it survives restarts and lasts as long as history does.
 - **`SHOW HISTORY`** (HTTP `history`): each world's forks, writes, commits, merges and discards, with who unrecorded.
@@ -355,7 +364,7 @@ There's no dedicated security log. What's recorded:
 - **Agents:** `created` and `disabled` in `SHOW AGENTS`.
 - **Metrics** (`SHOW METRICS`, `GET /metrics`): counts of operations, `errors` and `conflicts`, per database, not per client.
 
-Not recorded: who, when it's the database's own user (the shell, the server or admin token, MCP without `--agent`): its changes are in `SHOW HISTORY` but not in the audit trail. Nor reads, logins, failed logins or client addresses; and creating, changing or dropping an agent is only a write to `main`, not an event of its own. Lowering `history_retention` drops the audit trail with the history, and a database in memory keeps none.
+Not recorded: who, when it's the database's own user (the shell, the server or admin token, MCP without `--agent`): its changes are in `SHOW HISTORY` but not in the audit trail. Nor reads, logins, failed logins or client addresses. Creating, changing or dropping an agent, and rotating its token, are in `SHOW SECURITY AUDIT` only until the next restart. Lowering `history_retention` drops the audit trail with the history, and a database in memory keeps none.
 
 ## A hardened deployment
 
@@ -370,7 +379,7 @@ Not recorded: who, when it's the database's own user (the shell, the server or a
    included: a leaked admin token can then still merge, but not quietly rewrite `main` (see [protecting
    `main`](#protecting-main)). Turn it on after `chronos import`, which writes `main`'s rows; from then on, row
    edits go through a world.
-5. Give every agent its own agent and token, with only the rights it needs (the default is right for most), and set `max_worlds`, `max_changes`, `writes_per_minute`, `world_ttl`, `max_query_ms`, `max_concurrent` and `max_memory_mb`.
+5. Give every agent its own agent and token, with only the rights it needs (the default is right for most), rotate a token that may have leaked (`ALTER AGENT bot ROTATE TOKEN`), and set `max_worlds`, `max_changes`, `writes_per_minute`, `world_ttl`, `max_query_ms`, `max_concurrent` and `max_memory_mb`.
 6. Set `max_worlds` and `world_idle_ttl` for the whole database.
 7. For MCP, give each agent its token and `chronos serve`'s `/mcp`, or run `chronos mcp <folder> --agent NAME` where only you start it; never `--allow-merge` for an agent you don't fully trust.
 8. Run the server as its own OS user, with the folder `0700`, and agents as other OS users, or in containers that hold only their token (see [agents in containers](#agents-in-containers)).
@@ -394,9 +403,9 @@ Found in a full code review on 2026-09-26 and still open on `main` (the review's
 - **Deeply nested SQL can crash the process.** The SQL parser has no nesting limit, so a statement like `select ((((…))))` nested deeply enough overflows the stack, which aborts the whole server, not just the connection. (Regular expressions and text-search queries are now limited: 54001 / 2201B.)
 - **`$N` parameter numbers in a statement aren't capped:** `$999999999` makes room for that many. (`repeat()`, `lpad()`, `rpad()` and `format()` widths past 1 GB are refused with 54000.)
 - **A panic can leave internal locks poisoned.** Most counters and flags recover, but a panic while the database holds one of its internal read-write locks (the list of worlds, a world's state, checkpoints) makes later writes fail until a restart.
-- **An agent made by an older Chronos needs one HTTP request first.** Its token was kept only as a hash, so no SCRAM exchange can check it: on a server with `--token` it is asked for SCRAM like every name and refused until it has used its token once over the HTTP API, which keeps a verifier of it. On loopback without `--token` it may send its token in the clear once instead, and is asked for a cleartext password until then, which tells it apart from others there. There is no token rotation: disable such an agent and make a new one to be rid of it. There is no `pg_hba.conf`.
+- **An agent made by an older Chronos needs one HTTP request first.** Its token was kept only as a hash, so no SCRAM exchange can check it: on a server with `--token` it is asked for SCRAM like every name and refused until it has used its token once over the HTTP API, which keeps a verifier of it. On loopback without `--token` it may send its token in the clear once instead, and is asked for a cleartext password until then, which tells it apart from others there. `ALTER AGENT ... ROTATE TOKEN` also gives such an agent a verifier, with a new token. There is no `pg_hba.conf`.
 - **Names that still show.** A role whose password is kept as an md5 hash is asked for MD5 (as under Postgres's `md5` method). The secret mock salts are made from is drawn at each start, so a name with no verifier gets a new salt after a restart where a role keeps its own; Postgres keeps its secret across restarts.
-- **No request-rate limits** on either port beyond agents' own quotas and the wait after failed logins (connections are capped at 1000 per port).
+- **No request-rate limits** on either port beyond agents' own quotas and the wait after failed logins (connections are capped at 1000, both ports together; `CHRONOS_MAX_CONNECTIONS`).
 
 What to do meanwhile:
 

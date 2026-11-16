@@ -3737,7 +3737,7 @@ pub fn refresh(core: &Core) -> std::result::Result<Refreshed, String> {
 /// as the other tables weren't read.
 fn refresh_with(core: &Core, only: Option<&[usize]>) -> std::result::Result<Refreshed, String> {
     let Some(att) = core.attached.as_deref() else {
-        return Err("this folder isn't attached to Postgres (chronos attach makes one that is)".into());
+        return Err("this folder isn't attached to a database (chronos attach makes one that is)".into());
     };
     let _held = att.hold();
     if att.pending() {
@@ -3908,7 +3908,7 @@ fn refresh_read(
 /// the write-back lock as a refresh. Ok(rows main took).
 pub fn load_tenant(core: &Core, value: &str) -> std::result::Result<u64, String> {
     let Some(att) = core.attached.as_deref() else {
-        return Err("this folder isn't attached to Postgres (chronos attach makes one that is)".into());
+        return Err("this folder isn't attached to a database (chronos attach makes one that is)".into());
     };
     let Some(lazy) = att.lazy() else {
         return Err("this folder's tables are copied whole: it has no tenants to load (chronos attach \
@@ -4023,7 +4023,7 @@ impl Attached {
 /// `unfollow` drops it.
 pub fn follow(core: &Core) -> std::result::Result<Refreshed, String> {
     let Some(att) = core.attached.as_deref() else {
-        return Err("this folder isn't attached to Postgres (chronos attach makes one that is)".into());
+        return Err("this folder isn't attached to a database (chronos attach makes one that is)".into());
     };
     let _held = att.hold();
     if att.pending() {
@@ -4375,7 +4375,7 @@ fn by_keys(
 /// Drops the slot `follow` reads, if there is one: Postgres keeps no WAL for this folder after. Whether there was.
 pub fn unfollow(core: &Core) -> std::result::Result<bool, String> {
     let Some(att) = core.attached.as_deref() else {
-        return Err("this folder isn't attached to Postgres (chronos attach makes one that is)".into());
+        return Err("this folder isn't attached to a database (chronos attach makes one that is)".into());
     };
     let _held = att.hold();
     att.src.unfollow(att)

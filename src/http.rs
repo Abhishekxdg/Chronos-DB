@@ -339,6 +339,8 @@ fn write<W: Write>(w: &mut W, res: &Response, extra: &str, keep: bool) -> io::Re
         415 => "Unsupported Media Type",
         429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
         507 => "Insufficient Storage",
         _ => "Error",

@@ -2156,14 +2156,15 @@ fn a_merge_is_undone_by_its_id() {
     );
     assert_eq!(cell(&db, MAIN, "select count(*) from leads"), "3");
     assert_eq!(chronos::attach::refresh(&db).unwrap().changed(), 0, "main is Postgres's");
-    // once undone, its rows aren't as it left them: a second undo is refused, nothing written
-    let e = db
+    // once undone, its rows are as they were before it: a second undo finds nothing to do, and writes nothing
+    let again = db
         .undo_merges(
             std::slice::from_ref(&first),
             chronos::attach::UndoOptions { skip_changed: false, dry_run: false, ..Default::default() },
         )
-        .unwrap_err();
-    assert!(e.to_string().contains("changed again since"), "{e}");
+        .unwrap();
+    assert_eq!((again.undone, again.skipped, again.merge.is_none()), (0, 0, true), "{again:?}");
+    assert!(again.already > 0 && again.rows.iter().all(|r| r.status == "already"), "{again:?}");
     assert_eq!(state(&mut pg), was);
 
     // two merges undone at once, the later first: the row both wrote goes back to how it was before the first
@@ -2201,6 +2202,32 @@ fn a_merge_is_undone_by_its_id() {
     assert_eq!(pg_cell(&mut pg, "select string_agg(owner, ',' order by id) from leads"), "later,pat,eve");
     let changed: Vec<_> = done.rows.iter().filter(|r| r.status == "changed").collect();
     assert!(changed.iter().any(|r| r.now["owner"] == "pat"), "{done:?}");
+    // undone in part: the row put back isn't "changed since" to a second undo, which the two changed rows still
+    // refuse whole; once one holds what the merge wrote again, it goes back with skip_changed
+    let plan = db
+        .undo_merges(
+            std::slice::from_ref(&c),
+            chronos::attach::UndoOptions { skip_changed: false, dry_run: true, ..Default::default() },
+        )
+        .unwrap();
+    assert_eq!((plan.undone, plan.skipped, plan.already), (0, 2, 1), "{plan:?}");
+    let e = db
+        .undo_merges(
+            std::slice::from_ref(&c),
+            chronos::attach::UndoOptions { skip_changed: false, dry_run: false, ..Default::default() },
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("2 rows the merge changed have changed again since"), "{e}");
+    merge("e", "update leads set owner = 'cy' where id = 1");
+    let done = db
+        .undo_merges(
+            std::slice::from_ref(&c),
+            chronos::attach::UndoOptions { skip_changed: true, dry_run: false, ..Default::default() },
+        )
+        .unwrap();
+    assert_eq!((done.undone, done.skipped, done.already), (1, 1, 1), "{done:?}");
+    assert_eq!(pg_cell(&mut pg, "select owner from leads where id = 2"), "pat");
+    assert_ne!(pg_cell(&mut pg, "select owner from leads where id = 1"), "cy", "back as it was before the merge");
 
     // a cascade: the undo removes a lead the merge added, and Postgres would delete the tasks added under it since.
     // The dry run names the table and writes nothing; the undo is refused until told ALLOW CASCADE

@@ -348,7 +348,7 @@ fn main() {
                     0
                 }
                 Ok(n) => {
-                    println!("tenant {v}: main took {n} rows from Postgres");
+                    println!("tenant {v}: main took {n} rows from {}", source_name(&db));
                     0
                 }
                 Err(e) => {
@@ -385,16 +385,17 @@ fn main() {
             let _ = db.close();
             std::process::exit(code);
         }
+        let from = source_name(&db);
         let code = match chronos::attach::refresh(&db) {
             Ok(r) => {
                 for c in &r.added {
-                    println!("column added in Postgres, taken: {c}");
+                    println!("column added in {from}, taken: {c}");
                 }
                 for c in &r.altered {
-                    println!("changed in Postgres, taken: {c}");
+                    println!("changed in {from}, taken: {c}");
                 }
                 for l in &r.labels {
-                    println!("enum label added in Postgres, taken: {l}");
+                    println!("enum label added in {from}, taken: {l}");
                 }
                 for (t, i, u, d) in &r.tables {
                     println!("{t}: {i} inserted, {u} updated, {d} deleted");
@@ -755,16 +756,17 @@ fn main() {
                 std::process::exit(2);
             };
             if db.attached().is_none() {
-                eprintln!("chronos: --refresh-every is for a folder attached to Postgres (chronos attach)");
+                eprintln!("chronos: --refresh-every is for a folder attached to a database (chronos attach)");
                 std::process::exit(2);
             }
             let db = sh.db.clone();
+            let from = source_name(&db);
             std::thread::spawn(move || {
                 loop {
                     std::thread::sleep(every);
                     match chronos::attach::refresh(&db) {
-                        Ok(r) => said(&r),
-                        Err(e) => eprintln!("chronos: refresh from Postgres failed (tried again in {every:?}): {e}"),
+                        Ok(r) => said(&r, from),
+                        Err(e) => eprintln!("chronos: refresh from {from} failed (tried again in {every:?}): {e}"),
                     }
                 }
             });
@@ -773,10 +775,11 @@ fn main() {
         // chronos::attach::follow)
         if follow {
             if db.attached().is_none() {
-                eprintln!("chronos: --follow is for a folder attached to Postgres (chronos attach)");
+                eprintln!("chronos: --follow is for a folder attached to Postgres or MongoDB (chronos attach)");
                 std::process::exit(2);
             }
             let db = sh.db.clone();
+            let from = source_name(&db);
             std::thread::spawn(move || {
                 // (a failure is said once until it changes, and tried again less often while it lasts)
                 let mut failing: Option<String> = None;
@@ -800,7 +803,7 @@ fn main() {
                                 None => {}
                             }
                             wait = FOLLOW_EVERY;
-                            said(&r);
+                            said(&r, from);
                         }
                         Err(e) => {
                             if failing.as_deref() != Some(e.as_str()) {
@@ -1054,7 +1057,7 @@ fn db_key() -> std::io::Result<Option<[u8; 32]>> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: chronos [-b branch] [--remote s3://bucket/prefix [--takeover]] [--anchor FILE [--anchor-reset]] <folder> [command]\n       chronos mcp <folder> [--allow-merge | --agent NAME] [--unmask]   (MCP server for AI agents, over stdio; without --allow-merge, agents can't merge; --agent acts as that agent; masked columns read masked unless --unmask)\n       chronos import <folder> <table> <data.csv> --schema <schema.csv>   (a copy of one Postgres table)\n       chronos attach <new folder> --tables a,b | --schema s [--yes]   (work beside a Postgres: merges into main are written there; CHRONOS_SOURCE_URL)\n       chronos refresh <attached folder> [--unfollow]   (main takes Postgres's rows as they are now; chronos serve --refresh-every 5m does it on a timer, serve --follow as they change; --unfollow drops --follow's replication slot)\n       chronos restore <backup> <new folder>   (start a database from a backup, and verify it)\n       chronos init [--no-open]   (in a project folder: its Chronos Cloud database, wired up for agents; chronos cloud help)\n       chronos keygen   (a new encryption key: CHRONOS_KEY=<key> chronos <new folder> makes an encrypted database)\n       chronos studio <folder> [--port N] [--no-open]   (a web UI for the database, on 127.0.0.1; works beside a running serve)\n       chronos studio <folder> --login [--port N | --listen ADDR:PORT] [--host NAME[:PORT]]... [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--no-open]\n                                  (the web UI, signed in with a database role and its password, acting with its privileges;\n                                   make one with: create role admin login superuser password '...'; any address but loopback needs TLS)\n       chronos serve <folder> [--listen 127.0.0.1:7070] [--pg 127.0.0.1:5433|off] [--token T] [--admin-token A] [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--safe | --unsafe] [--studio-api]
+        "usage: chronos [-b branch] [--remote s3://bucket/prefix [--takeover]] [--anchor FILE [--anchor-reset]] <folder> [command]\n       chronos mcp <folder> [--allow-merge | --agent NAME] [--unmask]   (MCP server for AI agents, over stdio; without --allow-merge, agents can't merge; --agent acts as that agent; masked columns read masked unless --unmask)\n       chronos import <folder> <table> <data.csv> --schema <schema.csv>   (a copy of one Postgres table)\n       chronos attach <new folder> --tables a,b | --schema s [--lazy-tenant column] [--yes]   (work beside a Postgres, MySQL, MariaDB or MongoDB you run: merges into main are written there; CHRONOS_SOURCE_URL or CHRONOS_SOURCE_FILE; chronos attach alone says more)\n       chronos refresh <attached folder> [--unfollow | --tenant value]   (main takes the database's rows as they are now; chronos serve --refresh-every 5m does it on a timer, serve --follow as they change, beside Postgres and MongoDB; --unfollow drops --follow's replication slot, or forgets its place in MongoDB's change stream)\n       chronos restore <backup> <new folder>   (start a database from a backup, and verify it)\n       chronos init [--no-open]   (in a project folder: its Chronos Cloud database, wired up for agents; chronos cloud help)\n       chronos keygen   (a new encryption key: CHRONOS_KEY=<key> chronos <new folder> makes an encrypted database)\n       chronos studio <folder> [--port N] [--no-open]   (a web UI for the database, on 127.0.0.1; works beside a running serve)\n       chronos studio <folder> --login [--port N | --listen ADDR:PORT] [--host NAME[:PORT]]... [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--no-open]\n                                  (the web UI, signed in with a database role and its password, acting with its privileges;\n                                   make one with: create role admin login superuser password '...'; any address but loopback needs TLS)\n       chronos serve <folder> [--listen 127.0.0.1:7070] [--pg 127.0.0.1:5433|off] [--token T] [--admin-token A] [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--safe | --unsafe] [--studio-api] [--refresh-every 5m] [--follow]
                                   (HTTP JSON API, and Postgres protocol: psql postgres://127.0.0.1:5433/main; the server token T
                                    lets a client in as the guest, which only forks and changes its own worlds; the admin token A
                                    is the database's own user; --unsafe makes T the database's own user, as before 0.4, and --safe
@@ -1141,21 +1144,33 @@ fn is_sql(line: &str) -> bool {
 /// How often `serve --follow` reads Postgres's changes.
 const FOLLOW_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// What a refresh or a follow took from Postgres, said by `serve` (nothing when nothing changed).
-fn said(r: &chronos::attach::Refreshed) {
+/// The database a folder is attached to, by its name, for what is said to a person.
+fn source_name(db: &Db) -> &'static str {
+    use chronos::attach::SourceKind;
+    match db.attached().map(|a| a.kind()) {
+        Some(SourceKind::MySql) => "MySQL",
+        Some(SourceKind::MariaDb) => "MariaDB",
+        Some(SourceKind::Mongo) => "MongoDB",
+        Some(SourceKind::Postgres) | None => "Postgres",
+    }
+}
+
+/// What a refresh or a follow took from the database `from` (see `source_name`), said by `serve` (nothing when
+/// nothing changed).
+fn said(r: &chronos::attach::Refreshed, from: &str) {
     for c in &r.added {
-        eprintln!("chronos: column added in Postgres, taken: {c}");
+        eprintln!("chronos: column added in {from}, taken: {c}");
     }
     for c in &r.altered {
-        eprintln!("chronos: changed in Postgres, taken: {c}");
+        eprintln!("chronos: changed in {from}, taken: {c}");
     }
     for l in &r.labels {
-        eprintln!("chronos: enum label added in Postgres, taken: {l}");
+        eprintln!("chronos: enum label added in {from}, taken: {l}");
     }
     let tables: Vec<String> =
         r.tables.iter().filter(|t| t.1 + t.2 + t.3 > 0).map(|(t, i, u, d)| format!("{t} +{i} ~{u} -{d}")).collect();
     if !tables.is_empty() {
-        eprintln!("chronos: refreshed from Postgres: {}", tables.join(", "));
+        eprintln!("chronos: refreshed from {from}: {}", tables.join(", "));
     }
     for s in &r.skipped {
         eprintln!("chronos: refresh left as it was: {s}");

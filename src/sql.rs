@@ -43323,6 +43323,15 @@ impl Statement {
                         format!("{} rows changed since {does} as they are: {}", u.skipped, changed.join(", ")),
                     );
                 }
+                if u.already > 0 {
+                    notice(
+                        "NOTICE",
+                        format!(
+                            "{} are as they were before the merge already: nothing to undo there",
+                            crate::agents::n_rows(u.already as u64)
+                        ),
+                    );
+                }
                 if let Some(c) = u.cascades.as_ref().filter(|c| !c.is_empty()) {
                     notice(
                         "WARNING",

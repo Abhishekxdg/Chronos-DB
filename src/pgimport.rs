@@ -1667,7 +1667,12 @@ pub fn attach_help() -> &'static str {
      --refresh-every); a changed key or row-level security: attach again into a new folder.\n\n\
      --lazy-tenant org_id: tables with that column (and those whose foreign key points straight at one) start empty;\n\
      a tenant's rows are loaded the first time a world is forked for it, or by chronos refresh <dir> --tenant <value>.\n\
-     A mysql:// CHRONOS_SOURCE_URL attaches beside MySQL 8.0+ or MariaDB 10.5+ (--tables only)."
+     Changes made in Postgres come into main as they commit with chronos serve --follow (a replication slot).\n\n\
+     Other databases, by CHRONOS_SOURCE_URL (--tables only; no --schema, no --lazy-tenant):\n\
+     mysql:// or mariadb://   beside MySQL 8.0+ or MariaDB 10.5+. Merges are written there and can be undone; rows\n\
+     changed there come over at a refresh (no --follow).\n\
+     mongodb:// or mongodb+srv://   beside MongoDB 5.0+ (a replica set), in a build with MongoDB support: --tables names\n\
+     collections, each a table of documents. serve --follow reads a change stream on each."
 }
 
 /// What attach reads of a table before copying it: its name, kind, what Chronos's attach refuses in it, and its

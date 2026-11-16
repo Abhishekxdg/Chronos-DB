@@ -2,7 +2,7 @@
 title: Migrating from Postgres
 ---
 
-> **Beta.** Chronos 0.2 is a public beta. It speaks the Postgres 16 protocol and much of its SQL, but it is not Postgres: check your own database with the steps below before you rely on it, and keep your Postgres until you have. What is measured so far is on [Postgres compatibility](postgres-compatibility.md#where-it-stands-beta).
+> **Beta.** Chronos 0.5 is a public beta. It speaks the Postgres 16 protocol and much of its SQL, but it is not Postgres: check your own database with the steps below before you rely on it, and keep your Postgres until you have. What is measured so far is on [Postgres compatibility](postgres-compatibility.md#where-it-stands-beta).
 
 There are two ways in. Both leave the Postgres database untouched (they only read it).
 
