@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 0.5.4 (beta), 2026-11-16
+
+**Faster scans, `GROUP BY` and one-key joins.** A filter on an integer column is checked as each row is read, a text
+column read row after row allocates once, and a join on one whole-number column keeps its keys as numbers. Over
+200,000-row tables on one core a filtered count is 25% faster, a `GROUP BY` 23% and the joins 20%; on two cores
+`GROUP BY` is now faster than Postgres 18. Answers are the same; nothing changes in how rows are stored or merges
+are written. The speed tables of 0.5.3 were measured on a busy machine and are measured again here. Built and
+signed on the maintainer's Mac as 0.5.3 was.
+
+- **Faster scans and one-key joins.** A condition that compares an integer column with a whole number
+  (`amount > 500`) is checked as each row is read, without the expression being worked out; a text column read row
+  after row for a `GROUP BY` or a join allocates once, not for each row; a hash join on one whole-number column
+  keeps its keys as numbers. On one core, over 200,000-row tables: a filtered count 13.5 to 10.1 ms, `GROUP BY`
+  with `max` of a text 24.0 to 18.4 ms, a join + `GROUP BY` 95 to 75 ms. Answers are the same. BENCHMARKS.md's
+  2026-11-16 tables (sections 4 and 16.2) are measured again on an idle machine, with what is still slower than
+  Postgres.
+
 ## 0.5.3 (beta), 2026-11-16
 
 **Faster undo of big merges, and faster analytical joins.** Undoing a merge by its id read the whole table for each

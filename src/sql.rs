@@ -29060,10 +29060,19 @@ fn unpack_row(t: &Table, raw: &str, out: &mut [Value], need: Option<&[bool]>) ->
     let (layout, body) = packed_parts(raw)?;
     let n = out.len();
     if layout == t.layout() {
-        nulls(out);
+        // a text the last row left in a column this one reads stays, for its bytes to be written over (a buffer
+        // read into row after row allocates for a text column once, not for each row); everything else is null
+        for (i, x) in out.iter_mut().enumerate() {
+            let kept = matches!(x, Value::Text(_)) && need.is_none_or(|w| w[i]);
+            if !kept && !matches!(x, Value::Null) {
+                *x = Value::Null;
+            }
+        }
         // (fields after the last one asked for aren't read at all)
         let stop = need.map_or(n, |w| w.iter().rposition(|&x| x).map_or(0, |i| i + 1));
-        unpack_fields(body, out, need, stop, |p| (p < n).then_some(p))?;
+        let read = unpack_fields(body, out, need, stop, |p| (p < n).then_some(p))?;
+        // (a column the row has no field for: null, not the last row's text)
+        nulls(&mut out[read.min(n)..]);
         kept_names(t, out);
         return Some(());
     }
@@ -29103,36 +29112,46 @@ fn kept_names(t: &Table, out: &mut [Value]) {
     }
 }
 
-/// A packed integer's digits (`-` first if it is negative) as `str::parse` reads them; None if they aren't one.
-fn int_of(s: &[u8]) -> Option<i64> {
-    let (neg, digits) = match s {
-        [b'-', rest @ ..] => (true, rest),
-        [b'+', rest @ ..] => (false, rest),
-        _ => (false, s),
+/// A packed integer field starting at `i` (its digits, `-` first if it is negative, then `;`): its value as
+/// `str::parse` reads it, and where the next field starts. None if it isn't one.
+fn int_field(b: &[u8], mut i: usize) -> Option<(i64, usize)> {
+    let neg = match b.get(i)? {
+        b'-' => {
+            i += 1;
+            true
+        }
+        b'+' => {
+            i += 1;
+            false
+        }
+        _ => false,
     };
-    if digits.is_empty() {
-        return None;
-    }
+    let first = i;
     let mut n: i64 = 0;
-    for &d in digits {
-        let d = i64::from(d.wrapping_sub(b'0'));
+    loop {
+        let c = *b.get(i)?;
+        if c == b';' {
+            return (i > first).then_some((n, i + 1));
+        }
+        let d = i64::from(c.wrapping_sub(b'0'));
         if d > 9 {
             return None;
         }
         n = n.checked_mul(10)?;
         n = if neg { n.checked_sub(d)? } else { n.checked_add(d)? };
+        i += 1;
     }
-    Some(n)
 }
 
 /// Reads packed fields: the one at position p goes to `out[to(p)]` (None: skipped), those before position `stop`.
+/// Gives how many positions it read. A text goes into the text its place already holds, if it holds one.
 fn unpack_fields(
     body: &str,
     out: &mut [Value],
     need: Option<&[bool]>,
     stop: usize,
     to: impl Fn(usize) -> Option<usize>,
-) -> Option<()> {
+) -> Option<usize> {
     let b = body.as_bytes();
     let (mut i, mut pos) = (0, 0);
     while i < b.len() && pos < stop {
@@ -29145,11 +29164,27 @@ fn unpack_fields(
         // an integer, the commonest field: read into its place (a value made apart and then moved there cost more
         // than reading it)
         if tag == b'i' {
-            let end = upto(i, b';')?;
-            if let Some(c) = col.filter(|_| want) {
-                out[c] = Value::Int(int_of(&b[i..end])?);
+            match col.filter(|_| want) {
+                Some(c) => {
+                    let (n, next) = int_field(b, i)?;
+                    out[c] = Value::Int(n);
+                    i = next;
+                }
+                None => i = upto(i, b';')? + 1,
             }
-            i = end + 1;
+            continue;
+        }
+        // a text into the text already there
+        if tag == b's'
+            && let Some(c) = col.filter(|_| want)
+            && let Value::Text(held) = &mut out[c]
+        {
+            let colon = upto(i, b':')?;
+            let len: usize = body[i..colon].parse().ok()?;
+            let text = body.get(colon + 1..colon + 1 + len)?;
+            i = colon + 1 + len;
+            held.clear();
+            held.push_str(text);
             continue;
         }
         let v = match tag {
@@ -29221,7 +29256,7 @@ fn unpack_fields(
             out[c] = v;
         }
     }
-    Some(())
+    Some(pos)
 }
 
 /// A stored row of the table whose schema row is `schema`, as Postgres's output functions write each column (what
@@ -30291,6 +30326,11 @@ fn holds(conds: &[&Expr], cols: &[Col], row: &[Value], params: &[Value]) -> Resu
     // called for every pair a hash join's probe makes, on any core: where a big join notices a
     // timeout, a cancel or its memory limit (a probe's part can make millions of rows)
     tick()?;
+    holds_now(conds, cols, row, params)
+}
+
+/// `holds` without its look at the clock, for a caller that keeps its own count (see `KeyBuf::tick`).
+fn holds_now(conds: &[&Expr], cols: &[Col], row: &[Value], params: &[Value]) -> Result<bool> {
     if conds.is_empty() {
         return Ok(true);
     }
@@ -30312,24 +30352,55 @@ struct HashIndex {
 }
 
 struct Part {
-    head: FastMap<HKey, usize>, // a value's first place in `rows`
-    rows: Vec<usize>,           // rows of this partition, in order
-    next: Vec<usize>,           // for each place, the next place with the same value (MAX: none)
+    head: Heads,      // a value's first place in `rows`
+    rows: Vec<usize>, // rows of this partition, in order
+    next: Vec<usize>, // for each place, the next place with the same value (MAX: none)
+}
+
+/// Where each key of a `Part` first is. When every key is a whole number (a join on an id), they are kept as the
+/// numbers they are: a third the size of the keys, and hashed as one word. A key of any other kind then matches
+/// nothing, as it would among them (keys are equal only when they are of one kind).
+enum Heads {
+    Ints(FastMap<i64, usize>),
+    Any(FastMap<HKey, usize>),
+}
+
+impl Heads {
+    fn get(&self, k: &HKey) -> Option<usize> {
+        match (self, k) {
+            (Heads::Ints(m), HKey::Int(n)) => m.get(n).copied(),
+            (Heads::Ints(_), _) => None,
+            (Heads::Any(m), k) => m.get(k).copied(),
+        }
+    }
 }
 
 impl Part {
     /// `keyed`: (row, key), rows in order.
     fn new(keyed: Vec<(usize, HKey)>) -> Part {
-        let mut head: FastMap<HKey, usize> = FastMap::default();
-        head.reserve(keyed.len());
         let mut next = vec![usize::MAX; keyed.len()];
         let rows = keyed.iter().map(|(i, _)| *i).collect();
         // built backwards, so each value's rows come out in order
-        for (at, (_, k)) in keyed.into_iter().enumerate().rev() {
-            if let Some(was) = head.insert(k, at) {
-                next[at] = was;
+        let head = if keyed.iter().all(|(_, k)| matches!(k, HKey::Int(_))) {
+            let mut head: FastMap<i64, usize> = FastMap::default();
+            head.reserve(keyed.len());
+            for (at, (_, k)) in keyed.into_iter().enumerate().rev() {
+                let HKey::Int(n) = k else { unreachable!("checked above") };
+                if let Some(was) = head.insert(n, at) {
+                    next[at] = was;
+                }
             }
-        }
+            Heads::Ints(head)
+        } else {
+            let mut head: FastMap<HKey, usize> = FastMap::default();
+            head.reserve(keyed.len());
+            for (at, (_, k)) in keyed.into_iter().enumerate().rev() {
+                if let Some(was) = head.insert(k, at) {
+                    next[at] = was;
+                }
+            }
+            Heads::Any(head)
+        };
         Part { head, rows, next }
     }
 }
@@ -30402,7 +30473,7 @@ impl HashIndex {
         let (mut part, mut first) = (&self.parts[0], None);
         if let Some(k) = k {
             part = &self.parts[partition(&k, self.parts.len())];
-            first = part.head.get(&k).copied();
+            first = part.head.get(&k);
         }
         std::iter::successors(first, |&at| Some(part.next[at]).filter(|&n| n != usize::MAX)).map(|at| part.rows[at])
     }
@@ -30410,7 +30481,7 @@ impl HashIndex {
     /// The rows whose key is `k`, in order.
     fn get_ref(&self, k: &HKey) -> impl Iterator<Item = usize> + '_ {
         let part = &self.parts[partition(k, self.parts.len())];
-        let first = part.head.get(k).copied();
+        let first = part.head.get(k);
         std::iter::successors(first, |&at| Some(part.next[at]).filter(|&n| n != usize::MAX)).map(|at| part.rows[at])
     }
 }
@@ -30420,11 +30491,28 @@ impl HashIndex {
 struct KeyBuf {
     key: HKey,
     parts: Vec<HKey>,
+    /// the thread's count of rows and pairs (`TICKS`) as the probe began, and the pairs it has made since: see `tick`
+    from: u32,
+    pairs: u32,
+}
+
+impl Drop for KeyBuf {
+    fn drop(&mut self) {
+        TICKS.set(TICKS.get().wrapping_add(self.pairs));
+    }
 }
 
 impl KeyBuf {
     fn new() -> KeyBuf {
-        KeyBuf { key: HKey::Null, parts: vec![] }
+        KeyBuf { key: HKey::Null, parts: vec![], from: TICKS.get(), pairs: 0 }
+    }
+
+    /// Called for every pair a probe makes: `tick`, counted here and added to the thread's own count when the
+    /// probe is done (reaching that count costs a call for each pair). So the statement looks at whether it has to
+    /// stop (a timeout, a cancel, its memory limit) as often as it did, every 4096th row or pair of its thread.
+    fn tick(&mut self) -> Result<()> {
+        self.pairs = self.pairs.wrapping_add(1);
+        if self.from.wrapping_add(self.pairs).is_multiple_of(4096) { stopped() } else { Ok(()) }
     }
 
     /// Makes `key` the `vals_key` of what `keys` come to for `env`'s row; false if any is null (it matches nothing).
@@ -30468,6 +30556,7 @@ fn hkey_into(v: &Value, key: &mut HKey) {
             k.clear();
             k.push_str(s);
         }
+        (Value::Int(n), HKey::Int(k)) => *k = *n,
         (v, key) => *key = hkey(v),
     }
 }
@@ -30629,6 +30718,9 @@ struct Parts<'a> {
     marks: Vec<(String, usize)>, // where parts may be cut (reading all rows), and rows before each
     total: usize,                // rows in all: exact for rows an index found, else about
     k: usize,                    // parts
+    /// for each of `conds`, when it is an integer column compared with a whole number: (column, operator, number),
+    /// checked on the decoded integer without the expression being worked out (see `quick_cond`)
+    quick: Vec<Option<(usize, Op, i64)>>,
     /// the read the planner chose, counted for the cumulative statistics when the parts are done with (see
     /// `Drop`), and the rows the parts found
     counted: Option<pgstat::Read>,
@@ -30679,6 +30771,7 @@ impl<'a> Parts<'a> {
             }
         };
         let counted = if t.schema && t.mem.is_none() { pgstat::taken(&t.name) } else { None };
+        let quick = conds.iter().map(|c| quick_cond(c, &t.cols)).collect();
         Ok(Parts {
             v,
             t,
@@ -30693,6 +30786,7 @@ impl<'a> Parts<'a> {
             marks,
             total,
             k: k.max(1),
+            quick,
             counted,
             found: Default::default(),
         })
@@ -30767,12 +30861,32 @@ impl<'a> Parts<'a> {
         let (t, k, n) = (self.t, self.k, self.total);
         let mut buf = vec![Value::Null; t.cols.len()];
         let mut found = 0i64;
+        // where a long read notices a timeout, a cancel or its memory limit: `tick` for each row, counted here and
+        // added to the thread's own count when the part is done (reaching that count costs a call for each row)
+        let from = TICKS.get();
         let mut one = |key: &str, raw: &Val| -> Result<bool> {
             found += 1;
-            decode_into(t, &key[self.prefix.len()..], raw, Some(self.need), &mut buf)?;
-            if holds(self.conds, &t.cols, &buf, self.params)? {
-                pass(&mut buf)?;
+            if from.wrapping_add(found as u32).is_multiple_of(4096) {
+                stopped()?;
             }
+            decode_into(t, &key[self.prefix.len()..], raw, Some(self.need), &mut buf)?;
+            for (c, quick) in self.conds.iter().zip(&self.quick) {
+                let holds = match quick {
+                    // (a null, or anything that isn't the integer the column's type says: worked out in full)
+                    Some((i, op, n)) if matches!(buf[*i], Value::Int(_)) => {
+                        let Value::Int(x) = buf[*i] else { unreachable!() };
+                        int_holds(*op, x, *n)
+                    }
+                    _ => {
+                        let env = Env { cols: &t.cols, row: &buf, params: self.params, aggs: &[], sub: None };
+                        truth(ev(c, &env)?.as_ref())? == Some(true)
+                    }
+                };
+                if !holds {
+                    return Ok(true);
+                }
+            }
+            pass(&mut buf)?;
             Ok(true)
         };
         match self.access {
@@ -30812,6 +30926,7 @@ impl<'a> Parts<'a> {
             Access::Filtered => self.v.unrecorded().each(&self.prefix, self.cut(i), self.cut(i + 1), &mut one)?,
             _ => self.v.each(&self.prefix, self.cut(i), self.cut(i + 1), &mut one)?,
         }
+        TICKS.set(TICKS.get().wrapping_add(found as u32));
         self.found.fetch_add(found, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
@@ -30819,6 +30934,47 @@ impl<'a> Parts<'a> {
     /// Every part, on every free core, end to end.
     fn all(&self) -> Result<Batch> {
         Ok(concat(self.width, par_run(self.k, |i, _| self.read(i))?))
+    }
+}
+
+/// `e` as (column, operator, number) when it compares a smallint, integer or bigint column of `cols` with a whole
+/// number (either way round): what a scan checks on each row's decoded integer instead of working the expression
+/// out, as `compare_op` of two integers would have it (see `int_holds`).
+fn quick_cond(e: &Expr, cols: &[Col]) -> Option<(usize, Op, i64)> {
+    let Expr::Bin(a, op, b) = e else { return None };
+    if !matches!(op, Op::Eq | Op::Ne | Op::Lt | Op::Le | Op::Gt | Op::Ge) {
+        return None;
+    }
+    let column = |x: &Expr| match x {
+        Expr::Idx(i) if cols.get(*i).is_some_and(|c| c.ty.integral()) => Some(*i),
+        _ => None,
+    };
+    match (&**a, &**b) {
+        (x, Expr::Lit(Value::Int(n))) => Some((column(x)?, *op, *n)),
+        // `5 < x` is `x > 5`
+        (Expr::Lit(Value::Int(n)), x) => {
+            let flipped = match op {
+                Op::Lt => Op::Gt,
+                Op::Le => Op::Ge,
+                Op::Gt => Op::Lt,
+                Op::Ge => Op::Le,
+                op => *op,
+            };
+            Some((column(x)?, flipped, *n))
+        }
+        _ => None,
+    }
+}
+
+/// `x op n` of two integers (see `quick_cond`).
+fn int_holds(op: Op, x: i64, n: i64) -> bool {
+    match op {
+        Op::Eq => x == n,
+        Op::Ne => x != n,
+        Op::Lt => x < n,
+        Op::Le => x <= n,
+        Op::Gt => x > n,
+        _ => x >= n,
     }
 }
 
@@ -56279,9 +56435,10 @@ impl Exec<'_> {
                 let mut matched = false;
                 if key.fill(lkeys, &env)? {
                     for j in index.get_ref(&key.key) {
+                        key.tick()?;
                         let c = out.extend(l);
                         place(c, at, cols, right.row(j));
-                        if holds(&rest, &p.cols, c, self.params)? {
+                        if holds_now(&rest, &p.cols, c, self.params)? {
                             matched = true;
                         } else {
                             out.pop();
@@ -56327,16 +56484,17 @@ impl Exec<'_> {
                                 set_from(d, Cow::Borrowed(x));
                             }
                         }
+                        key.tick()?;
                         place(c, at, cols, right.row(j));
-                        if holds(&rest, &p.cols, c, self.params)? {
+                        if holds_now(&rest, &p.cols, c, self.params)? {
                             matched = true;
-                            if holds(&now, &p.cols, c, self.params)? {
+                            if holds_now(&now, &p.cols, c, self.params)? {
                                 g.add(c, group, p, self.params, None)?;
                             }
                         }
                     }
                 }
-                if !matched && left_join && holds(&now, &p.cols, l, self.params)? {
+                if !matched && left_join && holds_now(&now, &p.cols, l, self.params)? {
                     g.add(l, group, p, self.params, None)?;
                 }
                 Ok::<_, SqlError>(())
@@ -73869,6 +74027,20 @@ mod tests {
         assert_eq!(vals_key([Value::Int(1), dec("2.00")].iter()), vals_key([Value::Int(1), Value::Int(2)].iter()));
         assert!(matches!(vals_key([Value::Int(1), dec("2.50")].iter()), Some(HKey::Tuple(_))));
         assert_eq!(vals_key([Value::Int(1), Value::Null].iter()), None);
+    }
+
+    #[test]
+    fn packed_integers_read_in_one_pass() {
+        use super::int_field;
+        assert_eq!(int_field(b"42;", 0), Some((42, 3)));
+        assert_eq!(int_field(b"xx-7;i9;", 2), Some((-7, 5)));
+        assert_eq!(int_field(b"+0;", 0), Some((0, 3)));
+        assert_eq!(int_field(b"9223372036854775807;", 0), Some((i64::MAX, 20)));
+        assert_eq!(int_field(b"-9223372036854775808;", 0), Some((i64::MIN, 21)));
+        // too big, not digits, no digits, no end
+        for bad in [&b"9223372036854775808;"[..], b"-9223372036854775809;", b"1a;", b";", b"-;", b"12", b""] {
+            assert_eq!(int_field(bad, 0), None, "{bad:?}");
+        }
     }
 
     #[test]
