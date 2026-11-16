@@ -158,3 +158,17 @@ fn with_queries_reach_order_by_group_by_limit_and_offset() {
     let grouped = "with c as (select 5 v) select count(*) from generate_series(1, 10) x group by x % (select v from c)";
     assert_eq!(rows(grouped), 5);
 }
+
+/// Calls nested in their own first argument are typed once a level: COALESCE 30 deep took minutes while each level
+/// asked for its argument's type twice (a second for 20 levels, doubling with each).
+#[test]
+fn nested_calls_take_time_by_their_depth_not_its_power() {
+    let db = Db::new();
+    run(&db, MAIN, "create table t (a int)", &[]).unwrap();
+    let t = std::time::Instant::now();
+    for (open, close) in [("coalesce(", ", 1)"), ("greatest(", ", 1)"), ("least(", ", 1)"), ("mod(", ", 7)")] {
+        assert_eq!(code(&db, &format!("select {} from t", nested(open, "a", close, 30))), "ok", "{open}");
+    }
+    assert_eq!(col(&db, &format!("select {}", nested("coalesce(", "null", ", 7)", 30))), ["7"]);
+    assert!(t.elapsed() < std::time::Duration::from_secs(20), "{:?}", t.elapsed());
+}

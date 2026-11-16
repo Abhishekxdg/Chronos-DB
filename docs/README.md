@@ -3,7 +3,7 @@ title: Chronos DB documentation
 slug: /
 ---
 
-> **Beta.** Chronos 0.5 is a public beta for developers (0.5.4 is the current release); see [where it stands](postgres-compatibility.md#where-it-stands-beta). Since 0.5 `chronos attach` works beside MySQL, MariaDB and MongoDB as it does beside Postgres, and a merge written there can be undone by its id. `chronos serve --follow` works beside Postgres and MongoDB.
+> **Beta.** Chronos 0.5 is a public beta for developers (0.5.5 is the current release); see [where it stands](postgres-compatibility.md#where-it-stands-beta). Since 0.5 `chronos attach` works beside MySQL, MariaDB and MongoDB as it does beside Postgres, and a merge written there can be undone by its id. `chronos serve --follow` works beside Postgres and MongoDB.
 
 Chronos DB gives every AI agent its own **world**: a copy-on-write branch of the whole database, made in about 2 microseconds. Agents change their world freely; you look at what changed and keep what works.
 

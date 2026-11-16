@@ -10858,6 +10858,9 @@ struct Parser {
     /// UPDATE pg_class SET ...: each `column = value` read, with the value's text (see `Stmt::PlannerStats`); None
     /// when not wanted
     set_texts: Option<Vec<(String, String)>>,
+    /// a plain function call `primary_rest` found, for `primary` to read: its name, its name's token, and whether
+    /// it was written `pg_catalog.name` (see `plain_call`)
+    pending_call: Option<(String, usize, bool)>,
 }
 
 /// How deep a statement may nest: a level per parenthesis, NOT, sign, cast and operator in a
@@ -10941,6 +10944,7 @@ impl Parser {
             agg_at: vec![],
             spread: false,
             set_texts: None,
+            pending_call: None,
         }
     }
 
@@ -20708,6 +20712,13 @@ impl Parser {
     fn cmp_one(&mut self) -> Result<Expr> {
         let (start, copied) = (self.i, self.copied.get());
         let l = self.concat()?;
+        self.cmp_tail(l, start, copied)
+    }
+
+    /// `cmp_one` after its left side `l`: the comparison that follows it, if one does. Apart and never inlined: its
+    /// frame is about 3 KB (release build), which every level of nesting inside `l` would otherwise hold.
+    #[inline(never)]
+    fn cmp_tail(&mut self, l: Expr, start: usize, copied: usize) -> Result<Expr> {
         // s ^@ prefix: starts_with
         if self.sym("^@") {
             let r = self.concat()?;
@@ -21283,35 +21294,65 @@ impl Parser {
     }
 
     fn primary(&mut self) -> Result<Expr> {
-        let catalog = std::mem::take(&mut self.catalog_call);
-        let t = self.next();
-        if let Some(Tok::Str(s) | Tok::Num(s)) = &t
-            && let Some(at) = self.starts.get(self.i - 1)
-        {
-            self.lits.push((s.clone(), *at as u32 + 1));
+        // A parenthesis is read apart from everything else a value can start with: `primary_rest` takes about 5 KB
+        // of stack (release build), which every level of nested parentheses would otherwise hold, and MAX_STACK
+        // then refused 80 of them.
+        if matches!(self.peek(), Some(Tok::Sym("("))) {
+            return self.primary_paren();
         }
+        let e = self.primary_rest()?;
+        match self.pending_call.take() {
+            Some((w, at, catalog)) => self.plain_call(w, at, catalog),
+            None => Ok(e),
+        }
+    }
+
+    /// A call of a function that is no aggregate, window function or syntax of its own, from its `(`: `w`, its name, at
+    /// token `at`; `catalog` when written `pg_catalog.w`. Read by `primary` after `primary_rest` returned, not inside
+    /// it: that frame is about 5 KB (release build), which every level of nested calls would otherwise hold.
+    #[inline(never)]
+    fn plain_call(&mut self, w: String, at: usize, catalog: bool) -> Result<Expr> {
+        let Some((f, arity)) = builtin_of(&w) else {
+            // one made with CREATE FUNCTION, found when it runs
+            self.bind(at, &w, Kind::Func)?;
+            return self.call(func_named(&w));
+        };
+        self.spread = matches!(w.as_str(), "concat" | "concat_ws" | "format" | "num_nulls" | "num_nonnulls");
+        let (args, names) = self.call_args()?;
+        // functions made with CREATE FUNCTION of its name on the search_path: the arguments' types choose
+        // between them and the built-in (see `functions::means_builtin`) when the call is bound or run, or
+        // now, for what looks at it unbound (a default, VALUES), where they are known without columns and
+        // choose the built-in. COALESCE, NULLIF, GREATEST and LEAST are syntax in Postgres, always the
+        // built-in.
+        let syntax = matches!(w.as_str(), "coalesce" | "nullif" | "greatest" | "least");
+        // (pg_catalog.f, and a policy's condition, call the built-in)
+        let made = !syntax && !catalog && !self.pinned && !funcs_on_path(&w).is_empty();
+        if made && self.binding.is_some() {
+            return err(
+                UNSUPPORTED,
+                format!(
+                    "{w}() is a built-in function and one made with CREATE FUNCTION on the search_path: write pg_catalog.{w}(...) or the other one's schema"
+                ),
+            );
+        }
+        if made {
+            self.calls = true;
+            let name = format!("{PLAIN}{w}");
+            let c = Call { name, args, names, def: None, via_call: false, builtin: true };
+            return match functions::settled(&c, &[], None) {
+                Some(Ok(Expr::Call(_))) | None => Ok(Expr::Call(Box::new(c))),
+                Some(e) => e,
+            };
+        }
+        builtin_call(&w, f, arity, args, &names)
+    }
+
+    /// `primary` at a parenthesis: a subquery, a row value `(a, b)`, or an expression in parentheses.
+    #[inline(never)]
+    fn primary_paren(&mut self) -> Result<Expr> {
+        self.catalog_call = false;
+        let t = self.next();
         Ok(match t {
-            // as in Postgres: a whole number is an integer, anything else (1.5, 1e3, a whole
-            // number past bigint) is numeric, exact
-            Some(Tok::Num(n)) => Expr::Lit(match n.parse::<i64>() {
-                Ok(i) => Value::Int(i),
-                // (every digit kept; past numeric's range, numeric_in's error)
-                Err(_) => match decimal::Dec::parse_input(&n) {
-                    Ok(d) => Value::Numeric(d),
-                    Err(true) => {
-                        return Err(SqlError {
-                            code: RANGE,
-                            message: "value overflows numeric format".into(),
-                            info: None,
-                        });
-                    }
-                    Err(false) => {
-                        return Err(SqlError { code: SYNTAX, message: format!("bad number {n}"), info: None });
-                    }
-                },
-            }),
-            Some(Tok::Str(s)) => Expr::Lit(Value::Text(s)),
-            Some(Tok::Param(n)) => Expr::Param(n),
             // ((VALUES (1)) too: VALUES is reserved, never a function's name)
             Some(Tok::Sym("("))
                 if self.is_kw("select")
@@ -21319,34 +21360,8 @@ impl Parser {
                     || (self.is_kw("values") && matches!(self.t.get(self.i + 1), Some(Tok::Sym("("))))
                     || self.paren_query_goes_on(self.i) =>
             {
-                let q = self.expect_subquery()?;
-                self.expect_sym(")")?;
-                // (SELECT agg(x)) with no FROM: every column is the outer query's, so the aggregate is that query's
-                // own, as in Postgres, and the subquery is the aggregate
-                if q.set.is_empty()
-                    && !q.distinct
-                    && q.from.is_none()
-                    && q.joins.is_empty()
-                    && q.filter.is_none()
-                    && q.group.is_empty()
-                    && q.having.is_none()
-                    && q.order.is_empty()
-                    && q.limit.is_none()
-                    && q.offset.is_none()
-                    && let [Item::Expr(e, _)] = &q.items[..]
-                    && has_agg(e)
-                {
-                    return Ok(e.clone());
-                }
-                Expr::Sub(Box::new(SubQ {
-                    q: Box::new(q),
-                    outer: vec![],
-                    ty: Type::Text,
-                    cmp: None,
-                    sig: 0,
-                    coll: collation::Strength::None,
-                    lifted: vec![],
-                }))
+                // (apart: a query's frame is kilobytes, which nested parentheses would hold too)
+                return self.paren_subquery();
             }
             Some(Tok::Sym("(")) => {
                 let e = self.expr()?;
@@ -21382,6 +21397,80 @@ impl Parser {
                         _ => e,
                     }
                 }
+            }
+            // (never: `primary` comes here at a parenthesis only)
+            _ => return err("XX000", "a parenthesis was expected"),
+        })
+    }
+
+    /// `(query)` where a value is read, after its `(`.
+    #[inline(never)]
+    fn paren_subquery(&mut self) -> Result<Expr> {
+        let q = self.expect_subquery()?;
+        self.expect_sym(")")?;
+        // (SELECT agg(x)) with no FROM: every column is the outer query's, so the aggregate is that query's
+        // own, as in Postgres, and the subquery is the aggregate
+        if q.set.is_empty()
+            && !q.distinct
+            && q.from.is_none()
+            && q.joins.is_empty()
+            && q.filter.is_none()
+            && q.group.is_empty()
+            && q.having.is_none()
+            && q.order.is_empty()
+            && q.limit.is_none()
+            && q.offset.is_none()
+            && let [Item::Expr(e, _)] = &q.items[..]
+            && has_agg(e)
+        {
+            return Ok(e.clone());
+        }
+        Ok(Expr::Sub(Box::new(SubQ {
+            q: Box::new(q),
+            outer: vec![],
+            ty: Type::Text,
+            cmp: None,
+            sig: 0,
+            coll: collation::Strength::None,
+            lifted: vec![],
+        })))
+    }
+
+    /// `primary`, for anything but a parenthesis.
+    #[inline(never)]
+    fn primary_rest(&mut self) -> Result<Expr> {
+        let catalog = std::mem::take(&mut self.catalog_call);
+        let t = self.next();
+        if let Some(Tok::Str(s) | Tok::Num(s)) = &t
+            && let Some(at) = self.starts.get(self.i - 1)
+        {
+            self.lits.push((s.clone(), *at as u32 + 1));
+        }
+        Ok(match t {
+            // as in Postgres: a whole number is an integer, anything else (1.5, 1e3, a whole
+            // number past bigint) is numeric, exact
+            Some(Tok::Num(n)) => Expr::Lit(match n.parse::<i64>() {
+                Ok(i) => Value::Int(i),
+                // (every digit kept; past numeric's range, numeric_in's error)
+                Err(_) => match decimal::Dec::parse_input(&n) {
+                    Ok(d) => Value::Numeric(d),
+                    Err(true) => {
+                        return Err(SqlError {
+                            code: RANGE,
+                            message: "value overflows numeric format".into(),
+                            info: None,
+                        });
+                    }
+                    Err(false) => {
+                        return Err(SqlError { code: SYNTAX, message: format!("bad number {n}"), info: None });
+                    }
+                },
+            }),
+            Some(Tok::Str(s)) => Expr::Lit(Value::Text(s)),
+            Some(Tok::Param(n)) => Expr::Param(n),
+            t @ Some(Tok::Sym("(")) => {
+                self.put_back(t);
+                return self.primary_paren();
             }
             Some(Tok::Word(w)) if w == "row" && matches!(self.peek(), Some(Tok::Sym("("))) => {
                 self.i += 1;
@@ -22107,39 +22196,9 @@ impl Parser {
                     }
                     return self.window(f, args);
                 }
-                let Some((f, arity)) = builtin_of(&w) else {
-                    // one made with CREATE FUNCTION, found when it runs
-                    self.bind(at, &w, Kind::Func)?;
-                    return self.call(func_named(&w));
-                };
-                self.spread = matches!(w.as_str(), "concat" | "concat_ws" | "format" | "num_nulls" | "num_nonnulls");
-                let (args, names) = self.call_args()?;
-                // functions made with CREATE FUNCTION of its name on the search_path: the arguments' types choose
-                // between them and the built-in (see `functions::means_builtin`) when the call is bound or run, or
-                // now, for what looks at it unbound (a default, VALUES), where they are known without columns and
-                // choose the built-in. COALESCE, NULLIF, GREATEST and LEAST are syntax in Postgres, always the
-                // built-in.
-                let syntax = matches!(w.as_str(), "coalesce" | "nullif" | "greatest" | "least");
-                // (pg_catalog.f, and a policy's condition, call the built-in)
-                let made = !syntax && !catalog && !self.pinned && !funcs_on_path(&w).is_empty();
-                if made && self.binding.is_some() {
-                    return err(
-                        UNSUPPORTED,
-                        format!(
-                            "{w}() is a built-in function and one made with CREATE FUNCTION on the search_path: write pg_catalog.{w}(...) or the other one's schema"
-                        ),
-                    );
-                }
-                if made {
-                    self.calls = true;
-                    let name = format!("{PLAIN}{w}");
-                    let c = Call { name, args, names, def: None, via_call: false, builtin: true };
-                    return match functions::settled(&c, &[], None) {
-                        Some(Ok(Expr::Call(_))) | None => Ok(Expr::Call(Box::new(c))),
-                        Some(e) => e,
-                    };
-                }
-                builtin_call(&w, f, arity, args, &names)?
+                // (its arguments are read by `primary`, once this frame is gone: see `plain_call`)
+                self.pending_call = Some((w, at, catalog));
+                Expr::Default
             }
             // pg_catalog.format_type(...), pg_catalog.pg_class.relname: the catalog's functions and
             // tables are also known by their plain names
@@ -34675,7 +34734,18 @@ fn ty_of(e: &Expr, cols: &[Col], params: &[Option<Type>]) -> Result<Type> {
 
 /// `ty_of`, for expressions whose aggregates were collected into `aggs` (see `Binder`).
 fn ty_in(e: &Expr, cols: &[Col], params: &[Option<Type>], aggs: &[Expr]) -> Result<Type> {
-    let ty = |e: &Expr| ty_in(e, cols, params, aggs);
+    // A function's arguments are each typed once here, however many of the arms below ask (a guard, then its arm):
+    // asked twice a level, COALESCE nested 30 deep took minutes, doubling with each level.
+    let args: &[Expr] = if let Expr::Func(_, a) = e { a } else { &[] };
+    let known: Vec<std::cell::OnceCell<Result<Type>>> = args.iter().map(|_| std::cell::OnceCell::new()).collect();
+    let ty = |e: &Expr| {
+        // (which argument `e` is, by where it lies in `args`)
+        let at = (std::ptr::from_ref(e) as usize).wrapping_sub(args.as_ptr() as usize) / std::mem::size_of::<Expr>();
+        match args.get(at) {
+            Some(a) if std::ptr::eq(a, e) => known[at].get_or_init(|| ty_in(e, cols, params, aggs)).clone(),
+            _ => ty_in(e, cols, params, aggs),
+        }
+    };
     Ok(match e {
         Expr::Default => Type::Text,
         Expr::WinRef(_, t) => *t,

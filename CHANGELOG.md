@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.5.5 (beta), 2026-11-17
+
+**Deeply nested statements run again, and nested calls no longer take minutes.** A release build refused 80 nested
+parentheses or function calls where 100 are meant to run, and `coalesce` nested in its own argument doubled in time
+with each level (22 deep: 3 seconds). Both are old, in every release build since the parser grew past its stack
+budget; both are fixed. Answers are the same; nothing changes in how rows are stored or merges are written. Built
+and signed on the maintainer's Mac as 0.5.4 was.
+
+- **Statements nest as deep as they are meant to again, and nested calls no longer take minutes.** A release build
+  refused 80 nested parentheses (and 80 nested calls) as too complex, where 100 are meant to
+  run: the parser's stack frames had grown, and the tests that measure it run only in release builds, which nothing
+  ran after the build machine went away. The heaviest frames are out of the nesting path: 150 parentheses,
+  140 calls on a 2 MB stack. And `coalesce`, `greatest`, `least`, `mod` and `array[...]` nested in
+  their own arguments were typed twice a level, so each level doubled the time (22 deep: 3 seconds; 30: minutes);
+  each argument is typed once now (60 deep: 19 ms). The release gate runs those tests.
+
 ## 0.5.4 (beta), 2026-11-16
 
 **Faster scans, `GROUP BY` and one-key joins.** A filter on an integer column is checked as each row is read, a text
