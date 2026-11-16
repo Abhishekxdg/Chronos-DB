@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The Studio's README and issue links, and the TypeScript client's package links, name the public repository as it
+  is now called (`Abhishekxdg/Chronos-DB`). The old name still redirects.
+
 ## 0.5.5 (beta), 2026-11-17
 
 **Deeply nested statements run again, and nested calls no longer take minutes.** A release build refused 80 nested
