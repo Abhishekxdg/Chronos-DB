@@ -81,7 +81,7 @@ Evidence levels used below:
 - **Tested:** run by the repo's test suite against a real `chronos serve`.
 - **Harness:** run end to end by a benchmark harness in the repo, not by the tests.
 - **Queries tested:** the library's own SQL is replayed in the tests, but the library itself wasn't run.
-- **Reported:** the [CHANGELOG](https://github.com/Abhishekxdg/Chronos-DB/blob/main/CHANGELOG.md) says it ran, and nothing in the repo runs it.
+- **Reported:** the [CHANGELOG](https://github.com/2090-labs/Chronos-DB/blob/main/CHANGELOG.md) says it ran, and nothing in the repo runs it.
 - **Protocol only:** should work, given the protocol features below. Not tried.
 
 ### psql
@@ -109,7 +109,7 @@ merge world trial;           -- into main; the connection moves back to main
 
 ### Rust: `postgres` crate
 
-**Tested:** `tests/pg.rs` `postgres_driver` (extended protocol, binary parameters and results, prepared statements, SQLSTATEs), `transactions_and_branches_over_the_wire`, `dates_over_the_wire`, `arrays_numeric_and_time_over_the_wire`, `token_is_the_password`, `agents_log_in_with_their_token`, `timeouts_and_cancel_requests_stop_a_query`, `listen_and_notify_over_the_wire`; `tests/copy.rs` `driver_copy_in_and_out`; `tests/safe.rs` `safe_mode_over_http_and_postgres`. The benchmarks in [examples/sql.rs](https://github.com/Abhishekxdg/Chronos-DB/blob/main/examples/sql.rs) use it too.
+**Tested:** `tests/pg.rs` `postgres_driver` (extended protocol, binary parameters and results, prepared statements, SQLSTATEs), `transactions_and_branches_over_the_wire`, `dates_over_the_wire`, `arrays_numeric_and_time_over_the_wire`, `token_is_the_password`, `agents_log_in_with_their_token`, `timeouts_and_cancel_requests_stop_a_query`, `listen_and_notify_over_the_wire`; `tests/copy.rs` `driver_copy_in_and_out`; `tests/safe.rs` `safe_mode_over_http_and_postgres`. The benchmarks in [examples/sql.rs](https://github.com/2090-labs/Chronos-DB/blob/main/examples/sql.rs) use it too.
 
 ```rust
 use postgres::{Client, NoTls};
@@ -130,7 +130,7 @@ c.batch_execute("merge world trial")?;
 
 ### Python: psycopg 3 with pgvector
 
-**Harness:** `bench/vector_dbs.py` loads and queries 76,424 OpenAI embeddings through psycopg 3, with vectors sent in binary through pgvector's `register_vector` (the [benchmarks](https://github.com/Abhishekxdg/Chronos-DB/blob/main/BENCHMARKS.md)). Not in the test suite.
+**Harness:** `bench/vector_dbs.py` loads and queries 76,424 OpenAI embeddings through psycopg 3, with vectors sent in binary through pgvector's `register_vector` (the [benchmarks](https://github.com/2090-labs/Chronos-DB/blob/main/BENCHMARKS.md)). Not in the test suite.
 
 ```python
 import json, numpy as np, psycopg
@@ -197,7 +197,7 @@ Watch out for: `CREATE EXTENSION` of an extension that isn't [built in](#known-g
 
 ### Node: `pg` (node-postgres)
 
-**Protocol only:** not tested. The repo's TypeScript client ([clients/typescript](https://github.com/Abhishekxdg/Chronos-DB/blob/main/clients/typescript)) uses the HTTP API, not the Postgres port.
+**Protocol only:** not tested. The repo's TypeScript client ([clients/typescript](https://github.com/2090-labs/Chronos-DB/blob/main/clients/typescript)) uses the HTTP API, not the Postgres port.
 
 ```js
 import pg from "pg";

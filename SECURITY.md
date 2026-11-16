@@ -2,7 +2,7 @@
 
 ## Reporting a problem
 
-Please don't open a public issue for security problems. Report them privately with GitHub's [private vulnerability reporting](https://github.com/Abhishekxdg/Chronos-DB/security/advisories/new) on the chronosdb repository. We aim to reply within 3 working days.
+Please don't open a public issue for security problems. Report them privately with GitHub's [private vulnerability reporting](https://github.com/2090-labs/Chronos-DB/security/advisories/new) on the chronosdb repository. We aim to reply within 3 working days.
 
 Data-loss and corruption bugs count as security problems here: please report them privately too.
 

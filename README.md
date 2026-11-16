@@ -4,7 +4,7 @@
 
 <div align="center">
 
-[![release](https://img.shields.io/github/v/release/Abhishekxdg/Chronos-DB?label=release&color=c8ff2e&style=flat-square&labelColor=050505)](https://github.com/Abhishekxdg/Chronos-DB/releases/latest)
+[![release](https://img.shields.io/github/v/release/2090-labs/Chronos-DB?label=release&color=c8ff2e&style=flat-square&labelColor=050505)](https://github.com/2090-labs/Chronos-DB/releases/latest)
 ![status](https://img.shields.io/badge/status-public%20beta-2c2c2c?style=flat-square&labelColor=050505)
 ![postgres wire](https://img.shields.io/badge/postgres-wire%20protocol-2c2c2c?style=flat-square&labelColor=050505&logo=postgresql&logoColor=f2f2ee)
 ![attach](https://img.shields.io/badge/beside-Postgres%20%C2%B7%20MySQL%20%C2%B7%20MariaDB%20%C2%B7%20MongoDB-2c2c2c?style=flat-square&labelColor=050505)
@@ -19,7 +19,7 @@
 [**SQL**](docs/sql.md) ·
 [**Benchmarks**](BENCHMARKS.md) ·
 [**Changelog**](CHANGELOG.md) ·
-[**Releases**](https://github.com/Abhishekxdg/Chronos-DB/releases)
+[**Releases**](https://github.com/2090-labs/Chronos-DB/releases)
 
 </div>
 
@@ -97,7 +97,7 @@ Every change, release by release: [CHANGELOG.md](CHANGELOG.md).
 ## Install
 
 ```bash
-curl -fsSL https://github.com/Abhishekxdg/Chronos-DB/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/2090-labs/Chronos-DB/releases/latest/download/install.sh | sh
 chronos --version
 ```
 
@@ -330,7 +330,7 @@ await agent.merge(); // throws ChronosError 409 on conflicts
 
 Tool definitions for any LLM API with tool calling, and a parallel-agents example, are in [`examples/agents`](examples/agents).
 
-**Chronos Gateway** is a separate product built on this engine: a self-hosted service that lets your own product's agents change the database your app already uses (Postgres, MySQL, MariaDB or MongoDB), one customer's rows at a time, through approved merges, with undo. It has its own releases at [chronos-gateway-releases](https://github.com/Abhishekxdg/chronos-gateway-releases).
+**Chronos Gateway** is a separate product built on this engine: a self-hosted service that lets your own product's agents change the database your app already uses (Postgres, MySQL, MariaDB or MongoDB), one customer's rows at a time, through approved merges, with undo. It has its own releases at [chronos-gateway-releases](https://github.com/2090-labs/chronos-gateway-releases).
 
 <p align="center"><img src="docs/assets/readme/scene-gateway.png" alt="An isometric drawing of Chronos Gateway between a product's agents and its Postgres: the agents reach a world per run, one tenant each, and hold no Postgres credential. Changes reach Postgres as a checked write, or ask the end user first. The product's app keeps talking to Postgres as it does today." width="820"></p>
 
@@ -373,12 +373,12 @@ The same pages, with search, are on the [docs site](https://chronosdb-docs.verce
 
 ## Feedback and contributing
 
-- **Questions or ideas:** [Discussions](https://github.com/Abhishekxdg/Chronos-DB/discussions).
-- **A bug, or something unclear:** [open an issue](https://github.com/Abhishekxdg/Chronos-DB/issues/new/choose). The templates ask for the few lines that reproduce it.
+- **Questions or ideas:** [Discussions](https://github.com/2090-labs/Chronos-DB/discussions).
+- **A bug, or something unclear:** [open an issue](https://github.com/2090-labs/Chronos-DB/issues/new/choose). The templates ask for the few lines that reproduce it.
 - **Security issues:** report them privately, as [SECURITY.md](SECURITY.md) describes.
 - **Contributing:** see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-What changed in each release: [CHANGELOG.md](CHANGELOG.md). The newest build is always at [releases/latest](https://github.com/Abhishekxdg/Chronos-DB/releases/latest); as this page was written that was [v0.5.5](https://github.com/Abhishekxdg/Chronos-DB/releases/tag/v0.5.5), 2026-11-17.
+What changed in each release: [CHANGELOG.md](CHANGELOG.md). The newest build is always at [releases/latest](https://github.com/2090-labs/Chronos-DB/releases/latest); as this page was written that was [v0.5.5](https://github.com/2090-labs/Chronos-DB/releases/tag/v0.5.5), 2026-11-17.
 
 ## What's in this repository
 
@@ -390,7 +390,7 @@ What changed in each release: [CHANGELOG.md](CHANGELOG.md). The newest build is 
 | [`docs/`](docs), [`site/`](site) | The documentation and the docs site that publishes it |
 | [`examples/`](examples) | The five-minute trial, the guides' SQL, agent tool definitions, and the Rust benchmark harnesses |
 | [`bench/slt`](bench/slt) | The sqllogictest runner's scripts and results |
-| [`install.sh`](install.sh) | The installer; signed binaries are on the [releases page](https://github.com/Abhishekxdg/Chronos-DB/releases) |
+| [`install.sh`](install.sh) | The installer; signed binaries are on the [releases page](https://github.com/2090-labs/Chronos-DB/releases) |
 
 ## License
 

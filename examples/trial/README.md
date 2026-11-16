@@ -17,9 +17,9 @@ merging a world.
 ## Run it
 
 ```bash
-curl -fsSL https://github.com/Abhishekxdg/Chronos-DB/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/2090-labs/Chronos-DB/releases/latest/download/install.sh | sh
 CHRONOS_PROTECT_MAIN=off chronos serve crm-trial &   # the trial seeds main directly; HTTP on 127.0.0.1:7070, Postgres on 127.0.0.1:5433
-git clone https://github.com/Abhishekxdg/Chronos-DB && cd Chronos-DB/examples/trial
+git clone https://github.com/2090-labs/Chronos-DB && cd Chronos-DB/examples/trial
 python3 trial.py                        # Python 3.9+, nothing to install
 ```
 
@@ -84,7 +84,7 @@ say how to write your own rules.
 ## Tell us what broke
 
 This is the part we need most. If your agents write to real data (CRM, orders, tickets), open an
-issue at [github.com/Abhishekxdg/Chronos-DB](https://github.com/Abhishekxdg/Chronos-DB/issues) with
+issue at [github.com/2090-labs/Chronos-DB](https://github.com/2090-labs/Chronos-DB/issues) with
 what you ran and what happened, or what you expected to be caught and wasn't.
 
 To start over: stop the server and delete the `crm-trial` folder.

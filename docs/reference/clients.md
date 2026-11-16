@@ -24,8 +24,8 @@ Python isn't on PyPI yet: copy the file into your project.
 
 | Language | Get it | Needs |
 |---|---|---|
-| TypeScript / JavaScript | `npm install @chronosdb/client`, or copy [clients/typescript/chronos.ts](https://github.com/Abhishekxdg/Chronos-DB/blob/main/clients/typescript/chronos.ts) | global `fetch`: Node 18+, browsers, edge runtimes |
-| Python | [clients/python/chronos.py](https://github.com/Abhishekxdg/Chronos-DB/blob/main/clients/python/chronos.py) | Python 3.9+, standard library only |
+| TypeScript / JavaScript | `npm install @chronosdb/client`, or copy [clients/typescript/chronos.ts](https://github.com/2090-labs/Chronos-DB/blob/main/clients/typescript/chronos.ts) | global `fetch`: Node 18+, browsers, edge runtimes |
+| Python | [clients/python/chronos.py](https://github.com/2090-labs/Chronos-DB/blob/main/clients/python/chronos.py) | Python 3.9+, standard library only |
 
 ```ts
 import { Chronos, ChronosError } from "@chronosdb/client";
@@ -254,7 +254,7 @@ agent.merge()
 
 Two more files beside `chronos.py`, each needing only its framework.
 
-[`chronos_langgraph.py`](https://github.com/Abhishekxdg/Chronos-DB/blob/main/clients/python/chronos_langgraph.py) (`pip install langgraph`): `ChronosSaver`, a checkpointer, and `ChronosStore`, a long-term memory store, on a branch. Give them a world: main is protected by default, and a world keeps the agent's state beside the rows it changed.
+[`chronos_langgraph.py`](https://github.com/2090-labs/Chronos-DB/blob/main/clients/python/chronos_langgraph.py) (`pip install langgraph`): `ChronosSaver`, a checkpointer, and `ChronosStore`, a long-term memory store, on a branch. Give them a world: main is protected by default, and a world keeps the agent's state beside the rows it changed.
 
 ```python
 from chronos import Chronos
@@ -273,7 +273,7 @@ world.merge()         # both land; world.discard() drops both
 - `ChronosSaver` passes LangGraph's checkpointer conformance suite (`langgraph-checkpoint-conformance`), except `prune` and `delete_for_runs`, which it doesn't offer. The async methods (`aget_tuple`, `aput`, ...) run the same calls on a worker thread.
 - `ChronosStore.search(query=...)` is [find](#find)'s full-text search over the item's strings (or the fields a put's `index` names; `index=False` leaves it out), typos allowed. There is no vector search: a store given an embedding `index` is refused. Filters take values and `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`.
 
-[`chronos_pytest.py`](https://github.com/Abhishekxdg/Chronos-DB/blob/main/clients/python/chronos_pytest.py) (`pip install pytest`): the fixture `chronos_world`, a fork of main for each test, discarded after it (a test that merges it is fine). Turn it on with `pytest -p chronos_pytest` or `pytest_plugins = ["chronos_pytest"]`; it reads `CHRONOS_URL` and `CHRONOS_TOKEN`, and skips the test without `CHRONOS_URL`.
+[`chronos_pytest.py`](https://github.com/2090-labs/Chronos-DB/blob/main/clients/python/chronos_pytest.py) (`pip install pytest`): the fixture `chronos_world`, a fork of main for each test, discarded after it (a test that merges it is fine). Turn it on with `pytest -p chronos_pytest` or `pytest_plugins = ["chronos_pytest"]`; it reads `CHRONOS_URL` and `CHRONOS_TOKEN`, and skips the test without `CHRONOS_URL`.
 
 ```python
 def test_agent_fixes_names(chronos_world):
@@ -281,4 +281,4 @@ def test_agent_fixes_names(chronos_world):
     assert {c["key"] for c in chronos_world.diff()} == {"users/1", "users/7"}
 ```
 
-More: [examples/agents](https://github.com/Abhishekxdg/Chronos-DB/blob/main/examples/agents) (tool definitions for LLM APIs, 20 agents merging at once), run in CI by `tests/clients.rs`.
+More: [examples/agents](https://github.com/2090-labs/Chronos-DB/blob/main/examples/agents) (tool definitions for LLM APIs, 20 agents merging at once), run in CI by `tests/clients.rs`.

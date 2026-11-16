@@ -7,7 +7,7 @@ Reviewing every agent's diff works for ten changes a day. It breaks at ten thous
 - A merge that keeps to its agent's rules goes through on its own.
 - A merge that breaks any rule is refused, with the reasons. Its world stays, queued in `SHOW REVIEWS`, until a person merges it or drops it.
 
-You'll set up a shop, write a policy, give it to an agent, watch a small fix merge on its own while a bulk change and a refund wait for you, then approve one and reject the other. It all runs in `psql` in a few minutes. The whole script is [examples/guides/merge-policies.sql](https://github.com/Abhishekxdg/Chronos-DB/blob/main/examples/guides/merge-policies.sql).
+You'll set up a shop, write a policy, give it to an agent, watch a small fix merge on its own while a bulk change and a refund wait for you, then approve one and reject the other. It all runs in `psql` in a few minutes. The whole script is [examples/guides/merge-policies.sql](https://github.com/2090-labs/Chronos-DB/blob/main/examples/guides/merge-policies.sql).
 
 ## How it works
 

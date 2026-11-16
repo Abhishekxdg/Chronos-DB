@@ -416,4 +416,4 @@ What to do meanwhile:
 
 ## Reporting a vulnerability
 
-Don't open a public issue. Email the maintainer or use the repository's private advisory feature, as [SECURITY.md](https://github.com/Abhishekxdg/Chronos-DB/blob/main/SECURITY.md) describes; the aim is a reply within 3 working days. Data-loss and corruption bugs count as security problems here: report them privately too.
+Don't open a public issue. Email the maintainer or use the repository's private advisory feature, as [SECURITY.md](https://github.com/2090-labs/Chronos-DB/blob/main/SECURITY.md) describes; the aim is a reply within 3 working days. Data-loss and corruption bugs count as security problems here: report them privately too.

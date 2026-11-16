@@ -4,7 +4,7 @@ title: Simulate a thousand futures and merge one
 
 You'll put a small pricing model in `main`, let `SIMULATE` try a thousand futures of it (each a world with its own prices and its own random demand), score each future in SQL, look inside the best ones, check that one comes out the same when replayed, and merge its prices into `main`. One statement does the forking, running, scoring and cleanup.
 
-The whole script is [examples/guides/scenario-planning.sql](https://github.com/Abhishekxdg/Chronos-DB/blob/main/examples/guides/scenario-planning.sql).
+The whole script is [examples/guides/scenario-planning.sql](https://github.com/2090-labs/Chronos-DB/blob/main/examples/guides/scenario-planning.sql).
 
 ## Setup
 
@@ -140,7 +140,7 @@ A caveat: the best of 1,000 noisy scores is partly luck. Averaging 20 weeks per 
 
 ## The big version
 
-[BENCHMARKS.md §10](https://github.com/Abhishekxdg/Chronos-DB/blob/main/BENCHMARKS.md#10-the-ultimate-test-one-real-state-100000-worlds-a-learning-loop-one-merge) runs a supply-chain model the same way, driven from Rust ([examples/simulate.rs](https://github.com/Abhishekxdg/Chronos-DB/blob/main/examples/simulate.rs)): three rounds of 100,000 worlds, 300,000 futures in all, each stepping every product through the days with a `WITH RECURSIVE` query, the best 1% of each round forked again, and the winner's policy merged into `main`.
+[BENCHMARKS.md §10](https://github.com/2090-labs/Chronos-DB/blob/main/BENCHMARKS.md#10-the-ultimate-test-one-real-state-100000-worlds-a-learning-loop-one-merge) runs a supply-chain model the same way, driven from Rust ([examples/simulate.rs](https://github.com/2090-labs/Chronos-DB/blob/main/examples/simulate.rs)): three rounds of 100,000 worlds, 300,000 futures in all, each stepping every product through the days with a `WITH RECURSIVE` query, the best 1% of each round forked again, and the winner's policy merged into `main`.
 
 ## Next steps
 
