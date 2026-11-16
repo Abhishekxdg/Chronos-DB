@@ -1,10 +1,10 @@
 blank_issues_enabled: true
 contact_links:
   - name: Questions and ideas
-    url: https://github.com/Abhishekxdg/chronosdb/discussions
+    url: https://github.com/Abhishekxdg/Chronos-DB/discussions
     about: Ask how to do something, or share what you're building, in Discussions.
   - name: Security issue
-    url: https://github.com/Abhishekxdg/chronosdb/blob/main/SECURITY.md
+    url: https://github.com/Abhishekxdg/Chronos-DB/blob/main/SECURITY.md
     about: Please report vulnerabilities privately, as SECURITY.md says, not in a public issue.
   - name: Documentation
     url: https://chronosdb-docs.vercel.app/

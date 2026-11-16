@@ -10,7 +10,7 @@ Chronos 0.5 is a **beta**. It aims to run what an application written for Postgr
 |---|---|
 | Postgres 16's own regression suite (`src/test/regress`, 219 files run as scripts, output compared line by line with Postgres's expected output; measured 2026-10-27 against 16.15's files) | **88.98%** of the expected lines; **66 of 219** files exactly the same. Counted by statement on the earlier run of 2026-10-22 (86.24% of lines): of the files' **44,942** statements, **85.41%** gave exactly Postgres's output, **87.29%** counting partial matches |
 | Real databases moved in during the trials (`chronos import` and `pg_dump` replay), checked table by table with row counts and row checksums | **7 of 7** with identical checksums: Chinook, Northwind, pgbench at 2M rows, Pagila (after 1 manual fix: `DISTINCT` inside a user-defined aggregate, since fixed), a synthetic schema of 50 constructs, a micro schema of 47 types, a Rails-style application, a multi-tenant schema with row-level security and `LISTEN`/`NOTIFY` |
-| Differential tests against a real Postgres 16 (`tests/pgdiff.rs`) | 468 tests, each statement giving the same rows or the same error class on both |
+| Differential tests against a real Postgres 16 (`tests/pgdiff.rs`) | 495 tests, each statement giving the same rows or the same error class on both |
 | Speed, same machine, pgbench-style | point reads at about **0.5×** Postgres's rate; writes at a fraction of Postgres's rate. Not tuned yet; measure your own workload |
 
 **How the regression figures are counted.** Lines: of the lines of the expected file each test is compared with (Postgres ships variants of a few, for other platforms; the closest one counts), the share Chronos's output has, in order, blank lines and separators included. psql echoes each statement into the output, so a statement with a wrong result still matches its own echoed lines. Statements: each SQL statement or psql command of a test file, with the output after it up to the next one (statements written on one line share that line's output). One passes when that output is exactly Postgres's. It is a partial match when both fail with an error and only the messages differ (the error's text, position, DETAIL, HINT and CONTEXT, and any NOTICE or WARNING), or when only a table's column names differ and the rows are the same. Doltgres publishes a rate that counts partial matches too (per query, against Postgres 15's suite); the second figure is the one to set beside it.
@@ -33,7 +33,7 @@ Moving a database in, and checking it came over: [Migrating from Postgres](migra
 
 ## How it's tested
 
-`chronos serve` speaks the Postgres wire protocol, so PostgreSQL clients and drivers connect to it: psql, the Rust `postgres` crate, psycopg, pgvector's Python helpers. Chronos is not Postgres. It has its own SQL parser and executor ([SQL](sql.md)), and the surface is what that page lists, no more. What it does cover is checked against a real Postgres by a differential suite, `tests/pgdiff.rs`. Its 468 tests run statement by statement on a fresh Chronos database and on a fresh schema in Postgres, and each statement must give the same rows, or fail on both with the same SQLSTATE class. Cells compare as text, except that numbers compare as numbers and `t`/`f` as `true`/`false` (the numeric tests compare the text exactly). Three more suites work the same way:
+`chronos serve` speaks the Postgres wire protocol, so PostgreSQL clients and drivers connect to it: psql, the Rust `postgres` crate, psycopg, pgvector's Python helpers. Chronos is not Postgres. It has its own SQL parser and executor ([SQL](sql.md)), and the surface is what that page lists, no more. What it does cover is checked against a real Postgres by a differential suite, `tests/pgdiff.rs`. Its 495 tests run statement by statement on a fresh Chronos database and on a fresh schema in Postgres, and each statement must give the same rows, or fail on both with the same SQLSTATE class. Cells compare as text, except that numbers compare as numbers and `t`/`f` as `true`/`false` (the numeric tests compare the text exactly). Three more suites work the same way:
 
 - `tests/schemas.rs`: schemas, `regclass`, the catalog, and the reflection queries SQLAlchemy 2.0 and Prisma send.
 - `tests/pgcompat.rs`: 240 random app-style queries over 4,000 users and 12,000 orders. They must return the same rows, and where Postgres reads a table through an index, Chronos must not scan all of it.
@@ -81,7 +81,7 @@ Evidence levels used below:
 - **Tested:** run by the repo's test suite against a real `chronos serve`.
 - **Harness:** run end to end by a benchmark harness in the repo, not by the tests.
 - **Queries tested:** the library's own SQL is replayed in the tests, but the library itself wasn't run.
-- **Reported:** the [CHANGELOG](https://github.com/Abhishekxdg/chronosdb/blob/main/CHANGELOG.md) says it ran, and nothing in the repo runs it.
+- **Reported:** the [CHANGELOG](https://github.com/Abhishekxdg/Chronos-DB/blob/main/CHANGELOG.md) says it ran, and nothing in the repo runs it.
 - **Protocol only:** should work, given the protocol features below. Not tried.
 
 ### psql
@@ -109,7 +109,7 @@ merge world trial;           -- into main; the connection moves back to main
 
 ### Rust: `postgres` crate
 
-**Tested:** `tests/pg.rs` `postgres_driver` (extended protocol, binary parameters and results, prepared statements, SQLSTATEs), `transactions_and_branches_over_the_wire`, `dates_over_the_wire`, `arrays_numeric_and_time_over_the_wire`, `token_is_the_password`, `agents_log_in_with_their_token`, `timeouts_and_cancel_requests_stop_a_query`, `listen_and_notify_over_the_wire`; `tests/copy.rs` `driver_copy_in_and_out`; `tests/safe.rs` `safe_mode_over_http_and_postgres`. The benchmarks in [examples/sql.rs](https://github.com/Abhishekxdg/chronosdb/blob/main/examples/sql.rs) use it too.
+**Tested:** `tests/pg.rs` `postgres_driver` (extended protocol, binary parameters and results, prepared statements, SQLSTATEs), `transactions_and_branches_over_the_wire`, `dates_over_the_wire`, `arrays_numeric_and_time_over_the_wire`, `token_is_the_password`, `agents_log_in_with_their_token`, `timeouts_and_cancel_requests_stop_a_query`, `listen_and_notify_over_the_wire`; `tests/copy.rs` `driver_copy_in_and_out`; `tests/safe.rs` `safe_mode_over_http_and_postgres`. The benchmarks in [examples/sql.rs](https://github.com/Abhishekxdg/Chronos-DB/blob/main/examples/sql.rs) use it too.
 
 ```rust
 use postgres::{Client, NoTls};
@@ -130,7 +130,7 @@ c.batch_execute("merge world trial")?;
 
 ### Python: psycopg 3 with pgvector
 
-**Harness:** `bench/vector_dbs.py` loads and queries 76,424 OpenAI embeddings through psycopg 3, with vectors sent in binary through pgvector's `register_vector` (the [benchmarks](https://github.com/Abhishekxdg/chronosdb/blob/main/BENCHMARKS.md)). Not in the test suite.
+**Harness:** `bench/vector_dbs.py` loads and queries 76,424 OpenAI embeddings through psycopg 3, with vectors sent in binary through pgvector's `register_vector` (the [benchmarks](https://github.com/Abhishekxdg/Chronos-DB/blob/main/BENCHMARKS.md)). Not in the test suite.
 
 ```python
 import json, numpy as np, psycopg
@@ -197,7 +197,7 @@ Watch out for: `CREATE EXTENSION` of an extension that isn't [built in](#known-g
 
 ### Node: `pg` (node-postgres)
 
-**Protocol only:** not tested. The repo's TypeScript client ([clients/typescript](https://github.com/Abhishekxdg/chronosdb/blob/main/clients/typescript)) uses the HTTP API, not the Postgres port.
+**Protocol only:** not tested. The repo's TypeScript client ([clients/typescript](https://github.com/Abhishekxdg/Chronos-DB/blob/main/clients/typescript)) uses the HTTP API, not the Postgres port.
 
 ```js
 import pg from "pg";

@@ -56,7 +56,7 @@ The same query works from Rust (`Query`), HTTP (`find`, see [http-api.md](http-a
 
 ## Speed
 
-At 1M rows with 64-dimension vectors (8-core laptop), p99 was about 2 ms for filter + text + vector together. See [../BENCHMARKS.md](https://github.com/Abhishekxdg/chronosdb/blob/main/BENCHMARKS.md).
+At 1M rows with 64-dimension vectors (8-core laptop), p99 was about 2 ms for filter + text + vector together. See [../BENCHMARKS.md](https://github.com/Abhishekxdg/Chronos-DB/blob/main/BENCHMARKS.md).
 
 ## Not yet
 

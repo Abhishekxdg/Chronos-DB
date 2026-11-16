@@ -4,7 +4,7 @@ title: Grade an agent by diffing its world against the expected state
 
 You'll write an answer key once, as a world holding the state a correct run leaves behind. Each agent run gets a world of its own, and `DIFF` between the two worlds is the grade: every row it returns is a mistake, with the exact columns that are wrong. No output parsing, no string matching of SQL: two different ways of doing the task right both score 0.
 
-The whole script is [examples/guides/agent-evaluation.sql](https://github.com/Abhishekxdg/chronosdb/blob/main/examples/guides/agent-evaluation.sql).
+The whole script is [examples/guides/agent-evaluation.sql](https://github.com/Abhishekxdg/Chronos-DB/blob/main/examples/guides/agent-evaluation.sql).
 
 ## Setup
 

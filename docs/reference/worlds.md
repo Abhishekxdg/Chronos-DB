@@ -656,7 +656,7 @@ ALTER SYSTEM SET history_retention TO '0'
 SHOW history_retention
 ```
 
-How far back time travel, `RESTORE`, `UNDO MERGE`, `UNDO AGENT`, `SHOW HISTORY` and `REPLAY` reach. Default `1 day` for a new database (`30 days` for one made by a release before 0.2.0, which keeps what it had); `'0'` keeps none. Shorter settings free space at the next checkpoint. `SHOW history_retention` returns one `interval`. On an in-memory database: 22023.
+How far back time travel, `RESTORE`, `UNDO MERGE`, `UNDO AGENT`, `SHOW HISTORY` and `REPLAY` reach. Default `1 hour` for a new database (`30 days` for one made by a release before 0.2.0, which keeps what it had); `'0'` keeps none. Shorter settings free space at the next checkpoint. `SHOW history_retention` returns one `interval`. On an in-memory database: 22023.
 
 ## Agents
 

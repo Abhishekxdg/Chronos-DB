@@ -4,7 +4,7 @@ title: Give every agent its own world
 
 You'll build a small shop in `main`, give three agents a world each, see what each one changed, merge the best, settle a conflict, and throw the rest away. Nothing an agent does reaches `main` until you merge it.
 
-Everything below runs in `psql` in a few minutes. The whole script is [examples/guides/agent-sandbox.sql](https://github.com/Abhishekxdg/chronosdb/blob/main/examples/guides/agent-sandbox.sql).
+Everything below runs in `psql` in a few minutes. The whole script is [examples/guides/agent-sandbox.sql](https://github.com/Abhishekxdg/Chronos-DB/blob/main/examples/guides/agent-sandbox.sql).
 
 ## Setup
 

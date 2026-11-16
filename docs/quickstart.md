@@ -6,7 +6,7 @@
 
 ```bash
 # a prebuilt binary for macOS or Linux (x86_64 or arm64), into ~/.local/bin
-curl -fsSL https://github.com/Abhishekxdg/chronosdb/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Abhishekxdg/Chronos-DB/releases/latest/download/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"   # if ~/.local/bin isn't on your PATH yet (a fresh Ubuntu's isn't)
 chronos --version
 ```
@@ -180,4 +180,4 @@ db.merge_at("agent-7", Resolve::Fail, Some(v))?;
 
 A database folder is opened by one process at a time: the shell, `chronos serve`, `chronos mcp` or your program. Close one before opening another, or run `chronos serve` and point everything at it.
 
-Next: the [five-minute trial](https://github.com/Abhishekxdg/chronosdb/tree/main/examples/trial), an agent on a small CRM whose mistakes are caught before they land, then [concepts](concepts.md).
+Next: the [five-minute trial](https://github.com/Abhishekxdg/Chronos-DB/tree/main/examples/trial), an agent on a small CRM whose mistakes are caught before they land, then [concepts](concepts.md).

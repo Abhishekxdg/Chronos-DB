@@ -2,7 +2,7 @@
 title: What Chronos guarantees today
 ---
 
-Chronos is a **public beta**, built by one person, with no outside production use yet. This page
+Chronos is a **public beta**, built by a small team with one engineer on the engine, and with no outside production use yet. This page
 states plainly what it does and does not guarantee, so you can judge it for your own use. It links
 to the pages that back each claim. Where a number is a benchmark, it is an engineering measurement
 on one machine, not a published result; the losses are listed beside the wins.
@@ -11,8 +11,8 @@ on one machine, not a published result; the losses are listed beside the wins.
 
 - **Beta.** Try it on a staging copy, not production. The on-disk format is versioned and read
   across releases, but a release has changed authentication semantics before, so read the
-  [CHANGELOG](https://github.com/Abhishekxdg/chronosdb/blob/main/CHANGELOG.md) when you upgrade.
-- **One maintainer.** The storage engine has not had an outside review. Treat it accordingly.
+  [CHANGELOG](https://github.com/Abhishekxdg/Chronos-DB/blob/main/CHANGELOG.md) when you upgrade.
+- **One engineer on the engine.** The storage engine has not had an outside review. Treat it accordingly.
 - **Platforms:** macOS 13+ and Linux (x86-64-v2 and aarch64). No Windows.
 
 ## Durability — what survives a crash
@@ -81,7 +81,7 @@ audit trail records privileged and agent actions but not logins.
 ## Performance — measured, with the losses
 
 The benchmarks are engineering numbers on one machine, with every rival run on the same machine and
-the losses listed ([BENCHMARKS](https://github.com/Abhishekxdg/chronosdb/blob/main/BENCHMARKS.md)). Fork is O(1) and microsecond-scale; durable
+the losses listed ([BENCHMARKS](https://github.com/Abhishekxdg/Chronos-DB/blob/main/BENCHMARKS.md)). Fork is O(1) and microsecond-scale; durable
 single-row commit is at parity with Postgres for a single client; vector search beats pgvector at
 matched recall over SQL. Chronos is slower than DuckDB on in-process analytics, merges are slower
 than Postgres under a thousand concurrent agents, and several "versus" rows compare an in-process
@@ -90,4 +90,4 @@ library call to a networked server — each such row says so. Measure your own w
 ## In one line
 
 A beta that genuinely branches, diffs and merges a database and gates agent writes with rules —
-honest about being pre-production, Postgres-compatible-not-Postgres, and built by one person.
+honest about being pre-production, Postgres-compatible-not-Postgres, and built by a small team.

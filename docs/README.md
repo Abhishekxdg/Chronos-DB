@@ -52,4 +52,4 @@ It speaks the Postgres protocol, so `psql`, drivers and ORMs connect as they do 
 - [Security and auth](security.md): tokens, agents, safe mode, limits, and what not to expose yet.
 - [What Chronos protects](what-chronos-protects.md): what it guards for agents on production data, what an agent calling other systems directly gets past, and where backups must live.
 - [Operations](operations.md): the folder, checkpoints, crashes, cloud storage, backups, memory.
-- [Benchmarks](https://github.com/Abhishekxdg/chronosdb/blob/main/BENCHMARKS.md): every result with its method, losses included.
+- [Benchmarks](https://github.com/Abhishekxdg/Chronos-DB/blob/main/BENCHMARKS.md): every result with its method, losses included.

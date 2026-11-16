@@ -1014,7 +1014,7 @@ A world forked `WITH (check_reads = true)` records what it reads ([src/stale.rs]
 
 - **Reading costs nothing measurable:** per-statement time with recording on is within noise of off, for lookups and scans alike.
 - **Past 10,000 keys of one table, the read counts as the whole table** (by design: the read set stays small), so *any* change to that table holds the merge, as in the third row. An agent that reads that many rows of a table main is busy with will be held often; a filter (`where ...`) keeps the check precise.
-- **The merge-time check for filters grows with filters × changed rows**, about 1.7 µs per pair here: 1,000 filters × 1,000 changed rows took 1.8 s, and 100 × 1,000 or 1,000 × 100 about 0.18 s. Two causes, both fixable ([issue #29](https://github.com/Abhishekxdg/chronosdb/issues/29)): identical filters aren't kept once (25 conditions were kept as 1,000 filters), and each changed row is decoded again for each filter. Both fixed in 0.3.0: the 1,000-scan merge takes 2.7 ms there (same script, from the 0.3.0 release notes).
+- **The merge-time check for filters grows with filters × changed rows**, about 1.7 µs per pair here: 1,000 filters × 1,000 changed rows took 1.8 s, and 100 × 1,000 or 1,000 × 100 about 0.18 s. Two causes, both fixable ([issue #29](https://github.com/Abhishekxdg/Chronos-DB/issues/29)): identical filters aren't kept once (25 conditions were kept as 1,000 filters), and each changed row is decoded again for each filter. Both fixed in 0.3.0: the 1,000-scan merge takes 2.7 ms there (same script, from the 0.3.0 release notes).
 
 ## 16. BranchBench: six agent workflows against Doltgres and Postgres copies
 

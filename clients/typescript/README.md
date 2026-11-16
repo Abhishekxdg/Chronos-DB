@@ -1,6 +1,6 @@
 # @chronosdb/client
 
-The TypeScript/JavaScript client for [Chronos DB](https://github.com/Abhishekxdg/chronosdb)'s HTTP API (`chronos serve`): give every agent its own **world**, a copy-on-write branch of the whole database, then diff and merge what it did. No dependencies; needs a global `fetch` (Node 18+, browsers, edge runtimes).
+The TypeScript/JavaScript client for [Chronos DB](https://github.com/Abhishekxdg/Chronos-DB)'s HTTP API (`chronos serve`): give every agent its own **world**, a copy-on-write branch of the whole database, then diff and merge what it did. No dependencies; needs a global `fetch` (Node 18+, browsers, edge runtimes).
 
 ```bash
 npm install @chronosdb/client

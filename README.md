@@ -1,31 +1,44 @@
 <h1 align="center"><img src="docs/assets/readme/banner.png" alt="Chronos DB. Let AI agents write to your Postgres. Each run works on its own branch; your rules decide what lands." width="100%"></h1>
 
+<p align="center"><b>Let AI agents write to the database you already run.</b><br>Each run works on its own branch. Your rules decide what merges. Every merge can be undone.</p>
+
 <div align="center">
 
-![release](https://img.shields.io/badge/release-v0.4.10%20beta-c8ff2e?style=flat-square&labelColor=050505)
+[![release](https://img.shields.io/github/v/release/Abhishekxdg/Chronos-DB?label=release&color=c8ff2e&style=flat-square&labelColor=050505)](https://github.com/Abhishekxdg/Chronos-DB/releases/latest)
+![status](https://img.shields.io/badge/status-public%20beta-2c2c2c?style=flat-square&labelColor=050505)
 ![postgres wire](https://img.shields.io/badge/postgres-wire%20protocol-2c2c2c?style=flat-square&labelColor=050505&logo=postgresql&logoColor=f2f2ee)
+![attach](https://img.shields.io/badge/beside-Postgres%20%C2%B7%20MySQL%20%C2%B7%20MariaDB%20%C2%B7%20MongoDB-2c2c2c?style=flat-square&labelColor=050505)
 ![mcp](https://img.shields.io/badge/MCP-ready-2c2c2c?style=flat-square&labelColor=050505)
 ![rust](https://img.shields.io/badge/rust-1.90%2B-2c2c2c?style=flat-square&labelColor=050505&logo=rust&logoColor=f2f2ee)
 ![license](https://img.shields.io/badge/license-BUSL--1.1%20engine%20%2B%20MIT-2c2c2c?style=flat-square&labelColor=050505)
 
 [**Docs site**](https://chronosdb-docs.vercel.app/) ·
+[**Install**](#install) ·
 [**Quickstart**](docs/quickstart.md) ·
 [**Concepts**](docs/concepts.md) ·
 [**SQL**](docs/sql.md) ·
 [**Benchmarks**](BENCHMARKS.md) ·
 [**Changelog**](CHANGELOG.md) ·
-[**Releases**](https://github.com/Abhishekxdg/chronosdb/releases)
+[**Releases**](https://github.com/Abhishekxdg/Chronos-DB/releases)
 
 </div>
 
 Chronos DB is a database for teams that want AI agents to change real data without a person reading every change. Each agent run gets its own **world**: a private, copy-on-write copy of the whole database, made in about 2 microseconds at any size. When the run is done, Chronos shows exactly which rows it changed, and merges it only if the change keeps to rules you set once; anything else waits for a person.
 
-It speaks the Postgres wire protocol, so `psql`, drivers and ORMs connect to it. It can hold your data itself, or sit **beside the Postgres you already run** and write each approved merge back to it in one checked transaction.
+It speaks the Postgres wire protocol, so `psql`, drivers and ORMs connect to it. It can hold your data itself, or sit **beside the database you already run** (Postgres, MySQL, MariaDB or MongoDB) and write each approved merge back to it in one checked transaction. Your application keeps talking to its database as it does today.
 
 <p align="center"><img src="docs/assets/attach-demo.gif" alt="An agent cleans up a CRM in its own world beside a real Postgres: the diff, a merge policy holding back its deletes, Postgres unchanged until a person approves, then the change written to Postgres" width="820"></p>
 
 > [!IMPORTANT]
-> **Public beta, version 0.4.10.** Try it on a staging copy first, not production. It is built by one person and has no outside production use yet. Chronos is not Postgres: it runs much of Postgres 16's SQL, not all of it. Read [Where it stands](#where-it-stands) before you move data in.
+> **Public beta (0.5).** Try it on a staging copy first, not production. It is built by a small team, with one engineer on the engine, and has no outside production use yet. Chronos is not Postgres: it runs much of Postgres 16's SQL, not all of it. Read [Where it stands](#where-it-stands) before you move data in.
+
+| | |
+|---|---|
+| **A branch per run** | Every agent run gets a world: the whole database, copy-on-write, in about 2 µs. Nobody else sees its writes. |
+| **A diff before anything lands** | Every changed row, before and after, and what reads it. |
+| **Rules, not reviews of everything** | A merge policy lets small, safe changes land on their own. Deletes, big changes and sensitive tables wait for a person. |
+| **Written to your database first** | Beside Postgres, MySQL, MariaDB or MongoDB, a merge is one transaction there, every row compared with what the agent saw. |
+| **Undo** | Put back one merge by its id for 30 days, or everything an agent did since a time, leaving other changes alone. |
 
 ## In one example
 
@@ -57,6 +70,7 @@ If a merge keeps to every rule (no deletes, at most 500 rows, nothing in `paymen
 
 ## Contents
 
+- [What's new in 0.5](#whats-new-in-05)
 - [Install](#install)
 - [Quickstart: five minutes](#quickstart-five-minutes)
 - [Chronos Studio](#chronos-studio)
@@ -70,10 +84,20 @@ If a merge keeps to every rule (no deletes, at most 500 rows, nothing in `paymen
 - [What's in this repository](#whats-in-this-repository)
 - [License](#license)
 
+## What's new in 0.5
+
+- **Beside MySQL, MariaDB and MongoDB.** `chronos attach` works beside MySQL 8.0+, MariaDB 10.5+ and MongoDB 5.0+ (a replica set) as it does beside Postgres 12 to 18. Guides: [MySQL and MariaDB](docs/guides/attach-mysql.md), [MongoDB](docs/guides/attach-mongodb.md).
+- **Undo a merge by its id.** Each write-back keeps the rows it wrote, so a merge can be undone for 30 days, through the database it was written to. A merge undone in part can be finished later.
+- **Follow MongoDB as it changes.** `chronos serve --follow` reads change streams beside MongoDB, as it reads the log beside Postgres.
+- **Security fixes.** Five fixes for what a role or agent with few rights could reach. If you run more than one role or agent, upgrade.
+- **Faster reports.** Filtered counts, `GROUP BY` and joins over 200,000-row tables are 20 to 25% faster on one core; CH-benCHmark Q18 is 4.3 times faster and now ahead of Postgres 18 on the same two cores.
+
+Every change, release by release: [CHANGELOG.md](CHANGELOG.md).
+
 ## Install
 
 ```bash
-curl -fsSL https://github.com/Abhishekxdg/chronosdb/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/Abhishekxdg/Chronos-DB/releases/latest/download/install.sh | sh
 chronos --version
 ```
 
@@ -90,20 +114,20 @@ Options, set as environment variables for the script:
 | Variable | What it does |
 |---|---|
 | `CHRONOS_INSTALL_DIR=<folder>` | installs into another folder you can write (default `~/.local/bin`) |
-| `CHRONOS_VERSION=v0.4.10` | installs a given release tag instead of the latest |
+| `CHRONOS_VERSION=v0.5.5` | installs a given release tag instead of the latest |
 | `CHRONOS_VERIFY=1` | also checks the build's signature with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) (keyless, Sigstore) |
 
 If `~/.local/bin` isn't on your `PATH`, the script says so; add it with `export PATH="$HOME/.local/bin:$PATH"`. The examples below use `psql`: `brew install libpq` on macOS, `sudo apt-get install postgresql-client` on Debian or Ubuntu.
 
-**No telemetry.** Chronos connects only to what you point it at: a Postgres you import from or attach to, a storage bucket you give it, or Chronos Cloud when you run `chronos init` or `chronos cloud`.
+**No telemetry.** Chronos connects only to what you point it at: a database you import from or attach to, a storage bucket you give it, or Chronos Cloud if you run `chronos init` or `chronos cloud`.
 
 ## Quickstart: five minutes
 
-Pick one: work beside a Postgres you already run, or let Chronos hold the data.
+Pick one: work beside a database you already run, or let Chronos hold the data.
 
-### A. Beside your Postgres (`chronos attach`)
+### A. Beside your database (`chronos attach`)
 
-**Attach** means: Chronos copies the tables an agent will work on into a local folder, agents work in worlds of that copy, and each merge into `main` is written to your Postgres first. Your application keeps using Postgres as before.
+**Attach** means: Chronos copies the tables an agent will work on into a local folder, agents work in worlds of that copy, and each merge into `main` is written to your database first. Your application keeps using its database as before. The example is Postgres; MySQL, MariaDB and MongoDB work the same way ([what each one supports](#beside-which-databases)).
 
 ```bash
 export CHRONOS_SOURCE_URL='postgres://agent_writer:...@staging-db:5432/crm?sslmode=verify-full'
@@ -128,7 +152,7 @@ merge world fix_leads;         -- written to Postgres in one transaction, then h
 
 At `merge world`, Chronos runs its own checks, then opens one Postgres transaction. It locks each row the world changed and compares it with what Chronos last saw. If any row changed in Postgres meanwhile, nothing is written and the merge returns those rows as conflicts. Otherwise it applies the changes, runs your checks on the result, and commits. Values your Postgres triggers or defaults set come back into Chronos.
 
-Requirements and limits are under [Where it stands](#where-it-stands). The full guide, including refresh, undo and a restore drill: [Working beside your Postgres](docs/guides/attach-postgres.md). For a big multi-tenant database, `--lazy-tenant org_id` copies a tenant's rows the first time a world is forked for it. MySQL 8.0+ and MariaDB 10.5+ work too: [Attach beside MySQL](docs/guides/attach-mysql.md).
+Requirements and limits are under [Where it stands](#where-it-stands). The full guide, including refresh, undo and a restore drill: [Working beside your Postgres](docs/guides/attach-postgres.md). For a big multi-tenant Postgres, `--lazy-tenant org_id` copies a tenant's rows the first time a world is forked for it. The other databases have their own guides: [MySQL and MariaDB](docs/guides/attach-mysql.md), [MongoDB](docs/guides/attach-mongodb.md).
 
 ### B. On its own (`chronos serve`)
 
@@ -204,7 +228,7 @@ These pictures show a made-up CRM. More: [Studio](docs/studio.md).
 | **Merge policy** | Rules an agent's merges must keep to go through without a person: `max_rows`, `max_deletes`, `review_tables`, `review_columns`, rows per hour, and more. |
 | **Merge check** | A SQL query a merge's result must return no rows for, such as "every lead list still has a lead". It runs inside every merge. |
 | **Review** | A merge that broke a rule waits in `SHOW REVIEWS` with its reasons. A person merges it (approve) or drops it (reject). |
-| **Attach** | Running beside an existing Postgres: merges into `main` are written back to it in one checked transaction. |
+| **Attach** | Running beside an existing Postgres, MySQL, MariaDB or MongoDB: merges into `main` are written back to it in one checked transaction. |
 
 ### The life of an agent run
 
@@ -214,8 +238,8 @@ These pictures show a made-up CRM. More: [Studio](docs/studio.md).
 2. **Work.** It reads and writes with ordinary SQL. It can write only the worlds it forked, unless you give it more.
 3. **Diff.** You, or the agent, see every changed row. `merge ... dry run` shows what a merge would do and why it would be held.
 4. **Merge.** Inside the merge, while it holds its locks, Chronos checks conflicts, constraints, the merge policy, merge checks, and (if asked) whether rows the agent read changed since. What is checked is exactly what merges.
-5. **Review or land.** Within the rules, it lands. Outside them, it waits in `SHOW REVIEWS`. Attached, it is written to Postgres first.
-6. **Undo, if needed.** `UNDO MERGE OF WORLD w` or `UNDO AGENT bot SINCE '-2 hours'` puts the rows back, within the history window (1 hour by default for a new database; `history_retention` sets it). In an attached folder the undo goes back through Postgres too.
+5. **Review or land.** Within the rules, it lands. Outside them, it waits in `SHOW REVIEWS`. Attached, it is written to your database first.
+6. **Undo, if needed.** `UNDO MERGE OF WORLD w` or `UNDO AGENT bot SINCE '-2 hours'` puts the rows back, within the history window (1 hour by default for a new database; `history_retention` sets it). In an attached folder a merge can also be undone by its id for 30 days, and the undo is written through the database the merge went to.
 
 More on each step: [Concepts](docs/concepts.md), [Worlds reference](docs/reference/worlds.md), [Merge policies guide](docs/guides/merge-policies.md), [Merge checks guide](docs/guides/merge-checks.md).
 
@@ -226,7 +250,7 @@ More on each step: [Concepts](docs/concepts.md), [Worlds reference](docs/referen
 | Write real data without a person reading every change | Read-only agents, or hand-built staging tables and approvals | A merge policy: changes within the rules land, the rest wait in `SHOW REVIEWS` |
 | Show what they changed | Audit tables you build yourself | `diff world w`: every changed row, before and after |
 | Keep the good work and drop the rest | Hand-written migrations | Merge all of a world, some tables (`only tables`), some rows (`only keys`), or `drop world` |
-| Undo a bad run | Restore a backup and lose everyone's work | `UNDO AGENT bot SINCE '-2 hours'`, row by row, leaving others' changes |
+| Undo a bad run | Restore a backup and lose everyone's work | `UNDO AGENT bot SINCE '-2 hours'`, or one merge by its id, row by row, leaving others' changes |
 | Try many things at once | Copy the database, or share one and fight over locks | Thousands of isolated worlds; 100,000 tested |
 | Not act on stale data | Hope | A world can record what it read; its merge is held if that changed |
 | Search while they work | A separate vector store that can't see uncommitted edits | Filters, full text and vectors (pgvector syntax) inside every world |
@@ -236,9 +260,9 @@ Other things in the box: time travel (`select * from orders as of '-1 hour'`, `r
 
 ## Where it stands
 
-Chronos DB 0.4.10 is a **public beta**. Use it with staging copies first. More detail: [What Chronos guarantees today](docs/guarantees.md) and [What it protects, and what it doesn't](docs/what-chronos-protects.md).
+Chronos DB 0.5 is a **public beta**. Use it with staging copies first. More detail: [What Chronos guarantees today](docs/guarantees.md) and [What it protects, and what it doesn't](docs/what-chronos-protects.md).
 
-**Project.** One maintainer. The storage engine has not had an outside review. No outside production use yet.
+**Project.** A small team; one engineer writes the engine. The storage engine has not had an outside review. No outside production use yet.
 
 **Postgres compatibility** (on its own, without attach). Chronos has its own SQL parser and executor; it is not a Postgres fork.
 
@@ -246,12 +270,27 @@ Chronos DB 0.4.10 is a **public beta**. Use it with staging copies first. More d
 |---|---|
 | Postgres 16's own regression suite, output compared line by line | about **89%** of the expected lines; 66 of its 219 files match exactly (run of 2026-10-27) |
 | Real databases moved in (Chinook, Northwind, Pagila, pgbench at 2M rows, and others) | **7 of 7** with identical row checksums |
-| Differential tests against a real Postgres (`tests/pgdiff.rs`) | 468 tests, each giving the same rows or the same error class |
+| Differential tests against a real Postgres (`tests/pgdiff.rs`) | 495 tests, each giving the same rows or the same error class |
 | Speed, pgbench-style, same machine | point reads at about **half** Postgres's rate; writes at a fraction of it |
 
 Known gaps include: no C extensions or functions in languages other than SQL and PL/pgSQL (common extensions such as `vector`, `pgcrypto`, `citext`, `hstore` and `pg_trgm` are built in); `SERIALIZABLE` is refused rather than weakened; no replication or `pg_hba.conf`; text sorts by bytes unless a column has an ICU collation. Full list and tested drivers and ORMs: [Postgres compatibility](docs/postgres-compatibility.md#where-it-stands-beta).
 
-**Attach limits** (Stage 1, for staging copies):
+### Beside which databases
+
+| | Postgres 12–18 | MySQL 8.0+, MariaDB 10.5+ | MongoDB 5.0+ (replica set) |
+|---|---|---|---|
+| Merge written in one checked transaction | yes | yes | yes |
+| Dry run against the live database | yes | yes | yes |
+| Reads checked against the live database (`check_reads`) | yes | yes | yes |
+| Undo a merge by its id, 30 days | yes | yes | yes |
+| `chronos refresh` | yes | yes | yes |
+| `serve --follow` (changes as they commit) | yes (`wal_level = logical`) | not yet | yes (change streams) |
+| Rehearse a merge and roll it back (`REHEARSE`) | yes | not yet | not yet |
+| `--lazy-tenant`, merge checks run in the source | yes | not yet | not yet |
+
+Tested on Postgres 12 to 18, Neon and Supabase; on MongoDB 5.0 and 7.0 run locally, not on Atlas. Not beside MongoDB: sharded clusters, standalone servers. A program can ask what a folder supports: the HTTP API's `attached` answers `kind` and `capabilities`.
+
+**Attach limits beside Postgres** (Stage 1, for staging copies):
 
 - Postgres 12 or later. Tested on 12 to 18, on Neon (direct and through its pooler) and on Supabase (through its pooler, Supavisor).
 - Each attached table needs a primary key, or a unique index on NOT NULL columns to stand for one. A partitioned table is attached whole; inheriting tables aren't. Generated columns are attached, worked out by Postgres. A table with row-level security on is attached only if the role reads every row (Supabase turns it on for every table).
@@ -291,7 +330,7 @@ await agent.merge(); // throws ChronosError 409 on conflicts
 
 Tool definitions for any LLM API with tool calling, and a parallel-agents example, are in [`examples/agents`](examples/agents).
 
-**Chronos Gateway** is a separate product built on this engine: a self-hosted service that lets your own product's agents change the Postgres your app already uses, one customer's rows at a time, through approved merges. It has its own releases at [chronos-gateway-releases](https://github.com/Abhishekxdg/chronos-gateway-releases).
+**Chronos Gateway** is a separate product built on this engine: a self-hosted service that lets your own product's agents change the database your app already uses (Postgres, MySQL, MariaDB or MongoDB), one customer's rows at a time, through approved merges, with undo. It has its own releases at [chronos-gateway-releases](https://github.com/Abhishekxdg/chronos-gateway-releases).
 
 <p align="center"><img src="docs/assets/readme/scene-gateway.png" alt="An isometric drawing of Chronos Gateway between a product's agents and its Postgres: the agents reach a world per run, one tenant each, and hold no Postgres credential. Changes reach Postgres as a checked write, or ask the end user first. The product's app keeps talking to Postgres as it does today." width="820"></p>
 
@@ -313,8 +352,8 @@ Engineering numbers from one machine, not a published benchmark. Unless noted: o
 
 **Where it loses** (the full table is at the top of [BENCHMARKS.md](BENCHMARKS.md#where-chronos-db-loses)):
 
-- **Analytics:** DuckDB 1.5.5 is 2.2–7× faster on reports over 200,000-row tables. Chronos stores rows, not columns.
-- **Analytical joins in BranchBench:** CH-benCHmark Q3 and Q18 take about 4× Postgres 18's time.
+- **Analytics:** DuckDB 1.5.5 is 2.2–7× faster on reports over 200,000-row tables (2026-09-28). Chronos stores rows, not columns.
+- **Reports against Postgres 18** (0.5.4, a laptop, both on two cores, 2026-11-16): Postgres is 1.1–1.4× faster on three of five reports over 200,000-row tables, and on CH-benCHmark Q3 (64 ms against 88 ms). Q18, 2.6× slower in 0.5.2, is now 1.6× faster than Postgres.
 - **Merges under extreme contention:** with 1,000 agents on one thread each, on disk, merge p50 is 714–718 ms against Postgres's 128 ms. At 25 workers it is 25–26 ms.
 - **Redis** answers vector searches faster (0.46–0.50 ms), at 74–75% recall against Chronos's 98.6–99.98%.
 - **LanceDB** loads vectors faster (1.0 s against 4.7 s for 76k).
@@ -327,19 +366,19 @@ Engineering numbers from one machine, not a published benchmark. Unless noted: o
 | [Concepts](docs/concepts.md) | [Merge policies](docs/guides/merge-policies.md) | [Worlds](docs/reference/worlds.md) | [Security and auth](docs/security.md) |
 | [Migrating from Postgres](docs/migrating-from-postgres.md) | [Merge checks](docs/guides/merge-checks.md) | [Search](docs/search.md) | [What Chronos protects](docs/what-chronos-protects.md) |
 | [Five-minute trial](examples/trial) | [Agent sandbox](docs/guides/agent-sandbox.md) | [HTTP API](docs/http-api.md) | [What it guarantees](docs/guarantees.md) |
-| [Chronos Cloud](docs/cloud.md) (private alpha) | [Agent evaluation](docs/guides/agent-evaluation.md) | [MCP](docs/reference/mcp.md), [Clients](docs/reference/clients.md) | [Operations](docs/operations.md) |
+| [Attach beside MySQL](docs/guides/attach-mysql.md), [MongoDB](docs/guides/attach-mongodb.md) | [Agent evaluation](docs/guides/agent-evaluation.md) | [MCP](docs/reference/mcp.md), [Clients](docs/reference/clients.md) | [Operations](docs/operations.md) |
 | | [Scenario planning](docs/guides/scenario-planning.md) | [CLI and settings](docs/reference/cli.md), [Errors](docs/reference/errors.md) | [Benchmarks](BENCHMARKS.md), [Changelog](CHANGELOG.md) |
 
 The same pages, with search, are on the [docs site](https://chronosdb-docs.vercel.app/). The guides' SQL scripts are in [`examples/guides`](examples/guides).
 
 ## Feedback and contributing
 
-- **Questions or ideas:** [Discussions](https://github.com/Abhishekxdg/chronosdb/discussions).
-- **A bug, or something unclear:** [open an issue](https://github.com/Abhishekxdg/chronosdb/issues/new/choose). The templates ask for the few lines that reproduce it.
+- **Questions or ideas:** [Discussions](https://github.com/Abhishekxdg/Chronos-DB/discussions).
+- **A bug, or something unclear:** [open an issue](https://github.com/Abhishekxdg/Chronos-DB/issues/new/choose). The templates ask for the few lines that reproduce it.
 - **Security issues:** report them privately, as [SECURITY.md](SECURITY.md) describes.
 - **Contributing:** see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-What changed in each release: [CHANGELOG.md](CHANGELOG.md). This release: [v0.4.10](https://github.com/Abhishekxdg/chronosdb/releases/tag/v0.4.10), 2026-11-10.
+What changed in each release: [CHANGELOG.md](CHANGELOG.md). The newest build is always at [releases/latest](https://github.com/Abhishekxdg/Chronos-DB/releases/latest); as this page was written that was [v0.5.5](https://github.com/Abhishekxdg/Chronos-DB/releases/tag/v0.5.5), 2026-11-17.
 
 ## What's in this repository
 
@@ -351,7 +390,7 @@ What changed in each release: [CHANGELOG.md](CHANGELOG.md). This release: [v0.4.
 | [`docs/`](docs), [`site/`](site) | The documentation and the docs site that publishes it |
 | [`examples/`](examples) | The five-minute trial, the guides' SQL, agent tool definitions, and the Rust benchmark harnesses |
 | [`bench/slt`](bench/slt) | The sqllogictest runner's scripts and results |
-| [`install.sh`](install.sh) | The installer; signed binaries are on the [releases page](https://github.com/Abhishekxdg/chronosdb/releases) |
+| [`install.sh`](install.sh) | The installer; signed binaries are on the [releases page](https://github.com/Abhishekxdg/Chronos-DB/releases) |
 
 ## License
 

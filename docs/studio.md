@@ -78,7 +78,7 @@ The grid never loads a whole table: it counts the rows, then fetches the pages i
 
 ## Developing the Studio
 
-The UI is a small React + TypeScript app, open source under the MIT license in [`studio/`](https://github.com/Abhishekxdg/chronosdb/tree/main/studio) of the chronosdb repo. Each release of `chronos` has that release's Studio built into it.
+The UI is a small React + TypeScript app, open source under the MIT license in [`studio/`](https://github.com/Abhishekxdg/Chronos-DB/tree/main/studio) of the Chronos-DB repository. Each release of `chronos` has that release's Studio built into it.
 
 To work on the UI with live reload, run a Studio from any installed `chronos` for the API, then Vite's dev server, which proxies `/studio/api` to it (with the Host and Origin it expects):
 
