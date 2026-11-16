@@ -1,6 +1,6 @@
 # Chronos Cloud
 
-> **Private alpha.** Chronos Cloud, at `chronos.2090.tech` (the dashboard) with its backend on a name Google gives, and built by [2090.tech](https://2090.tech), is invite only while it is built; the commands below are in the `chronos` binary now. The hosted platform itself is developed in a separate, private repository.
+> **Not available right now.** Hosted Chronos Cloud is not taking projects at present, so `chronos init` and `chronos cloud` have nothing to sign in to. Run Chronos yourself instead: the [quickstart](quickstart.md) starts a server in a minute, and [`chronos attach`](guides/attach-postgres.md) works beside the database you already run. This page describes how the hosted service works for when it returns; the commands are still in the `chronos` binary. Chronos Cloud is built by [2090.tech](https://2090.tech), in a separate, private repository.
 
 Chronos Cloud hosts a project's database, so an agent in Claude Code, Codex or Cursor (or in CI, or on a teammate's laptop) can use it without anyone running `chronos serve`. One command in the project folder connects it:
 
