@@ -2430,7 +2430,7 @@ fn merges_keep_one_connection_and_make_a_new_one_when_it_is_gone() {
 
 /// UNDO MERGE ... SKIP CHANGED in an attached folder leaves a row changed straight in Postgres (one main hasn't heard
 /// of yet) and puts the rest back there; the effects the merge sent aren't undone, and are listed with where they are.
-/// UNDO AGENT on main goes back through Postgres too. Issue Abhishekxdg/Chronos-DB#48.
+/// UNDO AGENT on main goes back through Postgres too. Issue 2090-labs/Chronos-DB#48.
 #[test]
 fn undo_skips_rows_changed_in_postgres_and_lists_the_effects_it_cant_undo() {
     let Some((mut pg, name, _url, _turn)) = throwaway("undoskip") else {
@@ -2511,7 +2511,7 @@ fn line<'a>(lines: &'a [(String, String)], outcome: &str) -> Vec<&'a str> {
 
 /// `MERGE WORLD w REHEARSE [FAIL AT n]`: the write-back run in Postgres (triggers, constraints, deferred ones too),
 /// then rolled back, Postgres checked unchanged after, and the effects the merge would send listed, unsent. Issue
-/// Abhishekxdg/Chronos-DB#48.
+/// 2090-labs/Chronos-DB#48.
 #[test]
 fn a_rehearsal_runs_the_write_back_in_postgres_and_rolls_it_back() {
     let Some((mut pg, name, _url, _turn)) = throwaway("rehearse") else {

@@ -30,7 +30,7 @@ module.exports = {
         { to: '/quickstart', label: 'Quickstart', position: 'left' },
         { to: '/guides/agent-sandbox', label: 'Guides', position: 'left' },
         { to: '/sql', label: 'Reference', position: 'left' },
-        { href: 'https://github.com/Abhishekxdg/Chronos-DB', label: 'GitHub', position: 'right' },
+        { href: 'https://github.com/2090-labs/Chronos-DB', label: 'GitHub', position: 'right' },
       ],
     },
     prism: { additionalLanguages: ['rust', 'bash', 'sql', 'toml', 'json'] },

@@ -2,7 +2,7 @@
 # it npm doesn't: bump "version" in its package.json (in the engine repository, which mirrors clients/ here) and
 # the next push publishes it, with provenance (which npm signs only from a public repository, so from here).
 # No token: npm trusts this workflow (trusted publishing, GitHub's OIDC identity), set on npmjs.com under
-# @chronosdb/client > Settings > Trusted Publisher: GitHub Actions, Abhishekxdg / chronosdb, npm-client.yml.
+# @chronosdb/client > Settings > Trusted Publisher: GitHub Actions, 2090-labs / Chronos-DB, npm-client.yml.
 # npm lets a package trust a workflow only once it exists, so its first version was published by hand.
 name: npm client
 on:

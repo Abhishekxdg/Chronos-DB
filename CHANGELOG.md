@@ -2,8 +2,9 @@
 
 ## Unreleased
 
-- The Studio's README and issue links, and the TypeScript client's package links, name the public repository as it
-  is now called (`Abhishekxdg/Chronos-DB`). The old name still redirects.
+- The public repository moved to the 2090 Labs organization: `github.com/2090-labs/Chronos-DB`. The Studio's README
+  and issue links and the TypeScript client's package links name it. The old addresses still redirect, so the
+  install command of earlier releases keeps working.
 
 ## 0.5.5 (beta), 2026-11-17
 

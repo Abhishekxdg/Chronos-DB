@@ -495,7 +495,7 @@ function Studio() {
                 {item('Keyboard shortcuts', () => shortcuts(dlg), '?')}
                 <a
                   className="menu-item"
-                  href="https://github.com/Abhishekxdg/Chronos-DB#readme"
+                  href="https://github.com/2090-labs/Chronos-DB#readme"
                   target="_blank"
                   rel="noreferrer noopener"
                   onClick={() => setMenu(null)}
@@ -504,7 +504,7 @@ function Studio() {
                 </a>
                 <a
                   className="menu-item"
-                  href="https://github.com/Abhishekxdg/Chronos-DB/issues/new/choose"
+                  href="https://github.com/2090-labs/Chronos-DB/issues/new/choose"
                   target="_blank"
                   rel="noreferrer noopener"
                   onClick={() => setMenu(null)}

@@ -7,10 +7,10 @@
   "homepage": "https://chronosdb-docs.vercel.app/reference/clients",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Abhishekxdg/Chronos-DB.git",
+    "url": "git+https://github.com/2090-labs/Chronos-DB.git",
     "directory": "clients/typescript"
   },
-  "bugs": "https://github.com/Abhishekxdg/Chronos-DB/issues",
+  "bugs": "https://github.com/2090-labs/Chronos-DB/issues",
   "keywords": [
     "chronos",
     "chronosdb",
