@@ -356,3 +356,36 @@ fn an_approved_proposal_merges_whole_under_a_canary() {
     assert_eq!(count(&db, "select count(*) from t where id >= 40"), "3");
     assert_eq!(status(&db, &id), "merged");
 }
+
+/// Gate C (plan r3 section 5, approval validation), under section E's rules now that certified proposals have shipped
+/// (5.1's "any commit refuses" was the interim until they did): a commit to main after the approval that touches
+/// nothing the proposal merges leaves it valid (E10), and one that changes a row the proposal changes refuses its
+/// merge with nothing merged (E2).
+#[test]
+fn approval_and_commits_to_main_after_it() {
+    let db = Db::new();
+    setup(&db);
+    run(&db, MAIN, "create table other (id int primary key)", &[]).unwrap();
+    run(&db, MAIN, "create merge policy small with (max_rows = 1)", &[]).unwrap();
+    let mut bot = agent(&db, "bot", &WRITER, Some("small"));
+    let approved = |bot: &mut Session, w: &str, sql: &str| {
+        bot.run(&db, &format!("create world {w}; use world {w}; {sql}; use world main"), &[]).unwrap();
+        let id = col(&bot.run(&db, &format!("propose merge world {w}"), &[]).unwrap(), "id");
+        run(&db, MAIN, &format!("approve proposal '{id}'"), &[]).unwrap();
+        id
+    };
+
+    // E10: a commit to a table the proposal doesn't touch
+    let id = approved(&mut bot, "w", "insert into t values (10, 'x'), (11, 'y')");
+    run(&db, MAIN, "insert into other values (1)", &[]).unwrap();
+    run(&db, MAIN, &format!("merge proposal '{id}'"), &[]).unwrap();
+    assert_eq!(count(&db, "select count(*) from t where id >= 10"), "2");
+
+    // E2: a commit to a row the proposal changes
+    let id = approved(&mut bot, "v", "update t set v = 'bot' where id in (1, 2)");
+    run(&db, MAIN, "update t set v = 'person' where id = 1", &[]).unwrap();
+    let e = run(&db, MAIN, &format!("merge proposal '{id}'"), &[]).unwrap_err();
+    assert!(["40001", "40P01"].contains(&e.code) || e.message.contains("conflict"), "{}: {}", e.code, e.message);
+    assert_eq!(count(&db, "select v from t where id = 1"), "person", "nothing merged");
+    assert_eq!(count(&db, "select v from t where id = 2"), "v2", "nothing merged");
+}

@@ -5708,6 +5708,7 @@ impl Core {
     /// same statement goes on from there.
     pub fn merge_in_chunks(&self, b: &str, o: &MergeOptions, chunk: usize) -> Result<Chunked> {
         let chunk = chunk.max(1);
+        let mut o = o.clone();
         let mut done = Chunked::default();
         let mut left_before = usize::MAX;
         loop {
@@ -5720,16 +5721,21 @@ impl Core {
             if keys.len() <= chunk || keys.len() >= left_before {
                 // the last chunk with the world itself (schema, constraint rows), which drops it; or a chunk that
                 // merged nothing (rows only the whole world's merge can take), merged whole the same way
-                let n = self.merge_with(b, o).map_err(|e| chunk_failed(e, &done))?;
+                let n = self.merge_with(b, &o).map_err(|e| chunk_failed(e, &done))?;
                 done.rows += n;
                 done.chunks += 1;
                 return Ok(done);
             }
             left_before = keys.len();
             let part = MergeOptions { only_keys: keys[..chunk].to_vec(), ..o.clone() };
-            let n = self.merge_with(b, &part).map_err(|e| chunk_failed(e, &done))?;
+            let (n, left) = self.merge_kept(b, &part).map_err(|e| chunk_failed(e, &done))?;
             done.rows += n;
             done.chunks += 1;
+            // a version given is checked by the first chunk; each chunk moves it, so the next checks from the version
+            // this chunk left, read under its locks: a write in between is stale, not taken as confirmed
+            if o.expected.is_some() {
+                o.expected = left.or(o.expected); // (a part merged always leaves the world open: Some)
+            }
         }
     }
 
@@ -7087,6 +7093,15 @@ impl Core {
                 reads.as_ref(),
                 &checks,
                 attach::ActAs::of(&child.info.read().unwrap().meta).as_ref(),
+                serde_json::json!({
+                    "version": child.version.load(Ordering::Relaxed),
+                    // rows only: `only` takes the unique, reference and index rows they own (and refuses them named)
+                    "keys": (!o.only_keys.is_empty() || !o.only_tables.is_empty()).then(|| {
+                        keys.iter().filter(|k| !reserved_table(k) && k.contains('/')).collect::<Vec<_>>()
+                    }),
+                    "tables": &o.only_tables,
+                    "into": &o.into,
+                }),
             );
             match written {
                 Ok(None) => {}

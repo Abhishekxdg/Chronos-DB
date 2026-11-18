@@ -1072,7 +1072,7 @@ fn transaction(
         }
         send(c, &stmts)?;
     }
-    let pending = json!({"merge": merge_id, "world": world, "world_id": world_id, "rows": touched, "others": []});
+    let pending = super::pending_record(&merge_id, world, world_id, json!(touched), json!([]));
     crate::disk::write_file(&att.pending_path(), pending.to_string().as_bytes()).map_err(Error::Io)?;
     crash_point("before_commit");
     // 3. COMMIT

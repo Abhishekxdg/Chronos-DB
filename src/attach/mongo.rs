@@ -637,7 +637,7 @@ fn transaction(
         let t = &tables[ti];
         touched.entry(t.name.clone()).or_default().extend(rs.iter().map(|r| r.key_texts(t)));
     }
-    let pending = json!({"merge": merge_id, "world": world, "world_id": world_id, "rows": touched, "others": []});
+    let pending = super::pending_record(&merge_id, world, world_id, json!(touched), json!([]));
     crate::disk::write_file(&att.pending_path(), pending.to_string().as_bytes()).map_err(Error::Io)?;
     crash_point("before_commit");
     let outcome = session.commit_transaction().run();

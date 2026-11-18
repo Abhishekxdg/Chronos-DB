@@ -86,6 +86,7 @@ If a merge keeps to every rule (no deletes, at most 500 rows, nothing in `paymen
 
 ## What's new in 0.6
 
+- **0.6.1: merges cut short by a crash.** Beside Postgres or MySQL, crash recovery now settles exactly the merge the source committed (it could put rows in main the source never got), and `MERGE WORLD ... IN CHUNKS OF n` resumes in chunks after a crash.
 - **Merges are logged as what they did, in a hash-chained ledger.** Recovery replays the rows a merge wrote instead of judging it again, and `VERIFY LEDGER` checks every merge into main. The first checkpoint or merge writes data format 8, which 0.5 cannot open: upgrade replicas before the primary, and back up first.
 - **Merges check the constraints they bring.** A world that adds a UNIQUE, FOREIGN KEY or NOT NULL constraint has the whole table checked when it merges; `VERIFY DATABASE` lists rows that break one.
 - **Worlds for long-running agents.** Expiry held at every use, `max_depth` and `max_children`, `GRANT ... ON WORLD`, `TRANSFER WORLD`, budgets, durable worlds with pinned checkpoints, `ROLLBACK WORLD ... TO CHECKPOINT` and `RESUME WORLD`.
@@ -124,7 +125,7 @@ Options, set as environment variables for the script:
 | Variable | What it does |
 |---|---|
 | `CHRONOS_INSTALL_DIR=<folder>` | installs into another folder you can write (default `~/.local/bin`) |
-| `CHRONOS_VERSION=v0.6.0` | installs a given release tag instead of the latest |
+| `CHRONOS_VERSION=v0.6.1` | installs a given release tag instead of the latest |
 | `CHRONOS_VERIFY=1` | also checks the build's signature with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) (keyless, Sigstore) |
 
 If `~/.local/bin` isn't on your `PATH`, the script says so; add it with `export PATH="$HOME/.local/bin:$PATH"`. The examples below use `psql`: `brew install libpq` on macOS, `sudo apt-get install postgresql-client` on Debian or Ubuntu.
@@ -388,7 +389,7 @@ The same pages, with search, are on the [docs site](https://chronosdb-docs.verce
 - **Security issues:** report them privately, as [SECURITY.md](SECURITY.md) describes.
 - **Contributing:** see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-What changed in each release: [CHANGELOG.md](CHANGELOG.md). The newest build is always at [releases/latest](https://github.com/2090-labs/Chronos-DB/releases/latest); as this page was written that was [v0.6.0](https://github.com/2090-labs/Chronos-DB/releases/tag/v0.6.0), 2026-11-18.
+What changed in each release: [CHANGELOG.md](CHANGELOG.md). The newest build is always at [releases/latest](https://github.com/2090-labs/Chronos-DB/releases/latest); as this page was written that was [v0.6.1](https://github.com/2090-labs/Chronos-DB/releases/tag/v0.6.1), 2026-11-18.
 
 ## What's in this repository
 

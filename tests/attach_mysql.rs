@@ -626,3 +626,89 @@ fn a_user_who_cannot_create_tables_is_enough() {
     let _ = std::fs::remove_dir_all(&dir);
     admin.query(&format!("drop user '{user}'@'%'; drop database {name}")).unwrap();
 }
+
+/// kill -9 at every step of a write-back to MySQL, then a partial merge crashed after COMMIT: after recovery, main
+/// and MySQL agree, a world is merged exactly when MySQL committed (only the keys a partial merge took), and each
+/// committed merge is in `chronos_merges` and main's merge ledger once. Debug builds only.
+#[test]
+fn crash_matrix_mysql() {
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: crash points are in debug builds only");
+        return;
+    }
+    let Some((mut admin, mut my, name)) = throwaway("crash") else {
+        eprintln!("skipped: set CHRONOS_TEST_MYSQL to a MySQL URL");
+        return;
+    };
+    my.query("create table t (id int primary key, v varchar(40)) engine = InnoDB; insert into t values (1, 'a')")
+        .unwrap();
+    let dir = std::env::temp_dir().join(format!("chronos-attach-mysql-crash-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let out =
+        Command::new(env!("CARGO_BIN_EXE_chronos")).arg("attach").arg(&dir).args(["--tables", "t"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let all = "select group_concat(concat(id, '=', v) order by id separator ',') from t";
+    let ledger = |db: &Db| db.ledger_rows().unwrap().len();
+    let base = ledger(&Db::open(&dir).unwrap());
+    let crash = |args: &[&str], at: &str| {
+        let out =
+            Command::new(env!("CARGO_BIN_EXE_chronos")).args(args).env("CHRONOS_ATTACH_CRASH", at).output().unwrap();
+        assert!(!out.status.success(), "{at}: it crashed: {}", String::from_utf8_lossy(&out.stdout));
+        assert!(dir.join("attached.pending").exists(), "{at}: the outcome is left to settle");
+    };
+    let mut committed = 0;
+    for (i, at) in ["before_commit", "after_commit", "after_publish", "before_forget"].iter().enumerate() {
+        let (w, id) = (format!("m{i}"), 10 + i);
+        let db = Db::open(&dir).unwrap();
+        run(&db, MAIN, &format!("create world {w}"), &[]).unwrap();
+        run(&db, &w, &format!("insert into t values ({id}, '{at}')"), &[]).unwrap();
+        drop(db);
+        crash(&["-b", &w, dir.to_str().unwrap(), "merge"], at);
+        let did = *at != "before_commit";
+        committed += usize::from(did);
+        let db = Db::open(&dir).unwrap();
+        let said = chronos::attach::resolve(&db).unwrap().unwrap_or_default();
+        assert!(!dir.join("attached.pending").exists(), "{at}: {said}");
+        assert_eq!(chronos::attach::resolve(&db).unwrap(), None, "{at}: settled once");
+        assert_eq!(
+            cell(
+                &db,
+                MAIN,
+                &all.replace(
+                    "group_concat(concat(id, '=', v) order by id separator ',')",
+                    "string_agg(id || '=' || v, ',' order by id)"
+                )
+            ),
+            my_cell(&mut my, all),
+            "{at}: main and MySQL agree ({said})"
+        );
+        assert_eq!(db.world(&w).is_err(), did, "{at}: merged exactly when MySQL committed ({said})");
+        assert_eq!(
+            my_cell(&mut my, "select count(*) from chronos_merges where id like 'merge:%'"),
+            committed.to_string()
+        );
+        assert_eq!(ledger(&db) - base, committed, "{at}: each merge in main's ledger once");
+        if !did {
+            run(&db, MAIN, &format!("drop world {w}"), &[]).unwrap();
+        }
+    }
+    // a partial merge of a durable world (not flagged by the crash), committed in MySQL: recovery takes only its key
+    let db = Db::open(&dir).unwrap();
+    run(&db, MAIN, "create world p", &[]).unwrap();
+    run(&db, MAIN, "alter world p set (durable = true)", &[]).unwrap();
+    run(&db, "p", "update t set v = 'p' where id in (1, 11)", &[]).unwrap();
+    drop(db);
+    crash(&[dir.to_str().unwrap(), "merge world p only keys ('t/1');"], "after_commit");
+    let db = Db::open(&dir).unwrap();
+    let said = chronos::attach::resolve(&db).unwrap().unwrap_or_default();
+    assert_eq!(my_cell(&mut my, "select v from t where id = 11"), "after_commit", "MySQL took row 1 only");
+    assert_eq!(cell(&db, MAIN, "select v from t where id = 11"), "after_commit", "and so did main ({said})");
+    assert_eq!(cell(&db, MAIN, "select v from t where id = 1"), "p");
+    assert!(db.world("p").is_ok(), "the partial merge leaves p open");
+    drop(db);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    drop(my);
+    admin.query(&format!("drop database {name}")).unwrap();
+}

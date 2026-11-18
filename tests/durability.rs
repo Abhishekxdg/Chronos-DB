@@ -734,6 +734,75 @@ fn legacy_exploit_merge_still_replays() {
     assert_eq!(leads(&db, "z_0"), ["1|42|acme", "3|42|globex"]);
 }
 
+/// A log the 0.5.5 release binary wrote, with no checkpoint, so every merge replays from its logical record: a whole
+/// merge settling a row both changed and deleting one (tag 4), a partial merge (13), a merge INTO another world (13),
+/// a rebase (18) and a transaction's commit (4). It opens to the rows and versions 0.5.5 itself showed when it opened
+/// that log (tests/fixtures/legacy-v055-kinds, written 2026-11-18), and its history still lists the merges.
+#[test]
+fn fixture_v055_same_state() {
+    let dir = legacy_fixture("legacy-v055-kinds");
+    let tags = all_tags(&dir);
+    for t in [4, 13, 18] {
+        assert!(tags.contains(&t), "the fixture's log holds logical merge records (tag {t}): {tags:?}");
+    }
+    assert!(!dir.join("manifest").exists(), "no checkpoint: recovery replays every record");
+    for _ in 0..2 {
+        let db = Db::open(&dir).unwrap();
+        let rows = |w: &str| -> Vec<String> {
+            chronos::sql::run(&db, w, "select id, v from t order by id", &[]).unwrap()[0]
+                .rows
+                .iter()
+                .map(|r| r.iter().map(|v| v.to_text()).collect::<Vec<_>>().join("|"))
+                .collect()
+        };
+        assert_eq!(rows("main"), ["1|w", "2|tx", "3|main", "6|main", "7|tx"]);
+        assert_eq!(rows("p"), ["1|w", "2|p", "3|p"]);
+        assert_eq!(rows("q"), ["1|w", "2|p", "3|p"]);
+        assert_eq!(rows("r"), ["1|w", "2|p", "3|r", "5|r", "6|main"]);
+        let v = |w: &str| db.world(w).unwrap().version;
+        // 0.5.5 showed [5, 2, 0, 3]; this release counts merges into main and INTO a world as it does when the same SQL
+        // runs on it fresh ([8, 2, 1, 3]). Higher only: a version read under 0.5.5 is refused as stale, never taken.
+        assert_eq!([v("main"), v("p"), v("q"), v("r")], [8, 2, 1, 3]);
+        assert!(db.world("r").unwrap().meta.get("_sonos_rebased").is_some());
+        assert!(db.branches().iter().all(|(b, _)| b != "w"), "the whole merge retired w");
+        let h = chronos::sql::run(&db, "main", "show history limit 50", &[]).unwrap().pop().unwrap();
+        let text: String = h.rows.iter().flatten().map(|v| v.to_text()).collect::<Vec<_>>().join(" ");
+        for w in [" w ", " p "] {
+            assert!(format!(" {text} ").contains(w), "main's history lists the merge of{w}: {text}");
+        }
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// 0.5.5 refuses a folder this release has merged in, before it reads the log: the merge wrote a format-8 manifest
+/// first. Needs the 0.5.5 release binary: CHRONOS_055_BIN=/path/to/chronos cargo test -- --ignored.
+#[test]
+#[ignore = "needs the 0.5.5 binary in CHRONOS_055_BIN"]
+fn old_binary_refuses_upgraded_folder() {
+    let bin = std::env::var("CHRONOS_055_BIN").expect("CHRONOS_055_BIN");
+    let dir = legacy_fixture("legacy-v055-kinds");
+    let run_old = |dir: &Path| {
+        let out = std::process::Command::new(&bin).arg(dir).arg("worlds").output().unwrap();
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr))
+    };
+    // before: 0.5.5 opens its own folder
+    let scratch = tmp("v055-own");
+    copy_dir(&dir, &scratch);
+    let (ok, text) = run_old(&scratch);
+    assert!(ok, "{text}");
+    fs::remove_dir_all(&scratch).unwrap();
+    {
+        let db = Db::open(&dir).unwrap();
+        db.fork("main", "z").unwrap();
+        db.put("z", "u/9", "z").unwrap();
+        db.merge("z", Resolve::Fail).unwrap();
+    }
+    assert!(all_tags(&dir).contains(&20), "the merge is logged as Op::Applied");
+    let (ok, text) = run_old(&dir);
+    assert!(!ok && text.contains("newer Chronos"), "0.5.5 must refuse the upgraded folder: {text}");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The tags of the records in every log segment of `dir`, in order.
 fn all_tags(dir: &Path) -> Vec<u8> {
     let mut segs: Vec<_> = fs::read_dir(dir)

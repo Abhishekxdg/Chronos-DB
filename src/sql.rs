@@ -44924,13 +44924,12 @@ impl Statement {
                         || o.into.is_some()
                         || !o.only_tables.is_empty()
                         || !o.only_keys.is_empty()
-                        || o.expected.is_some()
                         || !o.picks.is_empty()
                     {
                         return Err(SqlError {
                             code: "42601",
-                            message: "MERGE WORLD ... IN CHUNKS OF n takes USING and BY COLUMNS; not INTO, ONLY, \
-                                      RESOLVE, AT VERSION, CONFIRM or DRY RUN (each chunk is a merge of its own)"
+                            message: "MERGE WORLD ... IN CHUNKS OF n takes USING, BY COLUMNS, AT VERSION and CONFIRM; not \
+                                      INTO, ONLY, RESOLVE or DRY RUN (each chunk is a merge of its own)"
                                 .into(),
                             info: None,
                         });

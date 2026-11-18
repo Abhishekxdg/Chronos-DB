@@ -542,6 +542,16 @@ thread_local! {
     static SKIP: Cell<bool> = const { Cell::new(false) };
     /// What the merge just made in `merge_locked` left for after its locks (see `After`).
     static AFTER: RefCell<Option<After>> = const { RefCell::new(None) };
+    /// What the merge being written back covers, for its pending record (see `write_back` and `resolve`).
+    static SCOPE: RefCell<Json> = const { RefCell::new(Json::Null) };
+}
+
+/// A write-back's pending record: what recovery needs should the commit's outcome be lost. `scope` says what the
+/// merge covered (the world's version it merged at, its keys if partial, and where into), so recovery makes that
+/// merge and no other: not the rest of a partial merge, nor writes to the world since (see `resolve`).
+pub(crate) fn pending_record(merge_id: &str, world: &str, world_id: &str, rows: Json, others: Json) -> Json {
+    json!({"merge": merge_id, "world": world, "world_id": world_id, "rows": rows, "others": others,
+        "scope": SCOPE.with_borrow(|s| s.clone())})
 }
 
 /// What a write-back leaves to do once the merge's own locks are let go: main takes Postgres's rows (its values
@@ -976,8 +986,9 @@ impl Error {
 
 /// For crash tests (tests/attach.rs), in debug builds: with CHRONOS_ATTACH_CRASH=<at>, the process aborts at that step
 /// of a write-back (`before_commit`: the pending record written, COMMIT not sent; `after_commit`: Postgres committed,
-/// nothing published here; `before_trigger_refresh`: the merge made here, the tables its triggers wrote not yet
-/// refreshed), as a kill -9 there would.
+/// nothing published here; `after_publish`: the merge made here too, main not yet given Postgres's values;
+/// `before_trigger_refresh`: the tables its triggers wrote not yet refreshed; `before_forget`: all done but the
+/// pending record's removal), as a kill -9 there would.
 fn crash_point(at: &str) {
     #[cfg(debug_assertions)]
     if std::env::var("CHRONOS_ATTACH_CRASH").is_ok_and(|v| v == at) {
@@ -1319,7 +1330,9 @@ pub(crate) fn write_back(
     reads: Option<&Reads>,
     checks: &[crate::checks::MergeCheck],
     who: Option<&ActAs>,
+    scope: Json,
 ) -> Result<Option<Held>> {
+    SCOPE.set(scope);
     let rows = rows_of(core, att, world, theirs, ours, apply)?;
     if rows.is_empty() {
         return Ok(None);
@@ -1986,7 +1999,7 @@ fn transaction(
     }
     // (and the tables written besides: after a crash, recovery refreshes them, as nothing else would say they changed)
     let besides: Vec<&str> = others.iter().map(|&ti| tables[ti].name.as_str()).collect();
-    let pending = json!({"merge": merge_id, "world": world, "world_id": world_id, "rows": touched, "others": besides});
+    let pending = pending_record(&merge_id, world, world_id, json!(touched), json!(besides));
     crate::disk::write_file(&att.pending_path(), pending.to_string().as_bytes()).map_err(Error::Io)?;
     crash_point("before_commit");
     let record = [merge_id.clone()];
@@ -3434,6 +3447,9 @@ pub(crate) fn before_merge(core: &Core, into_main: bool) -> Result<Option<Hold<'
 pub(crate) fn after_merge(core: &Core) {
     let Some(after) = AFTER.take() else { return };
     let Some(att) = core.attached.as_deref() else { return };
+    if after.committed {
+        crash_point("after_publish");
+    }
     let failed = store(core, att, &after.rows).err();
     if let Some(e) = failed {
         eprintln!(
@@ -3457,6 +3473,7 @@ pub(crate) fn after_merge(core: &Core) {
         return;
     }
     if after.committed {
+        crash_point("before_forget");
         let _ = std::fs::remove_file(att.pending_path());
     }
 }
@@ -3607,8 +3624,24 @@ pub fn resolve(core: &Core) -> std::result::Result<Option<String>, String> {
     // the world still there (the crash came before Chronos made the merge): made now, with no second write-back
     let there = db.world(world).ok().is_some_and(|w| Some(w.id.as_str()) == world_id);
     if there {
+        // the merge Postgres has, and no other: at the version it merged at (a write to the world since makes it
+        // stale, and main takes Postgres's rows below), just its keys if partial, into where it went
+        let s = &p["scope"];
+        let o = crate::MergeOptions {
+            expected: s["version"].as_u64(),
+            only_keys: s["keys"]
+                .as_array()
+                .map(|k| k.iter().filter_map(|k| k.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+            only_tables: s["tables"]
+                .as_array()
+                .map(|t| t.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+            into: s["into"].as_str().map(String::from),
+            ..Default::default()
+        };
         let skip = SKIP.replace(true);
-        let merged = db.merge_with(world, &crate::MergeOptions::default());
+        let merged = db.merge_with(world, &o);
         SKIP.set(skip);
         match merged {
             Ok(_) => said.push_str(&format!("; {world} is merged into main now")),

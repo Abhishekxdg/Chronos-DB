@@ -2894,3 +2894,147 @@ fn cross_tenant_write_matrix_postgres() {
         drop(turn);
     }
 }
+
+/// A crash after Postgres committed a partial merge (`ONLY KEYS`) of a durable world (one the crash doesn't flag):
+/// recovery makes only the merge Postgres committed, not the rest of the world, nor what was written to it after the
+/// crash. Main and Postgres agree on every row, and merging the rest later writes it to Postgres. Debug builds only.
+#[test]
+fn partial_merge_not_applied_twice() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: crash points are in debug builds only");
+        return;
+    }
+    let Some((mut pg, name, _url, _turn)) = throwaway("partial_twice") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    let dir = folder("partial_twice");
+    for late in [false, true] {
+        pg.batch_execute(
+            "drop table if exists t; create table t (id int primary key, v text, u text unique);
+             insert into t values (1, 'a', 'a'), (2, 'b', 'b'), (3, 'c', 'c')",
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let (ok, out) = attach(&dir, &["--tables", "t"]);
+        assert!(ok, "{out}");
+        let db = Db::open(&dir).unwrap();
+        run(&db, MAIN, "create world p", &[]).unwrap();
+        run(&db, MAIN, "alter world p set (durable = true)", &[]).unwrap();
+        // (u is UNIQUE: the merge's keys hold its index rows too, which recovery must not name)
+        run(&db, "p", "update t set v = 'p', u = 'p' || id where id in (1, 2)", &[]).unwrap();
+        drop(db);
+        let out = Command::new(env!("CARGO_BIN_EXE_chronos"))
+            .args([dir.to_str().unwrap(), "merge world p only keys ('t/1');"])
+            .env("CHRONOS_ATTACH_CRASH", "after_commit")
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "it crashed: {}", String::from_utf8_lossy(&out.stdout));
+        assert!(dir.join("attached.pending").exists());
+        let all = "select string_agg(v, ',' order by id) from t";
+        assert_eq!(pg_cell(&mut pg, all), "p,b,c", "Postgres has row 1 only");
+        let db = Db::open(&dir).unwrap();
+        if late {
+            // work in the world goes on before anything merges into main
+            run(&db, "p", "update t set v = 'late' where id = 3", &[]).unwrap();
+        }
+        let said = chronos::attach::resolve(&db).unwrap().unwrap_or_default();
+        assert!(!dir.join("attached.pending").exists(), "{said}");
+        assert_eq!(pg_cell(&mut pg, all), "p,b,c", "late {late}");
+        assert_eq!(cell(&db, MAIN, all), "p,b,c", "late {late}: main and Postgres agree ({said})");
+        assert!(db.world("p").is_ok(), "the partial merge leaves p open");
+        if !late {
+            // recovery made the partial merge: one row (2) is left to merge
+            let left = db.diff("p").unwrap().into_iter().filter(|c| c.key.starts_with("t/")).count();
+            assert_eq!(left, 1, "{said}");
+        }
+        let rest = if late { "p,p,late" } else { "p,p,c" };
+        assert_eq!(cell(&db, "p", all), rest, "p keeps what is left");
+        // the rest, merged later, reaches Postgres (after the late write, recovery took row 1 from Postgres, which p
+        // changed too: settled as p has it)
+        run(&db, MAIN, "merge world p using ours", &[]).unwrap();
+        assert_eq!(pg_cell(&mut pg, all), rest);
+        assert_eq!(cell(&db, MAIN, all), rest);
+        drop(db);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+/// kill -9 at every step of a write-back, with a trigger writing a second table: after recovery, main and Postgres
+/// agree on both tables, the world is merged exactly when Postgres committed, and each committed merge is in
+/// Postgres's `chronos.merges` and main's merge ledger once. Recovery run again finds nothing to do. Debug builds only.
+#[test]
+fn crash_matrix_postgres() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: crash points are in debug builds only");
+        return;
+    }
+    let Some((mut pg, name, _url, _turn)) = throwaway("crash_matrix") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table t (id int primary key, v text);
+         create table seen (id int primary key, n int not null);
+         insert into seen values (1, 0);
+         create function count_write() returns trigger language plpgsql as $$
+         begin update seen set n = n + 1 where id = 1; return new; end $$;
+         create trigger t_count after insert or update on t for each row execute function count_write();
+         insert into t values (1, 'a');",
+    )
+    .unwrap();
+    let dir = folder("crash_matrix");
+    let (ok, out) = attach(&dir, &["--tables", "t,seen"]);
+    assert!(ok, "{out}");
+    let ledger = |db: &Db| db.ledger_rows().unwrap().len();
+    let base = {
+        let db = Db::open(&dir).unwrap();
+        ledger(&db)
+    };
+    let points = ["before_commit", "after_commit", "after_publish", "before_trigger_refresh", "before_forget"];
+    let mut committed = 0;
+    for (i, at) in points.iter().enumerate() {
+        let (w, id) = (format!("m{i}"), 10 + i);
+        let db = Db::open(&dir).unwrap();
+        run(&db, MAIN, &format!("create world {w}"), &[]).unwrap();
+        run(&db, &w, &format!("insert into t values ({id}, '{at}')"), &[]).unwrap();
+        drop(db);
+        let out = Command::new(env!("CARGO_BIN_EXE_chronos"))
+            .args(["-b", &w, dir.to_str().unwrap(), "merge"])
+            .env("CHRONOS_ATTACH_CRASH", at)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{at}: it crashed: {}", String::from_utf8_lossy(&out.stdout));
+        assert!(dir.join("attached.pending").exists(), "{at}: the outcome is left to settle");
+        let did = *at != "before_commit";
+        committed += usize::from(did);
+        let db = Db::open(&dir).unwrap();
+        let said = chronos::attach::resolve(&db).unwrap().unwrap_or_default();
+        assert!(!dir.join("attached.pending").exists(), "{at}: {said}");
+        assert_eq!(chronos::attach::resolve(&db).unwrap(), None, "{at}: settled once");
+        for q in ["select string_agg(id || '=' || v, ',' order by id) from t", "select n::text from seen"] {
+            assert_eq!(cell(&db, MAIN, q), pg_cell(&mut pg, q), "{at}: main and Postgres agree: {q} ({said})");
+        }
+        assert_eq!(pg_cell(&mut pg, &format!("select count(*) from t where id = {id}")), if did { "1" } else { "0" });
+        assert_eq!(db.world(&w).is_err(), did, "{at}: merged exactly when Postgres committed ({said})");
+        assert_eq!(
+            pg_cell(&mut pg, "select count(*) from chronos.merges where id like 'merge:%'"),
+            committed.to_string(),
+            "{at}"
+        );
+        assert_eq!(ledger(&db) - base, committed, "{at}: each merge in main's ledger once ({said})");
+        if !did {
+            run(&db, MAIN, &format!("drop world {w}"), &[]).unwrap();
+        }
+        drop(db);
+        // and once more after a clean open: the same
+        let db = Db::open(&dir).unwrap();
+        assert_eq!(ledger(&db) - base, committed, "{at}");
+        drop(db);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}

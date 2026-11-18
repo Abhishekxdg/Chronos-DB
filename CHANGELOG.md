@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.6.1 (beta), 2026-11-18
+
+**Two fixes for merges cut short by a crash.** Beside Postgres or MySQL, recovery from a crash after the source
+database committed a merge could put rows in main that never reached the source: it now settles exactly the merge the
+source committed. And `MERGE WORLD ... IN CHUNKS OF n` refused the version confirmation a world open at a crash asks
+for, so such a merge could only finish all at once; it now goes on in chunks. If you merge into an attached database,
+upgrade. Nothing changes in how rows are stored or merges are written: 0.6.1 opens and writes data format 8 as 0.6.0
+does. Built and signed on the maintainer's Mac as 0.6.0 was.
+
+- `MERGE WORLD ... IN CHUNKS OF n` takes `CONFIRM` and `AT VERSION`, so a chunked merge cut short by a crash goes on
+  in chunks: a world open at the crash merges only with its version confirmed, which IN CHUNKS used to refuse. The
+  version is checked by the first chunk, and each chunk after checks from where the one before left it (before, a
+  version given through the API failed the second chunk).
+- Attached databases: a merge into main whose outcome was lost in a crash after the source database committed it is
+  now settled as the merge that was written there, and no other. Recovery used to merge the whole world again, so
+  after a partial merge (`ONLY KEYS`, `ONLY TABLES`), or a write to the world after the crash, main took rows that were
+  never written to Postgres or MySQL. Recovery now merges at the world's version and keys as the merge had them; a
+  world written since keeps those writes, and main takes the source's rows.
+
 ## 0.6.0 (beta), 2026-11-18
 
 **Merges are logged as what they did, agents are kept to their tenant, and worlds gain what long-running agents

@@ -302,3 +302,210 @@ fn sequence_values_are_durable_before_they_are_handed_out() {
     drop(db);
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Gate C (plan r3 section 5, "Crash recovery, Chronos only"): every kind of merge, cut at every step. The log is cut
+/// at every record boundary (and a byte either side) and at random bytes (with torn-write garbage), and the folder must
+/// come back as it was after some whole number of the steps: every world's rows and main's ledger rows, never a merge
+/// half applied.
+#[test]
+fn cut_at_every_merge_step() {
+    use chronos::{MergeOptions, Pick, Resolve};
+    let (dir, crash) = (tmp("merges"), tmp("merges-crash"));
+    let mut states = vec![];
+    let mut ends = vec![];
+    let names = [
+        "merge",
+        "partial merge (only keys)",
+        "partial merge, the rest",
+        "merge into another world",
+        "merge that world",
+        "conflict settled by picks",
+        "rebase",
+        "merge after rebase",
+        "undo merge",
+        "merge with an operation id",
+    ];
+    let seg;
+    {
+        let db = Db::open(&dir).unwrap();
+        put_all(&db, MAIN, "base");
+        // the folder's first merge checkpoints first (manifest 8): done before the steps, so one segment holds them
+        db.fork(MAIN, "warm").unwrap();
+        db.put("warm", "warm", "1").unwrap();
+        db.merge("warm", Resolve::Fail).unwrap();
+        db.fork(MAIN, "a").unwrap();
+        put_all(&db, "a", "a");
+        db.fork(MAIN, "p").unwrap();
+        db.put("p", "p/1", "1").unwrap();
+        db.put("p", "p/2", "2").unwrap();
+        db.fork(MAIN, "x").unwrap();
+        db.fork(MAIN, "r").unwrap();
+        db.put("r", "r/1", "1").unwrap();
+        db.put(MAIN, "after", "1").unwrap(); // main moves on: r has something to rebase onto
+        db.fork("x", "y").unwrap();
+        db.put("y", "y/1", "1").unwrap();
+        // durable, so a merge into x is on disk when it returns, as main's are (see `durable`)
+        chronos::sql::run(&db, MAIN, "alter world x set (durable = true); alter world y set (durable = true); alter world r set (durable = true)", &[])
+            .unwrap();
+        db.put(MAIN, "c", "0").unwrap();
+        db.fork(MAIN, "c").unwrap();
+        db.put("c", "c", "world").unwrap();
+        db.put(MAIN, "c", "main").unwrap();
+        db.fork(MAIN, "u").unwrap();
+        db.put("u", "u/1", "1").unwrap();
+        db.merge("u", Resolve::Fail).unwrap();
+        db.fork(MAIN, "o").unwrap();
+        db.put("o", "o/1", "1").unwrap();
+        db.checkpoint().unwrap();
+        seg = last_segment(&dir);
+        states.push(fingerprint(&db));
+        let steps: Vec<Box<dyn Fn(&Db)>> = vec![
+            Box::new(|db| {
+                db.merge("a", Resolve::Fail).unwrap();
+            }),
+            Box::new(|db| {
+                db.merge_with("p", &MergeOptions { only_keys: vec!["p/1".into()], ..Default::default() }).unwrap();
+            }),
+            Box::new(|db| {
+                db.merge("p", Resolve::Fail).unwrap();
+            }),
+            Box::new(|db| {
+                db.merge("y", Resolve::Fail).unwrap();
+            }),
+            Box::new(|db| {
+                db.merge("x", Resolve::Fail).unwrap();
+            }),
+            Box::new(|db| {
+                let mut o = MergeOptions::default();
+                o.picks.insert("c".into(), Pick::Ours);
+                db.merge_with("c", &o).unwrap();
+            }),
+            Box::new(|db| {
+                db.rebase("r", &MergeOptions::default()).unwrap();
+            }),
+            Box::new(|db| {
+                db.merge("r", Resolve::Fail).unwrap();
+            }),
+            Box::new(|db| {
+                db.undo_merge("u", false).unwrap();
+            }),
+            Box::new(|db| {
+                db.merge_with("o", &MergeOptions { operation: Some("op".into()), ..Default::default() }).unwrap();
+            }),
+        ];
+        for step in &steps {
+            step(&db);
+            // a write to main is synced before it returns: the log holds all of the step by now
+            ends.push(log_end(&seg));
+            states.push(fingerprint(&db));
+        }
+    }
+    assert_eq!(last_segment(&dir), seg, "no checkpoint in between: one segment holds every step");
+    assert!(ends.windows(2).all(|w| w[0] < w[1]), "each step logged something: {ends:?}");
+    let len = fs::metadata(&seg).unwrap().len();
+    let mut r = 0x2545f4914f6cdd1du64;
+    let mut next = move || {
+        r ^= r << 13;
+        r ^= r >> 7;
+        r ^= r << 17;
+        r
+    };
+    let mut cuts: Vec<u64> = ends.iter().flat_map(|&e| [e.saturating_sub(1), e, e + 1]).collect();
+    cuts.extend((0..200).map(|_| next() % (len + 1)));
+    cuts.extend([0, len]);
+    for cut in cuts.into_iter().filter(|&c| c <= len) {
+        let _ = fs::remove_dir_all(&crash);
+        copy_dir(&dir, &crash);
+        let mut bytes = fs::read(&seg).unwrap();
+        bytes.truncate(cut as usize);
+        if next() % 2 == 0 {
+            bytes.extend((0..next() % 40).map(|_| next() as u8)); // torn write garbage
+        }
+        fs::write(crash.join(seg.file_name().unwrap()), bytes).unwrap();
+        let db = Db::open(&crash).unwrap_or_else(|e| panic!("cut {cut}/{len}: {e}"));
+        let whole = ends.iter().filter(|&&e| e <= cut).count();
+        let got = fingerprint(&db);
+        assert!(
+            got == states[whole],
+            "cut {cut}/{len}: not the state after {whole} whole steps (next: {:?})",
+            names.get(whole)
+        );
+        assert!(db.verify_ledger().unwrap().iter().all(|r| r.1), "cut {cut}/{len}: the ledger verifies");
+    }
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&crash);
+}
+
+/// Gate C: a big merge in chunks (MERGE ... IN CHUNKS, `merge_in_chunks`), cut anywhere: each chunk is a merge of its
+/// own, so the folder comes back with some whole number of chunks merged (in main and in its ledger, and gone from the
+/// world), and the same merge goes on from there to merge every row exactly once.
+#[test]
+fn chunked_merge_cut() {
+    use chronos::MergeOptions;
+    let (dir, crash) = (tmp("chunks"), tmp("chunks-crash"));
+    const ROWS: usize = 1000;
+    const CHUNK: usize = 150;
+    let rows_in =
+        |db: &Db, b: &str| db.scan(b, "t/", usize::MAX).unwrap().iter().filter(|(k, _)| k.starts_with("t/")).count();
+    let seg;
+    let base_ledger;
+    {
+        let db = Db::open(&dir).unwrap();
+        db.fork(MAIN, "warm").unwrap();
+        db.put("warm", "warm", "1").unwrap();
+        db.merge("warm", chronos::Resolve::Fail).unwrap();
+        db.fork(MAIN, "big").unwrap();
+        put_all(&db, "big", "big");
+        for i in ROWS..1500 {
+            db.del("big", &format!("t/{i:05}")).unwrap(); // put_all's 1500, down to ROWS
+        }
+        assert_eq!(rows_in(&db, "big"), ROWS);
+        db.checkpoint().unwrap();
+        seg = last_segment(&dir);
+        base_ledger = db.ledger_rows().unwrap().len();
+        let done = db.merge_in_chunks("big", &MergeOptions::default(), CHUNK).unwrap();
+        assert_eq!(done.chunks, ROWS.div_ceil(CHUNK));
+    }
+    assert_eq!(last_segment(&dir), seg, "one segment holds every chunk");
+    let len = fs::metadata(&seg).unwrap().len();
+    let mut r = 0x9e3779b97f4a7c15u64;
+    let mut next = move || {
+        r ^= r << 13;
+        r ^= r >> 7;
+        r ^= r << 17;
+        r
+    };
+    let mut cuts: Vec<u64> = (0..300).map(|_| next() % (len + 1)).collect();
+    cuts.extend([0, len]);
+    let mut seen = std::collections::BTreeSet::new();
+    for cut in cuts {
+        let _ = fs::remove_dir_all(&crash);
+        copy_dir(&dir, &crash);
+        let mut bytes = fs::read(&seg).unwrap();
+        bytes.truncate(cut as usize);
+        if next() % 2 == 0 {
+            bytes.extend((0..next() % 40).map(|_| next() as u8));
+        }
+        fs::write(crash.join(seg.file_name().unwrap()), bytes).unwrap();
+        let db = Db::open(&crash).unwrap_or_else(|e| panic!("cut {cut}/{len}: {e}"));
+        let chunks = db.ledger_rows().unwrap().len() - base_ledger;
+        let in_main = rows_in(&db, MAIN);
+        // each chunk whole: its rows in main and its ledger row, or neither
+        let expect = (chunks * CHUNK).min(ROWS);
+        assert_eq!(in_main, expect, "cut {cut}/{len}: {chunks} chunks in the ledger");
+        assert!(db.verify_ledger().unwrap().iter().all(|r| r.1), "cut {cut}/{len}");
+        if in_main < ROWS {
+            assert_eq!(rows_in(&db, "big"), ROWS, "cut {cut}/{len}: the world still has its changes");
+            // the same merge goes on from there: every row merged once, a ledger row per chunk
+            // (open when it crashed: CONFIRM takes its version as the one checked, as a person does after a crash)
+            chronos::sql::run(&db, MAIN, &format!("merge world big confirm in chunks of {CHUNK}"), &[])
+                .unwrap_or_else(|e| panic!("cut {cut}/{len}: resuming after {chunks} chunks: {}", e.message));
+            assert_eq!(rows_in(&db, MAIN), ROWS, "cut {cut}/{len}: resumed");
+        }
+        seen.insert(chunks);
+        drop(db);
+    }
+    assert!(seen.len() > 3, "cuts landed between several chunks: {seen:?}");
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&crash);
+}

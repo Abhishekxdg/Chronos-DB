@@ -132,3 +132,60 @@ fn replay_schedule() {
     let Ok(schedule) = std::env::var("SIM_REPLAY") else { return };
     shuttle::replay(scenario, schedule.trim().trim_matches('"'));
 }
+
+/// Gate C (plan r3 section 5, approval validation): an approved proposal's merge races a person's write to its
+/// world. Whatever the schedule, main ends with exactly the approved rows, or none of them: never the write made
+/// after the approval.
+fn approve_vs_write() {
+    use chronos::sql::{Session, run};
+    let db = Db::new();
+    run(
+        &db,
+        "main",
+        "create table t (id int primary key, v text);
+         create merge policy small with (max_rows = 1);
+         create agent bot with (can = 'read,fork,write_own,write_main,merge_own', policy = 'small')",
+        &[],
+    )
+    .unwrap();
+    let mut bot = Session::new("main");
+    bot.agent = Some("bot".into());
+    bot.run(
+        &db,
+        "create world w; use world w; insert into t values (1, 'approved'), (2, 'approved'); use world main",
+        &[],
+    )
+    .unwrap();
+    let out = bot.run(&db, "propose merge world w", &[]).unwrap();
+    let o = out.last().unwrap();
+    let at = o.columns.as_ref().unwrap().iter().position(|(c, _)| c == "id").unwrap();
+    let id = o.rows[0][at].to_text();
+    run(&db, "main", &format!("approve proposal '{id}'"), &[]).unwrap();
+    let merged = std::sync::Mutex::new(None);
+    shuttle::thread::scope(|s| {
+        s.spawn(|| *merged.lock().unwrap() = Some(run(&db, "main", &format!("merge proposal '{id}'"), &[]).is_ok()));
+        s.spawn(|| {
+            let _ = run(&db, "w", "update t set v = 'late' where id = 1", &[]); // fails once w is merged
+        });
+    });
+    let rows = run(&db, "main", "select id, v from t order by id", &[]).unwrap().pop().unwrap().rows;
+    let rows: Vec<String> = rows.iter().map(|r| format!("{}={}", r[0].to_text(), r[1].to_text())).collect();
+    if merged.into_inner().unwrap() == Some(true) {
+        assert_eq!(rows, ["1=approved", "2=approved"], "merged: exactly what was approved");
+    } else {
+        assert!(rows.is_empty(), "refused: nothing merged, {rows:?}");
+    }
+}
+
+/// `runner` with 8 MiB a task, as a main thread has: SQL statements' frames, in a debug build, need more than 512 KiB.
+fn big_runner<S: shuttle::scheduler::Scheduler + 'static>(s: S) -> shuttle::Runner<S> {
+    let mut config = shuttle::Config::new();
+    config.stack_size = 0x800000;
+    shuttle::Runner::new(s, config)
+}
+
+#[test]
+fn approve_vs_write_schedules() {
+    big_runner(shuttle::scheduler::RandomScheduler::new(iters())).run(approve_vs_write);
+    big_runner(shuttle::scheduler::PctScheduler::new(3, iters())).run(approve_vs_write);
+}
