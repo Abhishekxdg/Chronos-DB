@@ -1057,3 +1057,21 @@ fn own_worlds_of_different_moments_show_no_other_tenants_changes() {
     assert!(!shown(&db, &mut s, "compare worlds b, c").starts_with("ERROR"));
     s.close(&db);
 }
+
+/// SHOW WORLDS to an agent held to a tenant lists main and its tenant's worlds: other tenants' world names, owners and
+/// metadata are theirs, even with the old default `read` right.
+#[test]
+fn show_worlds_lists_no_other_tenants_worlds() {
+    let db = setup("show-worlds");
+    run(&db, MAIN, "create agent run7 with (can = 'read,fork,write_own', tenant = 'org_id = 7')", &[]).unwrap();
+    let mut seven = Session::new(MAIN);
+    seven.agent = Some("run7".into());
+    seven.run(&db, "create world umbrella_plan from main", &[]).unwrap();
+    let mut s = agent();
+    s.run(&db, "create world acme_plan from main", &[]).unwrap();
+    let listed = shown(&db, &mut s, "show worlds");
+    assert!(listed.contains("acme_plan") && listed.contains("main"), "{listed}");
+    assert!(!listed.contains("umbrella_plan") && !listed.contains("run7"), "{listed}");
+    let all = run(&db, MAIN, "show worlds", &[]).unwrap();
+    assert!(format!("{all:?}").contains("umbrella_plan"), "an admin lists every world");
+}

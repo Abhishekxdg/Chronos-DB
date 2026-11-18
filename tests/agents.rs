@@ -1263,3 +1263,48 @@ fn an_agent_writes_back_as_a_postgres_role() {
     run(&db, MAIN, "alter agent run17 set (pg_role = '')", &[]).unwrap();
     assert_eq!(db.agent("run17").unwrap().act_as, None);
 }
+
+/// An agent's world limit holds against forks sent at once: each counted its worlds before any fork landed, and all
+/// went through.
+#[test]
+fn a_world_limit_holds_against_forks_at_once() {
+    let db = Db::new();
+    db.create_agent("eager", &AgentSpec { max_worlds: Some(2), ..Default::default() }).unwrap();
+    let made = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for i in 0..16 {
+            let (db, made) = (&db, &made);
+            s.spawn(move || {
+                let me = db.as_agent("eager").unwrap();
+                if me.fork(MAIN, &format!("e{i}"), serde_json::Value::Null).is_ok() {
+                    made.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        }
+    });
+    assert_eq!(made.into_inner(), 2);
+    assert_eq!(db.worlds().iter().filter(|w| w.owner.as_deref() == Some("eager")).count(), 2);
+}
+
+/// Grants and a policy's reviewer role are kept by agent name: a new agent made with a dropped one's name would get
+/// them, so the name is refused until they are revoked or changed.
+#[test]
+fn a_reused_agent_name_inherits_no_grants_or_reviews() {
+    let db = Db::new();
+    db.create_agent("helper", &AgentSpec::default()).unwrap();
+    db.fork(MAIN, "shared").unwrap();
+    db.grant_world("shared", "helper", &["write".to_string()], None).unwrap();
+    db.drop_agent("helper").unwrap();
+    let e = db.create_agent("helper", &AgentSpec::default()).unwrap_err().to_string();
+    assert!(e.contains("grants") && e.contains("shared"), "{e}");
+    db.revoke_world("shared", "helper", &["write".to_string()]).unwrap();
+    db.create_agent("helper", &AgentSpec::default()).unwrap();
+
+    db.create_agent("judge", &AgentSpec::default()).unwrap();
+    db.create_policy("careful", &serde_json::json!({ "reviewer": "judge" })).unwrap();
+    // a policy may name a reviewer that doesn't exist yet; one that does can't be dropped from under it
+    db.create_policy("later", &serde_json::json!({ "reviewer": "critic" })).unwrap();
+    db.create_agent("critic", &AgentSpec::default()).unwrap();
+    let e = db.drop_agent("judge").unwrap_err().to_string();
+    assert!(e.contains("reviewer") && e.contains("careful"), "{e}");
+}

@@ -32348,6 +32348,20 @@ fn explain_merge(db: &Db, w: &str) -> Result<Vec<Vec<Value>>> {
     for e in db.world_effects(&world.name)? {
         line("effect", e.channel, e.payload);
     }
+    // strict (rules E7 and E8): what a caller asking a person needs to know first
+    let (strict, window) = db.strict_effects(&world.name, &merge_as)?;
+    if !strict.is_empty() {
+        line(
+            "strict",
+            strict.join(", "),
+            format!(
+                "a proposal of this merge is strict: only a person approves it, within {} s of proposing it, and any \
+                 commit to {} since it was proposed supersedes it",
+                window / 1000,
+                world.parent.as_deref().unwrap_or("main")
+            ),
+        );
+    }
     for e in parts["evidence"].as_array().into_iter().flatten() {
         let s = |k: &str| e[k].as_str().unwrap_or_default().to_string();
         let d = [s("uri"), s("sha256"), s("note"), format!("by {}", s("by"))]
@@ -32383,6 +32397,8 @@ fn proposal_row(p: &Json) -> Vec<Value> {
         s("certificate"),
         Value::Json(p["approvals"].clone()),
         p["created"].as_u64().map_or(Value::Null, |t| Value::TimestampTz(t as i64 * 1000)),
+        Value::Bool(p["strict"].is_object()),
+        p["strict"]["until"].as_u64().map_or(Value::Null, |t| Value::TimestampTz(t as i64 * 1000)),
     ]
 }
 
@@ -38313,6 +38329,7 @@ pub(crate) fn forget_stats(uid: u64) {
 pub(crate) fn forget_world_stats(uid: u64, worlds: &[&str]) {
     if !worlds.is_empty() {
         stmtstats::forget_worlds(uid, worlds);
+        pgstat::forget_worlds(uid, worlds);
     }
 }
 
@@ -43992,6 +44009,8 @@ impl Statement {
                     ("effects_delay", Type::Interval),
                     ("max_unusual", Type::BigInt),
                     ("require_evidence", Type::Text),
+                    ("strict_channels", Type::Text),
+                    ("strict_window", Type::Interval),
                 ]);
             }
             Stmt::ShowChecks | Stmt::CreateCheck { .. } => {
@@ -44094,6 +44113,8 @@ impl Statement {
                     ("certificate", Type::Text),
                     ("approvals", Type::Json),
                     ("created", Type::TimestampTz),
+                    ("strict", Type::Bool),
+                    ("strict_until", Type::TimestampTz),
                 ]);
             }
             Stmt::ExplainMerge(_) => {
@@ -44928,9 +44949,10 @@ impl Statement {
                     {
                         return Err(SqlError {
                             code: "42601",
-                            message: "MERGE WORLD ... IN CHUNKS OF n takes USING, BY COLUMNS, AT VERSION and CONFIRM; not \
+                            message:
+                                "MERGE WORLD ... IN CHUNKS OF n takes USING, BY COLUMNS, AT VERSION and CONFIRM; not \
                                       INTO, ONLY, RESOLVE or DRY RUN (each chunk is a merge of its own)"
-                                .into(),
+                                    .into(),
                             info: None,
                         });
                     }
@@ -45398,6 +45420,8 @@ impl Statement {
                             p.effects_delay.map_or(Value::Null, interval_of),
                             limit(p.max_unusual),
                             Value::Text(p.require_evidence.join(",")),
+                            Value::Text(crate::agents::listed(&p.strict_channels)),
+                            p.strict_window.map_or(Value::Null, interval_of),
                         ]
                     })
                     .collect();

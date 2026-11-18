@@ -177,6 +177,65 @@ fn approve_vs_write() {
     }
 }
 
+/// Rule E7 under every schedule: an approved strict proposal (it queues a payout) merges while a commit lands on main,
+/// in a table it doesn't touch. The merge goes through only with no commit before it; refused, the proposal is
+/// superseded and nothing is sent. Never both a payout and a superseded proposal, nor a refusal with no commit.
+fn strict_merge_vs_commit() {
+    use chronos::sql::{Session, run};
+    let db = Db::new();
+    run(
+        &db,
+        "main",
+        "create table t (id int primary key, v text);
+         create table other (id int primary key);
+         create agent bot with (can = 'read,fork,write_own,write_main,merge_own')",
+        &[],
+    )
+    .unwrap();
+    let mut bot = Session::new("main");
+    bot.agent = Some("bot".into());
+    bot.run(&db, "create world w; use world w; insert into t values (1, 'paid'); notify on merge payout, 'pay 1'", &[])
+        .unwrap();
+    bot.run(&db, "use world main", &[]).unwrap();
+    let column = |sql: &str, col: &str| -> String {
+        let o = run(&db, "main", sql, &[]).unwrap().pop().unwrap();
+        let at = o.columns.as_ref().unwrap().iter().position(|(c, _)| c == col).unwrap();
+        o.rows[0][at].to_text()
+    };
+    let o = bot.run(&db, "propose merge world w", &[]).unwrap().pop().unwrap();
+    let at = o.columns.as_ref().unwrap().iter().position(|(c, _)| c == "id").unwrap();
+    let id = o.rows[0][at].to_text();
+    run(&db, "main", &format!("approve proposal '{id}'"), &[]).unwrap();
+    let (merged, committed) = (std::sync::Mutex::new(None), std::sync::Mutex::new(false));
+    shuttle::thread::scope(|s| {
+        s.spawn(|| {
+            let r = run(&db, "main", &format!("merge proposal '{id}'"), &[]);
+            *merged.lock().unwrap() = Some(r.map(|_| ()).map_err(|e| e.message));
+        });
+        s.spawn(|| *committed.lock().unwrap() = run(&db, "main", "insert into other values (1)", &[]).is_ok());
+    });
+    let sent = run(&db, "main", "show outbox", &[]).unwrap().pop().unwrap().rows.len();
+    let status = column("show proposals", "status");
+    match merged.into_inner().unwrap().unwrap() {
+        Ok(()) => {
+            assert_eq!(sent, 1, "merged: the payout queued");
+            assert_eq!(status, "merged");
+        }
+        Err(m) => {
+            assert!(m.contains("strict_target"), "refused only for a commit to main: {m}");
+            assert!(*committed.lock().unwrap(), "a refusal with no commit to main");
+            assert_eq!(sent, 0, "superseded: nothing sent");
+            assert_eq!(status, "superseded");
+        }
+    }
+}
+
+#[test]
+fn strict_merge_vs_commit_schedules() {
+    big_runner(shuttle::scheduler::RandomScheduler::new(iters())).run(strict_merge_vs_commit);
+    big_runner(shuttle::scheduler::PctScheduler::new(3, iters())).run(strict_merge_vs_commit);
+}
+
 /// `runner` with 8 MiB a task, as a main thread has: SQL statements' frames, in a debug build, need more than 512 KiB.
 fn big_runner<S: shuttle::scheduler::Scheduler + 'static>(s: S) -> shuttle::Runner<S> {
     let mut config = shuttle::Config::new();

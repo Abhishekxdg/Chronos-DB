@@ -1648,3 +1648,54 @@ fn a_declared_cursor_is_a_portal_describe_can_name() {
     assert!(body.windows(2).any(|w| w == b"a\0") && body.windows(2).any(|w| w == b"b\0"));
     while read_message(&mut s).0 != b'Z' {}
 }
+
+/// A client that takes a row lock, asks for a result bigger than the socket buffers and never reads it: the server's
+/// write waits, and gives up after a minute, so the connection ends, its transaction rolls back and the row is free.
+/// Before, the write waited forever and the lock was never let go. (Takes a little over a minute.)
+#[test]
+fn a_client_that_stops_reading_lets_its_locks_go() {
+    use std::io::{Read, Write};
+    let (_server, port) = start("stalled_reader", None);
+    let mut admin = connect(port, "").unwrap();
+    admin.batch_execute("create table t (id int primary key, v text); insert into t values (1, 'one')").unwrap();
+    // a raw client: log in, then send one query and read nothing more
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let params = b"user\0tester\0database\0main\0\0";
+    let mut startup = ((8 + params.len()) as i32).to_be_bytes().to_vec();
+    startup.extend(196608i32.to_be_bytes()); // protocol 3.0
+    startup.extend(params);
+    c.write_all(&startup).unwrap();
+    let msg = |c: &mut std::net::TcpStream| {
+        let mut head = [0u8; 5];
+        c.read_exact(&mut head).unwrap();
+        let mut body = vec![0u8; i32::from_be_bytes(head[1..5].try_into().unwrap()) as usize - 4];
+        c.read_exact(&mut body).unwrap();
+        head[0]
+    };
+    while msg(&mut c) != b'Z' {} // logged in, ready
+    let q = b"begin; update t set v = 'held' where id = 1; select repeat('x', 1000000) from generate_series(1, 100)\0";
+    let mut query = vec![b'Q'];
+    query.extend(((4 + q.len()) as i32).to_be_bytes());
+    query.extend(q);
+    c.write_all(&query).unwrap();
+    // the server builds the whole result before it writes: wait for its first row, so the stall starts now
+    while msg(&mut c) != b'D' {}
+    // ~100 MB of rows the client never takes: past every buffer, so the server's write waits on it. A write that
+    // times out having sent part returns that part, and only the next fails: up to two minutes, not one
+    std::thread::sleep(Duration::from_secs(135));
+    // the server gave up on it: what was buffered, then the end, never the whole result and ReadyForQuery
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut got = 0usize;
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        match c.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) => panic!("the connection is still open after its write timed out: {e} ({got} bytes read)"),
+        }
+    }
+    assert!(got < 50_000_000, "the client got the whole result ({got} bytes): the server never gave up");
+    // its transaction rolled back, and the row is free to change
+    assert_eq!(admin.query_one("select v from t where id = 1", &[]).unwrap().get::<_, String>(0), "one");
+    admin.batch_execute("update t set v = 'free' where id = 1").unwrap();
+}

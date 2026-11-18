@@ -783,6 +783,20 @@ impl Core {
                 left.join(", ")
             )));
         }
+        // and so are grants: a new agent of the name would get rights it was never given (a policy's reviewer can't
+        // outlive its agent, see `drop_agent`)
+        let granted: Vec<String> = self
+            .worlds()
+            .into_iter()
+            .filter(|w| w.meta.get(crate::lifecycle::GRANTS).and_then(|g| g.get(name)).is_some())
+            .map(|w| w.name)
+            .collect();
+        if !granted.is_empty() {
+            return Err(bad(format!(
+                "a dropped agent {name} still holds grants on worlds ({}); revoke them before reusing the name",
+                granted.join(", ")
+            )));
+        }
         let token = new_token()?;
         let scram = crate::sql::scram::fresh(&token, iterations)
             .map_err(|e| Error::Constraint { code: e.code, message: e.message })?;
@@ -973,6 +987,16 @@ impl Core {
     /// name can't name a new agent until they're gone (see `create_agent`).
     pub fn drop_agent(&self, name: &str) -> Result<()> {
         self.agent(name)?;
+        // a policy may name its reviewer before the agent exists, so the name can't be checked when one is made: a
+        // reviewer can't be dropped instead, or a new agent of its name would decide its merges
+        let reviews: Vec<String> =
+            self.policies()?.into_iter().filter(|p| p.reviewer.as_deref() == Some(name)).map(|p| p.name).collect();
+        if !reviews.is_empty() {
+            return Err(bad(format!(
+                "agent {name} is the reviewer of merge policies ({}); change them before dropping it",
+                reviews.join(", ")
+            )));
+        }
         self.write(MAIN, &[(&format!("{AGENTS}/{name}"), None)])?;
         self.record_security("drop agent", name);
         Ok(())
@@ -1643,6 +1667,11 @@ pub struct MergePolicy {
     /// kinds of evidence (see `proposals`: ATTACH EVIDENCE) a merge must carry, every one: a merge without one of
     /// them waits for a person, and no approval lifts it
     pub require_evidence: Vec<String>,
+    /// channels that make a proposal queueing an effect on one strict (see `proposals`: rules E7 and E8), beside
+    /// `review_channels` and the built-in payment ones (`outbox::strict`): they add to those, never take one away
+    pub strict_channels: Vec<String>,
+    /// how long after a strict proposal a person may approve it, ms (None: 15 minutes)
+    pub strict_window: Option<u64>,
     pub created: u64,
 }
 
@@ -1764,7 +1793,7 @@ impl MergePolicy {
     fn apply(&mut self, j: &Json) -> Result<()> {
         let list = |k: &str, v: &Json| -> Result<Vec<String>> {
             let wrong = || {
-                let what = if k == "review_channels" {
+                let what = if k == "review_channels" || k == "strict_channels" {
                     "channel names like 'billing,email'"
                 } else {
                     "table names like 'orders,items'"
@@ -1805,6 +1834,15 @@ impl MergePolicy {
                 "max_effects" => self.max_effects = limit()?,
                 "effects_per_hour" => self.effects_per_hour = limit()?,
                 "review_channels" => self.review_channels = list(k, v)?,
+                "strict_channels" => self.strict_channels = list(k, v)?,
+                "strict_window" => {
+                    self.strict_window = duration(k, v)?;
+                    if self.strict_window == Some(0) {
+                        return Err(bad(
+                            "strict_window is a length of time like '15 minutes', or null for 15 minutes".into()
+                        ));
+                    }
+                }
                 "canary_wait" => self.canary_wait = duration(k, v)?,
                 "effects_delay" => self.effects_delay = duration(k, v)?,
                 "watch_totals" => self.watch_totals = totals(v)?,
@@ -1889,7 +1927,7 @@ impl MergePolicy {
                 }
                 k => {
                     return Err(bad(format!(
-                        "merge policies have no setting {k} (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, all_rows_per_hour, all_deletes_per_hour, all_effects_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, row_rules, max_nulled, untrusted_columns, trusted_columns, untrusted_guards, spot_check, schema, overwrite, critical, check_reads, rerun_reads, require_scope, reviewer, review_every, person_only, watch_totals, max_shift, canary, canary_wait, effects_delay, max_unusual, arbitrate, require_evidence)"
+                        "merge policies have no setting {k} (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, all_rows_per_hour, all_deletes_per_hour, all_effects_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, row_rules, max_nulled, untrusted_columns, trusted_columns, untrusted_guards, spot_check, schema, overwrite, critical, check_reads, rerun_reads, require_scope, reviewer, review_every, person_only, watch_totals, max_shift, canary, canary_wait, effects_delay, max_unusual, arbitrate, require_evidence, strict_channels, strict_window)"
                     )));
                 }
             }
@@ -1915,6 +1953,7 @@ impl MergePolicy {
             "trusted_columns": self.trusted_columns, "watch_totals": self.watch_totals, "max_shift": self.max_shift,
             "canary": self.canary, "canary_wait": self.canary_wait, "effects_delay": self.effects_delay,
             "max_unusual": self.max_unusual, "require_evidence": self.require_evidence,
+            "strict_channels": self.strict_channels, "strict_window": self.strict_window,
             "review_every": self.review_every, "person_only": self.person_only,
         })
         .to_string()
@@ -1974,6 +2013,8 @@ impl MergePolicy {
             effects_delay: j["effects_delay"].as_u64(),
             max_unusual: j["max_unusual"].as_u64().filter(|n| *n > 0),
             require_evidence: list("require_evidence"),
+            strict_channels: list("strict_channels"),
+            strict_window: j["strict_window"].as_u64().filter(|ms| *ms > 0),
             untrusted_guards: list("untrusted_guards"),
             review_every: j["review_every"].as_bool().unwrap_or(false),
             person_only: j["person_only"]
@@ -3291,6 +3332,7 @@ impl Acting<'_> {
     /// Forks `from` as `name`, owned by this agent (expiring after its world TTL, if any).
     pub fn fork(&self, from: &str, name: &str, meta: Json) -> Result<World> {
         self.may_fork(from)?;
+        let _one = self.forking();
         let owner = self.forks(1)?;
         let meta = self.fork_meta(from, meta, owner)?;
         self.core.tenant_first(from, &meta)?;
@@ -3398,6 +3440,15 @@ impl Acting<'_> {
             meta.insert(EXPIRES.into(), json!(disk::now_ms().saturating_add(a.world_ttl)));
         }
         Ok(meta)
+    }
+
+    /// Held from counting this agent's worlds (`forks`, `agent_fork_room`) to making the new ones, when it has a limit
+    /// to count against: forks at once would each see room for one more, and all go through.
+    /// shortcut: one lock for every limited agent, so their forks queue behind each other's; per agent if that shows.
+    pub(crate) fn forking(&self) -> Option<std::sync::MutexGuard<'static, ()>> {
+        static FORKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let a = &self.agent;
+        (a.max_worlds > 0 || a.max_children > 0).then(|| FORKING.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     /// The worlds this agent owns now.

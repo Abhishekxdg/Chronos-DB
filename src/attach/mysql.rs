@@ -1120,6 +1120,33 @@ impl Row {
     }
 }
 
+/// MySQL's settings that let it lose a commit it acknowledged: the redo log not flushed at each commit
+/// (`innodb_flush_log_at_trx_commit` not 1), or, with the binary log on, it not synced at each (`sync_binlog` not 1).
+pub(super) fn unsafe_durability(att: &Attached) -> std::result::Result<Option<String>, String> {
+    let sql = "select @@innodb_flush_log_at_trx_commit, @@sync_binlog, @@log_bin";
+    let (mut c, reused) = lease(att)?;
+    let done = match c.query(sql) {
+        // a kept connection MySQL closed while it was idle: once more on a new one (this reads only)
+        Err(_) if reused => {
+            c = open(&url()?)?;
+            c.query(sql)
+        }
+        out => out,
+    }
+    .map_err(|e| format!("reading MySQL's settings: {e}"))?;
+    put(att, c);
+    let r = done.last().and_then(|d| d.rows.first()).ok_or("reading MySQL's settings: no row")?;
+    let v = |i: usize| r[i].as_deref().unwrap_or("");
+    let mut bad = vec![];
+    if v(0) != "1" {
+        bad.push(format!("innodb_flush_log_at_trx_commit = {}", v(0)));
+    }
+    if v(2) == "1" && v(1) != "1" {
+        bad.push(format!("sync_binlog = {}", v(1)));
+    }
+    Ok((!bad.is_empty()).then(|| bad.join(", ")))
+}
+
 /// Whether the write-back that inserted `merge_id` committed (see `super::committed`): its row inserted again from a
 /// new connection waits for the first transaction to end, then is a duplicate if it committed.
 pub(super) fn committed(merge_id: &str) -> std::result::Result<bool, String> {
@@ -1185,6 +1212,14 @@ pub(super) fn refresh(core: &Core, att: &Attached, only: Option<&[usize]>) -> st
         att.refreshed(done.at).map_err(|e| e.to_string())?;
     }
     Ok(done)
+}
+
+/// `super::reconcile` of a MySQL folder: `refresh`'s read and comparison, nothing taken.
+pub(super) fn reconcile(core: &Core, att: &Attached) -> std::result::Result<Refreshed, String> {
+    let (mut c, _) = lease(att)?;
+    let out = refresh_read(core, att, &mut c, None);
+    put(att, c);
+    out.map(|(done, _)| done)
 }
 
 fn refresh_read(
@@ -1611,6 +1646,9 @@ pub fn attach(dir: &str, opts: &crate::Open, named: &[String], yes: bool) -> std
                 t.name
             );
         }
+    }
+    if let Some(w) = super::durability_warning(&att) {
+        println!("\n{w}");
     }
     println!(
         "\nnext: chronos serve {dir} (with CHRONOS_SOURCE_URL set), fork a world, change rows there, and MERGE WORLD:\n\

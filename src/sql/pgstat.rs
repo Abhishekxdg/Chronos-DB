@@ -162,6 +162,16 @@ pub(super) fn forget(uid: u64) {
     clusters().remove(&uid);
 }
 
+/// Forgets the statistics of worlds of database `uid` that are gone (dropped, merged or discarded): without this,
+/// every short task world ever used keeps an entry until the process ends.
+pub(super) fn forget_worlds(uid: u64, worlds: &[&str]) {
+    if let Some(c) = clusters().get_mut(&uid) {
+        for w in worlds {
+            c.dbs.remove(*w);
+        }
+    }
+}
+
 /// What a read of the statistics sees: its own database's, every database's own counters, the shared
 /// objects' and the fixed ones.
 #[derive(Clone, Default, Debug)]
@@ -1580,4 +1590,26 @@ fn io_op(bk: u8, obj: u8, ctx: u8, op: IoOp) -> bool {
         return false;
     }
     !(strategy && op == IoOp::Fsync)
+}
+
+#[cfg(test)]
+mod tests {
+    /// A world's statistics go with it: a process running millions of short task worlds kept every one's.
+    #[test]
+    fn a_gone_worlds_statistics_are_freed() {
+        let db = crate::Db::new();
+        let kept = |w: &str| super::clusters().get(&db.uid).is_some_and(|c| c.dbs.contains_key(w));
+        for (w, merge) in [("task", false), ("done", true)] {
+            db.fork(crate::MAIN, w).unwrap();
+            super::connected(&db, w);
+            assert!(kept(w));
+            if merge {
+                db.put(w, "k", "1").unwrap();
+                db.merge_with(w, &crate::MergeOptions::default()).unwrap();
+            } else {
+                db.discard(w).unwrap();
+            }
+            assert!(!kept(w), "{w}'s statistics outlived it");
+        }
+    }
 }

@@ -1007,6 +1007,25 @@ but merge checks, reads that changed since the fork, and `require_evidence`; a r
 policy's `person_only`. So, unlike `REVIEW WORLD ... APPROVE` (which merges as a person), a reviewer's approval of a
 merge that deletes rows doesn't merge it: it waits for a person. The merge shows in the audit as the agent's.
 
+A proposal is **strict** when the world queues an effect on a strict channel: one whose name starts with `payment`,
+`payout`, `transfer` or `refund`, or one in its policy's `review_channels` or `strict_channels` (a policy adds strict
+channels and can't take the built-in ones away: name the channel otherwise). `SHOW PROPOSALS` says so (`strict`,
+`strict_until`). A strict proposal merges the whole world into its parent (one `INTO` another world is refused,
+`22023`), and:
+
+- only a person approves it (the reviewer and admin agents are refused, `42501`), within the policy's `strict_window`
+  of being proposed (15 minutes unless it says); past that it's `expired` (`55000`) and a new proposal is needed;
+- it's bound to the world it merges into as that was when it was proposed: any commit there since, even to a table
+  it doesn't touch, supersedes it at its approval or its merge (`40001`, `superseded (strict_target)`), and nothing is
+  sent. On a busy `main` a strict proposal waits for a quiet moment: that's on purpose, so a payment never goes out
+  against a state nobody approved. Another proposal's steps are commits to `main` too. In a folder attached to a
+  source database, a refresh is one.
+
+The window is the server's clock: a clock that jumps expires a proposal early or late.
+
+`EXPLAIN MERGE WORLD w` has a `strict` line (the strict channels, the window) when a proposal of the merge would
+be strict, so a caller can tell before proposing.
+
 `EXPLAIN MERGE WORLD w` puts in one answer: the certificate a proposal made now would carry, rows per table, each
 conflict, what would block it, the merge policy's verdict (as its owner's merge) and each reason, what reads the
 columns it changes (as `DIFF ... READERS`), the effects it would queue (`NOTIFY ON MERGE`), its evidence and scope.

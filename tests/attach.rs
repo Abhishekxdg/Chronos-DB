@@ -2153,9 +2153,10 @@ fn a_merge_is_undone_by_its_id() {
     assert_eq!((done.undone, done.skipped), (5, 0), "{done:?}");
     assert!(done.merge.as_deref().is_some_and(|m| m.starts_with("merge:") && m != first), "{done:?}");
     assert_eq!(state(&mut pg), was);
+    // the instant read in UTC: `seen::text` prints in the server's TimeZone (Asia/Kolkata gave +05:30)
     assert_eq!(
-        pg_cell(&mut pg, "select meta::text || seen::text from leads where id = 1"),
-        "{\"a\": 1}2026-10-01 10:00:00+00"
+        pg_cell(&mut pg, "select meta::text || (seen at time zone 'utc')::text from leads where id = 1"),
+        "{\"a\": 1}2026-10-01 10:00:00"
     );
     assert_eq!(cell(&db, MAIN, "select count(*) from leads"), "3");
     assert_eq!(chronos::attach::refresh(&db).unwrap().changed(), 0, "main is Postgres's");
@@ -3034,6 +3035,185 @@ fn crash_matrix_postgres() {
         assert_eq!(ledger(&db) - base, committed, "{at}");
         drop(db);
     }
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+/// A Postgres set to lose commits it acknowledged (`synchronous_commit = off`) refuses merges into main, nothing
+/// written; with CHRONOS_ATTACH_UNSAFE_SOURCE=1, or once it is set back, they go.
+#[test]
+fn unsafe_durability_settings_refused() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("unsafe") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute("create table t (id int primary key, v text); insert into t values (1, 'a')").unwrap();
+    let dir = folder("unsafe");
+    let (ok, out) = attach(&dir, &["--tables", "t"]);
+    assert!(ok, "{out}");
+    pg.batch_execute(&format!("alter database {name} set synchronous_commit = off")).unwrap();
+    let db = Db::open(&dir).unwrap();
+    let e = change(&db, "w1", "update t set v = 'x' where id = 1").expect("refused");
+    assert!(
+        e.message.contains("synchronous_commit = off") && e.message.contains("CHRONOS_ATTACH_UNSAFE_SOURCE"),
+        "{}",
+        e.message
+    );
+    assert_eq!(pg_cell(&mut pg, "select v from t where id = 1"), "a", "nothing written");
+    assert_eq!(cell(&db, MAIN, "select v from t where id = 1"), "a");
+    unsafe { std::env::set_var("CHRONOS_ATTACH_UNSAFE_SOURCE", "1") };
+    let e = change(&db, "w2", "update t set v = 'y' where id = 1");
+    unsafe { std::env::remove_var("CHRONOS_ATTACH_UNSAFE_SOURCE") };
+    assert!(e.is_none(), "{:?}", e.map(|e| e.message));
+    assert_eq!(pg_cell(&mut pg, "select v from t where id = 1"), "y");
+    drop(db);
+    pg.batch_execute(&format!("alter database {name} reset synchronous_commit")).unwrap();
+    let db = Db::open(&dir).unwrap();
+    assert!(change(&db, "w3", "update t set v = 'z' where id = 1").is_none());
+    assert_eq!(pg_cell(&mut pg, "select v from t where id = 1"), "z");
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+/// The reconciliation scan (`chronos refresh --check`, `attach::reconcile`): rows changed straight in Postgres, a row
+/// added and one deleted there, and a column added, are reported per table with nothing taken into main; exit 1.
+/// After a refresh it reports agreement; exit 0.
+#[test]
+fn reconciliation_scan_reports_divergence() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("reconcile") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute(
+        "create table t (id int primary key, v text); insert into t values (1, 'a'), (2, 'b'), (3, 'c');
+         create table u (id int primary key, v text); insert into u values (1, 'a')",
+    )
+    .unwrap();
+    let dir = folder("reconcile");
+    let (ok, out) = attach(&dir, &["--tables", "t,u"]);
+    assert!(ok, "{out}");
+    let scan = || {
+        let out = Command::new(env!("CARGO_BIN_EXE_chronos"))
+            .args(["refresh", dir.to_str().unwrap(), "--check"])
+            .output()
+            .unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr))
+    };
+    let (code, text) = scan();
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("main agrees with"), "{text}");
+    // --check changes nothing: with --unfollow or --tenant, which would, it is refused
+    for other in [&["--unfollow"][..], &["--tenant", "1"][..]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_chronos"))
+            .args(["refresh", dir.to_str().unwrap(), "--check"])
+            .args(other)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{other:?}");
+    }
+    pg.batch_execute(
+        "update t set v = 'changed' where id = 1; delete from t where id = 2; insert into t values (4, 'd');
+         alter table u add column note text",
+    )
+    .unwrap();
+    let db = Db::open(&dir).unwrap();
+    let r = chronos::attach::reconcile(&db).unwrap();
+    let t = r.tables.iter().find(|x| x.0 == "t").unwrap();
+    assert_eq!((t.1, t.2, t.3), (1, 1, 1), "one only in Postgres, one differing, one only in main: {:?}", r.tables);
+    assert!(r.skipped.iter().any(|s| s.starts_with("u:") && s.contains("note")), "{:?}", r.skipped);
+    // nothing taken
+    assert_eq!(cell(&db, MAIN, "select string_agg(id || '=' || v, ',' order by id) from t"), "1=a,2=b,3=c");
+    drop(db);
+    let (code, text) = scan();
+    assert_eq!(code, Some(1), "{text}");
+    assert!(text.contains("t: 1 only in") && text.contains("1 differ, 1 only in main"), "{text}");
+    let out = Command::new(env!("CARGO_BIN_EXE_chronos")).args(["refresh", dir.to_str().unwrap()]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let (code, text) = scan();
+    assert_eq!(code, Some(0), "after a refresh: {text}");
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+/// A merge Postgres committed before a crash cut it short is made in Chronos as it was decided: a merge check made
+/// since, which the merged result breaks, doesn't refuse it, so the world is merged and main agrees with Postgres. An
+/// ordinary merge afterwards is still judged by that check. Debug builds only.
+#[test]
+fn recovery_applies_intent_payload_without_validation() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: crash points are in debug builds only");
+        return;
+    }
+    let Some((mut pg, name, _url, _turn)) = throwaway("recorded") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute("create table t (id int primary key, v text); insert into t values (1, 'a')").unwrap();
+    let dir = folder("recorded");
+    let (ok, out) = attach(&dir, &["--tables", "t"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    run(&db, MAIN, "create world p", &[]).unwrap();
+    run(&db, MAIN, "alter world p set (durable = true)", &[]).unwrap();
+    run(&db, "p", "update t set v = 'p' where id = 1", &[]).unwrap();
+    drop(db);
+    let out = Command::new(env!("CARGO_BIN_EXE_chronos"))
+        .args([dir.to_str().unwrap(), "merge world p;"])
+        .env("CHRONOS_ATTACH_CRASH", "after_commit")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "it crashed: {}", String::from_utf8_lossy(&out.stdout));
+    assert!(dir.join("attached.pending").exists());
+    assert_eq!(pg_cell(&mut pg, "select v from t where id = 1"), "p", "Postgres committed it");
+    let db = Db::open(&dir).unwrap();
+    // decided before the crash; a rule made since would refuse it now
+    run(&db, MAIN, "create merge check no_p on tables (t) as select id from t where v = 'p'", &[]).unwrap();
+    let said = chronos::attach::resolve(&db).unwrap().unwrap_or_default();
+    assert!(!dir.join("attached.pending").exists(), "{said}");
+    assert!(db.world("p").is_err(), "p is merged: {said}");
+    assert_eq!(cell(&db, MAIN, "select v from t where id = 1"), "p", "main agrees with Postgres ({said})");
+    // the check still judges what comes next
+    run(&db, MAIN, "create world q", &[]).unwrap();
+    run(&db, "q", "insert into t values (2, 'p')", &[]).unwrap();
+    assert!(run(&db, MAIN, "merge world q", &[]).is_err(), "the merge check refuses a new merge");
+    assert_eq!(pg_cell(&mut pg, "select count(*) from t where id = 2"), "0", "nothing written");
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+    drop(pg);
+    drop_db(&name);
+}
+
+/// A Postgres that may lose commits it acknowledged is said at `chronos attach` and when `serve` opens the folder
+/// (`attach::check`), not only at the first merge; not with CHRONOS_ATTACH_UNSAFE_SOURCE=1, nor once it is set back.
+#[test]
+fn unsafe_source_is_said_at_attach_and_serve_start() {
+    let Some((mut pg, name, _url, _turn)) = throwaway("unsafe_said") else {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    };
+    pg.batch_execute("create table t (id int primary key, v text); insert into t values (1, 'a')").unwrap();
+    pg.batch_execute(&format!("alter database {name} set synchronous_commit = off")).unwrap();
+    let dir = folder("unsafe_said");
+    let (ok, out) = attach(&dir, &["--tables", "t"]);
+    assert!(ok, "{out}");
+    assert!(out.contains("may lose commits") && out.contains("synchronous_commit = off"), "{out}");
+    let db = Db::open(&dir).unwrap();
+    let line = chronos::attach::check(&db).unwrap();
+    assert!(line.contains("warning:") && line.contains("synchronous_commit = off"), "{line}");
+    unsafe { std::env::set_var("CHRONOS_ATTACH_UNSAFE_SOURCE", "1") };
+    let line = chronos::attach::check(&db);
+    unsafe { std::env::remove_var("CHRONOS_ATTACH_UNSAFE_SOURCE") };
+    assert!(!line.unwrap().contains("warning:"), "overridden");
+    drop(db);
+    pg.batch_execute(&format!("alter database {name} reset synchronous_commit")).unwrap();
+    let db = Db::open(&dir).unwrap();
+    let line = chronos::attach::check(&db).unwrap();
+    assert!(!line.contains("warning:"), "{line}");
+    drop(db);
     std::fs::remove_dir_all(&dir).unwrap();
     drop(pg);
     drop_db(&name);

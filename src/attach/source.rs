@@ -94,6 +94,12 @@ pub(super) trait Source: Send + Sync + std::fmt::Debug {
     /// Whether the write-back that recorded `merge_id` committed in the source (a merge in doubt after a crash).
     fn committed(&self, merge_id: &str) -> std::result::Result<bool, String>;
 
+    /// Why the source may lose a commit it acknowledged (a crash of it), from its settings; None: it keeps them.
+    fn unsafe_durability(&self, att: &Attached) -> std::result::Result<Option<String>, String> {
+        let _ = att;
+        Ok(None)
+    }
+
     /// A dry run's read of the source (see `dry_run` in the parent module): each of `rows` compared with the source's
     /// row, and `reads` checked, into `live`; nothing is written or locked.
     fn dry_run(
@@ -120,6 +126,10 @@ pub(super) trait Source: Send + Sync + std::fmt::Debug {
 
     /// Main takes the source's rows as they are now, of the tables `only` names if given.
     fn refresh(&self, core: &Core, att: &Attached, only: Option<&[usize]>) -> std::result::Result<Refreshed, String>;
+
+    /// The reconciliation scan (`super::reconcile`): main's rows compared with the source's as a refresh compares
+    /// them, nothing taken.
+    fn reconcile(&self, core: &Core, att: &Attached) -> std::result::Result<Refreshed, String>;
 
     /// Main takes the rows the source changed since the last follow (see `follow` in the parent module), with the
     /// write-back lock held.
@@ -171,6 +181,10 @@ impl Source for Postgres {
         super::committed(merge_id)
     }
 
+    fn unsafe_durability(&self, att: &Attached) -> std::result::Result<Option<String>, String> {
+        super::pg_unsafe_durability(att)
+    }
+
     fn check_reads(&self, core: &Core, att: &Attached, reads: &Reads) -> std::result::Result<Vec<String>, String> {
         super::pg_check_reads(core, att, reads)
     }
@@ -198,6 +212,10 @@ impl Source for Postgres {
 
     fn refresh(&self, core: &Core, att: &Attached, only: Option<&[usize]>) -> std::result::Result<Refreshed, String> {
         super::pg_refresh(core, att, only)
+    }
+
+    fn reconcile(&self, core: &Core, att: &Attached) -> std::result::Result<Refreshed, String> {
+        super::pg_reconcile(core, att)
     }
 
     fn follow(&self, core: &Core, att: &Attached) -> std::result::Result<Refreshed, String> {
@@ -246,6 +264,10 @@ impl Source for MySql {
         mysql::committed(merge_id)
     }
 
+    fn unsafe_durability(&self, att: &Attached) -> std::result::Result<Option<String>, String> {
+        mysql::unsafe_durability(att)
+    }
+
     fn check_reads(&self, core: &Core, att: &Attached, reads: &Reads) -> std::result::Result<Vec<String>, String> {
         mysql::check_reads(core, att, reads)
     }
@@ -275,6 +297,10 @@ impl Source for MySql {
 
     fn refresh(&self, core: &Core, att: &Attached, only: Option<&[usize]>) -> std::result::Result<Refreshed, String> {
         mysql::refresh(core, att, only)
+    }
+
+    fn reconcile(&self, core: &Core, att: &Attached) -> std::result::Result<Refreshed, String> {
+        mysql::reconcile(core, att)
     }
 
     fn follow(&self, _core: &Core, _att: &Attached) -> std::result::Result<Refreshed, String> {
@@ -376,6 +402,14 @@ impl Source for Mongo {
     fn refresh(&self, core: &Core, att: &Attached, only: Option<&[usize]>) -> std::result::Result<Refreshed, String> {
         #[cfg(feature = "mongo")]
         return mongo::refresh(core, att, only);
+        #[cfg(not(feature = "mongo"))]
+        Err(NO_MONGO.into())
+    }
+
+    #[allow(unused_variables)]
+    fn reconcile(&self, core: &Core, att: &Attached) -> std::result::Result<Refreshed, String> {
+        #[cfg(feature = "mongo")]
+        return mongo::reconcile(core, att);
         #[cfg(not(feature = "mongo"))]
         Err(NO_MONGO.into())
     }

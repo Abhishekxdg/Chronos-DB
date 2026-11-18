@@ -427,7 +427,12 @@ fn transaction(
     let tables = att.tables();
     let by_table = by_table(rows);
     let keeps_undo = super::undo::ready(att);
-    session.start_transaction().run().map_err(|e| failed("starting the write-back", &e))?;
+    session
+        .start_transaction()
+        .write_concern(durable())
+        .read_concern(mongodb::options::ReadConcern::majority())
+        .run()
+        .map_err(|e| failed("starting the write-back", &e))?;
     let marker = db
         .collection::<Document>(MERGES)
         .count_documents(doc! { "_id": att.marker() })
@@ -671,25 +676,46 @@ fn transaction(
     Ok(None)
 }
 
-/// Whether the write-back that inserted `merge_id` committed (see `super::committed`): its document inserted again
-/// from outside waits for the first transaction to end, then is a duplicate if it committed.
+/// The write concern of a write-back's commit: acknowledged by a majority of the replica set, in their journals, so
+/// a failover or a crash of MongoDB can't take back a merge main has.
+fn durable() -> mongodb::options::WriteConcern {
+    let mut wc = mongodb::options::WriteConcern::majority();
+    wc.journal = Some(true);
+    wc
+}
+
+/// Whether the write-back that inserted `merge_id` committed (see `super::committed`): its document inserted again,
+/// in a transaction of a new session that is always aborted, so the probe leaves nothing behind (a crash during it
+/// ends the transaction, which MongoDB then aborts). A duplicate is a commit; an insert that goes through, none. A
+/// write conflict (the first transaction still holds the document) or a transient error can't tell: Err, and the
+/// merge stays in doubt.
 pub(super) fn committed(merge_id: &str) -> std::result::Result<bool, String> {
-    let (_, db) = client()?;
+    let (client, db) = client()?;
     let coll = db.collection::<Document>(MERGES);
-    match coll.insert_one(doc! { "_id": merge_id, "probe": true }).run() {
-        Ok(_) => {
-            let _ = coll.delete_one(doc! { "_id": merge_id, "probe": true }).run();
-            Ok(false)
-        }
-        Err(e) if plain(&e).contains("E11000") => {
-            // (its own probe left by a crash between the two statements above isn't a commit)
-            let probe = coll.count_documents(doc! { "_id": merge_id, "probe": true }).run().map_err(|e| plain(&e))?;
-            if probe == 1 {
-                let _ = coll.delete_one(doc! { "_id": merge_id, "probe": true }).run();
-            }
-            Ok(probe == 0)
-        }
-        Err(e) => Err(plain(&e)),
+    // a probe document an earlier Chronos left (inserted outside a transaction, then deleted) isn't a commit
+    let left = doc! { "_id": merge_id, "probe": true };
+    if coll
+        .count_documents(left.clone())
+        .read_concern(mongodb::options::ReadConcern::majority())
+        .run()
+        .map_err(|e| plain(&e))?
+        == 1
+    {
+        coll.delete_one(left).write_concern(durable()).run().map_err(|e| plain(&e))?;
+    }
+    let mut session = client.start_session().run().map_err(|e| plain(&e))?;
+    session
+        .start_transaction()
+        .read_concern(mongodb::options::ReadConcern::majority())
+        .write_concern(durable())
+        .run()
+        .map_err(|e| plain(&e))?;
+    let out = coll.insert_one(doc! { "_id": merge_id }).session(&mut session).run();
+    let _ = session.abort_transaction().run();
+    match out {
+        Ok(_) => Ok(false),
+        Err(e) if plain(&e).contains("E11000") => Ok(true),
+        Err(e) => Err(format!("can't tell yet: {}", plain(&e))),
     }
 }
 
@@ -925,6 +951,25 @@ pub(super) fn dry_run(
 /// `super::refresh` of a MongoDB folder: each collection read whole in one snapshot, compared with main's rows, main
 /// taking the differences in one change.
 pub(super) fn refresh(core: &Core, att: &Attached, only: Option<&[usize]>) -> std::result::Result<Refreshed, String> {
+    let (out, rows) = refresh_read(core, att, only)?;
+    store(core, att, &rows)?;
+    if only.is_none() {
+        att.refreshed(out.at).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
+}
+
+/// `super::reconcile` of a MongoDB folder: `refresh`'s read and comparison, nothing taken.
+pub(super) fn reconcile(core: &Core, att: &Attached) -> std::result::Result<Refreshed, String> {
+    refresh_read(core, att, None).map(|(out, _)| out)
+}
+
+/// `refresh`'s read: what main is to take, per collection.
+fn refresh_read(
+    core: &Core,
+    att: &Attached,
+    only: Option<&[usize]>,
+) -> std::result::Result<(Refreshed, Vec<Stored>), String> {
     let (client, db) = client()?;
     let mut session = client.start_session().snapshot(true).run().map_err(|e| plain(&e))?;
     let marker = db
@@ -984,11 +1029,7 @@ pub(super) fn refresh(core: &Core, att: &Attached, only: Option<&[usize]>) -> st
         }
         out.tables.push((t.name.clone(), ins, upd, del));
     }
-    store(core, att, &rows)?;
-    if only.is_none() {
-        att.refreshed(out.at).map_err(|e| e.to_string())?;
-    }
-    Ok(out)
+    Ok((out, rows))
 }
 
 // ---------------------------------------------------------------- following MongoDB's changes
@@ -1494,6 +1535,9 @@ pub fn attach(
         }
     };
     println!("\nattached {} collections of {} (MongoDB {version}) to {dir}", att.tables().len(), att.source());
+    if let Some(w) = super::durability_warning(&att) {
+        println!("\n{w}");
+    }
     println!(
         "\nnext: chronos serve {dir} (with CHRONOS_SOURCE_URL set), fork a world, change documents there (each is a \
          row: _id, and doc, its fields as jsonb), and MERGE WORLD: the change goes to MongoDB first. chronos serve --follow \
@@ -1517,6 +1561,15 @@ fn host_of(url: &str) -> (String, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A write-back commits acknowledged by a majority of the replica set, in their journals: a failover or a crash
+    /// of MongoDB can't take back a merge main has.
+    #[test]
+    fn write_backs_commit_to_a_majority_journaled() {
+        let wc = durable();
+        assert_eq!(wc.w, Some(mongodb::options::Acknowledgment::Majority));
+        assert_eq!(wc.journal, Some(true));
+    }
 
     #[test]
     fn ids_round_trip() {

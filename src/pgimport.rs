@@ -1904,6 +1904,9 @@ pub fn attach(
             l.column
         );
     }
+    if let Some(w) = attach::durability_warning(&att) {
+        println!("\n{w}");
+    }
     println!(
         "\nnext: chronos serve {dir} (with CHRONOS_SOURCE_URL set), fork a world, change rows there, and MERGE WORLD:\n\
          the change goes to Postgres first. main's own rows can't be written directly; tables change shape only as Postgres's do (a refresh takes columns added, dropped, renamed or retyped)."

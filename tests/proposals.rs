@@ -389,3 +389,138 @@ fn approval_and_commits_to_main_after_it() {
     assert_eq!(count(&db, "select v from t where id = 1"), "person", "nothing merged");
     assert_eq!(count(&db, "select v from t where id = 2"), "v2", "nothing merged");
 }
+
+/// Rows in main's outbox (effects landed there).
+fn outbox(db: &Db) -> usize {
+    run(db, MAIN, "show outbox", &[]).unwrap().pop().unwrap().rows.len()
+}
+
+/// Proposes world `w`, made by `bot` with `sql` run in it, and returns the proposal's id and its `strict` column.
+fn proposed(db: &Db, bot: &mut Session, w: &str, sql: &str) -> (String, String) {
+    bot.run(db, &format!("create world {w}; use world {w}; {sql}; use world main"), &[]).unwrap();
+    let out = bot.run(db, &format!("propose merge world {w}"), &[]).unwrap();
+    (col(&out, "id"), col(&out, "strict"))
+}
+
+/// Rule E7: a proposal queueing an effect on a strict channel (a payout) binds to main as it was when it was
+/// proposed. Any commit to main since, even to a table it doesn't touch, supersedes it, at approval or at its merge,
+/// and nothing is sent; with none, it merges as any proposal does.
+#[test]
+fn strict_proposal_binds_to_main_as_it_was() {
+    let db = Db::new();
+    setup(&db);
+    run(&db, MAIN, "create table other (id int primary key)", &[]).unwrap();
+    let mut bot = agent(&db, "bot", &WRITER, None);
+    let pay = "insert into t values (10, 'x'); notify on merge payout_eu, 'pay 10'";
+
+    // a commit to main before the approval
+    let (id, strict) = proposed(&db, &mut bot, "w", pay);
+    assert_eq!(strict, "true", "payout_eu is strict by default");
+    run(&db, MAIN, "insert into other values (1)", &[]).unwrap();
+    let e = run(&db, MAIN, &format!("approve proposal '{id}'"), &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    assert!(e.message.contains("strict_target"), "{}", e.message);
+    assert_eq!(status(&db, &id), "superseded");
+    // its world is the agent's again
+    bot.run(&db, "use world w; insert into t values (11, 'y'); use world main", &[]).unwrap();
+    run(&db, MAIN, "drop world w", &[]).unwrap();
+
+    // a commit to main between the approval and the merge
+    let (id, _) = proposed(&db, &mut bot, "v", pay);
+    run(&db, MAIN, &format!("approve proposal '{id}'"), &[]).unwrap();
+    run(&db, MAIN, "insert into other values (2)", &[]).unwrap();
+    let e = run(&db, MAIN, &format!("merge proposal '{id}'"), &[]).unwrap_err();
+    assert_eq!(e.code, "40001", "{}", e.message);
+    assert!(e.message.contains("strict_target"), "{}", e.message);
+    assert_eq!(status(&db, &id), "superseded");
+    assert!(db.world("v").is_ok(), "not merged");
+    assert_eq!(outbox(&db), 0, "nothing sent");
+    run(&db, MAIN, "drop world v", &[]).unwrap();
+
+    // none: merged, and the payout queued
+    let (id, _) = proposed(&db, &mut bot, "u", pay);
+    run(&db, MAIN, &format!("approve proposal '{id}'"), &[]).unwrap();
+    run(&db, MAIN, &format!("merge proposal '{id}'"), &[]).unwrap();
+    assert_eq!(status(&db, &id), "merged");
+    assert_eq!(outbox(&db), 1);
+    assert_eq!(count(&db, "select count(*) from t where id = 10"), "1");
+}
+
+/// Rule E8: only a person approves a strict proposal, not the policy's reviewer nor an admin agent, and only within
+/// the policy's strict window; past it the proposal is expired.
+#[test]
+fn strict_proposal_is_for_a_person_in_its_window() {
+    let db = Db::new();
+    setup(&db);
+    run(&db, MAIN, "create merge policy pay with (reviewer = 'critic')", &[]).unwrap();
+    run(&db, MAIN, "create merge policy quick with (strict_window = 50)", &[]).unwrap();
+    let mut bot = agent(&db, "bot", &WRITER, Some("pay"));
+    let mut quick = agent(&db, "quick", &WRITER, Some("quick"));
+    let mut critic = agent(&db, "critic", &[Can::Read], None);
+    let mut boss = agent(&db, "boss", &[Can::Read, Can::Admin], None);
+
+    let (id, strict) = proposed(&db, &mut bot, "w", "notify on merge refund, 'order 7'");
+    assert_eq!(strict, "true");
+    for who in [&mut critic, &mut boss] {
+        let e = who.run(&db, &format!("approve proposal '{id}'"), &[]).unwrap_err();
+        assert_eq!(e.code, "42501", "{}", e.message);
+        assert!(e.message.contains("only a person"), "{}", e.message);
+    }
+    assert_eq!(status(&db, &id), "open");
+    // a rejection is anyone's who may decide it
+    critic.run(&db, &format!("reject proposal '{id}' reason 'no ticket'"), &[]).unwrap();
+    assert_eq!(status(&db, &id), "rejected");
+
+    let (id, _) = proposed(&db, &mut quick, "q", "notify on merge payment_card, 'card 1'");
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    let e = run(&db, MAIN, &format!("approve proposal '{id}'"), &[]).unwrap_err();
+    assert_eq!(e.code, "55000", "{}", e.message);
+    assert!(e.message.contains("expired"), "{}", e.message);
+    assert_eq!(status(&db, &id), "expired");
+    quick.run(&db, "use world q; insert into t values (12, 'z'); use world main", &[]).unwrap();
+}
+
+/// Which proposals are strict: the policy's review_channels and strict_channels, and the built-in payment, payout,
+/// transfer and refund ones, which a policy can't take away. Any other channel's proposal isn't strict, and merges
+/// past commits to main as today. A strict proposal merges whole into its parent: one into another world is refused.
+#[test]
+fn which_proposals_are_strict() {
+    let db = Db::new();
+    setup(&db);
+    run(&db, MAIN, "create merge policy mine with (strict_channels = 'ledger', review_channels = 'billing')", &[])
+        .unwrap();
+    run(&db, MAIN, "create merge policy none with (strict_channels = '')", &[]).unwrap();
+    let mut bot = agent(&db, "bot", &WRITER, Some("mine"));
+    let mut plain = agent(&db, "plain", &WRITER, Some("none"));
+    assert_eq!(proposed(&db, &mut bot, "a", "notify on merge ledger, 'x'").1, "true");
+    assert_eq!(proposed(&db, &mut bot, "b", "notify on merge billing, 'x'").1, "true");
+    assert_eq!(proposed(&db, &mut plain, "c", "notify on merge ledger, 'x'").1, "false", "another policy's");
+    assert_eq!(proposed(&db, &mut plain, "d", "notify on merge Transfer_out, 'x'").1, "true", "built in");
+    let (id, strict) = proposed(&db, &mut plain, "e", "insert into t values (10, 'x'); notify on merge email, 'x'");
+    assert_eq!(strict, "false");
+    run(&db, MAIN, &format!("approve proposal '{id}'"), &[]).unwrap();
+    run(&db, MAIN, "insert into t values (20, 'y')", &[]).unwrap();
+    run(&db, MAIN, &format!("merge proposal '{id}'"), &[]).unwrap();
+    assert_eq!(status(&db, &id), "merged");
+
+    // into a world that isn't its parent
+    plain.run(&db, "create world elsewhere", &[]).unwrap();
+    plain.run(&db, "create world f; use world f; notify on merge payout, 'x'; use world main", &[]).unwrap();
+    let e = plain.run(&db, "propose merge world f into elsewhere", &[]).unwrap_err();
+    assert_eq!(e.code, "22023", "{}", e.message);
+    assert!(e.message.contains("strict"), "{}", e.message);
+    // EXPLAIN MERGE says so before anything is proposed
+    let explained = run(&db, MAIN, "explain merge world f", &[]).unwrap().pop().unwrap();
+    let strict: Vec<String> =
+        explained.rows.iter().filter(|r| r[0].to_text() == "strict").map(|r| r[1].to_text()).collect();
+    assert_eq!(strict, ["payout"]);
+    let plain_world = run(&db, MAIN, "explain merge world e", &[]);
+    assert!(
+        plain_world.is_err() || plain_world.unwrap().pop().unwrap().rows.iter().all(|r| r[0].to_text() != "strict")
+    );
+    let policies = run(&db, MAIN, "show merge policies", &[]).unwrap();
+    let o = policies.last().unwrap();
+    let cols = o.columns.as_ref().unwrap();
+    let at = cols.iter().position(|(c, _)| c == "strict_channels").unwrap();
+    assert!(o.rows.iter().any(|r| r[at].to_text() == "ledger"), "shown");
+}

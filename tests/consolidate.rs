@@ -366,3 +366,47 @@ fn an_agent_consolidates_its_own_coordinator() {
     let left = worlds(&db);
     assert!(!left.iter().any(|w| w == "c1" || w == "c2" || w.starts_with("_")), "{left:?}");
 }
+
+/// TODOS (PR #361 review): no other session drops a consolidation's scratch world while it runs. A drop between the
+/// children's marks and the scratch world's merge into p, then a crash, would have the next open discard children
+/// whose rows never reached p.
+#[test]
+fn the_scratch_world_is_not_dropped_while_its_consolidation_runs() {
+    let db = Db::new();
+    setup(&db);
+    q(&db, "c1", "update inv set note = 'c1' where sku = 1");
+    q(&db, "c2", "update inv set note = 'c2' where sku = 2");
+    q(&db, "c3", "update inv set note = 'c3' where sku = 3");
+    let tried = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = tried.clone();
+    chronos::test_consolidate_copied(Some(Box::new(move |db: &Db, _c: &str| {
+        // another session, on another thread
+        let out = std::thread::scope(|s| {
+            s.spawn(|| chronos::sql::run(db, MAIN, "drop world _consolidate_p", &[]).map(|_| ())).join().unwrap()
+        });
+        match out {
+            Ok(()) => panic!("the scratch world was dropped mid-consolidation"),
+            Err(e) => assert!(e.message.contains("CONSOLIDATE under way"), "{}: {}", e.code, e.message),
+        }
+        seen.set(seen.get() + 1);
+    })));
+    let out = chronos::sql::run(&db, MAIN, "consolidate p", &[]);
+    chronos::test_consolidate_copied(None);
+    assert_eq!(out.unwrap().pop().unwrap().tag, "CONSOLIDATE 3");
+    assert_eq!(tried.get(), 3, "tried after each child was copied");
+    assert_eq!(worlds(&db), ["main", "p"]);
+    assert_eq!(rows(&q(&db, "p", "select note from inv order by sku")), ["c1", "c2", "c3"]);
+}
+
+/// CONSOLIDATE given the coordinator's id does as given its name: its children found, its scratch world named after
+/// it (which `consolidating` looks for by name).
+#[test]
+fn consolidate_by_id() {
+    let db = Db::new();
+    setup(&db);
+    q(&db, "c1", "update inv set note = 'c1' where sku = 1");
+    let id = db.world("p").unwrap().id;
+    assert_eq!(db.consolidate(&id, &[], false).unwrap(), 3);
+    assert_eq!(worlds(&db), ["main", "p"]);
+    assert_eq!(rows(&q(&db, "p", "select note from inv where sku = 1")), ["c1"]);
+}

@@ -204,6 +204,7 @@ fn main() {
     let safe = args.iter().position(|a| a == "--safe").map(|i| args.remove(i)).is_some();
     let follow = args.iter().position(|a| a == "--follow").map(|i| args.remove(i)).is_some();
     let unfollow = args.iter().position(|a| a == "--unfollow").map(|i| args.remove(i)).is_some();
+    let check = args.iter().position(|a| a == "--check").map(|i| args.remove(i)).is_some();
     let unsafe_ = args.iter().position(|a| a == "--unsafe").map(|i| args.remove(i)).is_some();
     let studio_api = args.iter().position(|a| a == "--studio-api").map(|i| args.remove(i)).is_some();
     let insecure_no_tls = args.iter().position(|a| a == "--insecure-no-tls").map(|i| args.remove(i)).is_some();
@@ -313,10 +314,10 @@ fn main() {
     }
     // chronos refresh <attached folder>: main takes Postgres's rows as they are now (see chronos::attach::refresh)
     if args[0] == "refresh" {
-        if args.len() != 2 {
+        if args.len() != 2 || (check && (unfollow || load_tenant.is_some())) {
             eprintln!(
-                "usage: chronos refresh <attached folder> [--unfollow | --tenant <value>]   (CHRONOS_SOURCE_URL, or \
-                 --source-file)"
+                "usage: chronos refresh <attached folder> [--unfollow | --tenant <value> | --check]   \
+                 (CHRONOS_SOURCE_URL, or --source-file)"
             );
             std::process::exit(2);
         }
@@ -386,6 +387,32 @@ fn main() {
             std::process::exit(code);
         }
         let from = source_name(&db);
+        // --check: the reconciliation scan, main compared with the source and nothing taken; exit 1 if they differ
+        if check {
+            let code = match chronos::attach::reconcile(&db) {
+                Ok(r) => {
+                    for (t, i, u, d) in &r.tables {
+                        println!("{t}: {i} only in {from}, {u} differ, {d} only in main");
+                    }
+                    for s in &r.skipped {
+                        println!("{s}");
+                    }
+                    match r.changed() == 0 && r.skipped.is_empty() {
+                        true => {
+                            println!("main agrees with {from}");
+                            0
+                        }
+                        false => 1,
+                    }
+                }
+                Err(e) => {
+                    eprintln!("chronos refresh --check: {e}");
+                    2
+                }
+            };
+            let _ = db.close();
+            std::process::exit(code);
+        }
         let code = match chronos::attach::refresh(&db) {
             Ok(r) => {
                 for c in &r.added {
@@ -1057,7 +1084,7 @@ fn db_key() -> std::io::Result<Option<[u8; 32]>> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: chronos [-b branch] [--remote s3://bucket/prefix [--takeover]] [--anchor FILE [--anchor-reset]] <folder> [command]\n       chronos mcp <folder> [--allow-merge | --agent NAME] [--unmask]   (MCP server for AI agents, over stdio; without --allow-merge, agents can't merge; --agent acts as that agent; masked columns read masked unless --unmask)\n       chronos import <folder> <table> <data.csv> --schema <schema.csv>   (a copy of one Postgres table)\n       chronos attach <new folder> --tables a,b | --schema s [--lazy-tenant column] [--yes]   (work beside a Postgres, MySQL, MariaDB or MongoDB you run: merges into main are written there; CHRONOS_SOURCE_URL or CHRONOS_SOURCE_FILE; chronos attach alone says more)\n       chronos refresh <attached folder> [--unfollow | --tenant value]   (main takes the database's rows as they are now; chronos serve --refresh-every 5m does it on a timer, serve --follow as they change, beside Postgres and MongoDB; --unfollow drops --follow's replication slot, or forgets its place in MongoDB's change stream)\n       chronos restore <backup> <new folder>   (start a database from a backup, and verify it)\n       chronos init [--no-open]   (in a project folder: its Chronos Cloud database, wired up for agents; chronos cloud help)\n       chronos keygen   (a new encryption key: CHRONOS_KEY=<key> chronos <new folder> makes an encrypted database)\n       chronos studio <folder> [--port N] [--no-open]   (a web UI for the database, on 127.0.0.1; works beside a running serve)\n       chronos studio <folder> --login [--port N | --listen ADDR:PORT] [--host NAME[:PORT]]... [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--no-open]\n                                  (the web UI, signed in with a database role and its password, acting with its privileges;\n                                   make one with: create role admin login superuser password '...'; any address but loopback needs TLS)\n       chronos serve <folder> [--listen 127.0.0.1:7070] [--pg 127.0.0.1:5433|off] [--token T] [--admin-token A] [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--safe | --unsafe] [--studio-api] [--refresh-every 5m] [--follow]
+        "usage: chronos [-b branch] [--remote s3://bucket/prefix [--takeover]] [--anchor FILE [--anchor-reset]] <folder> [command]\n       chronos mcp <folder> [--allow-merge | --agent NAME] [--unmask]   (MCP server for AI agents, over stdio; without --allow-merge, agents can't merge; --agent acts as that agent; masked columns read masked unless --unmask)\n       chronos import <folder> <table> <data.csv> --schema <schema.csv>   (a copy of one Postgres table)\n       chronos attach <new folder> --tables a,b | --schema s [--lazy-tenant column] [--yes]   (work beside a Postgres, MySQL, MariaDB or MongoDB you run: merges into main are written there; CHRONOS_SOURCE_URL or CHRONOS_SOURCE_FILE; chronos attach alone says more)\n       chronos refresh <attached folder> [--unfollow | --tenant value | --check]   (main takes the database's rows as they are now; --check only compares, exit 1 if they differ; chronos serve --refresh-every 5m does it on a timer, serve --follow as they change, beside Postgres and MongoDB; --unfollow drops --follow's replication slot, or forgets its place in MongoDB's change stream)\n       chronos restore <backup> <new folder>   (start a database from a backup, and verify it)\n       chronos init [--no-open]   (in a project folder: its Chronos Cloud database, wired up for agents; chronos cloud help)\n       chronos keygen   (a new encryption key: CHRONOS_KEY=<key> chronos <new folder> makes an encrypted database)\n       chronos studio <folder> [--port N] [--no-open]   (a web UI for the database, on 127.0.0.1; works beside a running serve)\n       chronos studio <folder> --login [--port N | --listen ADDR:PORT] [--host NAME[:PORT]]... [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--no-open]\n                                  (the web UI, signed in with a database role and its password, acting with its privileges;\n                                   make one with: create role admin login superuser password '...'; any address but loopback needs TLS)\n       chronos serve <folder> [--listen 127.0.0.1:7070] [--pg 127.0.0.1:5433|off] [--token T] [--admin-token A] [--tls-cert cert.pem --tls-key key.pem | --insecure-no-tls] [--safe | --unsafe] [--studio-api] [--refresh-every 5m] [--follow]
                                   (HTTP JSON API, and Postgres protocol: psql postgres://127.0.0.1:5433/main; the server token T
                                    lets a client in as the guest, which only forks and changes its own worlds; the admin token A
                                    is the database's own user; --unsafe makes T the database's own user, as before 0.4, and --safe

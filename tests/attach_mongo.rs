@@ -410,3 +410,178 @@ fn main_follows_mongodb_through_a_change_stream() {
     let _ = std::fs::remove_dir_all(&dir);
     mdb.drop().run().unwrap();
 }
+
+/// The outcome probe a crash leaves to `resolve` (a pending record naming a merge's id): never "not committed" while
+/// a transaction still holds the merge's document; committed once it commits; not committed once it aborts; a probe
+/// document an older Chronos left is no commit and goes. No probe leaves a document behind.
+#[test]
+fn probe_during_inflight_commit() {
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some((client, mdb)) = throwaway("probe") else {
+        eprintln!("skipped: set CHRONOS_TEST_MONGO to a MongoDB URL");
+        return;
+    };
+    mdb.collection::<Document>("leads").insert_one(doc! { "_id": 1, "org_id": 42, "name": "a" }).run().unwrap();
+    let dir = std::env::temp_dir().join(format!("chronos-attach-mongo-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (ok, out) = attach(&dir, &["--tables", "leads", "--fields", "org_id"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    let merges = mdb.collection::<Document>("chronos_merges");
+    let pending = |m: &str| {
+        let p = serde_json::json!({"merge": m, "world": "gone", "world_id": "none", "rows": {}, "others": []});
+        std::fs::write(dir.join("attached.pending"), p.to_string()).unwrap();
+    };
+    let count = |id: &str| merges.count_documents(doc! { "_id": id }).run().unwrap();
+
+    // a transaction holding the merge's document, not yet committed: can't tell, and the record stays
+    let mut s = client.start_session().run().unwrap();
+    s.start_transaction().run().unwrap();
+    merges
+        .insert_one(doc! { "_id": "merge:inflight", "at": mongodb::bson::DateTime::now() })
+        .session(&mut s)
+        .run()
+        .unwrap();
+    pending("merge:inflight");
+    let e = chronos::attach::resolve(&db).expect_err("an in-flight commit is never taken as not committed");
+    assert!(e.contains("can't tell"), "{e}");
+    assert!(dir.join("attached.pending").exists());
+    s.commit_transaction().run().unwrap();
+    let said = chronos::attach::resolve(&db).unwrap().unwrap();
+    assert!(said.contains("committed") && !said.contains("didn't commit"), "{said}");
+    assert_eq!(count("merge:inflight"), 1);
+    assert_eq!(merges.count_documents(doc! { "probe": true }).run().unwrap(), 0, "no probe left");
+
+    // rolled back: not committed, and nothing left
+    let mut s = client.start_session().run().unwrap();
+    s.start_transaction().run().unwrap();
+    merges
+        .insert_one(doc! { "_id": "merge:rolled", "at": mongodb::bson::DateTime::now() })
+        .session(&mut s)
+        .run()
+        .unwrap();
+    s.abort_transaction().run().unwrap();
+    pending("merge:rolled");
+    let said = chronos::attach::resolve(&db).unwrap().unwrap();
+    assert!(said.contains("didn't commit"), "{said}");
+    assert_eq!(count("merge:rolled"), 0, "the probe left no document");
+
+    // a probe document an older Chronos left behind: not a commit, and removed
+    merges.insert_one(doc! { "_id": "merge:legacy", "probe": true }).run().unwrap();
+    pending("merge:legacy");
+    let said = chronos::attach::resolve(&db).unwrap().unwrap();
+    assert!(said.contains("didn't commit"), "{said}");
+    assert_eq!(count("merge:legacy"), 0);
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+    mdb.drop().run().unwrap();
+}
+
+/// kill -9 at every step of a write-back to MongoDB: after recovery main and MongoDB agree, the world is merged
+/// exactly when MongoDB committed, and each committed merge is in `chronos_merges` and main's ledger once. Debug
+/// builds only.
+#[test]
+fn crash_matrix_mongo() {
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: crash points are in debug builds only");
+        return;
+    }
+    let Some((_client, mdb)) = throwaway("crash") else {
+        eprintln!("skipped: set CHRONOS_TEST_MONGO to a MongoDB URL");
+        return;
+    };
+    let leads = mdb.collection::<Document>("leads");
+    leads.insert_many((1..=4).map(|i| doc! { "_id": i, "org_id": 42, "name": "a" })).run().unwrap();
+    let dir = std::env::temp_dir().join(format!("chronos-attach-mongo-crash-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (ok, out) = attach(&dir, &["--tables", "leads", "--fields", "org_id"]);
+    assert!(ok, "{out}");
+    let ledger = |db: &Db| db.ledger_rows().unwrap().len();
+    let base = ledger(&Db::open(&dir).unwrap());
+    let mut committed = 0;
+    for (i, at) in ["before_commit", "after_commit", "after_publish", "before_forget"].iter().enumerate() {
+        let (w, id) = (format!("m{i}"), i as i32 + 1);
+        let db = Db::open(&dir).unwrap();
+        run(&db, MAIN, &format!("create world {w}"), &[]).unwrap();
+        run(&db, &w, &format!("update leads set doc = jsonb_set(doc, '{{name}}', '\"{at}\"') where _id = '{id}'"), &[])
+            .unwrap();
+        drop(db);
+        let out = Command::new(env!("CARGO_BIN_EXE_chronos"))
+            .args(["-b", &w, dir.to_str().unwrap(), "merge"])
+            .env("CHRONOS_ATTACH_CRASH", at)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{at}: it crashed: {}", String::from_utf8_lossy(&out.stdout));
+        assert!(dir.join("attached.pending").exists(), "{at}: the outcome is left to settle");
+        let did = *at != "before_commit";
+        committed += usize::from(did);
+        let db = Db::open(&dir).unwrap();
+        // a write-back killed before its commit leaves its transaction open in MongoDB, holding the merge's document,
+        // until MongoDB aborts it (transactionLifetimeLimitSeconds): until then the probe can't tell, and the record
+        // stays (never "not committed" while it could still commit)
+        let started = std::time::Instant::now();
+        let said = loop {
+            match chronos::attach::resolve(&db) {
+                Ok(s) => break s.unwrap_or_default(),
+                Err(e) if e.contains("can't tell") && started.elapsed().as_secs() < 150 => {
+                    assert!(dir.join("attached.pending").exists(), "{at}: kept while unknown");
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+                Err(e) => panic!("{at}: {e}"),
+            }
+        };
+        assert!(!dir.join("attached.pending").exists(), "{at}: {said}");
+        assert_eq!(chronos::attach::resolve(&db).unwrap(), None, "{at}: settled once");
+        let in_mongo = leads.find_one(doc! { "_id": id }).run().unwrap().unwrap().get_str("name").unwrap().to_string();
+        assert_eq!(in_mongo, if did { *at } else { "a" }, "{at}");
+        let in_main = cell(&db, MAIN, &format!("select doc->>'name' from leads where _id = '{id}'"));
+        assert_eq!(in_main, in_mongo, "{at}: main and MongoDB agree ({said})");
+        assert_eq!(db.world(&w).is_err(), did, "{at}: merged exactly when MongoDB committed ({said})");
+        let n =
+            mdb.collection::<Document>("chronos_merges").count_documents(doc! { "_id": { "$regex": "^merge:" } }).run();
+        assert_eq!(n.unwrap(), committed as u64, "{at}");
+        assert_eq!(ledger(&db) - base, committed, "{at}: each merge in main's ledger once");
+        if !did {
+            run(&db, MAIN, &format!("drop world {w}"), &[]).unwrap();
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    mdb.drop().run().unwrap();
+}
+
+/// The reconciliation scan (`chronos refresh --check`) beside MongoDB: documents changed, added and deleted straight
+/// in MongoDB are counted per collection, and nothing is taken into main.
+#[test]
+fn reconciliation_scan_beside_mongodb() {
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some((_client, mdb)) = throwaway("reconcile") else {
+        eprintln!("skipped: set CHRONOS_TEST_MONGO to a MongoDB URL");
+        return;
+    };
+    let leads = mdb.collection::<Document>("leads");
+    leads.insert_many((1..=3).map(|i| doc! { "_id": i, "org_id": 42, "name": "a" })).run().unwrap();
+    let dir = std::env::temp_dir().join(format!("chronos-attach-mongo-reconcile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (ok, out) = attach(&dir, &["--tables", "leads", "--fields", "org_id"]);
+    assert!(ok, "{out}");
+    let db = Db::open(&dir).unwrap();
+    let r = chronos::attach::reconcile(&db).unwrap();
+    assert!(r.tables.iter().all(|t| (t.1, t.2, t.3) == (0, 0, 0)), "{:?}", r.tables);
+    leads.update_one(doc! { "_id": 1 }, doc! { "$set": { "name": "changed" } }).run().unwrap();
+    leads.delete_one(doc! { "_id": 2 }).run().unwrap();
+    leads.insert_one(doc! { "_id": 4, "org_id": 42, "name": "d" }).run().unwrap();
+    let r = chronos::attach::reconcile(&db).unwrap();
+    let t = r.tables.iter().find(|x| x.0 == "leads").unwrap();
+    assert_eq!((t.1, t.2, t.3), (1, 1, 1), "one only in MongoDB, one differing, one only in main: {:?}", r.tables);
+    assert_eq!(cell(&db, MAIN, "select count(*) from leads"), "3", "nothing taken");
+    drop(db);
+    let out = Command::new(env!("CARGO_BIN_EXE_chronos"))
+        .args(["refresh", dir.to_str().unwrap(), "--check"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&dir);
+    mdb.drop().run().unwrap();
+}

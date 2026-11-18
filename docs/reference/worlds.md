@@ -734,6 +734,8 @@ ALTER AGENT name SET (policy = 'name')              -- or policy = null
 | `max_effects` | it queues more effects than this (`NOTIFY ON MERGE`: the emails, webhooks and payments that happen once it lands; see the [outbox](../sql.md#effects-on-merge-notify-on-merge-and-the-outbox)) | `null` (no limit) |
 | `effects_per_hour` | it's a merge into `main`, and with the agent's other merges into `main` in the last hour it queues more effects than this | `null` (no limit) |
 | `review_channels` | it queues an effect on any channel in this list (`'payments,refunds'`), even one | none |
+| `strict_channels` | never itself: a proposal of a merge queueing an effect on one of these is strict (see [certified merges](../sql.md)): a person approves it within `strict_window`, and any commit to the world it merges into since the proposal supersedes it. `review_channels` and any channel starting `payment`, `payout`, `transfer` or `refund` are strict too | none |
+| `strict_window` | never itself: how long after a strict proposal a person may approve it (`'10 minutes'`) | `15 minutes` |
 | `tables` | it changes a table not in this list (`'orders,items'`) | any table |
 | `review_tables` | it changes any table in this list | none |
 | `review_columns` | it changes any column in this list (`'users.email,accounts.owner'`), even in one row: an update changing it, an insert giving it a value, a delete of a row with one | none |

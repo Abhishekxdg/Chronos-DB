@@ -790,7 +790,7 @@ fn policy_sql(db: &chronos::Db, tool: &str, name: &str, a: &Value) -> Result<Str
     for (k, v) in &rules {
         if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(format!(
-                "'{k}' isn't a rule (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, rerun_reads, require_scope, row_rules, all_rows_per_hour, all_deletes_per_hour, all_effects_per_hour, spot_check, max_nulled, untrusted_columns, trusted_columns, untrusted_guards, review_every, person_only, watch_totals, max_shift, canary, canary_wait, effects_delay, max_unusual, arbitrate, require_evidence)"
+                "'{k}' isn't a rule (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, rerun_reads, require_scope, row_rules, all_rows_per_hour, all_deletes_per_hour, all_effects_per_hour, spot_check, max_nulled, untrusted_columns, trusted_columns, untrusted_guards, review_every, person_only, watch_totals, max_shift, canary, canary_wait, effects_delay, max_unusual, arbitrate, require_evidence, strict_channels, strict_window)"
             ));
         }
         let v = match v {
@@ -1014,6 +1014,8 @@ fn tools(hidden: &[&str]) -> Value {
             "max_effects": { "type": ["integer", "null"], "description": "Most effects (NOTIFY ON MERGE: emails, webhooks) one merge may queue (null: no limit)" },
             "effects_per_hour": { "type": ["integer", "null"], "description": "Most effects one agent's merges into main may queue in an hour, together (null: no limit)" },
             "review_channels": { "type": "array", "items": { "type": "string" }, "description": "Channels every effect queued on needs a person, e.g. [\"payments\"]" },
+            "strict_channels": { "type": "array", "items": { "type": "string" }, "description": "Channels that make a proposal queueing an effect on one strict, beside review_channels and the built-in payment*, payout*, transfer* and refund*: only a person approves it, within strict_window, and any commit to its target since the proposal supersedes it" },
+            "strict_window": { "type": ["string", "integer", "null"], "description": "How long after a strict proposal a person may approve it, e.g. \"15 minutes\" (null: 15 minutes)" },
             "row_rules": { "type": "array", "items": { "type": "string" }, "description": "Conditions every row a merge changes in a table must keep, over old.col (now) and new.col (after), e.g. [\"payments: new.amount >= -50\", \"prices: new.price <= old.price * 1.2\"]; NULL keeps the rule, as a CHECK's does" },
             "all_rows_per_hour": { "type": ["integer", "null"], "description": "Most rows all the policy's agents' merges into main may change in an hour, together: a circuit breaker across agents (null: no limit)" },
             "all_deletes_per_hour": { "type": ["integer", "null"], "description": "Most rows all the policy's agents' merges into main may delete in an hour, together (null: no limit)" },

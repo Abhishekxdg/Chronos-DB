@@ -395,3 +395,55 @@ fn ledger_and_data_all_or_nothing() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// The same request sent twice at once (a client that timed out and retried while the first was merging): both get
+/// what the merge did, not "no such world" for the one that found the world merged away.
+#[test]
+fn operation_id_retried_during_the_merge_gets_its_result() {
+    let dir = tmp("operation-race");
+    let db = std::sync::Arc::new(Db::open(&dir).unwrap());
+    for round in 0..20 {
+        let w = format!("w{round}");
+        db.fork(MAIN, &w).unwrap();
+        for k in 0..200 {
+            db.put(&w, &format!("{w}-{k}"), "1").unwrap();
+        }
+        let o = MergeOptions { operation: Some(format!("op-race-{round}")), ..Default::default() };
+        let tries: Vec<_> = (0..2)
+            .map(|_| {
+                let (db, w, o) = (db.clone(), w.clone(), o.clone());
+                std::thread::spawn(move || db.merge_with(&w, &o))
+            })
+            .collect();
+        for t in tries {
+            assert_eq!(t.join().unwrap().unwrap(), 200, "round {round}");
+        }
+    }
+    assert_eq!(db.ledger_rows().unwrap().len(), 20);
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// While the checkpoint that upgrades a folder to format 8 fails (here its manifest can't be written), a merge into
+/// main is refused rather than landing with no ledger row; once the checkpoint gets out, merges go through, logged.
+#[test]
+fn no_merge_into_main_lands_unrecorded_while_the_upgrade_fails() {
+    let dir = tmp("upgrade-fails");
+    let db = Db::open(&dir).unwrap();
+    let block = dir.join("manifest.tmp");
+    std::fs::create_dir(&block).unwrap(); // the manifest can't be written
+    db.fork(MAIN, "w").unwrap();
+    db.put("w", "k", "1").unwrap();
+    let e = db.merge_with("w", &MergeOptions::default()).unwrap_err().to_string();
+    assert!(e.contains("format 8") && e.contains("ledger"), "{e}");
+    assert_eq!(db.get(MAIN, "k").unwrap(), None);
+    // a world into another world needs no ledger row
+    db.fork("w", "w2").unwrap();
+    db.put("w2", "k2", "2").unwrap();
+    db.merge_with("w2", &MergeOptions::default()).unwrap();
+    std::fs::remove_dir(&block).unwrap();
+    assert_eq!(db.merge_with("w", &MergeOptions::default()).unwrap(), 2);
+    assert_eq!(db.ledger_rows().unwrap().len(), 1);
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

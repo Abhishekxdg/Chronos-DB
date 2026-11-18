@@ -261,6 +261,11 @@ pub fn serve(db: &Db, listen: &str, auth: &crate::Auth, tls: Option<crate::tls::
     let refuse = |c| too_many(c, tls.clone());
     crate::http::connections(&l, refuse, |c| {
         let _ = c.set_nodelay(true);
+        // a client that stops reading (a big result it never takes) would block its session's writes, and keep its
+        // locks, forever: a write that waits a minute ends the connection, and with it the transaction (two at most: a
+        // write that times out having sent part returns that part, and the next one fails)
+        let _ = c.set_write_timeout(Some(std::time::Duration::from_secs(60)));
+        keepalive(&c); // and a peer gone without a word is found by the kernel, not never
         // until it has logged in, a client gets a minute, or CHRONOS_LOGIN_TIMEOUT s (see also STARTUP_MESSAGE)
         let _ = c.set_read_timeout(Some(*STARTUP_TIME).filter(|t| !t.is_zero()));
         // one descriptor each for the reader and TLS; the rest (peer_gone, the registry, waiting
@@ -302,6 +307,9 @@ pub fn serve(db: &Db, listen: &str, auth: &crate::Auth, tls: Option<crate::tls::
         crate::http::guarded(|| {
             let ok = matches!(conn.startup(auth, tokens), Ok(true));
             drop(login); // off the login deadline's list
+            if ok {
+                crate::http::known(); // no longer one of its address's connections still to log in
+            }
             if ok && conn.sock.set_read_timeout(None).is_ok() {
                 let _ = conn.serve();
             }
@@ -362,6 +370,23 @@ fn too_many_message() -> Vec<u8> {
     msg.extend_from_slice(&(m.len() as i32 + 4).to_be_bytes());
     msg.extend_from_slice(&m);
     msg
+}
+
+/// Turns on TCP keepalive: the kernel probes an idle connection whose peer vanished (a laptop shut, a NAT that
+/// forgot it) and fails its next read, so a session idle in a transaction ends and lets its locks go.
+fn keepalive(c: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let on: libc::c_int = 1;
+    // SAFETY: a socket we own; the option is an int, passed by pointer with its size
+    unsafe {
+        libc::setsockopt(
+            c.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            (&on as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
 }
 
 /// A stream to read and write: the socket, or TLS over it.

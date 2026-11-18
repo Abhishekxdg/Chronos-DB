@@ -2,6 +2,69 @@
 
 ## Unreleased
 
+## 0.6.2 (beta), 2026-11-19
+
+**Strict proposals for payments, safer attached databases, and fixes from an audit of 0.6.0.** A proposal that would
+send a payment, payout, transfer or refund is now strict: only a person approves it, within 15 minutes, and any commit
+to main since it was proposed supersedes it. Beside Postgres or MySQL, merges into main are refused when the source
+may lose a commit it acknowledged; beside MongoDB, merges commit to a majority, journaled, and a merge whose outcome
+was lost is no longer dropped when it in fact committed. `chronos refresh --check` compares main with the source and
+changes nothing. Nothing changes in how rows are stored: 0.6.2 opens and writes data format 8 as 0.6.0 does. Built and
+signed on the maintainer's Mac as 0.6.1 was.
+
+- Attached databases: merges into main are refused when the source may lose a commit it acknowledged (Postgres with
+  `fsync` or `synchronous_commit` off; MySQL with `innodb_flush_log_at_trx_commit` not 1, or `sync_binlog` not 1
+  with the binary log on), nothing written, saying which setting. `CHRONOS_ATTACH_UNSAFE_SOURCE=1` merges anyway.
+- Attached MongoDB: a merge's commit is acknowledged by a majority of the replica set, journaled, and its reads use
+  read concern `majority`. The probe that settles a merge whose commit outcome was lost now runs in a transaction it
+  always aborts. The old probe took a merge still committing for one that never would, and dropped it, so a merge
+  that then committed in MongoDB never reached main; it also could leave a probe document behind. A probe that can't
+  tell yet (the merge's transaction still open) keeps the merge in doubt, and merges into main wait.
+- `chronos refresh <folder> --check`: the reconciliation scan. Compares main with Postgres as a refresh does and takes
+  nothing: per table, rows only in Postgres, rows that differ, rows only in main, and tables whose columns differ.
+  Exit 1 if they differ. Postgres sources only for now.
+- **Fixes from an audit of 0.6.0.**
+  - A Postgres client that stops reading (a big result it never takes) no longer blocks its session, and keeps its
+    locks, forever: a write that waits a minute ends the connection. TCP keepalive finds clients gone without a word.
+  - One address can no longer fill every connection slot with connections that never log in: at most 64 from it may
+    be logging in at once; the rest are refused as "too many clients".
+  - A new agent can't take the name of a dropped one while grants on worlds still name it: it would have had them.
+    An agent a merge policy names as its reviewer can't be dropped until the policy changes.
+  - An agent's `max_worlds` holds against forks sent at once (each counted before any landed, and all went through).
+  - `SHOW WORLDS` (and the HTTP `branches` op) to an agent held to a tenant lists main and its tenant's worlds only.
+  - A merge retried by its operation id while the first try is still merging returns the first's result, not "no
+    such world".
+  - While the checkpoint that upgrades a folder to format 8 fails (a full disk, a store down), merges into main are
+    refused instead of landing with no ledger row; each merge tries the upgrade again.
+  - With a transaction left open, commits no longer slow down as row locks pile up: the list is pruned again only
+    once it doubles.
+  - Statistics of dropped, merged and discarded worlds are freed, as a process running millions of short task worlds
+    kept them all.
+- Attached databases: `chronos attach` and `chronos serve` say at the start when the source may lose a commit it
+  acknowledged, and so refuses merges into main, instead of leaving it to the first merge.
+- Attached databases: a merge the source committed before a crash cut it short is made in Chronos as it was decided.
+  Recovery no longer judges it again by a merge policy, merge checks, scope or stale reads, which could refuse it and
+  leave the world open with its rows already in the source; nor as the agent whose merge happened to start the
+  recovery. Its effects keep their delay, and its rows the taint the merge gave them. A merge recorded by 0.6.0, which
+  doesn't name the world's version it merged at, is judged as before.
+- `chronos refresh <folder> --check` works beside MySQL, MariaDB and MongoDB too, comparing main with the source as
+  their refreshes do.
+- `ASSIGN WORLD` writes the whole tree's tenant in one change: an `ALTER WORLD`, a discard or a fork of one of its
+  worlds can no longer land between its checks and its writes and leave the root assigned with a descendant not. A
+  world forked from the tree meanwhile refuses the assignment (40001, try again), and a fork that
+  started before the assignment landed refuses itself instead of staying unassigned under an assigned world. The same statement (tenant and
+  reason) run again after a crash cut one short finishes the worlds left.
+- `CONSOLIDATE`: its scratch world (`_consolidate_<p>`) can't be dropped while the consolidation runs. A drop between
+  marking the children and the scratch world's merge into p, then a crash, discarded children whose rows never
+  reached p. `CONSOLIDATE` given a world's id works as given its name (it found none of the world's children).
+- **Strict proposals for payments (rules E7 and E8).** A proposal whose world queues an effect on a payment-like
+  channel (`payment*`, `payout*`, `transfer*`, `refund*`, or a policy's `review_channels` or new `strict_channels`)
+  is strict: only a person approves it, within the policy's new `strict_window` (15 minutes unless set; then it's
+  `expired`), and any commit to the world it merges into since it was proposed supersedes it, at approval or at the
+  merge (40001, `strict_target`), so a payment never goes out against a state nobody approved. It merges whole into
+  its parent. `SHOW PROPOSALS` shows `strict` and `strict_until`; `SHOW MERGE POLICIES` the two settings;
+  `EXPLAIN MERGE` a `strict` line before anything is proposed.
+
 ## 0.6.1 (beta), 2026-11-18
 
 **Two fixes for merges cut short by a crash.** Beside Postgres or MySQL, recovery from a crash after the source

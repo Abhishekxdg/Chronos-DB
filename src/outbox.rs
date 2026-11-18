@@ -94,6 +94,18 @@ pub(crate) fn delay(apply: &mut [crate::Change], ms: u64) {
     }
 }
 
+/// Channels strict for every policy (see `strict`): payments and the like.
+pub(crate) const STRICT_PREFIXES: [&str; 4] = ["payment", "payout", "transfer", "refund"];
+
+/// Whether `channel` is strict for a merge as `policy` judges it (rules E7 and E8, see `proposals`): one of the
+/// policy's `review_channels` or `strict_channels`, or any whose name starts with a `STRICT_PREFIXES` one. A policy
+/// adds strict channels; it can't take away the built-in ones (name the channel otherwise).
+pub(crate) fn strict(channel: &str, policy: Option<&crate::agents::MergePolicy>) -> bool {
+    let lower = channel.to_ascii_lowercase();
+    STRICT_PREFIXES.iter().any(|p| lower.starts_with(p))
+        || policy.is_some_and(|p| p.review_channels.iter().chain(&p.strict_channels).any(|c| c == channel))
+}
+
 /// An entry's channel (see `entry`), from its stored value.
 pub(crate) fn channel_of(raw: &str) -> Option<String> {
     let j: Json = serde_json::from_str(raw).ok()?;

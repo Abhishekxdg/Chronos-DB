@@ -278,10 +278,12 @@ impl Db {
             for from in (0..n).step_by(batch) {
                 let to = (from + batch).min(n);
                 let t = Instant::now();
+                let one = me.as_ref().and_then(|m| m.forking()); // counted and made at once (see `forking`)
                 let meta = self.made_meta(me.as_ref(), &base, to - from)?;
                 let infos =
                     (from..to).map(|i| (names[i].clone(), Info { meta: meta.clone(), ..Info::new() })).collect();
                 let forked = self.fork_all(&base, infos)?;
+                drop(one);
                 alive.extend(from..to);
                 let fix = if forked.same(&fixed) { vec![] } else { self.undo(&forked, &fixed)? };
                 fork_ms += ms(t);
@@ -466,8 +468,10 @@ impl Db {
             }
             None => format!("_replay_{}", &crate::new_world_id()[1..]),
         };
+        let one = me.as_ref().and_then(|m| m.forking());
         let meta = self.made_meta(me.as_ref(), &from.name, 1)?;
         let forked = self.fork_all(&from.name, vec![(target.clone(), Info { meta, ..Info::new() })])?;
+        drop(one);
         let fix = if forked.same(&past.s) { vec![] } else { self.undo(&forked, &past.s)? };
         let seed = world_seed(seed, index as usize);
         let fixed = crate::counters_fixed();

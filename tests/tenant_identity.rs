@@ -39,7 +39,10 @@ fn agent(name: &str) -> Session {
 fn code(db: &Db, s: &mut Session, sql: &str) -> String {
     match s.run(db, sql, &[]) {
         Ok(_) => "ok".into(),
-        Err(e) => e.code.to_string(),
+        Err(e) => {
+            eprintln!("{sql}: {} {}", e.code, e.message);
+            e.code.to_string()
+        }
     }
 }
 
@@ -422,4 +425,82 @@ fn concurrent_assigns_assign_once() {
         );
         assert!(assigned[0].target.contains(if a { "race a" } else { "race b" }), "{}", assigned[0].target);
     }
+}
+
+/// TODOS (PR #362 review): a fork or a discard of a world in the tree, racing ASSIGN WORLD, can't leave the root
+/// assigned with a descendant not. Whatever the timing: assigned, every world of the tree is the tenant's (a fork
+/// made after it inherits the tenant); refused, the root is as it was.
+#[test]
+fn assign_is_all_or_none_against_forks_and_discards() {
+    for i in 0..5 {
+        let dir = fixture("legacy-assign", &format!("assign_vs_tree_{i}"));
+        let db = std::sync::Arc::new(Db::open(&dir).unwrap());
+        run(&db, MAIN, "fork world clean_0 as kid_a", &[]).unwrap();
+        let go = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let forker = {
+            let (db, go) = (db.clone(), go.clone());
+            std::thread::spawn(move || {
+                go.wait();
+                for n in 0..20 {
+                    let _ = run(&db, MAIN, &format!("fork world kid_a as kid_{n}"), &[]);
+                    if n % 2 == 0 {
+                        let _ = run(&db, MAIN, &format!("drop world kid_{n}"), &[]);
+                    }
+                }
+            })
+        };
+        let assigner = {
+            let (db, go) = (db.clone(), go.clone());
+            std::thread::spawn(move || {
+                go.wait();
+                person().run(&db, "assign world clean_0 to tenant 'org_id = 42' reason 'race'", &[]).map_err(|e| e.code)
+            })
+        };
+        let assigned = assigner.join().unwrap();
+        forker.join().unwrap();
+        let root = shown_world(&db, "clean_0", "tenant_status");
+        let tree: Vec<(String, String)> =
+            db.descendants("clean_0").into_iter().map(|w| (shown_world(&db, &w, "tenant_status"), w)).collect();
+        match assigned {
+            Ok(_) => {
+                assert_eq!(root, "tenant");
+                assert!(tree.iter().all(|(s, _)| s == "tenant"), "run {i}: the whole tree: {tree:?}");
+            }
+            // (40001 from the writes; a world of the tree gone while its checks ran says so as any missing world)
+            Err(code) => {
+                assert_ne!(code, "42501", "run {i}: refused by a check: the tree is clean");
+                assert_eq!(root, "quarantined", "run {i}: the root as it was");
+                assert!(tree.iter().all(|(s, _)| s == "unassigned"), "run {i}: none of the tree: {tree:?}");
+            }
+        }
+    }
+}
+
+/// The same ASSIGN WORLD (tenant and reason) run again after a crash cut it short finishes the worlds it left, and
+/// once more does nothing; a world another ASSIGN WORLD gave the tenant still refuses it, as it always did.
+#[test]
+fn assign_run_again_finishes_only_the_same_statement() {
+    let dir = fixture("legacy-assign", "assign_again");
+    let db = Db::open(&dir).unwrap();
+    run(&db, MAIN, "fork world clean_0 as kid", &[]).unwrap();
+    // as a crash partway through the log leaves it: the descendant written, the root not
+    assert_eq!(assign(&db, "kid"), "ok");
+    assert_eq!(shown_world(&db, "clean_0", "tenant_status"), "quarantined");
+    // a fork of it made since inherits its tenant, with no record of its own: reached too
+    run(&db, MAIN, "fork world kid as grandkid", &[]).unwrap();
+    assert_eq!(shown_world(&db, "grandkid", "tenant_status"), "tenant");
+    assert_eq!(assign(&db, "clean_0"), "ok", "the same statement finishes the tree");
+    assert_eq!(shown_world(&db, "clean_0", "tenant_status"), "tenant");
+    assert_eq!(shown_world(&db, "grandkid", "tenant_status"), "tenant");
+    assert_ne!(assign(&db, "clean_0"), "ok", "once the root is assigned, it can't be assigned again");
+    let assigned = db.security_events(100).into_iter().filter(|e| e.action == "assign world").count();
+    assert_eq!(assigned, 2, "kid once, clean_0 once");
+    drop(db);
+
+    let dir = fixture("legacy-assign", "assign_other");
+    let db = Db::open(&dir).unwrap();
+    run(&db, MAIN, "fork world clean_0 as kid", &[]).unwrap();
+    run(&db, MAIN, "assign world kid to tenant 'org_id = 42' reason 'another'", &[]).unwrap();
+    assert_ne!(assign(&db, "clean_0"), "ok", "a world another statement assigned: refused");
+    assert_eq!(shown_world(&db, "clean_0", "tenant_status"), "quarantined");
 }

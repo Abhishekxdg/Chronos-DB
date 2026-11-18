@@ -84,6 +84,19 @@ pub(crate) fn of_meta(core: &Core, name: &str, meta: &Map<String, Json>) -> Iden
     Identity::Unassigned { quarantined }
 }
 
+/// A world as ASSIGN WORLD `reason` to `target` (a tenant, or Null: none) leaves it: its own record of that statement,
+/// or no record and that identity, inherited from a world the statement reached (a fork of one made since: an
+/// unassigned root's descendant gets a tenant, or none, no other way).
+fn reached(meta: &Map<String, Json>, reason: &str, target: &Json) -> bool {
+    match meta.get(ASSIGNED) {
+        Some(a) => a["reason"].as_str() == Some(reason) && (a["to"] == *target || same_tenant(&a["to"], target)),
+        None if target.is_null() => meta.get(GLOBAL) == Some(&Json::Bool(true)),
+        None => {
+            meta.get(scope::SCOPE).and_then(|s| s.get("tenant")).is_some_and(|t| !t.is_null() && same_tenant(t, target))
+        }
+    }
+}
+
 impl Core {
     /// World `w`'s tenant identity (a name or id; `name@when` is the world's; a session's transaction world is the
     /// world it was begun on).
@@ -202,9 +215,23 @@ impl Core {
         let name = self.world(w)?.name;
         let mut tree = vec![name.clone()];
         tree.extend(self.descendants(&name).into_iter().filter(|d| !d.starts_with("_tx_")));
-        // 1. every one of them unassigned
+        let target = match &to {
+            AssignTo::Tenant(t) => t.clone(),
+            AssignTo::Global => Json::Null,
+        };
+        // 1. every one of them unassigned. A descendant this same statement reached already (to the same tenant, for
+        // the same reason: an ASSIGN WORLD a crash cut short partway through the log; the root is written last) is
+        // left as it is, so running it again finishes it; an assigned root, or a world an earlier, other ASSIGN WORLD
+        // gave a tenant, is refused, as it always was
+        let mut done = vec![];
         for x in &tree {
             let id = self.identity(x)?;
+            // the world's own metadata: `world()` leaves the tenant keys out
+            let raw = self.branches.read().unwrap().get(x.as_str()).map(|e| e.br.info.read().unwrap().meta.clone());
+            if *x != name && raw.is_some_and(|m| reached(&m, reason, &target)) {
+                done.push(x.clone());
+                continue;
+            }
             if !matches!(id, Identity::Unassigned { .. }) {
                 return Err(refused(format!(
                     "world {x} is {}: only a world made before worlds recorded a tenant can be assigned one",
@@ -254,10 +281,7 @@ impl Core {
         }
         // all pass: record it, each in its own metadata write (logged as any other)
         let by = if actor.is_empty() { "owner".to_string() } else { actor.clone() };
-        let record = json!({ "by": by, "at": crate::disk::now_ms(), "reason": reason, "to": match &to {
-            AssignTo::Tenant(t) => t.clone(),
-            AssignTo::Global => Json::Null,
-        } });
+        let record = json!({ "by": by, "at": crate::disk::now_ms(), "reason": reason, "to": target });
         let assign = |meta: &mut Map<String, Json>| -> Result<()> {
             // still unassigned as it is written (`identity` from the world's own record)
             let tenant = meta.get(scope::SCOPE).and_then(|s| s.get("tenant")).is_some_and(|t| !t.is_null());
@@ -277,29 +301,25 @@ impl Core {
             meta.insert(ASSIGNED.into(), record.clone());
             Ok(())
         };
-        // every world's new metadata within its limit before any is written: none of the tree, or all of it
+        // the whole tree in one change (`put_metas`): nothing that forks, discards or changes one of them comes between
+        // these checks' last step and the writes, so none fails partway and leaves the root assigned alone. The root
+        // goes last: a crash between the log's records leaves it unassigned, so the statement can be run again
+        tree.rotate_left(1);
+        // (a world it reached already is checked again under the locks: one dropped and made again meanwhile isn't)
+        self.put_metas(&tree, |b, m| match done.iter().any(|d| d == b) {
+            false => assign(m),
+            true if reached(m, reason, &target) => Ok(()),
+            true => Err(Error::Constraint {
+                code: "40001",
+                message: format!("world {b} was dropped and made again meanwhile; nothing was changed"),
+            }),
+        })?;
+        tree.retain(|x| !done.contains(x));
+        let to_words = match &to {
+            AssignTo::Tenant(t) => format!("tenant {}", tenant_sql(t)),
+            AssignTo::Global => "no tenant".into(),
+        };
         for x in &tree {
-            // as stored, internal keys too (`World::meta` leaves out the scope, owner and the like, which count)
-            let mut meta = {
-                let m = self.branches.read().unwrap();
-                let e = m.get(x).ok_or_else(|| Error::NoBranch(x.clone()))?;
-                e.br.info.read().unwrap().meta.clone()
-            };
-            assign(&mut meta)?;
-            if Json::Object(meta).to_string().len() > crate::META_MAX {
-                return Err(crate::bad_meta(format!(
-                    "world {x}'s metadata would go over {} bytes as JSON with the assignment recorded: nothing \
-                     was assigned",
-                    crate::META_MAX
-                )));
-            }
-        }
-        for x in &tree {
-            self.put_meta(x, |m| assign(m))?;
-            let to_words = match &to {
-                AssignTo::Tenant(t) => format!("tenant {}", tenant_sql(t)),
-                AssignTo::Global => "no tenant".into(),
-            };
             self.record_security("assign world", &format!("{x} to {to_words}: {reason}"));
         }
         Ok(tree)

@@ -712,3 +712,110 @@ fn crash_matrix_mysql() {
     drop(my);
     admin.query(&format!("drop database {name}")).unwrap();
 }
+
+/// A MySQL set to lose commits it acknowledged (the redo log flushed once a second, the binary log not synced at
+/// each commit) refuses merges into main, nothing written; with CHRONOS_ATTACH_UNSAFE_SOURCE=1, or once set back,
+/// they go. Changes the server's global settings for the test, then sets them back.
+#[test]
+fn unsafe_durability_is_read_only() {
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some((mut admin, mut my, name)) = throwaway("unsafe") else {
+        eprintln!("skipped: set CHRONOS_TEST_MYSQL to a MySQL URL");
+        return;
+    };
+    my.query("create table t (id int primary key, v varchar(20)) engine = InnoDB; insert into t values (1, 'a')")
+        .unwrap();
+    let dir = std::env::temp_dir().join(format!("chronos-attach-mysql-unsafe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let out =
+        Command::new(env!("CARGO_BIN_EXE_chronos")).arg("attach").arg(&dir).args(["--tables", "t"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let was =
+        (my_cell(&mut admin, "select @@innodb_flush_log_at_trx_commit"), my_cell(&mut admin, "select @@sync_binlog"));
+    admin.query("set global innodb_flush_log_at_trx_commit = 2; set global sync_binlog = 0").unwrap();
+    let db = Db::open(&dir).unwrap();
+    let merge = |w: &str, v: &str| {
+        run(&db, MAIN, &format!("create world {w}"), &[]).unwrap();
+        run(&db, w, &format!("update t set v = '{v}' where id = 1"), &[]).unwrap();
+        run(&db, MAIN, &format!("merge world {w}"), &[])
+    };
+    let e = merge("w1", "x").expect_err("refused");
+    let set_back = |admin: &mut myclient::Client| {
+        admin
+            .query(&format!(
+                "set global innodb_flush_log_at_trx_commit = {}; set global sync_binlog = {}",
+                was.0, was.1
+            ))
+            .unwrap();
+    };
+    if !(e.message.contains("innodb_flush_log_at_trx_commit = 2") && e.message.contains("CHRONOS_ATTACH_UNSAFE_SOURCE"))
+    {
+        set_back(&mut admin);
+        panic!("{}", e.message);
+    }
+    assert_eq!(my_cell(&mut my, "select v from t where id = 1"), "a", "nothing written");
+    unsafe { std::env::set_var("CHRONOS_ATTACH_UNSAFE_SOURCE", "1") };
+    let r = merge("w2", "y");
+    unsafe { std::env::remove_var("CHRONOS_ATTACH_UNSAFE_SOURCE") };
+    set_back(&mut admin);
+    r.unwrap();
+    assert_eq!(my_cell(&mut my, "select v from t where id = 1"), "y");
+    merge("w3", "z").unwrap();
+    assert_eq!(my_cell(&mut my, "select v from t where id = 1"), "z");
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+    drop(my);
+    admin.query(&format!("drop database {name}")).unwrap();
+}
+
+/// The reconciliation scan (`chronos refresh --check`) beside MySQL: rows changed, added and deleted straight in
+/// MySQL are counted per table, a table whose columns changed is named, and nothing is taken into main.
+#[test]
+fn reconciliation_scan_beside_mysql() {
+    let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+    let Some((mut admin, mut my, name)) = throwaway("reconcile") else {
+        eprintln!("skipped: set CHRONOS_TEST_MYSQL to a MySQL URL");
+        return;
+    };
+    my.query(
+        "create table t (id int primary key, v varchar(20)) engine = InnoDB; insert into t values (1, 'a'), (2, 'b'), \
+         (3, 'c'); create table u (id int primary key, v varchar(20)) engine = InnoDB; insert into u values (1, 'a')",
+    )
+    .unwrap();
+    let dir = std::env::temp_dir().join(format!("chronos-attach-mysql-reconcile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let out =
+        Command::new(env!("CARGO_BIN_EXE_chronos")).arg("attach").arg(&dir).args(["--tables", "t,u"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let db = Db::open(&dir).unwrap();
+    let r = chronos::attach::reconcile(&db).unwrap();
+    assert!(
+        r.tables.iter().all(|t| (t.1, t.2, t.3) == (0, 0, 0)) && r.skipped.is_empty(),
+        "{:?} {:?}",
+        r.tables,
+        r.skipped
+    );
+    my.query(
+        "update t set v = 'changed' where id = 1; delete from t where id = 2; insert into t values (4, 'd'); \
+              alter table u add column note varchar(20)",
+    )
+    .unwrap();
+    let r = chronos::attach::reconcile(&db).unwrap();
+    let t = r.tables.iter().find(|x| x.0 == "t").unwrap();
+    assert_eq!((t.1, t.2, t.3), (1, 1, 1), "one only in MySQL, one differing, one only in main: {:?}", r.tables);
+    assert!(r.skipped.iter().any(|s| s.starts_with("u:")), "{:?}", r.skipped);
+    assert_eq!(
+        cell(&db, MAIN, "select string_agg(id::text || '=' || v, ',' order by id) from t"),
+        "1=a,2=b,3=c",
+        "nothing taken"
+    );
+    drop(db);
+    let out = Command::new(env!("CARGO_BIN_EXE_chronos"))
+        .args(["refresh", dir.to_str().unwrap(), "--check"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&dir);
+    drop(my);
+    admin.query(&format!("drop database {name}")).unwrap();
+}

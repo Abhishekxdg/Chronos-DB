@@ -1337,9 +1337,51 @@ pub(crate) fn write_back(
     if rows.is_empty() {
         return Ok(None);
     }
+    // a source that may lose what it acknowledged would leave main ahead of it after a crash of it: refused
+    if std::env::var("CHRONOS_ATTACH_UNSAFE_SOURCE").as_deref() != Ok("1")
+        && let Some(why) = att.src.unsafe_durability(att).map_err(|e| refused(format!("{e}; nothing was merged")))?
+    {
+        return Err(refused(format!(
+            "{} may lose commits it acknowledged ({why}): a merge written there could be gone after a crash of it while \
+             main kept it, so merges into main are refused, nothing written. Set it to keep its commits, or set \
+             CHRONOS_ATTACH_UNSAFE_SOURCE=1 to merge anyway",
+            att.source()
+        )));
+    }
     let rules = att.rules().map_err(|e| refused(format!("write-back rules: {e}; nothing was merged")))?;
     undo::effects(apply);
     att.src.write_back(core, att, world, world_id, &rows, reads, checks, who, &rules)
+}
+
+/// Said when a folder is attached and when `serve` opens one: the source's settings that let it lose a commit it
+/// acknowledged (see `unsafe_durability`), which refuse every merge into main until they're changed, so a person
+/// hears it at the start rather than at the first merge. None: safe, CHRONOS_ATTACH_UNSAFE_SOURCE=1, or its settings
+/// couldn't be read now (each merge reads them again).
+pub fn durability_warning(att: &Attached) -> Option<String> {
+    if std::env::var("CHRONOS_ATTACH_UNSAFE_SOURCE").as_deref() == Ok("1") {
+        return None;
+    }
+    let why = att.src.unsafe_durability(att).ok()??;
+    Some(format!(
+        "warning: {} may lose commits it acknowledged ({why}): merges into main are refused until it keeps them (reads, \
+         refreshes and worlds work). Change that setting, or set CHRONOS_ATTACH_UNSAFE_SOURCE=1 to merge anyway",
+        att.source()
+    ))
+}
+
+/// Postgres's settings that let it lose a commit it acknowledged: `fsync` or `synchronous_commit` off.
+fn pg_unsafe_durability(att: &Attached) -> std::result::Result<Option<String>, String> {
+    let mut pg = att.lease()?;
+    let rows = pg
+        .first(|pg| pg.query("select current_setting('fsync'), current_setting('synchronous_commit')"))
+        .map_err(|e| format!("reading Postgres's settings: {e}"))?;
+    let r = rows.first().ok_or("reading Postgres's settings: no row")?;
+    let bad: Vec<String> = [("fsync", &r[0]), ("synchronous_commit", &r[1])]
+        .into_iter()
+        .filter(|(_, v)| v.as_deref() == Some("off"))
+        .map(|(n, _)| format!("{n} = off"))
+        .collect();
+    Ok((!bad.is_empty()).then(|| bad.join(", ")))
 }
 
 /// `write_back`'s rows, written to Postgres.
@@ -3612,15 +3654,21 @@ pub fn resolve(core: &Core) -> std::result::Result<Option<String>, String> {
     let p: Json = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", att.pending_path().display()))?;
     let (merge_id, world, world_id) =
         (p["merge"].as_str().unwrap_or_default(), p["world"].as_str().unwrap_or_default(), p["world_id"].as_str());
+    let src = match att.kind() {
+        SourceKind::Postgres => "Postgres",
+        SourceKind::MySql => "MySQL",
+        SourceKind::MariaDb => "MariaDB",
+        SourceKind::Mongo => "MongoDB",
+    };
     if !att.src.committed(merge_id)? {
         std::fs::remove_file(att.pending_path()).map_err(|e| e.to_string())?;
         return Ok(Some(format!(
-            "the merge of {world} written to Postgres before a crash didn't commit there: nothing of it is in Postgres, \
+            "the merge of {world} written to {src} before a crash didn't commit there: nothing of it is in {src}, \
              and {world} is as it was"
         )));
     }
     let db = core.db().ok_or("no database")?;
-    let mut said = format!("the merge of {world} committed in Postgres before a crash");
+    let mut said = format!("the merge of {world} committed in {src} before a crash");
     // the world still there (the crash came before Chronos made the merge): made now, with no second write-back
     let there = db.world(world).ok().is_some_and(|w| Some(w.id.as_str()) == world_id);
     if there {
@@ -3640,13 +3688,24 @@ pub fn resolve(core: &Core) -> std::result::Result<Option<String>, String> {
             into: s["into"].as_str().map(String::from),
             ..Default::default()
         };
+        // as decided before the crash, by the database itself: no agent's policy, review, merge checks, scope or
+        // stale reads judge it again (see `crate::Recorded`); a recovery during an agent's merge isn't that agent's.
+        // Only with the version it merged at: a record 0.6.0 wrote has none, and without it the merge would take the
+        // world as it is now, writes since the crash too, which nothing judged; that one is judged as any merge
+        let recorded = o.expected.is_some();
         let skip = SKIP.replace(true);
-        let merged = db.merge_with(world, &o);
+        let merged = {
+            let _as = recorded.then(|| crate::disk::acting_as(""));
+            // a record with no taint (0.6.1's): its rows tainted, the side that can't let an outsider's text through
+            let taint = s["taint"].as_u64().map_or(crate::TAINT_WRITTEN, |t| t as u8);
+            let _recorded = recorded.then(|| crate::Recorded::enter(s["effects_delay"].as_u64().unwrap_or(0), taint));
+            db.merge_with(world, &o)
+        };
         SKIP.set(skip);
         match merged {
             Ok(_) => said.push_str(&format!("; {world} is merged into main now")),
             Err(e) => said.push_str(&format!(
-                "; merging {world} in Chronos failed after ({e}): main takes its rows from Postgres, and {world} \
+                "; merging {world} in Chronos failed after ({e}): main takes its rows from {src}, and {world} \
                  stays open (discard it)"
             )),
         }
@@ -3787,7 +3846,7 @@ fn refresh_now(core: &Core, att: &Attached, only: Option<&[usize]>) -> std::resu
 /// `refresh_now`, from Postgres.
 fn pg_refresh(core: &Core, att: &Attached, only: Option<&[usize]>) -> std::result::Result<Refreshed, String> {
     let mut pg = att.lease()?;
-    let out = refresh_read(core, att, &mut pg, only);
+    let out = refresh_read(core, att, &mut pg, only, false);
     rollback(&mut pg);
     drop(pg);
     let mut done = out.map_err(|e| e.to_string())?;
@@ -3801,12 +3860,39 @@ fn pg_refresh(core: &Core, att: &Attached, only: Option<&[usize]>) -> std::resul
     Ok(done.0)
 }
 
-/// The read of a refresh: what main is to take, per table (see `refresh`).
+/// The reconciliation scan: main's rows compared with the source's (Postgres, MySQL, MariaDB or MongoDB) as a refresh
+/// compares them, with nothing taken. Per table (`Refreshed::tables`), the rows the source has that main hasn't, has
+/// otherwise, and hasn't; in `skipped`, the tables whose columns differ (a refresh takes those first, beside Postgres).
+/// All zero and nothing skipped: main agrees with the source.
+/// A merge still in doubt is refused, as settling it writes (a refresh or the next merge settles it).
+// shortcut: Postgres only; MySQL and MongoDB read for a refresh their own way, give them a check mode when needed
+pub fn reconcile(core: &Core) -> std::result::Result<Refreshed, String> {
+    let Some(att) = core.attached.as_deref() else {
+        return Err("this folder isn't attached to a database (chronos attach makes one that is)".into());
+    };
+    let _held = att.hold();
+    if att.pending() {
+        return Err("a merge written to the source before isn't settled yet: chronos refresh settles it first".into());
+    }
+    att.src.reconcile(core, att)
+}
+
+/// `reconcile`, against Postgres.
+fn pg_reconcile(core: &Core, att: &Attached) -> std::result::Result<Refreshed, String> {
+    let mut pg = att.lease()?;
+    let out = refresh_read(core, att, &mut pg, None, true);
+    rollback(&mut pg);
+    out.map(|(r, _)| r).map_err(|e| e.to_string())
+}
+
+/// The read of a refresh: what main is to take, per table (see `refresh`). `check`: the reconciliation scan's (see
+/// `reconcile`), which changes nothing in main, columns and enum labels included.
 fn refresh_read(
     core: &Core,
     att: &Attached,
     pg: &mut Lease,
     only: Option<&[usize]>,
+    check: bool,
 ) -> Result<(Refreshed, Vec<Stored>)> {
     let start = format!(
         "begin isolation level repeatable read, read only; set local statement_timeout = '{STATEMENT_TIMEOUT}'; \
@@ -3821,7 +3907,9 @@ fn refresh_read(
         )));
     }
     let mut out = Refreshed { at: crate::now_ms(), ..Default::default() };
-    take_labels(core, pg, &mut out)?;
+    if !check {
+        take_labels(core, pg, &mut out)?;
+    }
     let mut rows = vec![];
     for ti in 0..att.tables().len() {
         if only.is_some_and(|o| !o.contains(&ti)) {
@@ -3831,6 +3919,14 @@ fn refresh_read(
         let t = &before[ti];
         match shape(pg, t)? {
             Shape::Same => {}
+            // (only metadata an older attach didn't record, filled in by a refresh: the columns are the same)
+            Shape::Reshaped(re) if check && re.quiet() => {}
+            Shape::Reshaped(re) if check => {
+                let mut said = re.said(t);
+                said.extend(re.added.iter().map(|a| format!("column {} added", a.col.name)));
+                out.skipped.push(format!("{}: columns differ in Postgres ({})", t.name, said.join("; ")));
+                continue;
+            }
             Shape::Reshaped(re) => {
                 let named: Vec<String> =
                     re.added.iter().map(|a| format!("{}.{} {}", t.name, a.col.name, a.col.ty)).collect();
@@ -4698,6 +4794,9 @@ pub fn check(core: &Core) -> std::result::Result<String, String> {
     );
     if let Some(s) = resolve(core)? {
         line.push_str(&format!("\n{s}"));
+    }
+    if let Some(w) = durability_warning(att) {
+        line.push_str(&format!("\n{w}"));
     }
     Ok(line)
 }

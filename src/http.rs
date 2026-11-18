@@ -58,6 +58,56 @@ pub fn live() -> usize {
     LIVE.load(Ordering::SeqCst)
 }
 
+/// Connections from one address that have not yet said who they are (logged in, or sent an admitted request): a client
+/// that opens connections and says nothing would otherwise hold every slot until each one's login time runs out,
+/// shutting everyone out, the admin too. Past this many from its address, a new one is refused as one past the limit.
+/// shortcut: per address, so many addresses at once still fill the slots; a reserve for the admin if that shows.
+const UNKNOWN_PER_ADDRESS: usize = 64;
+
+static UNKNOWN: LazyLock<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, usize>>> =
+    LazyLock::new(Default::default);
+
+/// A connection's place among its address's not-yet-known ones, given back when it says who it is (`known`) or ends.
+struct Unknown(Option<std::net::IpAddr>);
+
+impl Unknown {
+    /// A place for a connection from `ip`, or None when its address has its fill of them.
+    fn take(ip: Option<std::net::IpAddr>) -> Option<Unknown> {
+        let Some(ip) = ip else { return Some(Unknown(None)) };
+        let mut all = UNKNOWN.lock().unwrap_or_else(|p| p.into_inner());
+        let n = all.entry(ip).or_default();
+        if *n >= UNKNOWN_PER_ADDRESS {
+            return None;
+        }
+        *n += 1;
+        Some(Unknown(Some(ip)))
+    }
+}
+
+impl Drop for Unknown {
+    fn drop(&mut self) {
+        let Some(ip) = self.0 else { return };
+        let mut all = UNKNOWN.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = all.get_mut(&ip) {
+            *n -= 1;
+            if *n == 0 {
+                all.remove(&ip);
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// The place of the connection this thread serves, while it is not yet known.
+    static THIS_UNKNOWN: std::cell::RefCell<Option<Unknown>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The connection this thread serves has said who it is (it logged in, or a request of it was admitted): it no
+/// longer counts against its address's not-yet-known ones.
+pub fn known() {
+    THIS_UNKNOWN.with(|u| u.borrow_mut().take());
+}
+
 /// Runs `f` for each connection accepted on `l`, each on its own thread; a connection past
 /// `max_connections()` (counted across all listeners) goes to `refuse` instead. Accept errors (out of file descriptors, say) are logged
 /// and retried after a pause. Runs until the process ends.
@@ -76,6 +126,10 @@ pub fn connections<F: Fn(TcpStream) + Sync>(l: &TcpListener, refuse: impl Fn(Tcp
                     continue;
                 }
             };
+            let Some(unknown) = Unknown::take(c.peer_addr().ok().map(|a| a.ip())) else {
+                refuse(c);
+                continue;
+            };
             if live.fetch_add(1, Ordering::SeqCst) >= max {
                 live.fetch_sub(1, Ordering::SeqCst);
                 refuse(c);
@@ -84,7 +138,9 @@ pub fn connections<F: Fn(TcpStream) + Sync>(l: &TcpListener, refuse: impl Fn(Tcp
             let f = &f;
             let spawned = std::thread::Builder::new().stack_size(STACK).spawn_scoped(s, move || {
                 let _slot = Release(live);
+                THIS_UNKNOWN.with(|u| *u.borrow_mut() = Some(unknown));
                 guarded(|| f(c));
+                known(); // (a thread outlives its connection only here: give the place back now)
             });
             if let Err(e) = spawned {
                 live.fetch_sub(1, Ordering::SeqCst); // the connection closed with the closure
@@ -219,7 +275,10 @@ where
         };
         // the body isn't read for a request refused on its headers, so the connection can't go on
         let who = match admit(&req) {
-            Ok(who) => who,
+            Ok(who) => {
+                known();
+                who
+            }
             Err(res) => return write(r.get_mut(), &res, extra, false),
         };
         if len > 0 && req.header("Expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue")) {
@@ -390,5 +449,57 @@ mod panics {
         assert_eq!(echo(&mut before, b'b').unwrap(), b'b');
         let mut after = TcpStream::connect(("127.0.0.1", port)).unwrap();
         assert_eq!(echo(&mut after, b'c').unwrap(), b'c');
+    }
+}
+
+#[cfg(test)]
+mod unknown {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    /// What a client gets first: `R` from the refusal, `K` from a connection served once it said who it is.
+    fn first(port: u16) -> (TcpStream, u8) {
+        let mut c = TcpStream::connect(("::1", port)).unwrap();
+        c.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+        c.write_all(b"?").unwrap();
+        let mut b = [0u8; 1];
+        c.read_exact(&mut b).unwrap();
+        (c, b[0])
+    }
+
+    /// Connections from one address that never say who they are hold at most `UNKNOWN_PER_ADDRESS` places; once one
+    /// says who it is (`known`), its place is free for the next.
+    #[test]
+    fn one_address_cannot_fill_the_slots_without_logging_in() {
+        let Ok(l) = TcpListener::bind("[::1]:0") else { return }; // no IPv6 loopback here
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            super::connections(
+                &l,
+                |mut c| drop(c.write_all(b"R")),
+                |mut c| {
+                    let mut b = [0u8; 1];
+                    let _ = c.read_exact(&mut b);
+                    if b[0] == b'!' {
+                        super::known();
+                    }
+                    let _ = c.write_all(b"K");
+                    while c.read_exact(&mut b).is_ok() {}
+                },
+            )
+        });
+        let held: Vec<_> = (0..super::UNKNOWN_PER_ADDRESS).map(|_| first(port)).collect();
+        assert!(held.iter().all(|(_, b)| *b == b'K'));
+        assert_eq!(first(port).1, b'R', "one more from the address that says nothing: refused");
+        // one that says who it is gives its place back
+        drop(held);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut c = TcpStream::connect(("::1", port)).unwrap();
+        c.write_all(b"!").unwrap();
+        let mut b = [0u8; 1];
+        c.read_exact(&mut b).unwrap();
+        assert_eq!(b[0], b'K');
+        let more: Vec<_> = (0..super::UNKNOWN_PER_ADDRESS).map(|_| first(port)).collect();
+        assert!(more.iter().all(|(_, b)| *b == b'K'), "the known one holds no place");
     }
 }

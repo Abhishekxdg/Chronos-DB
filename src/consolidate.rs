@@ -395,7 +395,11 @@ impl Core {
     /// merged into p as one merge, then discarded; any one refused, and nothing merges. Returns how many merged.
     pub fn consolidate(&self, p: &str, only: &[String], arbitrate: bool) -> Result<usize> {
         crate::not_tx(p)?;
-        let _one = Running::take(self.uid, &self.world(p)?.name)?;
+        // by its name from here on, given by name or id: the scratch world is named after it, and found by that name
+        // in `Running` (see `consolidating`)
+        let name = self.world(p)?.name;
+        let p = name.as_str();
+        let _one = Running::take(self.uid, p)?;
         // children a consolidation cut short by a crash had already merged: gone now, before they're picked again
         self.finish_consolidations(Some(p));
         let kids = self.children_of(p, only)?;
@@ -699,20 +703,24 @@ impl Drop for Copying {
     }
 }
 
-/// The coordinator worlds being consolidated now (by database, `Core::uid`): one CONSOLIDATE of a world at a time, so
-/// none discards the scratch world of another under way.
-static RUNNING: std::sync::Mutex<BTreeSet<(u64, String)>> = std::sync::Mutex::new(BTreeSet::new());
+/// The coordinator worlds being consolidated now (by database, `Core::uid`), each with the thread doing it: one
+/// CONSOLIDATE of a world at a time, so none discards the scratch world of another under way; and no one else drops
+/// a scratch world while its consolidation runs (`Core::consolidating`).
+static RUNNING: std::sync::Mutex<BTreeMap<(u64, String), std::thread::ThreadId>> =
+    std::sync::Mutex::new(BTreeMap::new());
 
 struct Running(u64, String);
 
 impl Running {
     fn take(uid: u64, p: &str) -> Result<Running> {
-        if !RUNNING.lock().unwrap().insert((uid, p.to_string())) {
+        let mut running = RUNNING.lock().unwrap();
+        if running.contains_key(&(uid, p.to_string())) {
             return Err(Error::Constraint {
                 code: "55000",
                 message: format!("{p} is being consolidated already: wait for that CONSOLIDATE to end"),
             });
         }
+        running.insert((uid, p.to_string()), std::thread::current().id());
         Ok(Running(uid, p.to_string()))
     }
 }
@@ -720,6 +728,17 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         RUNNING.lock().unwrap().remove(&(self.0, std::mem::take(&mut self.1)));
+    }
+}
+
+impl Core {
+    /// Whether `b` is the scratch world of a consolidation running on another thread: dropping it then (by hand, a
+    /// cascade, or its time running out) is refused. Between the children's marks and the scratch world's merge into
+    /// p, a drop followed by a crash would leave marks whose scratch world is gone, and the next open would discard
+    /// children whose rows never reached p (see `finish_consolidations`).
+    pub(crate) fn consolidating(&self, b: &str) -> bool {
+        let Some(p) = b.strip_prefix(SCRATCH) else { return false };
+        RUNNING.lock().unwrap().get(&(self.uid, p.to_string())).is_some_and(|t| *t != std::thread::current().id())
     }
 }
 

@@ -33,6 +33,10 @@ pub(crate) const PROPOSAL: &str = "_sonos_proposal";
 pub(crate) const PROPOSALS: &str = "_sonos_proposals";
 /// Main's rows of worlds that didn't make it (discarded, a merge refused, a proposal rejected).
 pub(crate) const TOMBSTONES: &str = "_sonos_tombstones";
+/// How long after a strict proposal a person may approve it, ms, when its policy doesn't say (`strict_window`).
+const STRICT_WINDOW: u64 = 15 * 60_000;
+/// The rule that supersedes a strict proposal: its target took a commit since it was proposed (E7).
+pub(crate) const STRICT_TARGET: &str = "strict_target";
 /// The settings evidence takes.
 const EVIDENCE_KEYS: [&str; 4] = ["kind", "uri", "sha256", "note"];
 /// Most evidence one world may carry.
@@ -48,6 +52,8 @@ pub(crate) struct Approved {
     /// the proposal's row (key, and the proposal as it will be once merged, short of its `rows` and `at`): written
     /// in the merge's own log record where it can be (see `merged_row`)
     pub merged: Option<(String, Json)>,
+    /// a strict proposal's (rule E7): the version its target must still be at, checked under the merge's locks
+    pub strict_version: Option<u64>,
 }
 
 /// Held while a proposal's status is read, judged and written (decided, withdrawn, merged): two at once would each
@@ -158,6 +164,14 @@ fn changed(message: String) -> Error {
 
 fn no_proposal(id: &str) -> Error {
     Error::Constraint { code: "42704", message: format!("proposal '{id}' does not exist (SHOW PROPOSALS lists them)") }
+}
+
+/// A strict proposal superseded: its target took a commit since it was proposed (rule E7).
+fn superseded(id: &str, target: &str) -> Error {
+    changed(format!(
+        "proposal '{id}' is superseded ({STRICT_TARGET}): {target} took a commit since it was proposed, and a strict \
+         proposal (one queueing an effect on a strict channel) is bound to {target} as it was; propose again"
+    ))
 }
 
 /// Whether a proposal in `status` holds its world: open, or approved and not merged yet.
@@ -398,9 +412,19 @@ impl Core {
         let (cert, parts) = self.certificate(&world.name, into, &merge_as, &reads)?;
         let plan = self.preview_as(&world.name, into, &merge_as)?;
         let (verdict, reasons) = Self::verdict(&plan);
+        // strict (rules E7 and E8): its effects go out on a payment-like channel. Only the whole world, into its parent
+        let (strict, window) = self.strict_effects(&world.name, &merge_as)?;
+        if !strict.is_empty() && parts["target"]["name"].as_str() != world.parent.as_deref() {
+            return Err(bad(format!(
+                "world {} queues effects on {} (strict channels): its proposal merges into its parent, not into {}",
+                world.name,
+                strict.join(", "),
+                parts["target"]["name"].as_str().unwrap_or_default()
+            )));
+        }
         let now = disk::now_ms();
         let id = new_id("p", &cert);
-        let p = json!({
+        let mut p = json!({
             "id": id,
             "world": world.name,
             "world_id": world.id,
@@ -423,8 +447,12 @@ impl Core {
             "parent": world.parent,
             "born": world.created,
             "depth": world.depth,
+            "strict": if strict.is_empty() { Json::Null } else { json!({ "channels": strict, "until": now + window }) },
         });
-        self.put_proposal(&p)?;
+        match p["strict"].is_object() {
+            true => self.put_bound(&mut p, None)?,
+            false => self.put_proposal(&p)?,
+        }
         self.set_reserved(&world.name, PROPOSAL, Some(json!(id)))?;
         Ok(p)
     }
@@ -453,6 +481,54 @@ impl Core {
             return Err(gone("its certificate differs: rows, evidence, scope or policy".into()));
         }
         Ok(world)
+    }
+
+    /// The strict channels (see `outbox::strict`) world `w`'s merge as `merge_as` would queue effects on, once each,
+    /// and how long a person has to approve it (its policy's `strict_window`).
+    pub(crate) fn strict_effects(&self, w: &str, merge_as: &str) -> Result<(Vec<String>, u64)> {
+        let br = self.branch(w)?;
+        let policy = self.agent(merge_as).ok().and_then(|a| a.policy).and_then(|n| self.policy(&n).ok());
+        let mut channels: Vec<String> = self
+            .state_diff(&br.base(), &br.snapshot())?
+            .into_iter()
+            .filter(|c| crate::outbox::entry(&c.key) && c.before.is_none())
+            .filter_map(|c| crate::outbox::channel_of(c.after.as_deref()?))
+            .filter(|ch| crate::outbox::strict(ch, policy.as_ref()))
+            .collect();
+        channels.sort();
+        channels.dedup();
+        Ok((channels, policy.and_then(|p| p.strict_window).unwrap_or(STRICT_WINDOW)))
+    }
+
+    /// Writes strict proposal `p`'s row bound to its target's version (rule E7): `expect` is the version the target
+    /// must be at (None: proposing, nothing to check yet), read under main's writer lock, which merges into main take
+    /// too; the row keeps the version the target is at once the write lands (the row is on main: a target of main
+    /// moves with it). A commit landing meanwhile can only make a later check fail, never pass one.
+    fn put_bound(&self, p: &mut Json, expect: Option<u64>) -> Result<()> {
+        let id = p["id"].as_str().unwrap_or_default().to_string();
+        let target = p["target"].as_str().unwrap_or(MAIN).to_string();
+        let br = self.branch(&target).map_err(|_| superseded(&id, &target))?;
+        let own = u64::from(target == MAIN);
+        let _nobody = disk::acting_as("");
+        self.batch_with(MAIN, |_| {
+            let now = br.version.load(Ordering::Relaxed);
+            if expect.is_some_and(|e| e != now) {
+                return Err(superseded(&id, &target));
+            }
+            p["strict"]["version"] = json!(now + own);
+            Ok((vec![(format!("{PROPOSALS}/{id}"), Some(p.to_string()))], ()))
+        })?;
+        Ok(())
+    }
+
+    /// Ends strict proposal `p` (as it was before this step) as `status` (`expired`, `superseded`) by `rule`, freeing
+    /// its world, and gives back `e`, the refusal that says so.
+    fn end_strict(&self, mut p: Json, status: &str, rule: &str, e: Error) -> Error {
+        p["status"] = json!(status);
+        p["ended"] = json!({ "at": disk::now_ms(), "rule": rule });
+        let _ = self.put_proposal(&p);
+        self.unfreeze(&p);
+        e
     }
 
     /// Withdraws proposal `id`: the proposing agent, an admin agent, or a person. Its world is the agent's to change
@@ -518,9 +594,28 @@ impl Core {
                 )));
             }
         }
+        // strict (rules E7 and E8): a person approves it, within its window, while its target is as it was
+        let strict = p["strict"].is_object() && approve;
+        if strict {
+            let channels = texts(&p["strict"]["channels"]).join(", ");
+            if !actor.is_empty() {
+                return Err(refused(format!(
+                    "proposal '{id}' is strict (it queues effects on {channels}): only a person approves it, not agent \
+                     {actor}"
+                )));
+            }
+            if disk::now_ms() > p["strict"]["until"].as_u64().unwrap_or(0) {
+                let e = state(format!(
+                    "proposal '{id}' expired: a strict proposal (effects on {channels}) is approved within its \
+                     policy's strict_window of being proposed; propose again"
+                ));
+                return Err(self.end_strict(p, "expired", "strict_window", e));
+            }
+        }
         if approve {
             self.still_certified(&p, "approving")?;
         }
+        let before = p.clone();
         let person = actor.is_empty();
         let decision = json!({
             "by": if person { "person".to_string() } else { actor },
@@ -549,7 +644,14 @@ impl Core {
                 }
             }
         }
-        self.put_proposal(&p)?;
+        if strict {
+            let expect = p["strict"]["version"].as_u64();
+            if let Err(e) = self.put_bound(&mut p, expect) {
+                return Err(self.end_strict(before, "superseded", STRICT_TARGET, e));
+            }
+        } else {
+            self.put_proposal(&p)?;
+        }
         if !approve {
             self.unfreeze(&p);
         }
@@ -579,6 +681,15 @@ impl Core {
             return Err(refused(format!("agent {actor} didn't propose '{id}', so it can't merge it")));
         }
         let world = self.still_certified(&p, "merging")?;
+        // strict (rule E7): its target as it was when it was approved; checked again under the merge's locks
+        let strict_version = p["strict"]["version"].as_u64().filter(|_| p["strict"].is_object());
+        let before = p.clone();
+        if let Some(v) = strict_version {
+            let target = p["target"].as_str().unwrap_or(MAIN).to_string();
+            if self.branch(&target).ok().map(|b| b.version.load(Ordering::Relaxed)) != Some(v) {
+                return Err(self.end_strict(before, "superseded", STRICT_TARGET, superseded(id, &target)));
+            }
+        }
         let cert = p["certificate"].as_str().unwrap_or_default().to_string();
         let covering: Vec<&Json> = p["approvals"]
             .as_array()
@@ -609,7 +720,13 @@ impl Core {
         let row = (format!("{PROPOSALS}/{id}"), p.clone());
         let (n, carried) = {
             let _as = disk::acting_as(&merge_as);
-            APPROVED.set(Some(Approved { world: world.name.clone(), digest, person, merged: Some(row) }));
+            APPROVED.set(Some(Approved {
+                world: world.name.clone(),
+                digest,
+                person,
+                merged: Some(row),
+                strict_version,
+            }));
             CARRIED.set(false);
             let _carrying = Carrying;
             // an agent's proposal: its rights as they are now, not as they were when it proposed: revoked, disabled,
@@ -623,7 +740,15 @@ impl Core {
                     None => acting.may_merge(&world.name)?,
                 }
             }
-            let n = self.merge_with(&world.name, &o)?;
+            let n = match self.merge_with(&world.name, &o) {
+                Err(Error::Constraint { code: "40001", message })
+                    if strict_version.is_some() && message.contains(STRICT_TARGET) =>
+                {
+                    let e = Error::Constraint { code: "40001", message };
+                    return Err(self.end_strict(before, "superseded", STRICT_TARGET, e));
+                }
+                r => r?,
+            };
             (n, CARRIED.get())
         };
         if !carried {
