@@ -437,7 +437,7 @@ impl Core {
         let tables = att.tables();
         for again in [false, true] {
             let w = format!("undo-{}{}", crate::disk::now_ms(), if again { "-again" } else { "" });
-            self.fork(MAIN, &w)?;
+            self.fork_system(&w)?;
             let done = self.undo_in(&db, &w, &tables, &recs, skip_changed, dry_run);
             let mut out = match done {
                 Ok(out) if out.undone == 0 => {

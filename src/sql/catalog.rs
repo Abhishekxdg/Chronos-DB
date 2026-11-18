@@ -1144,7 +1144,8 @@ impl Catalog {
                 }
             }
         }
-        let mut worlds = core.worlds();
+        // pg_database: the worlds SHOW WORLDS lists the acting agent (without `read`, main and its own)
+        let mut worlds = core.visible_worlds();
         worlds.retain(|w| !w.name.starts_with("_tx_"));
         worlds.sort_by(|a, b| (a.created, &a.name).cmp(&(b.created, &b.name)));
         let world_ids = worlds.iter().map(|w| w.id.clone()).collect();

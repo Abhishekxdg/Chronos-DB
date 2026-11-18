@@ -1523,12 +1523,18 @@ impl Shell {
             }
             "verify" => {
                 let v = self.db.verify().map_err(|e| e.to_string())?;
-                Ok(format!(
-                    "ok: {} pages ({:.1} MB) and {} log records read and checked",
+                let found = self.db.constraint_violations().map_err(|e| e.to_string())?;
+                let read = format!(
+                    "{} pages ({:.1} MB) and {} log records read and checked",
                     v.pages,
                     v.bytes as f64 / 1e6,
                     v.log_records
-                ))
+                );
+                if found.is_empty() {
+                    return Ok(format!("ok: {read}"));
+                }
+                let lines: Vec<String> = found.iter().map(|(w, p)| format!("  {w}: {p}")).collect();
+                Ok(format!("{read}; {} rows break a constraint:\n{}", found.len(), lines.join("\n")))
             }
             _ => Err(format!("unknown command '{cmd}'; type help")),
         }

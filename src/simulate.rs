@@ -110,7 +110,7 @@ fn sql_error(e: sql::SqlError) -> Error {
 }
 
 /// World `index`'s seed: $2, and what its random() starts from.
-fn world_seed(seed: i64, index: usize) -> i64 {
+pub(crate) fn world_seed(seed: i64, index: usize) -> i64 {
     sql::mix(seed as u64 ^ sql::mix(index as u64)) as i64
 }
 
@@ -128,7 +128,7 @@ fn rank(a: &SimWorld, b: &SimWorld, ascending: bool) -> Ordering {
 
 /// What a script is refused for: statements that leave the world it runs in.
 /// `replay` checks a recorded script again the same way: it runs whatever its metadata says.
-fn check_sql(spec: &Simulate) -> Result<()> {
+pub(crate) fn check_sql(spec: &Simulate) -> Result<()> {
     // as kept in the `sim` metadata: escaped, so the metadata fits whatever the script holds
     let json = |s: &str| serde_json::to_string(s).map_or(usize::MAX, |t| t.len());
     if json(&spec.script).saturating_add(json(&spec.score)) > SCRIPT_MAX {
@@ -155,7 +155,7 @@ fn check_sql(spec: &Simulate) -> Result<()> {
 }
 
 /// The number a score query gave: its first row's first value.
-fn score_of(out: Vec<sql::Output>) -> sql::Result<f64> {
+pub(crate) fn score_of(out: Vec<sql::Output>) -> sql::Result<f64> {
     let v = out.into_iter().last().and_then(|o| o.rows.into_iter().next()).and_then(|r| r.into_iter().next());
     match v {
         Some(Value::Float(f)) => Ok(f),
@@ -172,14 +172,14 @@ fn score_of(out: Vec<sql::Output>) -> sql::Result<f64> {
 }
 
 /// What a world runs: its script and score query, with its index and seed.
-struct Run<'a> {
-    script: &'a str,
-    score: &'a str,
-    seed: i64,
-    agent: Option<&'a str>,
-    fix: &'a [(String, Option<Val>)], // rows the base changed since the moment, written back first
-    clock: i64,                       // now(), in µs: the base moment
-    fixed: bool,                      // under `crate::fixed_counters` (MCP safe mode)
+pub(crate) struct Run<'a> {
+    pub(crate) script: &'a str,
+    pub(crate) score: &'a str,
+    pub(crate) seed: i64,
+    pub(crate) agent: Option<&'a str>,
+    pub(crate) fix: &'a [(String, Option<Val>)], // rows the base changed since the moment, written back first
+    pub(crate) clock: i64,                       // now(), in µs: the base moment
+    pub(crate) fixed: bool,                      // under `crate::fixed_counters` (MCP safe mode)
 }
 
 impl Db {
@@ -214,6 +214,7 @@ impl Db {
             me.may_read(&spec.base)?;
             if spec.base.contains('@') && self.branch(&spec.base).is_err() {
                 // worlds as the base was: a restore, once merged
+                me.untenanted("simulate from a past moment")?;
                 me.need(crate::Can::Restore, "simulate from a past moment")?;
             }
         }
@@ -277,10 +278,7 @@ impl Db {
             for from in (0..n).step_by(batch) {
                 let to = (from + batch).min(n);
                 let t = Instant::now();
-                let meta = match &me {
-                    Some(me) => me.forks(to - from)?,
-                    None => Default::default(),
-                };
+                let meta = self.made_meta(me.as_ref(), &base, to - from)?;
                 let infos =
                     (from..to).map(|i| (names[i].clone(), Info { meta: meta.clone(), ..Info::new() })).collect();
                 let forked = self.fork_all(&base, infos)?;
@@ -345,8 +343,28 @@ impl Db {
         Ok(Simulated { worlds: out, base, at, fork_ms, run_ms, discard_ms, total_ms: ms(start) })
     }
 
+    /// The metadata of `n` worlds a simulation or a replay makes from `base`: made as a fork makes a world (its
+    /// tenant, its scope, its policy's read checks, its owner: see `Acting::fork_meta`), by agent `me` or a person.
+    fn made_meta(
+        &self,
+        me: Option<&crate::Acting>,
+        base: &str,
+        n: usize,
+    ) -> Result<serde_json::Map<String, serde_json::Value>> {
+        match me {
+            Some(me) => me.fork_meta(base, serde_json::Value::Null, me.forks(n)?),
+            None => {
+                let mut meta = serde_json::Map::new();
+                let parent = self.inherit(base, &mut meta, None)?;
+                crate::scope::from_meta(self, base, &mut meta)?;
+                crate::tenancy::mark(&parent, &mut meta);
+                Ok(meta)
+            }
+        }
+    }
+
     /// The base to fork (a live world's name), its ID, its version to simulate from, and when.
-    fn base_of(&self, base: &str) -> Result<(String, String, State, u64)> {
+    pub(crate) fn base_of(&self, base: &str) -> Result<(String, String, State, u64)> {
         if let Some((name, when)) = base.split_once('@')
             && self.branch(base).is_err()
         {
@@ -366,7 +384,7 @@ impl Db {
     }
 
     /// Runs one world's script and score: its score, or why it failed.
-    fn run_world(
+    pub(crate) fn run_world(
         &self,
         name: &str,
         index: usize,
@@ -406,6 +424,10 @@ impl Db {
     pub fn replay(&self, world: &str, name: Option<&str>, agent: Option<&str>) -> Result<Replayed> {
         let _t = self.metrics.time(metrics::Op::Simulate);
         let w = self.world(world)?;
+        let me = agent.map(|a| self.as_agent(a)).transpose()?;
+        if let Some(me) = &me {
+            me.may_read(&w.name)?; // before anything of it is said (rule T4: a world of another tenant is refused)
+        }
         let sim = w.meta.get("sim").filter(|s| s.is_object()).cloned();
         let sim =
             sim.ok_or_else(|| bad(format!("world {} wasn't made by SIMULATE: its metadata has no sim", w.name)))?;
@@ -418,10 +440,6 @@ impl Db {
         };
         // checked as a new simulation's script is: it runs as SIMULATE would run it
         check_sql(&Simulate::new(&base, 1, &w.name, &script, &score))?;
-        let me = agent.map(|a| self.as_agent(a)).transpose()?;
-        if let Some(me) = &me {
-            me.may_read(&w.name)?;
-        }
         let past = self.view_at(&base_id, at).map_err(|e| {
             bad(format!(
                 "{} can't be replayed: its base {base} as it was at {} can't be read ({e})",
@@ -437,6 +455,7 @@ impl Db {
             // the base as it was, not as it is: a restore, once merged, as simulate() checks
             let now = self.view(&from.name)?.s;
             if !now.same(&past.s) && !self.undo(&now, &past.s)?.is_empty() {
+                me.untenanted("replay a world from a past moment")?;
                 me.need(crate::Can::Restore, "replay a world from a past moment")?;
             }
         }
@@ -447,10 +466,7 @@ impl Db {
             }
             None => format!("_replay_{}", &crate::new_world_id()[1..]),
         };
-        let meta = match &me {
-            Some(me) => me.forks(1)?,
-            None => Default::default(),
-        };
+        let meta = self.made_meta(me.as_ref(), &from.name, 1)?;
         let forked = self.fork_all(&from.name, vec![(target.clone(), Info { meta, ..Info::new() })])?;
         let fix = if forked.same(&past.s) { vec![] } else { self.undo(&forked, &past.s)? };
         let seed = world_seed(seed, index as usize);

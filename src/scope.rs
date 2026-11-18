@@ -44,14 +44,83 @@ pub(crate) fn declared(meta: &Map<String, Json>) -> bool {
 
 /// Takes the scope keys out of `meta` (a new world's) and puts the scope they declare, resolved
 /// against world `from`'s tables, under `SCOPE`.
+/// A world forked from a scoped world keeps its parent's scope (decision D2): what it declares may narrow it (fewer
+/// tables or columns, lower limits, more row rules), never widen it.
 pub(crate) fn from_meta(core: &Core, from: &str, meta: &mut Map<String, Json>) -> Result<()> {
-    if !declared(meta) {
+    let parent = match from.split_once('@') {
+        Some(_) => None,
+        None => core.world(from).ok().and_then(|w| w.scope).and_then(|s| s.as_object().cloned()),
+    };
+    if !declared(meta) && parent.is_none() {
         return Ok(());
     }
-    let given: Map<String, Json> = KEYS.iter().filter_map(|k| Some((k.to_string(), meta.remove(*k)?))).collect();
-    let scope = resolve(&core.view(from)?, &Map::new(), given, from)?;
+    let mut given: Map<String, Json> = KEYS.iter().filter_map(|k| Some((k.to_string(), meta.remove(*k)?))).collect();
+    let view = core.view(from)?;
+    if let Some(p) = &parent {
+        narrower(&view, p, &mut given, from)?;
+    }
+    let scope = resolve(&view, &parent.unwrap_or_default(), given, from)?;
     if !scope.is_null() {
         meta.insert(SCOPE.into(), scope);
+    }
+    Ok(())
+}
+
+fn widened(from: &str, what: String) -> Error {
+    Error::Constraint {
+        code: "42501",
+        message: format!(
+            "world {from} has a declared scope: a world forked from it keeps it, and may narrow it, not widen it ({what})"
+        ),
+    }
+}
+
+/// Refuses a child's declared scope keys `given` that would widen parent scope `p` (of world `from`); row rules are
+/// added to the parent's.
+fn narrower(v: &View, p: &Map<String, Json>, given: &mut Map<String, Json>, from: &str) -> Result<()> {
+    if let Some(val) = given.get("may_change")
+        && let Some(Json::Array(theirs)) = p.get("may_change")
+    {
+        if val.is_null() {
+            return Err(widened(from, "may_change can't be removed".into()));
+        }
+        for item in may_change(v, val, from)? {
+            let covered = theirs.iter().any(|t| {
+                t["table"] == item["table"]
+                    && (t.get("column").is_none_or(Json::is_null) || t.get("column") == item.get("column"))
+            });
+            if !covered {
+                let name = match item["column"].as_str() {
+                    Some(c) => format!("{}.{c}", item["table"].as_str().unwrap_or_default()),
+                    None => item["table"].as_str().unwrap_or_default().to_string(),
+                };
+                return Err(widened(from, format!("may_change {name} is not within the parent's")));
+            }
+        }
+    }
+    for k in ["max_rows", "max_deletes"] {
+        if let (Some(val), Some(theirs)) = (given.get(k), p.get(k).and_then(Json::as_u64)) {
+            match count(val) {
+                None if val.is_null() => return Err(widened(from, format!("{k} can't be removed"))),
+                Some(n) if n > theirs => {
+                    return Err(widened(from, format!("{k} = {n} is more than the parent's {theirs}")));
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(val) = given.get("row_rules").cloned()
+        && let Some(Json::Array(theirs)) = p.get("row_rules")
+    {
+        if val.is_null() {
+            return Err(widened(from, "row_rules can't be removed".into()));
+        }
+        let mine = crate::agents::parse_row_rules(&val)?;
+        let mut all: Vec<Json> = theirs.clone();
+        all.extend(mine.iter().map(|(t, c)| json!([t, c])));
+        // stored as resolved rules: kept as they are by `resolve` below
+        given.remove("row_rules");
+        given.insert("_row_rules_resolved".into(), Json::Array(all));
     }
     Ok(())
 }
@@ -74,6 +143,9 @@ pub(crate) fn resolve(v: &View, old: &Map<String, Json>, patch: Map<String, Json
             ("max_rows" | "max_deletes", val) => {
                 let n = count(&val).ok_or_else(|| bad(format!("{k} must be a whole number of rows, 0 or more")))?;
                 s.insert(k, json!(n));
+            }
+            ("_row_rules_resolved", val) => {
+                s.insert("row_rules".into(), val);
             }
             ("row_rules", val) => {
                 let rules = crate::agents::parse_row_rules(&val)?;

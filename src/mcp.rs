@@ -110,7 +110,7 @@ impl Guard {
                 let may = |c: chronos::Can| a.as_ref().is_some_and(|a| a.may(c));
                 let mut h = vec![];
                 if !self.may_merge(db) {
-                    h.push("merge");
+                    h.extend(["merge", "propose"]);
                 }
                 if !may(chronos::Can::Restore) {
                     h.extend(["restore", "rollback"]);
@@ -149,14 +149,17 @@ impl Guard {
             "simulate" | "replay" => Ok(()), // checked as they run; the worlds are its own
             // a diff against another world shows that world's rows too: both are checked, as POST /v1/diff and
             // SQL's DIFF do
-            "diff" => me.may_see_changes(branch).and_then(|()| {
-                match a.get("to").and_then(Value::as_str).filter(|t| !t.is_empty()) {
-                    Some(to) => me.may_see_changes(to),
-                    None => Ok(()),
-                }
-            }),
+            "diff" => match a.get("to").and_then(Value::as_str).filter(|t| !t.is_empty()) {
+                Some(to) => me.may_see_between(branch, to),
+                None => me.may_see_changes(branch),
+            },
             // (check_merge_policy judges the world's real changes: which tables it changed shows in the answer)
-            "merge_preview" | "history" | "check_reads" | "review" | "check_merge_policy" => me.may_see_changes(branch),
+            "merge_preview" | "history" | "check_reads" | "review" | "check_merge_policy" | "explain_merge" => {
+                me.may_see_changes(branch)
+            }
+            // run as SQL acting as the agent: checked there too (PROPOSE MERGE as a merge, evidence as a change)
+            "propose" => me.may_merge(branch),
+            "attach_evidence" => me.may_write(branch, 0),
             "reviews" | "audit" => me.may_list_all(name),
             _ => me.may_read(branch),
         };
@@ -183,7 +186,8 @@ impl Guard {
             ));
         }
         let writes = match name {
-            "put" | "delete" | "set_meta" | "discard" | "checkpoint" | "rollback" | "rebase" => true,
+            "put" | "delete" | "set_meta" | "discard" | "checkpoint" | "rollback" | "rebase" | "propose"
+            | "attach_evidence" => true,
             "sql" => match chronos::sql::parse(a["sql"].as_str().unwrap_or("")) {
                 // a statement that doesn't parse never runs: the engine reports it
                 Err(_) => false,
@@ -674,6 +678,27 @@ fn call(sh: &mut Shell, g: &mut Guard, name: &str, a: &Value) -> Result<String, 
             } + " (rows both sides changed are merge_preview's: a merge that doesn't settle them fails anyway)")
         }
         "reviews" => sh.sql_as("show reviews", &[], g.agent.as_deref()),
+        // certified merges (see `chronos::proposals`): evidence, a proposal, and what a merge would do. Approving is
+        // a person's (or the policy's reviewer's, in SQL): no tool
+        "attach_evidence" => {
+            let world = format!("\"{}\"", word("branch")?.replace('"', "\"\""));
+            let mut settings = vec![format!("kind = {}", lit(word("kind")?))];
+            for k in ["uri", "sha256", "note"] {
+                if let Some(v) = opt(k) {
+                    settings.push(format!("{k} = {}", lit(v)));
+                }
+            }
+            sh.sql_as(&format!("attach evidence to world {world} ({})", settings.join(", ")), &[], g.agent.as_deref())
+        }
+        "propose" => {
+            let world = format!("\"{}\"", word("branch")?.replace('"', "\"\""));
+            let into = opt("into").map_or(String::new(), |i| format!(" into \"{}\"", i.replace('"', "\"\"")));
+            sh.sql_as(&format!("propose merge world {world}{into}"), &[], g.agent.as_deref())
+        }
+        "explain_merge" => {
+            let world = format!("\"{}\"", word("branch")?.replace('"', "\"\""));
+            sh.sql_as(&format!("explain merge world {world}"), &[], g.agent.as_deref())
+        }
         "review" => {
             let verdict = match word("verdict")? {
                 v @ ("approve" | "reject" | "pass") => v,
@@ -765,7 +790,7 @@ fn policy_sql(db: &chronos::Db, tool: &str, name: &str, a: &Value) -> Result<Str
     for (k, v) in &rules {
         if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(format!(
-                "'{k}' isn't a rule (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, rerun_reads, require_scope, row_rules, all_rows_per_hour, all_deletes_per_hour, all_effects_per_hour, spot_check, max_nulled, untrusted_columns, trusted_columns, untrusted_guards, review_every, person_only, watch_totals, max_shift, canary, canary_wait, effects_delay, max_unusual)"
+                "'{k}' isn't a rule (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, schema, overwrite, critical, check_reads, rerun_reads, require_scope, row_rules, all_rows_per_hour, all_deletes_per_hour, all_effects_per_hour, spot_check, max_nulled, untrusted_columns, trusted_columns, untrusted_guards, review_every, person_only, watch_totals, max_shift, canary, canary_wait, effects_delay, max_unusual, arbitrate, require_evidence)"
             ));
         }
         let v = match v {
@@ -949,7 +974,7 @@ fn page(text: String, head: usize, tail: usize, offset: usize, limit: usize) -> 
         return format!("{}\n(no changes past offset {offset}; there are {})", lines[..head].join("\n"), rows.len());
     }
     let from = offset;
-    let to = (from + limit).min(rows.len());
+    let to = from.saturating_add(limit).min(rows.len()); // an agent's limit may be any u64
     let mut out: Vec<&str> = lines[..head].to_vec();
     out.extend(&rows[from..to]);
     out.extend(&lines[lines.len() - tail..]);
@@ -1323,6 +1348,38 @@ fn tools(hidden: &[&str]) -> Value {
             }),
             &["branch", "verdict", "reason"],
         ),
+        tool(
+            "attach_evidence",
+            "Attach evidence to a branch before proposing its merge: what the change rests on (a ticket, an order \
+             snapshot), by kind, with a URI, the content's sha256 and a note. Kept with the branch and fixed once its \
+             merge is proposed; merge policies may require kinds (require_evidence). Store hashes and links, not \
+             the content.",
+            json!({
+                "branch": { "type": "string" },
+                "kind": { "type": "string", "description": "e.g. ticket, order_snapshot" },
+                "uri": { "type": "string" },
+                "sha256": { "type": "string", "description": "The evidence's content hash, in hex" },
+                "note": { "type": "string" }
+            }),
+            &["branch", "kind"],
+        ),
+        tool(
+            "propose",
+            "Propose a branch's merge for approval: answers the proposal's id, its certificate (a hash of every row \
+             it would merge, its evidence and the policy that judges it) and what the merge policy would say. The \
+             branch is then fixed until the proposal is merged, rejected or withdrawn. A person (or the policy's \
+             reviewer) approves it; tell them the id.",
+            json!({ "branch": { "type": "string" }, "into": { "type": "string" } }),
+            &["branch"],
+        ),
+        tool(
+            "explain_merge",
+            "Everything a branch's merge would do and why, before proposing it: rows per table, conflicts, the merge \
+             policy's verdict and reasons, what reads the columns it changes, the effects it would queue, its \
+             evidence, and the certificate a proposal would carry.",
+            json!({ "branch": { "type": "string" } }),
+            &["branch"],
+        ),
     ]);
     let Value::Array(all) = all else { unreachable!() };
     all.into_iter().filter(|t| !hidden.contains(&t["name"].as_str().unwrap_or(""))).collect()
@@ -1330,6 +1387,13 @@ fn tools(hidden: &[&str]) -> Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_page_past_any_end_is_the_rest() {
+        let text = "head\na\nb\nc\ntail".to_string();
+        // a limit near u64::MAX once wrapped `offset + limit` and panicked on the slice
+        assert!(page(text, 1, 1, 1, usize::MAX).contains("c"));
+    }
     use super::page;
 
     #[test]

@@ -158,3 +158,35 @@ fn sql_diff_summary_counts_the_diff() {
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Rows that merge are rows a diff and a dry run show: a GRANT made in a world (an ACL row of the database's own)
+/// merges with it, so both list it.
+#[test]
+fn grant_rows_shown_in_diff_and_dry_run() {
+    let db = Db::new();
+    run(&db, MAIN, "create table t (id int primary key)");
+    run(&db, MAIN, "create role bob");
+    db.fork(MAIN, "w").unwrap();
+    run(&db, "w", "grant select on t to bob");
+    let diff = db.diff("w").unwrap();
+    assert!(diff.iter().any(|c| c.key.starts_with("_sonos_acl/")), "{diff:?}");
+    check(&db, "w", None);
+    let shown = |q: &str| -> Vec<String> {
+        let o = Session::new(MAIN).run(&db, q, &[]).unwrap().pop().unwrap();
+        o.rows
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|v| if *v == Value::Null { "null".into() } else { v.to_text() })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect()
+    };
+    let plan = shown("merge world w dry run");
+    assert!(plan.iter().any(|r| r.contains("_sonos_acl")), "{plan:?}");
+    let rows = shown("diff world w");
+    assert!(rows.iter().any(|r| r.contains("|grant|")), "{rows:?}");
+    let sql = shown("diff world w as sql");
+    assert!(sql.iter().any(|r| r.starts_with("-- _sonos_acl/")), "{sql:?}");
+}

@@ -336,3 +336,131 @@ fn ten_thousand_worlds() {
         r.total_ms, r.fork_ms, r.run_ms, r.discard_ms
     );
 }
+
+// --- Gate S (CHRONOS-PLAN-2026-11-17-r3.md): simulations make worlds through the same choke point
+// as forks. Added failing in batch S0. ---
+
+fn tenant_db(policy: &str) -> Db {
+    tenant_db_at(Db::new(), policy)
+}
+
+fn tenant_db_at(db: Db, policy: &str) -> Db {
+    sql::run(
+        &db,
+        MAIN,
+        &format!(
+            "create table leads (id int primary key, org_id int not null, name text);
+             insert into leads values (1, 42, 'acme'), (3, 7, 'globex');
+             {policy}
+             create agent run42 with (can = 'read,fork,write_own,merge_own', tenant = 'org_id = 42'{})",
+            if policy.is_empty() { "" } else { ", policy = 'p'" }
+        ),
+        &[],
+    )
+    .unwrap();
+    db
+}
+
+fn spec_as(agent: &str, prefix: &str, script: &str) -> Simulate {
+    let mut s = Simulate::new(MAIN, 1, prefix, script, "select 1");
+    s.keep = Some(1);
+    s.agent = Some(agent.into());
+    s
+}
+
+/// A kept world carries what a fork by the same agent would: its owner, its tenant, and the read
+/// checks its merge policy asks for.
+#[test]
+fn kept_world_has_tenant_scope_and_read_flags() {
+    // on disk: a replay forks its base as it was, which needs history
+    let dir = std::env::temp_dir().join(format!("chronos-simulate-kept-scope-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = tenant_db_at(Db::open(&dir).unwrap(), "create merge policy p with (check_reads = true);");
+    db.as_agent("run42").unwrap().fork(MAIN, "forked", serde_json::Value::Null).unwrap();
+    let r = db.simulate(&spec_as("run42", "k", "select 1")).unwrap();
+    assert!(r.worlds[0].kept);
+    let (forked, kept) = (db.world("forked").unwrap(), db.world("k_0").unwrap());
+    assert_eq!(kept.owner.as_deref(), Some("run42"));
+    let scope = kept.scope.clone().unwrap_or_default();
+    assert_eq!(scope["tenant"]["column"], "org_id", "{scope}");
+    assert_eq!(scope["tenant"]["value"], 42, "{scope}");
+    for key in ["_sonos_check_reads", "_sonos_rerun_reads", "_sonos_watch_reads"] {
+        assert_eq!(kept.meta.get(key), forked.meta.get(key), "{key}: kept {} forked {}", kept.meta, forked.meta);
+    }
+    // and replay keeps the same
+    let rp = db.replay("k_0", Some("again"), Some("run42")).unwrap();
+    assert_eq!(rp.replay.as_deref(), Some("again"));
+    let again = db.world("again").unwrap();
+    assert_eq!(again.owner.as_deref(), Some("run42"));
+    assert_eq!(again.scope.unwrap_or_default()["tenant"]["value"], 42);
+    // and both are there once the folder is opened again
+    drop(db);
+    let db = Db::open(&dir).unwrap();
+    for w in ["k_0", "again"] {
+        let w = db.world(w).unwrap_or_else(|e| panic!("{w} after reopening: {e:?}"));
+        assert_eq!(w.scope.unwrap_or_default()["tenant"]["value"], 42, "{}", w.name);
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A policy that requires a declared scope holds for simulations as for forks: a tenant agent's
+/// worlds declare their tenant, so they pass; a plain agent's undeclared simulation is refused.
+#[test]
+fn require_scope_applies() {
+    let db = tenant_db("create merge policy p with (require_scope = true);");
+    sql::run(&db, MAIN, "create agent plain with (can = 'read,fork,write_own,merge_own', policy = 'p')", &[]).unwrap();
+    assert!(db.as_agent("plain").unwrap().fork(MAIN, "f", serde_json::Value::Null).is_err(), "fork refused");
+    let e = db.simulate(&spec_as("plain", "s", "select 1"));
+    assert!(e.is_err(), "simulate refused as fork is");
+    assert!(db.world("s_0").is_err());
+    db.simulate(&spec_as("run42", "t", "select 1")).unwrap();
+    assert!(db.world("t_0").is_ok());
+}
+
+/// Finding D (found while making the S0 fixtures, 2026-11-17, 0.5.5 release binary): a tenant
+/// agent's SIMULATE whose script changes a row overflows a thread's stack and aborts the whole
+/// server (`chronos serve`), for every client. A person's or a plain agent's same simulation runs.
+/// Run in a child process (MCP over stdio), so an abort fails this test, not the test binary.
+#[test]
+fn tenant_simulate_with_a_write_does_not_abort() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let dir = std::env::temp_dir().join(format!("chronos-simulate-finding-d-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    {
+        let db = Db::open(&dir).unwrap();
+        sql::run(
+            &db,
+            MAIN,
+            "create table leads (id int primary key, org_id int not null, name text, owner text);
+             insert into leads values (1, 42, 'acme', 'bo'), (3, 7, 'globex', 'eve');
+             create agent run42 with (can = 'read,fork,write_own,merge_own,write_main', tenant = 'org_id = 42')",
+            &[],
+        )
+        .unwrap();
+    }
+    for script in [
+        "update leads set owner = 'zz' where id = 1",
+        "insert into leads values (5, 42, 'n', 'o')",
+        "delete from leads where id = 1",
+    ] {
+        let call = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"simulate","arguments":{{"worlds":1,"prefix":"d","script":"{script}","score":"select 1","keep":0}}}}}}"#
+        );
+        let mut c = Command::new(env!("CARGO_BIN_EXE_chronos"))
+            .args(["mcp", dir.to_str().unwrap(), "--agent", "run42"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        c.stdin.take().unwrap().write_all(call.as_bytes()).unwrap();
+        let out = c.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success() && !err.contains("overflowed its stack"), "{script}: {:?}\n{err}", out.status);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("\"id\":1"), "{script}: no answer: {text}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

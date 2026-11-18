@@ -14,10 +14,14 @@ mod agents;
 pub mod attach;
 mod backup;
 mod checks;
+mod consolidate;
 pub mod crypt;
 mod disk;
+mod durable;
 mod hnsw;
 mod index;
+mod ledger;
+mod lifecycle;
 pub mod limits;
 pub mod metrics;
 mod migrate;
@@ -27,6 +31,7 @@ mod outbox;
 mod pages;
 pub mod pgclient;
 mod prolly;
+mod proposals;
 mod reads;
 mod remote;
 mod scope;
@@ -37,8 +42,10 @@ pub mod sql;
 mod stale;
 mod sync;
 mod tally;
+mod tenancy;
 mod traced;
 mod wal_ship;
+mod worldsets;
 pub mod writeback;
 
 use disk::Op;
@@ -59,9 +66,11 @@ pub use agents::{
 };
 pub use backup::{Backup, Verified};
 pub use checks::MergeCheck;
+pub use consolidate::{Consolidated, Forecast, test_consolidate_copied, test_consolidate_pause};
 /// Makes this thread act for an agent until the guard is dropped: what it writes is logged as the
 /// agent's (for servers that check rights with `Core::as_agent` and then run the operation).
 pub use disk::{ActingAs, SyncCommit, acting_as};
+pub use durable::WorldState;
 pub use outbox::Effect;
 pub use reads::Read;
 pub use wal_ship::Shipping;
@@ -98,9 +107,16 @@ pub(crate) fn counters_fixed() -> bool {
     FIXED.get()
 }
 pub use index::{Hit, Query};
+pub use lifecycle::{EPOCH, RIGHTS};
 pub use metrics::{Metrics, Timing};
 pub use migrate::Migration;
 pub use simulate::{Replayed, SimWorld, Simulate, Simulated};
+pub use tenancy::{AssignTo, Identity};
+/// A tenant as `{"column": c, "value": v}`, from text `'col = v'` or `{"col": v}` (see `scope::tenant`).
+pub fn scope_tenant(v: &serde_json::Value) -> Result<serde_json::Value> {
+    scope::tenant(v)
+}
+pub use worldsets::{Compared, Differs, ForkSet, Metric, Objective, Optimize, Prune, RankedWorld, SetMember, SetStmt};
 
 pub type Val = Arc<str>;
 
@@ -114,7 +130,7 @@ pub fn reserved_table(table: &str) -> bool {
 /// aren't shown, except tables' schemas and functions, which SQL's DIFF turns into CREATE and
 /// ALTER TABLE and CREATE FUNCTION.
 fn shown(key: &str) -> bool {
-    !reserved_table(key) || key.starts_with("_sonos_tables/") || sql::schema_object(key)
+    !reserved_table(key) || key.starts_with("_sonos_tables/") || sql::schema_object(key) || sql::merged_object(key)
 }
 
 /// How `Db::open_with` opens a folder.
@@ -267,6 +283,11 @@ struct Branch {
     /// not what its earlier statements were checked against, so its commit checks its rows on the world it goes into
     /// even when that is still its fork point (see `merge_locked`)
     rebased: AtomicBool,
+    /// held by a CONSOLIDATE of its parent that merged it (how many): no write, fork or merge of it or into it until
+    /// that's done (see `consolidate::Hold`)
+    held: std::sync::atomic::AtomicU32,
+    /// when it expires and its budget, kept from its metadata for every write to check (see `lifecycle`)
+    life: lifecycle::Life,
 }
 
 /// A world's read set, shared by the views of it that record into it (see `stale`).
@@ -306,7 +327,7 @@ fn main_info() -> Info {
     Info { id: MAIN.into(), created: 0, meta: Default::default() }
 }
 
-const META_MAX: usize = 64 << 10;
+pub(crate) const META_MAX: usize = 64 << 10;
 /// A simulated world's metadata key: what made it (see `simulate`).
 pub(crate) const SIM: &str = "sim";
 
@@ -343,6 +364,9 @@ fn world_of(name: &str, e: &Entry) -> World {
             agents::PINNED => pinned = v.as_bool() == Some(true),
             // whom it is written back to Postgres as: an end user's claims, maybe, shown to no one
             agents::ACT_AS => {}
+            // its tenant identity, shown as SHOW WORLDS' tenant_status (see `tenancy`)
+            tenancy::GLOBAL | tenancy::ASSIGNED => {}
+            durable::PINS => {} // tree roots: the labels are in `checkpoints`
             scope::SCOPE => declared = Some(v.clone()),
             agents::CHECKPOINTS => {
                 checkpoints =
@@ -389,7 +413,7 @@ pub struct World {
     pub parent: Option<String>,
     pub depth: usize,                    // forks between it and main
     pub created: u64,                    // ms since 1970
-    pub version: u64,                    // writes since its fork
+    pub version: u64,                    // writes since its fork, and merges into it that changed it
     pub flagged: bool,                   // open during a crash: its merge must confirm a version
     pub meta: serde_json::Value,         // a JSON object
     pub owner: Option<String>,           // the agent that forked it (see `agents`)
@@ -404,6 +428,7 @@ pub struct World {
 impl Branch {
     fn new(born: u64, base: State, data: State, info: Info) -> Arc<Self> {
         let synced = base.clone();
+        let life = lifecycle::Life::of(&info.meta);
         Arc::new(Branch {
             born,
             base: RwLock::new(base),
@@ -425,6 +450,8 @@ impl Branch {
             synced: Mutex::new(synced),
             synced_rows: AtomicU64::new(0),
             rebased: AtomicBool::new(false),
+            held: std::sync::atomic::AtomicU32::new(0),
+            life,
         })
     }
 
@@ -594,7 +621,7 @@ pub struct Core {
     /// bumped, and waiters woken, whenever intents are let go (std's, not shuttle's: nothing in the simulations waits)
     intent_wake: (std::sync::Mutex<u64>, std::sync::Condvar),
     metrics: Metrics,
-    settings: Mutex<[u64; 5]>, // by `Setting`: loaded from the folder after replay, so replay never applies them
+    settings: Mutex<[u64; 8]>, // by `Setting`: loaded from the folder after replay, so replay never applies them
     replay_clock: AtomicU64,   // while replaying the log: the time it has reached (0 otherwise)
     running: Mutex<HashMap<String, u64>>, // agents' statements in flight (see `slot`)
     dropped: (AtomicU64, AtomicU64), // worlds discarded since the last cleanup, and the rows they changed
@@ -616,6 +643,8 @@ pub struct Core {
     reads: Mutex<reads::Log>,
     /// where effects that landed in main came from, and those discarded with their worlds (see `outbox::Ledger`)
     ledger: Mutex<outbox::Ledger>,
+    /// the merge ledger's last row in main, as last written or read: (sequence, hash) (see `ledger`)
+    ledger_head: Mutex<Option<(u64, String)>>,
     tallies: Mutex<tally::Tallies>, // agents' merges into main in the last hour (see `tally`)
     /// the folder is attached to a Postgres database (see `attach`): its main changes only by merges written there
     attached: Option<Arc<attach::Attached>>,
@@ -657,15 +686,25 @@ pub enum Setting {
     /// 1: an effect discarded with its world keeps its payload in the outbox ledger; 0: only its SHA-256 (a payload
     /// can hold personal data). See `outbox::Discarded`.
     OutboxKeepPayloads = 4,
+    /// How deep worlds may nest: forks between a world and main, at most (0: no limit). See `lifecycle`.
+    MaxDepth = 5,
+    /// Live forks one world may have at once, besides transactions' own; main's are `MaxWorlds`' (0: no limit).
+    MaxChildren = 6,
+    /// What a new agent may read when its rights aren't given: 0, its own worlds and main (`read_own,read_main`, the
+    /// default since the security release); 1, any world (`read`, as before).
+    AgentDefaultRead = 7,
 }
 
 impl Setting {
-    pub const ALL: [Setting; 5] = [
+    pub const ALL: [Setting; 8] = [
         Setting::StatementTimeout,
         Setting::MaxWorlds,
         Setting::WorldIdleTtl,
         Setting::ProtectMain,
         Setting::OutboxKeepPayloads,
+        Setting::MaxDepth,
+        Setting::MaxChildren,
+        Setting::AgentDefaultRead,
     ];
 
     pub fn name(self) -> &'static str {
@@ -675,6 +714,9 @@ impl Setting {
             Setting::WorldIdleTtl => "world_idle_ttl",
             Setting::ProtectMain => "protect_main",
             Setting::OutboxKeepPayloads => "outbox_keep_payloads",
+            Setting::MaxDepth => "max_depth",
+            Setting::MaxChildren => "max_children",
+            Setting::AgentDefaultRead => "agent_default_read",
         }
     }
 
@@ -782,6 +824,9 @@ pub struct MergeOptions {
     /// the rows the merge deletes, as the person merging read them: asked for when the world's merge policy has
     /// `confirm_deletes_over` and the merge deletes more (see `ConfirmDeletes`); a wrong count is refused
     pub confirm_deletes: Option<u64>,
+    /// the caller's id for this merge into main (see `ledger`): the same id and request again returns what the
+    /// first did and merges nothing; the same id with another request is refused
+    pub operation: Option<String>,
 }
 
 /// What a merge would do, row by row (see `Core::merge_preview`).
@@ -893,6 +938,10 @@ pub struct MergePlan {
     pub live: Option<LiveCheck>,
     /// a person merging it must give the count of rows it deletes (`MergeOptions::confirm_deletes`)
     pub confirm_deletes: Option<ConfirmDeletes>,
+    /// the merge policy that judged it (the acting agent's), if any
+    pub policy: Option<String>,
+    /// why the merge would wait for a review or be refused: its policy's broken rules, merge checks, changed reads
+    pub reasons: Vec<String>,
 }
 
 /// A merge that deletes more rows than its world's merge policy lets a person approve without giving the count
@@ -1345,7 +1394,7 @@ impl Core {
             intents: Mutex::new(Intents::default()),
             intent_wake: (std::sync::Mutex::new(0), std::sync::Condvar::new()),
             metrics: Metrics::default(),
-            settings: Mutex::new([0; 5]),
+            settings: Mutex::new([0; 8]),
             replay_clock: AtomicU64::new(0),
             running: Mutex::new(HashMap::new()),
             dropped: (AtomicU64::new(0), AtomicU64::new(0)),
@@ -1357,6 +1406,7 @@ impl Core {
             merging: Mutex::new(HashMap::new()),
             reads: Mutex::new(reads::Log::new()),
             ledger: Mutex::new(outbox::Ledger::default()),
+            ledger_head: Mutex::new(None),
             tallies: Default::default(),
             attached: None,
             folder: Folder::default(),
@@ -1364,6 +1414,15 @@ impl Core {
             secaudit: secaudit::Log::default(),
             mem_limit: AtomicU64::new(0),
         }
+    }
+
+    /// Whether this core is replaying the log: recovering at open, or rebuilding the past in a scratch core (time
+    /// travel, undo, `REPLAY`). The one switch for "this already happened": what is replayed was authorized, judged
+    /// and checked when it was committed, so nothing that can refuse or hold (rights, scope, policy, merge checks,
+    /// stale reads, delete confirmations, reviews) runs again, and replay acts as nobody (`Core::replay`). A core
+    /// replaying has no `Db` yet (`me`): one gets it only once its open succeeded, and a scratch core never does.
+    pub(crate) fn replaying(&self) -> bool {
+        self.me.get().is_none()
     }
 
     /// The `Db` this is the core of, to run SQL with; None while replaying the log (see `me`).
@@ -1499,6 +1558,18 @@ impl Core {
         // after replay: the log holds what was accepted then, whatever the limits are now
         *db.reads.get_mut().unwrap() = reads::load(dir, crypt.as_deref());
         stale::load(&mut db, dir, crypt.as_deref(), clean)?; // what worlds read, if it closed cleanly
+        // (only in a folder whose manifest is format 8: an older Chronos can't read `Op::ReadSet`; the first read set a
+        // durable world logs writes that manifest first, its checkpoint logging every durable world's: see
+        // `persist_reads`)
+        if let Some(log) = db.log.as_ref().filter(|l| l.applied_ok.load(Ordering::Relaxed)) {
+            // durable worlds' read sets in this segment too: the ones they came from go at the next checkpoint
+            let m = db.branches.read().unwrap();
+            let pos = db.relog_reads(&mut log.lock(), m.iter().map(|(n, e)| (n, &e.br)));
+            drop(m);
+            if pos > 0 {
+                log.sync(pos);
+            }
+        }
         *db.tallies.get_mut().unwrap() = tally::load(dir, crypt.as_deref());
         db.migrate_tallies(); // (counts saved under a tenant agent's name, before they were its tenant's)
         *db.ledger.get_mut().unwrap() = outbox::load_ledger(dir, crypt.as_deref());
@@ -1541,7 +1612,13 @@ impl Core {
         if !clean {
             // Crashed: any branch may have lost writes that were never synced. Say so on merge
             // instead of merging less than the agent wrote. Logged, so it survives restarts.
-            let names: Vec<String> = db.branches().into_iter().map(|(n, _)| n).filter(|n| n != MAIN).collect();
+            // A durable world's acknowledged writes all waited for the disk: none was lost
+            let names: Vec<String> = db
+                .branches()
+                .into_iter()
+                .map(|(n, _)| n)
+                .filter(|n| n != MAIN && !db.branch(n).is_ok_and(|br| durable::is_durable(&br)))
+                .collect();
             let mut pos = 0;
             for n in names {
                 db.branch(&n).unwrap().flagged.store(true, Ordering::Relaxed);
@@ -1551,10 +1628,159 @@ impl Core {
                 log.sync(pos);
             }
         }
+        // children a consolidation had merged when the crash came, not yet discarded: discarded now (see `consolidate`)
+        db.finish_consolidations(None);
         if let Some(log) = &db.log {
             log.live.store(true, Ordering::Relaxed); // opened: from here, dropping it closes it
         }
         Ok(db)
+    }
+
+    /// Whether a merge runs the checks merges gained after 0.5.5 (`sql::recheck_merge`, `Core::carried`): never in a
+    /// replay, or a log holding a merge they refuse would stop opening; nor where a test turned them off.
+    pub(crate) fn rechecks(&self) -> bool {
+        !self.replaying() && !RECHECKS_OFF.get()
+    }
+
+    /// `sql::recheck_merge` on the merged state `next` (`before`: the world merged into, as it was; `keys`: the rows
+    /// merged), unless this merge doesn't run it (see `rechecks`): the index rows it adds go into `next`, and are
+    /// returned so the merge logs them with the rest of its rows (`Op::Applied`).
+    fn recheck(
+        &self,
+        next: &mut State,
+        before: &View,
+        keys: &[String],
+    ) -> std::result::Result<Vec<(String, Option<Val>)>, sql::SqlError> {
+        if !self.rechecks() {
+            return Ok(vec![]);
+        }
+        let rows = sql::recheck_merge(&View { s: next.clone(), ..before.clone() }, before, keys)?;
+        for (k, v) in &rows {
+            next.set(k, v.clone());
+        }
+        Ok(rows)
+    }
+
+    /// Every row of every world (main first) that breaks a constraint of its table, as (world, what): see
+    /// `sql::violations`. VERIFY DATABASE lists them.
+    pub fn constraint_violations(&self) -> Result<Vec<(String, String)>> {
+        let mut worlds: Vec<String> =
+            self.branches().into_iter().map(|(w, _)| w).filter(|w| !w.starts_with("_tx_")).collect();
+        worlds.sort_by_key(|w| (w != MAIN, w.clone()));
+        let mut out = vec![];
+        for w in worlds {
+            let Ok(v) = self.view(&w) else { continue }; // (discarded meanwhile)
+            let found = sql::violations(&v).map_err(|e| Error::Constraint { code: e.code, message: e.message })?;
+            out.extend(found.into_iter().map(|p| (w.clone(), p)));
+        }
+        Ok(out)
+    }
+
+    /// Whether world `w` is `from` or was forked from it, or from a world forked from it, and so on.
+    pub(crate) fn within(&self, w: &str, from: &str) -> bool {
+        let m = self.branches.read().unwrap();
+        let mut at = Some(w.to_string());
+        while let Some(x) = at {
+            if x == from {
+                return true;
+            }
+            at = m.get(&x).and_then(|e| e.parent.clone());
+        }
+        false
+    }
+
+    /// A merge of world `b` into `target`, a world other than its parent, refused (55000) when
+    /// a row it merges (`diff`) was changed by a world between it and where `target`'s line meets its own (its parent,
+    /// the parent's parent, ...) before `b` forked, and that world hasn't merged it there: `b`'s row has that change in
+    /// it, so the merge would take it along, unreviewed. A row the parent merged since is settled at its fork point
+    /// and goes. Not in a replay (see `rechecks`).
+    fn carried(&self, b: &str, target: &str, diff: &[Change]) -> Result<()> {
+        if !self.rechecks() {
+            return Ok(());
+        }
+        // the world of `b`'s line just below where it meets `target`'s
+        let top = {
+            let m = self.branches.read().unwrap();
+            let up = |w: &str| m.get(w).and_then(|e| e.parent.clone());
+            let mut above = std::collections::HashSet::new();
+            let mut at = Some(target.to_string());
+            while let Some(x) = at {
+                at = up(&x);
+                above.insert(x);
+            }
+            let (mut top, mut at) = (b.to_string(), up(b));
+            loop {
+                match at {
+                    None => return Ok(()),
+                    Some(p) if above.contains(&p) => break,
+                    Some(p) => {
+                        at = up(&p);
+                        top = p;
+                    }
+                }
+            }
+            match top == b {
+                true => return Ok(()), // (its parent is in `target`'s line: what it has, `target`'s line has had)
+                false => (top.clone(), m.get(&top).map(|e| e.br.base())),
+            }
+        };
+        let (top, Some(top_fork)) = top else { return Ok(()) };
+        let mut carried = vec![];
+        for c in diff {
+            if sql::internal(&c.key)
+                || sql::btree_entry(&c.key)
+                || c.key.starts_with("_sonos_seq/")
+                || outbox::entry(&c.key)
+            {
+                continue;
+            }
+            // (`before`: the row at `b`'s fork point)
+            if c.before != self.val(&top_fork, &c.key)? {
+                carried.push(sql::show_key(&c.key).into_owned());
+            }
+        }
+        if carried.is_empty() {
+            return Ok(());
+        }
+        let parent = self.world(b)?.parent.unwrap_or_default();
+        Err(Error::Constraint {
+            code: "55000",
+            message: format!(
+                "{} rows {b} changed were changed first in {parent} (or a world above it, below {top}'s parent), which hasn't \
+                 merged them: merging {b} into {target} would take that change along ({}); merge {b} into {parent}, or merge \
+                 {parent} first; nothing was merged",
+                carried.len(),
+                carried[..carried.len().min(10)].join(", ")
+            ),
+        })
+    }
+
+    /// An agent's merge of part of world `b` (ONLY TABLES, ONLY KEYS, INTO another world) while worlds are forked from
+    /// it: refused (42501). They forked from all of it, and would later merge what they forked from over rows of it
+    /// already merged. A person may. Not in a replay (see `rechecks`).
+    fn part_of_parent(&self, b: &str, o: &MergeOptions) -> Result<()> {
+        if b.starts_with("_tx_") || disk::actor().is_empty() || !self.rechecks() {
+            return Ok(());
+        }
+        let parent = self.world(b)?.parent;
+        let into = o.into.as_deref().is_some_and(|y| parent.as_deref() != Some(y));
+        if !into && o.only_tables.is_empty() && o.only_keys.is_empty() {
+            return Ok(());
+        }
+        let mut kids: Vec<String> = self.descendants(b).into_iter().filter(|d| !d.starts_with("_tx_")).collect();
+        if kids.is_empty() {
+            return Ok(());
+        }
+        kids.sort();
+        Err(Error::Constraint {
+            code: "42501",
+            message: format!(
+                "agent {} may not merge part of {b} (ONLY TABLES, ONLY KEYS or INTO) while worlds are forked from it ({}): \
+                 merge or discard them first, or merge it whole",
+                disk::actor(),
+                kids.join(", ")
+            ),
+        })
     }
 
     /// Applies one logged op again, without logging it: at recovery, and to rebuild the past.
@@ -1614,6 +1840,7 @@ impl Core {
             }
             Op::Close | Op::Actor(_) | Op::Synced(_) => true,
             Op::RebaseTx(b) => self.rebase_tx(&b).is_ok(),
+            Op::Applied(a) => self.replay_applied(*a).is_ok(),
             Op::Bulk(b, _, root, version) => match self.branch(&b) {
                 // the statement's tree, whole (after its checkpoint's manifest, this changes nothing)
                 Ok(br) => {
@@ -1633,6 +1860,171 @@ impl Core {
                 }
                 true
             }
+            Op::ReadSet(b, set) => {
+                self.replay_reads(&b, &set);
+                true
+            }
+        }
+    }
+
+    /// The merge ledger's last row in `main` (main's state, read under its writer lock): (sequence, hash).
+    fn ledger_head(&self, main: &State) -> Result<Option<(u64, String)>> {
+        let cached = self.ledger_head.lock().unwrap().clone();
+        // as last written, if main still ends there (a restore, or a past state, may have put it elsewhere)
+        if let Some((seq, h)) = &cached
+            && self.val(main, &ledger::key(seq + 1))?.is_none()
+            && let Some(v) = self.val(main, &ledger::key(*seq))?
+            && ledger::head_of(Some((ledger::key(*seq), v))).is_some_and(|(_, at)| at == *h)
+        {
+            return Ok(cached);
+        }
+        let mut last = None;
+        for r in self.rows(main, ledger::PREFIX)? {
+            let (k, v) = r?;
+            if !k.starts_with(ledger::PREFIX) {
+                break;
+            }
+            last = Some((k, v));
+        }
+        Ok(ledger::head_of(last))
+    }
+
+    /// What the ledger row of world `b`'s merge into main says beyond its rows (see `ledger::Context`).
+    fn ledger_context(
+        &self,
+        b: &str,
+        child: &Branch,
+        policy: Option<&agents::MergePolicy>,
+        o: &MergeOptions,
+        main: &State,
+    ) -> Result<ledger::Context> {
+        let held = child.info.read().unwrap().meta.get(agents::REVIEW).cloned();
+        let name = policy.map(|p| p.name.clone()).or_else(|| held.as_ref()?["policy"].as_str().map(String::from));
+        let policy = match name {
+            Some(n) => {
+                let row = self.val(main, &format!("{}/{n}", agents::POLICIES))?;
+                Some((n, row.map(|r| blake3::hash(r.as_bytes()).to_hex().to_string())))
+            }
+            None => None,
+        };
+        let reasons = held.as_ref().and_then(|h| h["reasons"].as_array().cloned()).unwrap_or_default();
+        Ok(ledger::Context {
+            actor: disk::actor(),
+            policy,
+            verdict: if held.is_some() { "approved" } else { "merged" },
+            reasons: reasons.into_iter().filter_map(|r| r.as_str().map(String::from)).collect(),
+            operation: o.operation.clone().map(|id| (id.clone(), ledger::request(b, o))),
+        })
+    }
+
+    /// The merge ledger checked (`VERIFY LEDGER`): each row of it in main, in order, with whether it holds and what
+    /// is wrong where it doesn't (see `ledger::verify`).
+    pub fn verify_ledger(&self) -> Result<Vec<(i64, bool, String)>> {
+        let main = self.branch(MAIN)?.snapshot();
+        let mut rows = vec![];
+        for r in self.rows(&main, ledger::PREFIX)? {
+            let (k, v) = r?;
+            if !k.starts_with(ledger::PREFIX) {
+                break;
+            }
+            rows.push((k, v));
+        }
+        Ok(ledger::verify(rows.into_iter()))
+    }
+
+    /// The merge ledger's rows in main, oldest first, as JSON (see `ledger`).
+    pub fn ledger_rows(&self) -> Result<Vec<serde_json::Value>> {
+        let main = self.branch(MAIN)?.snapshot();
+        let mut out = vec![];
+        for r in self.rows(&main, ledger::PREFIX)? {
+            let (k, v) = r?;
+            if !k.starts_with(ledger::PREFIX) {
+                break;
+            }
+            out.push(serde_json::from_str(&v).unwrap_or(serde_json::Value::Null));
+        }
+        Ok(out)
+    }
+
+    /// Recovery of an `Op::Applied`: the rows it set, written again, and the merged world's fate. Nothing is resolved
+    /// or checked (no diff, three-way, index rebuild, rights, policy or constraint): it happened, as logged. What is
+    /// checked is the log itself: the digest of the rows, and both worlds and the merged world's version as the record
+    /// found them. A mismatch is a log damaged or replayed out of order, and the open is refused.
+    fn replay_applied(&self, a: disk::Applied<String>) -> Result<()> {
+        let damaged = |what: String| {
+            Error::Io(io::Error::new(io::ErrorKind::InvalidData, format!("a logged merge of {} {what}", a.source)))
+        };
+        if disk::rows_digest(&a.rows) != a.digest {
+            return Err(damaged("doesn't match its digest".into()));
+        }
+        let (source, target) = (self.branch(&a.source)?, self.branch(&a.target)?);
+        if source.info.read().unwrap().id != a.source_id || target.info.read().unwrap().id != a.target_id {
+            return Err(damaged(format!("names worlds by ids that aren't {} and {}'s here", a.source, a.target)));
+        }
+        let version = source.version.load(Ordering::Relaxed);
+        if version != a.version {
+            return Err(damaged(format!("was at version {}, and it is at {version} here", a.version)));
+        }
+        let _g = self.gate();
+        let put = |s: &mut State| {
+            for (k, v) in a.rows.iter().chain(&a.ledger) {
+                s.set(k, v.as_deref().map(Val::from));
+            }
+        };
+        match a.kind {
+            disk::AppliedKind::Whole => {
+                let mut next = target.snapshot();
+                put(&mut next);
+                self.retire(&a.source, None, &target, next, || {})?;
+                *lock(&source.writer) = true;
+                self.touch(&a.target);
+            }
+            disk::AppliedKind::Partial => {
+                let mut next = target.snapshot();
+                put(&mut next);
+                *target.snap.write().unwrap() = next;
+                target.stamp.store(stamp(), Ordering::Relaxed);
+                if a.applied > 0 {
+                    target.version.fetch_add(1, Ordering::Relaxed); // as `publish` moved it
+                }
+                let mut base = source.base.write().unwrap();
+                if !a.settled.is_empty() {
+                    source.version.fetch_add(1, Ordering::Relaxed);
+                }
+                for (k, v) in &a.settled {
+                    base.set(k, v.as_deref().map(Val::from));
+                }
+                target.changed.fetch_add(a.applied, Ordering::Relaxed);
+                self.touch(&a.target);
+            }
+            disk::AppliedKind::Rebase => {
+                let theirs = target.snapshot();
+                let mut next = theirs.clone();
+                put(&mut next);
+                *source.snap.write().unwrap() = next;
+                source.stamp.store(stamp(), Ordering::Relaxed);
+                *source.base.write().unwrap() = theirs;
+                source.version.fetch_add(1, Ordering::Relaxed);
+                source.active.store(a.at, Ordering::Relaxed);
+                source.info.write().unwrap().meta.insert(REBASED.into(), serde_json::json!(a.at));
+            }
+        }
+        Ok(())
+    }
+
+    /// Before the first `Op::Applied` goes in the log: a checkpoint, whose manifest (`disk::MAN_APPLIED`) tells a
+    /// Chronos too old to read that record that the folder is newer than it, before it reads any of the log. Until
+    /// one is out, merges are logged as they were (see `publish`). Hold no lock a checkpoint takes.
+    pub(crate) fn upgrade_log(&self) {
+        let Some(log) = &self.log else { return };
+        if log.applied_ok.load(Ordering::Relaxed) {
+            return;
+        }
+        let _one = log.ckpt.lock().unwrap();
+        if !log.applied_ok.load(Ordering::Relaxed)
+            && let Err(e) = self.checkpoint_now(log, false)
+        {
+            log.failed(&e); // merges are logged as before until a checkpoint gets out
         }
     }
 
@@ -1742,7 +2134,11 @@ impl Core {
             Setting::StatementTimeout => self.ceilings.statement_timeout_ms,
             Setting::MaxWorlds => self.ceilings.max_worlds,
             Setting::WorldIdleTtl => self.ceilings.world_idle_ttl_ms,
-            Setting::ProtectMain | Setting::OutboxKeepPayloads => 0,
+            Setting::ProtectMain
+            | Setting::OutboxKeepPayloads
+            | Setting::MaxDepth
+            | Setting::MaxChildren
+            | Setting::AgentDefaultRead => 0,
         }
     }
 
@@ -1750,7 +2146,8 @@ impl Core {
     pub fn set_setting(&self, s: Setting, v: u64) -> Result<()> {
         let most = self.ceiling(s);
         if most > 0 && v > most {
-            let unit = if s == Setting::MaxWorlds { "" } else { " ms" };
+            let unit =
+                if matches!(s, Setting::MaxWorlds | Setting::MaxDepth | Setting::MaxChildren) { "" } else { " ms" };
             return Err(over_ceiling(s.name(), &format!("{v}{unit}"), &format!("{most}{unit}")));
         }
         let mut all = self.settings.lock().unwrap(); // held while the file is written: one writer at a time
@@ -1776,13 +2173,29 @@ impl Core {
     /// Definitions (CREATE TABLE, CREATE INDEX) and the database's own rows (agents, policies, the
     /// outbox) still change directly; so do the ways back (RESTORE, UNDO), and replaying the log.
     fn guard_main<'k>(&self, b: &str, mut keys: impl Iterator<Item = &'k str>) -> Result<()> {
+        if b != MAIN || RECOVERING.get() {
+            return Ok(());
+        }
+        // an agent held to a tenant changes main only by merging a world of its tenant (r3.1, T4), whatever it runs
+        // there (a function it calls, a trigger): checked here, where every direct write of main's rows passes
+        let actor = disk::actor();
+        let tenant = !actor.is_empty() && self.agent(&actor).is_ok_and(|a| a.tenant.is_some());
         let protected = self.setting(Setting::ProtectMain) != 0 || self.attached.is_some();
-        if b != MAIN || !protected || self.me.get().is_none() || RECOVERING.get() {
+        // the log replays as it was written, a tenant agent's rows too (rule T8)
+        if self.replaying() || (!tenant && !protected) {
             return Ok(());
         }
         let row = |k: &&str| !reserved_table(k.split('/').next().unwrap_or(k)); // not the database's own
         match keys.find(row) {
             None => Ok(()),
+            Some(k) if tenant => Err(Error::Constraint {
+                code: "42501",
+                message: format!(
+                    "agent {actor} works for one tenant, so it changes main only by merging a world of its tenant, \
+                     and this changes {}; fork a world, make the change there, and merge it",
+                    sql::show_key(k)
+                ),
+            }),
             // an attached folder's main holds what Postgres has: it changes only by a merge written there first
             Some(k) if self.attached.is_some() => Err(Error::Constraint {
                 code: "42501",
@@ -1896,6 +2309,7 @@ impl Core {
         // version, crash flag, world info and last activity per branch, at the cut
         let marks: HashMap<String, (u64, bool, Info, u64)>;
         let counters: disk::Counters;
+        let mut reads_at = 0;
         let (cut, first_seg) = {
             let _quiet = self.gate.write().unwrap();
             // a big statement's tree becomes its branch's state here, with the gate held, so
@@ -1907,6 +2321,7 @@ impl Core {
                     if br.born != c.born || *br.writer.lock().unwrap() {
                         return Err(Error::NoBranch(c.branch.clone()));
                     }
+                    self.check_held(&c.branch, &br)?; // (under the gate: see `consolidate::Hold`)
                     Some((c, br))
                 }
                 None => None,
@@ -1920,6 +2335,10 @@ impl Core {
             let mut g = log.lock();
             // the log moves on first: if it can't, nothing has changed that readers could see
             let (at, behind) = log.rotate(&mut g)?;
+            // durable worlds' read sets first in the new segment: the old ones are dropped (see `durable`)
+            if !closing {
+                reads_at = self.relog_reads(&mut g, m.iter().map(|(n, e)| (n, &e.br)));
+            }
             let installed = match target {
                 Some((c, br)) => {
                     *br.snap.write().unwrap() = c.state.clone();
@@ -1957,6 +2376,9 @@ impl Core {
             (cut, (g.seg, at, note, behind))
         };
         let (first_seg, cut_ms, note, behind) = first_seg;
+        if reads_at > 0 {
+            log.sync(reads_at); // before the manifest lets the segments they were in go
+        }
         if let Some(pos) = note {
             log.sync(pos); // readers see the statement now: so does the log, whatever comes next
             if let (Some(c), Some(v)) = (commit, version) {
@@ -2046,6 +2468,7 @@ impl Core {
             ship.wait_sealed(first_seg - 1)?;
         }
         disk::write_manifest(&log.dir, log.crypt.as_deref(), first_seg, &man, &counters, closing, cut_ms)?;
+        log.applied_ok.store(true, Ordering::Relaxed); // a manifest of this version is out: see `upgrade_log`
         log.move_anchor(first_seg, 0)?; // after the manifest: a crash between leaves the folder ahead, which opens
         self.past.lock().unwrap().clear(); // history may have been dropped: rebuild on demand
         if pages.remote().is_some() {
@@ -2247,6 +2670,7 @@ impl Core {
             roots.extend(trees.iter().filter_map(Weak::upgrade).map(|h| *h));
         }
         roots.extend(self.empty);
+        roots.extend(self.pinned_roots()); // pinned checkpoints, until their pins run out (see `durable`)
         Ok((roots, history))
     }
 
@@ -2320,7 +2744,7 @@ impl Core {
     /// cap (`disk_full`, 53100). Never while replaying the log, which holds only what was accepted.
     pub(crate) fn guard_disk(&self, adding: u64) -> Result<()> {
         let limit = self.folder.limit;
-        if limit == 0 || self.log.is_none() || self.me.get().is_none() || RECOVERING.get() {
+        if limit == 0 || self.log.is_none() || self.replaying() || RECOVERING.get() {
             return Ok(());
         }
         self.measure_folder(std::time::Duration::from_secs(1));
@@ -2363,7 +2787,7 @@ impl Core {
     /// with no cap, while replaying the log, or if the resident size can't be read.
     pub(crate) fn guard_memory(&self) -> Result<()> {
         let limit = self.mem_limit.load(Ordering::Relaxed);
-        if limit == 0 || self.me.get().is_none() || RECOVERING.get() {
+        if limit == 0 || self.replaying() || RECOVERING.get() {
             return Ok(());
         }
         match limits::process_rss_bytes() {
@@ -2501,6 +2925,19 @@ impl Core {
         v
     }
 
+    /// `worlds`, as the acting agent may list them: one without the `read` right (decision 3) sees main and the
+    /// worlds it owns; anyone else every world.
+    pub fn visible_worlds(&self) -> Vec<World> {
+        let all = self.worlds();
+        let actor = disk::actor();
+        match self.agent(&actor) {
+            Ok(a) if !actor.is_empty() && !a.may(agents::Can::Read) => {
+                all.into_iter().filter(|w| w.name == MAIN || w.owner.as_deref() == Some(actor.as_str())).collect()
+            }
+            _ => all,
+        }
+    }
+
     /// Every world with its ID, lineage and metadata, sorted by name.
     pub fn worlds(&self) -> Vec<World> {
         let m = self.branches.read().unwrap();
@@ -2538,6 +2975,10 @@ impl Core {
         if let Some(on) = patch.remove("check_reads") {
             self.check_reads(b, &br, on)?;
         }
+        self.rebudget(b, &mut patch)?; // budget_rows, budget_statements: kept as the database's own key
+        if let Some(on) = patch.remove("durable") {
+            self.set_durable(b, &br, on)?;
+        }
         // the scope and the rest in one write: all of it, or (if any of it is refused) none. A
         // scope change waits for a merge of the world in progress (merges hold its writer lock
         // from reading the scope to committing), so none commits under a scope already changed
@@ -2572,7 +3013,7 @@ impl Core {
             Ok(())
         })?;
         drop((writer, _g));
-        self.after(pos, false);
+        self.after(pos, durable::is_durable(&br));
         self.world(b)
     }
 
@@ -2595,6 +3036,18 @@ impl Core {
         }
         let given: serde_json::Map<String, serde_json::Value> =
             scope::KEYS.iter().filter_map(|k| Some((k.to_string(), patch.remove(*k)?))).collect();
+        // its tenant is set when it is made and never changes, admin or not (rule T2): ASSIGN WORLD gives an
+        // unassigned world one
+        if given.contains_key("tenant") {
+            return Err(Error::Constraint {
+                code: "42501",
+                message: format!(
+                    "world {b}'s tenant is set when it is made and never changes ({}); fork a new world for another \
+                     tenant",
+                    self.identity(b)?.words()
+                ),
+            });
+        }
         let was = self.world(b)?.scope;
         let old = was.as_ref().and_then(|s| s.as_object().cloned()).unwrap_or_default();
         let new = scope::resolve(&self.view(b)?, &old, given, b)?;
@@ -2638,7 +3091,7 @@ impl Core {
         if b == MAIN {
             return Err(bad_meta("main can't expire".into()));
         }
-        self.set_reserved(b, agents::EXPIRES, at.map(|t| serde_json::json!(t)))?;
+        self.set_expiry(b, at)?; // capped at its parent's; its forks' shortened to it
         self.world(b)
     }
 
@@ -2721,6 +3174,7 @@ impl Core {
         check_name(name)?;
         let from = self.world(from)?.name;
         self.fork_info(&from, name, Info { meta, ..Info::new() })?;
+        self.durable_born(name);
         self.world(name)
     }
 
@@ -2733,7 +3187,7 @@ impl Core {
         edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>) -> Result<()>,
     ) -> Result<()> {
         let pos = self.put_meta_in(b, true, edit)?;
-        self.after(pos, false);
+        self.after(pos, self.branch(b).is_ok_and(|br| durable::is_durable(&br)));
         Ok(())
     }
 
@@ -2761,6 +3215,7 @@ impl Core {
             }
             let rec = self.record(|| Op::Meta(b, text.as_str()));
             info.meta = meta;
+            e.br.life.cache(&info.meta);
             self.append_in(&mut g, rec)
         };
         Ok(pos)
@@ -2843,13 +3298,21 @@ impl Core {
     /// row spent most of its time handing its lock over): at the latest when something that
     /// depends on them is logged (a fork from the world, a merge of or into it, a discard), a
     /// write by another agent, a checkpoint's cut, a reader of the log, or closing. Returns the
-    /// log position to sync to (0 while it waits: worlds become durable when they reach main).
+    /// log position to sync to (0 while it waits: worlds become durable when they reach main). A
+    /// durable world's are logged now, as main's are, after any it batched before it was durable.
     fn log_write(&self, b: &str, br: &Branch, rec: Option<Vec<u8>>) -> u64 {
         let (Some(log), Some(rec)) = (&self.log, rec) else { return 0 };
         if b == MAIN {
             return log.append(&mut log.lock(), &rec);
         }
         let mut w = lock(&br.batch);
+        if durable::is_durable(br) {
+            let mut g = log.lock();
+            if !w.is_empty() {
+                log.append_batch(&mut g, &mut w);
+            }
+            return log.append(&mut g, &rec);
+        }
         if !w.takes(&rec) {
             log.append_batch(&mut log.lock(), &mut w);
         }
@@ -3083,6 +3546,9 @@ impl Core {
             if let Some(q) = &quota {
                 q.check(b, br.changed.load(Ordering::Relaxed), rows.len() as u64)?;
             }
+            self.check_alive(b, &br)?; // its time up: read-only
+            self.check_held(b, &br)?; // merged by a consolidation of its parent (see `consolidate`)
+            self.charge(b, rows.iter().map(|(k, _)| *k))?; // its budget, and its parents'
             let mut s = br.snap.write().unwrap();
             br.stamp.store(stamp(), Ordering::Relaxed);
             for (k, v) in rows {
@@ -3097,7 +3563,7 @@ impl Core {
         // its own wait covers this one too, and the waits of writers in between share one fsync, as Postgres's
         // commits share a WAL flush)
         drop(_long);
-        self.after(pos.1, b == MAIN);
+        self.after(pos.1, self.syncs(b, &br));
         if rows.iter().any(|(k, _)| sql::type_row(k)) {
             sql::world_types_moved(self, b); // (a type's row written through the API, or put back by a restore)
         }
@@ -3147,7 +3613,7 @@ impl Core {
             ((version, out), pos, rows.iter().any(|(k, _)| sql::type_row(k)))
         };
         drop(_long); // (the next writer goes on while this one waits for the disk: see `write`)
-        self.after(pos, b == MAIN);
+        self.after(pos, self.syncs(b, &br));
         if typed {
             sql::world_types_moved(self, b); // (a type's row: CREATE, ALTER or DROP TYPE, a restore, an undone merge)
         }
@@ -3179,6 +3645,9 @@ impl Core {
         self.guard_main(b, rows.iter().map(|(k, _)| k.as_str()))?;
         self.guard_rows(rows.iter().map(|(k, v)| (k.as_str(), v.as_ref().map(String::len))))?;
         let rows: Vec<(&str, Option<&str>)> = rows.iter().map(|(k, v)| (k.as_str(), v.as_deref())).collect();
+        self.check_alive(b, br)?; // its time up: read-only
+        self.check_held(b, br)?; // merged by a consolidation of its parent (see `consolidate`)
+        self.charge(b, rows.iter().map(|(k, _)| *k))?; // its budget, and its parents'
         self.note_sql(rows.iter().map(|(k, _)| *k));
         let rec = self.record(|| Op::Write(b, rows.clone()));
         let mut s = br.snap.write().unwrap();
@@ -3269,7 +3738,7 @@ impl Core {
         }
         let (version, pos) = write(&rows)?;
         drop(_long); // (the next writer goes on while this one waits for the disk: see `write`)
-        self.after(pos, b == MAIN);
+        self.after(pos, self.syncs(b, &long));
         if rows.iter().any(|(k, _)| sql::type_row(k)) {
             sql::world_types_moved(self, b); // (as in `batch_in`)
         }
@@ -3676,7 +4145,15 @@ impl Core {
         let past = self.past(t)?;
         let found = past.worlds.get_key_value(name).or_else(|| past.worlds.iter().find(|(_, (_, id))| id == name));
         let found = found.filter(|(n, _)| !n.starts_with("_tx_")).map(|(_, w)| w); // a transaction's: private
-        let (s, _) = found.ok_or_else(|| Error::NoBranch(format!("{name}@{}", show_ms(t))))?;
+        let (s, id) = found.ok_or_else(|| Error::NoBranch(format!("{name}@{}", show_ms(t))))?;
+        // an agent's rights are to the world that has the name now: a world dropped since under that name was
+        // someone else's (its ID reads it, with the rights to that ID's world)
+        if !disk::actor().is_empty()
+            && let Ok(now) = self.world(name)
+            && now.id != *id
+        {
+            return Err(Error::NoBranch(format!("{name}@{}: the world of that name then is not this one", show_ms(t))));
+        }
         Ok(View { core: self, born: PAST, s: s.clone(), branch: name.into(), reads: None })
     }
 
@@ -3695,30 +4172,42 @@ impl Core {
         if b == MAIN {
             attach::refuse_main(self, "RESTORE")?;
         }
-        let _back = Recovering::enter(); // a way back: main's protection lets it through
-        // a world rebased since: its rows then sat on another fork point, and put back on this one
-        // they'd undo, at its merge, what its parent changed in between
-        let since_rebase = || -> Result<()> {
-            let rebased = self.branch(b)?.info.read().unwrap().meta.get(REBASED).and_then(|v| v.as_u64());
-            match rebased.filter(|at| t < *at) {
-                Some(at) => Err(Error::Constraint {
-                    code: "55000",
-                    message: format!(
-                        "{b} was rebased at {}, after that time: it can go back only to a time since (or fork its parent as it was then)",
-                        show_ms(at)
-                    ),
-                }),
-                None => Ok(()),
-            }
+        self.since_rebase(b, t)?; // before reading the past, which may not be there to read
+        let past = {
+            let _back = Recovering::enter(); // a way back: main's protection lets it through
+            self.view_at(b, t)?.s
         };
-        since_rebase()?; // before reading the past, which may not be there to read
-        let past = self.view_at(b, t)?.s;
-        // and again under the world's writer lock, which a rebase holds while it moves the fork
-        // point: none comes between the check and the write
+        self.restore_to(b, t, &past)
+    }
+
+    /// A world rebased since `t`: its rows then sat on another fork point, and put back on this one
+    /// they'd undo, at its merge, what its parent changed in between.
+    fn since_rebase(&self, b: &str, t: u64) -> Result<()> {
+        let rebased = self.branch(b)?.info.read().unwrap().meta.get(REBASED).and_then(|v| v.as_u64());
+        match rebased.filter(|at| t < *at) {
+            Some(at) => Err(Error::Constraint {
+                code: "55000",
+                message: format!(
+                    "{b} was rebased at {}, after that time: it can go back only to a time since (or fork its parent as it was then)",
+                    show_ms(at)
+                ),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Writes into world `b` what turns it back into `past`, its state at `t` (see `restore`).
+    fn restore_to(&self, b: &str, t: u64, past: &State) -> Result<usize> {
+        if b == MAIN {
+            attach::refuse_main(self, "RESTORE")?;
+        }
+        let _back = Recovering::enter(); // a way back: main's protection lets it through
+        // the rebase checked again under the world's writer lock, which a rebase holds while it
+        // moves the fork point: none comes between the check and the write
         let (_, n) = self.batch_with(b, |now| {
-            since_rebase()?;
+            self.since_rebase(b, t)?;
             let rows: Vec<(String, Option<String>)> =
-                self.undo(&now.s, &past)?.into_iter().map(|(k, v)| (k, v.map(|v| v.to_string()))).collect();
+                self.undo(&now.s, past)?.into_iter().map(|(k, v)| (k, v.map(|v| v.to_string()))).collect();
             let n = rows.len();
             Ok::<_, Error>((rows, n))
         })?;
@@ -3826,6 +4315,32 @@ impl Core {
                     let parent = parents.get(&w).cloned().flatten().unwrap_or_default();
                     ev(format!("rebased onto {parent}"), 0);
                 }
+                // as the logical records above say it, from the worlds the record names
+                Op::Applied(a) => {
+                    let a = *a;
+                    let (w, into) = (a.source, a.target);
+                    match a.kind {
+                        disk::AppliedKind::Whole => {
+                            parents.remove(&w);
+                            let rows = written.remove(&w).unwrap_or(0);
+                            if w == b {
+                                ev(format!("merged into {into}"), rows);
+                            } else if into == b {
+                                ev(format!("merged {w}"), rows);
+                            }
+                        }
+                        disk::AppliedKind::Partial => {
+                            let rows = written.get(&w).copied().unwrap_or(0);
+                            if w == b {
+                                ev(format!("merged {}into {into}", if a.part { "part " } else { "" }), rows);
+                            } else if into == b {
+                                ev(format!("merged {}{w}", if a.part { "part of " } else { "" }), rows);
+                            }
+                        }
+                        disk::AppliedKind::Rebase if w == b => ev(format!("rebased onto {into}"), 0),
+                        disk::AppliedKind::Rebase => {}
+                    }
+                }
                 Op::Discard(w) => {
                     if w == b {
                         ev("discarded".into(), 0);
@@ -3879,6 +4394,14 @@ impl Core {
                     let into = if into.is_empty() { parents.get(&w).cloned().flatten() } else { Some(into) };
                     found = Some((place, at, into));
                 }
+                Op::Applied(a) if a.kind != disk::AppliedKind::Rebase => {
+                    if a.kind == disk::AppliedKind::Whole {
+                        parents.remove(&a.source);
+                    }
+                    if a.source == child {
+                        found = Some((place, at, Some(a.target)));
+                    }
+                }
                 Op::Discard(w) => {
                     parents.remove(&w);
                 }
@@ -3916,35 +4439,14 @@ impl Core {
         let effects = self.effects_undone(&changes)?;
         let changes: Vec<Change> =
             changes.into_iter().filter(|c| !c.key.starts_with("_sonos_seq/") && !outbox::entry(&c.key)).collect();
+        let changes: Vec<Change> = changes.into_iter().filter(|c| !ledger::reserved(&c.key)).collect();
+        // put back as any undo is: index rows rebuilt, constraints checked as in a merge (a parent the merge brought
+        // that a row added since references stays, or with SKIP CHANGED is left as one changed since)
+        let rows: std::collections::BTreeMap<String, (Option<Val>, Option<Val>, bool)> =
+            changes.iter().map(|c| (c.key.clone(), (c.before.clone(), c.after.clone(), false))).collect();
         let put = |target: &str| {
             let _back = Recovering::enter(); // a way back: main's protection lets it through
-            self.batch_with(target, |v| {
-                let (mut rows, mut changed) = (vec![], vec![]);
-                for c in &changes {
-                    if self.val(&v.s, &c.key)? == c.after {
-                        rows.push((c.key.clone(), c.before.as_deref().map(String::from)));
-                    } else if !sql::internal(&c.key) && !sql::btree_entry(&c.key) {
-                        changed.push(c.key.clone());
-                    }
-                }
-                if !changed.is_empty() && !skip_changed {
-                    let some: Vec<std::borrow::Cow<str>> = changed.iter().take(10).map(|k| sql::show_key(k)).collect();
-                    return Err(Error::Constraint {
-                        code: "40001",
-                        message: format!(
-                            "{} rows the merge changed have changed again since ({}); UNDO MERGE ... SKIP CHANGED undoes the rest; nothing was undone",
-                            changed.len(),
-                            some.join(", ")
-                        ),
-                    });
-                }
-                let n = rows
-                    .iter()
-                    .filter(|(k, _)| !sql::internal(k) && !sql::btree_entry(k) && !k.starts_with("_sonos_"))
-                    .count();
-                Ok((rows, (n, changed.len())))
-            })
-            .map(|(_, done)| done)
+            self.put_back(target, &rows, skip_changed, "the merge", "UNDO MERGE")
         };
         // in a folder attached to Postgres, main changes only by a merge written there first: the rows go back in a
         // world of main, which is then merged into it as any world is (each row locked and compared in Postgres, a
@@ -3987,7 +4489,12 @@ impl Core {
             let (mut put, mut changed) = (std::collections::BTreeMap::new(), vec![]);
             let mut owned = vec![]; // unique and reference rows: back only with their rows
             for (k, (before, after, others)) in rows {
-                if k.starts_with("_sonos_seq/") || sql::btree_entry(k) || agents::agent_row(k) || outbox::entry(k) {
+                if k.starts_with("_sonos_seq/")
+                    || sql::btree_entry(k)
+                    || agents::agent_row(k)
+                    || outbox::entry(k)
+                    || ledger::reserved(k)
+                {
                     continue; // (an effect isn't undone: see `effects_landed`)
                 }
                 let now = self.val(&v.s, k)?;
@@ -4013,26 +4520,60 @@ impl Core {
                     ),
                 });
             }
-            let n = put.len();
-            for (k, before) in owned {
-                let after = rows[k].1.as_deref();
-                if sql::owners(k, [before.as_deref(), after]).iter().all(|o| put.contains_key(o)) {
-                    put.insert(k.clone(), before.clone());
+            let undone = |e: sql::SqlError| Error::Constraint { code: e.code, message: format!("{}; nothing was undone", e.message) };
+            // the rows with their unique and reference rows, and the state they leave
+            let with_owned = |these: &std::collections::BTreeMap<String, Option<Val>>| {
+                let mut all = these.clone();
+                for &(k, before) in &owned {
+                    let after = rows[k].1.as_deref();
+                    if sql::owners(k, [before.as_deref(), after]).iter().all(|o| these.contains_key(o)) {
+                        all.insert(k.clone(), before.clone());
+                    }
+                }
+                all
+            };
+            let state = |these: &std::collections::BTreeMap<String, Option<Val>>| {
+                let mut next = v.s.clone();
+                for (k, val) in these {
+                    next.set(k, val.clone());
+                }
+                next
+            };
+            // with SKIP CHANGED, a row whose undoing would leave another referencing what it had (a parent the merge
+            // brought that a row added since references) is left as one changed since
+            let mut kept = 0;
+            // again until nothing left is referenced
+            if skip_changed {
+                loop {
+                    let keys: Vec<String> = put.keys().cloned().collect();
+                    let next = state(&with_owned(&put));
+                    let left = sql::left_referenced(&View { s: next, ..v.clone() }, v, &keys).map_err(undone)?;
+                    if left.is_empty() {
+                        break;
+                    }
+                    kept += left.len();
+                    for k in left {
+                        put.remove(&k);
+                    }
                 }
             }
+            let n = put.len();
+            let mut put = with_owned(&put);
             let keys: Vec<String> = put.keys().cloned().collect();
-            let mut next = v.s.clone();
-            for (k, val) in &put {
-                next.set(k, val.clone());
-            }
-            let undone = |e: sql::SqlError| Error::Constraint { code: e.code, message: format!("{}; nothing was undone", e.message) };
+            let mut next = state(&put);
             for (k, val) in sql::reindex(&View { s: next.clone(), ..v.clone() }, v, &keys).map_err(undone)? {
                 next.set(&k, val.clone());
                 put.insert(k, val);
             }
+            if self.rechecks() {
+                for (k, val) in sql::recheck_merge(&View { s: next.clone(), ..v.clone() }, v, &keys).map_err(undone)? {
+                    next.set(&k, val.clone());
+                    put.insert(k, val);
+                }
+            }
             sql::check_merge(&View { s: next, ..v.clone() }, v, &keys).map_err(undone)?;
             let out = put.into_iter().map(|(k, v)| (k, v.as_deref().map(String::from))).collect();
-            Ok((out, (n, changed.len())))
+            Ok((out, (n, changed.len() + kept)))
         })?;
         Ok(done)
     }
@@ -4123,6 +4664,11 @@ impl Core {
                 Op::Merge(w, ..) | Op::MergeWith(w, ..) => parents.remove(w).flatten(),
                 Op::MergeSome { branch: w, into, .. } if into.is_empty() => parents.get(w).cloned().flatten(),
                 Op::MergeSome { into, .. } => Some(into.clone()),
+                Op::Applied(a) if a.kind == disk::AppliedKind::Whole => {
+                    parents.remove(&a.source);
+                    Some(a.target.clone())
+                }
+                Op::Applied(a) if a.kind == disk::AppliedKind::Partial => Some(a.target.clone()),
                 Op::Fork(from, name) | Op::World(from, name, ..) => {
                     parents.insert(name.clone(), (!from.is_empty()).then(|| from.clone()));
                     None
@@ -4137,6 +4683,7 @@ impl Core {
             let from = match &op {
                 Op::Write(w, _) | Op::Bulk(w, ..) | Op::Merge(w, ..) | Op::MergeWith(w, ..) => Some(w.as_str()),
                 Op::MergeSome { branch, .. } => Some(branch.as_str()),
+                Op::Applied(a) if a.kind != disk::AppliedKind::Rebase => Some(a.source.as_str()),
                 _ => None,
             };
             let of_run = run.is_none_or(|r| {
@@ -4220,7 +4767,7 @@ impl Core {
     ) -> Result<(usize, usize)> {
         for again in [false, true] {
             let w = if again { format!("{via}-again") } else { via.to_string() };
-            self.fork(MAIN, &w)?;
+            self.fork_system(&w)?;
             match put(&w).and_then(|done| self.merge_with(&w, &MergeOptions::default()).map(|_| done)) {
                 Ok(done) => return Ok(done),
                 Err(e) => {
@@ -4264,7 +4811,10 @@ impl Core {
     /// a right that was dropped since.
     fn undo(&self, from: &State, to: &State) -> Result<Vec<(String, Option<Val>)>> {
         let mut out = vec![];
-        for c in self.state_diff(from, to)?.into_iter().filter(|c| !agents::agent_row(&c.key)) {
+        // (nor main's merge ledger: it is only appended, by merges, see `ledger`)
+        for c in
+            self.state_diff(from, to)?.into_iter().filter(|c| !agents::agent_row(&c.key) && !ledger::reserved(&c.key))
+        {
             out.push((c.key.clone(), self.val(to, &c.key)?));
         }
         Ok(out)
@@ -4624,7 +5174,55 @@ impl Core {
     /// O(1) regardless of data size, and never waits on writers of `from`.
     pub fn fork(&self, from: &str, name: &str) -> Result<()> {
         check_name(name)?;
-        self.fork_info(from, name, Info::new())
+        let mut meta = serde_json::Map::new();
+        self.creation_identity(from, &mut meta)?;
+        self.fork_info(from, name, Info { meta, ..Info::new() })
+    }
+
+    /// `fork` for the database's own working worlds (CONSOLIDATE's scratch world), made while an agent acts and
+    /// never handed to it: the tenant identity and scope of `from`, without refusing the acting agent, which has
+    /// been checked for the statement already.
+    pub(crate) fn fork_internal(&self, from: &str, name: &str) -> Result<()> {
+        check_name(name)?;
+        let mut meta = serde_json::Map::new();
+        self.fork_identity(from, &mut meta)?;
+        self.fork_info(from, name, Info { meta, ..Info::new() })
+    }
+
+    /// A world of main's the database makes for its own work (an undo's), whoever is acting: no tenant's.
+    pub(crate) fn fork_system(&self, name: &str) -> Result<()> {
+        check_name(name)?;
+        let mut meta = serde_json::Map::new();
+        meta.insert(tenancy::GLOBAL.into(), serde_json::Value::Bool(true));
+        self.fork_info(MAIN, name, Info { meta, ..Info::new() })
+    }
+
+    /// For a world made from `from` by a person (or an agent with no tenant: see `Acting::fork` for one with):
+    /// the tenant identity it gets (rules T1 and T5, see `tenancy`), with any scope `meta` declares resolved. An
+    /// agent held to a tenant acting here (a path that skipped `Acting::fork`) is refused: its world would not be
+    /// stamped as its own (r2 design D4).
+    fn creation_identity(&self, from: &str, meta: &mut serde_json::Map<String, serde_json::Value>) -> Result<()> {
+        let actor = disk::actor();
+        if !actor.is_empty()
+            && !RECOVERING.get()
+            && self.agent(&actor).is_ok_and(|a| a.tenant.is_some() || !a.may(agents::Can::Admin))
+        {
+            return Err(Error::Constraint {
+                code: "42501",
+                message: format!(
+                    "agent {actor} makes worlds of its own only through its fork (they hold its owner and tenant)"
+                ),
+            });
+        }
+        self.fork_identity(from, meta)
+    }
+
+    /// The tenant identity and scope a world forked from `from` gets (rules T1 and T5).
+    fn fork_identity(&self, from: &str, meta: &mut serde_json::Map<String, serde_json::Value>) -> Result<()> {
+        let parent = self.inherit(from, meta, None)?;
+        scope::from_meta(self, from, meta)?;
+        tenancy::mark(&parent, meta);
+        Ok(())
     }
 
     /// `fork`, with metadata for the new world (a JSON object: owner, description, tags, ...).
@@ -4634,10 +5232,14 @@ impl Core {
         let mut meta = meta_object(meta)?;
         reserved_keys(&meta)?;
         stale::from_meta(&mut meta)?; // `check_reads = true`: its reads are checked at merge
-        scope::from_meta(self, from, &mut meta)?; // what it may change, held to at its merge
+        durable::from_meta(&mut meta)?; // `durable`: its writes wait for the disk
+        // what it may change, held to at its merge, and its tenant (its parent's, if that has one)
+        self.creation_identity(from, &mut meta)?;
+        self.budget_from_meta(from, &mut meta)?; // budget_rows, budget_statements: at most what `from` has left
         self.tenant_first(from, &meta)?;
         let info = Info { meta, ..Info::new() };
         self.fork_info(from, name, info)?;
+        self.durable_born(name);
         self.world(name)
     }
 
@@ -4668,8 +5270,9 @@ impl Core {
     /// nothing, so it is dropped rather than merged, and it is never discarded for being idle.
     pub fn create_empty(&self, name: &str, meta: serde_json::Value) -> Result<World> {
         check_name(name)?;
-        let meta = meta_object(meta)?;
+        let mut meta = meta_object(meta)?;
         reserved_keys(&meta)?;
+        meta.insert(tenancy::GLOBAL.into(), serde_json::Value::Bool(true)); // a database of its own: no tenant's
         self.empty_world(name, Info { meta, ..Info::new() })?;
         self.world(name)
     }
@@ -4705,8 +5308,11 @@ impl Core {
     }
 
     /// Forks `from` once for each world named, all from one version of it, which it returns.
-    fn fork_all(&self, from: &str, worlds: Vec<(String, Info)>) -> Result<State> {
+    fn fork_all(&self, from: &str, mut worlds: Vec<(String, Info)>) -> Result<State> {
         worlds.iter().try_for_each(|(name, _)| check_name(name))?; // generated names too (`<prefix>_<i>`)
+        for (_, info) in &mut worlds {
+            self.fork_expiry(from, &mut info.meta)?; // as `fork_info`
+        }
         let _t = self.metrics.time(metrics::Op::Fork);
         let most = self.setting(Setting::MaxWorlds);
         self.guard_disk(WORLD_BYTES * worlds.len() as u64)?;
@@ -4730,6 +5336,7 @@ impl Core {
             if !m.contains_key(from) {
                 return Err(Error::NoBranch(from.into())); // merged or discarded meanwhile
             }
+            self.check_held(from, &m[from].br)?; // (under the map's lock: see `consolidate::Hold`)
             if let Some((name, _)) = worlds.iter().find(|(n, _)| m.contains_key(n)) {
                 return Err(Error::Exists(name.clone()));
             }
@@ -4738,6 +5345,12 @@ impl Core {
             {
                 return Err(max_worlds(most));
             }
+            let depth = m.get(from).map_or(0, |e| e.depth);
+            self.fork_room(from, depth, || {
+                (m.iter().filter(|(n, e)| e.parent.as_deref() == Some(from) && !n.starts_with("_tx_")).count()
+                    + worlds.len())
+                .saturating_sub(1)
+            })?;
             self.flush_batch_in(&mut g, &mut batch); // the forks start from them
             let mut pos = 0;
             for ((name, info), rec) in worlds.into_iter().zip(recs) {
@@ -4763,11 +5376,13 @@ impl Core {
         Ok((s.clone(), t))
     }
 
-    fn fork_info(&self, from: &str, name: &str, info: Info) -> Result<()> {
+    fn fork_info(&self, from: &str, name: &str, mut info: Info) -> Result<()> {
         let _t = (!name.starts_with("_tx_")).then(|| self.metrics.time(metrics::Op::Fork)); // not BEGIN's
         let most = if name.starts_with("_tx_") { 0 } else { self.setting(Setting::MaxWorlds) };
         if !name.starts_with("_tx_") {
             self.guard_disk(WORLD_BYTES)?; // a transaction's own world is no new world: a full database still BEGINs
+            // not from a world whose time is up, nor to outlive it (a transaction reads one: see `check_alive`)
+            self.fork_expiry(from, &mut info.meta)?;
         }
         let rec = self.record(|| {
             let meta = serde_json::Value::Object(info.meta.clone()).to_string();
@@ -4786,12 +5401,19 @@ impl Core {
             if !m.contains_key(from) {
                 return Err(Error::NoBranch(from.into())); // merged or discarded meanwhile
             }
+            self.check_held(from, &m[from].br)?; // (under the map's lock: see `consolidate::Hold`)
             if m.contains_key(name) {
                 return Err(Error::Exists(name.into()));
             }
             // ponytail: counts every world per fork while max_worlds is set; keep a count if 100k+ worlds
             if most > 0 && m.keys().filter(|n| *n != MAIN && !n.starts_with("_tx_")).count() as u64 >= most {
                 return Err(max_worlds(most));
+            }
+            if !name.starts_with("_tx_") {
+                let depth = m.get(from).map_or(0, |e| e.depth);
+                self.fork_room(from, depth, || {
+                    m.iter().filter(|(n, e)| e.parent.as_deref() == Some(from) && !n.starts_with("_tx_")).count()
+                })?;
             }
             src.active.store(self.now(), Ordering::Relaxed);
             self.flush_batch_in(&mut g, &mut batch); // the fork starts from them
@@ -4802,7 +5424,7 @@ impl Core {
                 true => src.recorder(),
                 false
                     if (info.meta.contains_key(stale::CHECK_READS) || info.meta.contains_key(stale::WATCH_READS))
-                        && self.me.get().is_some() =>
+                        && !self.replaying() =>
                 {
                     Some(Arc::new(Mutex::new(stale::ReadSet::of(&info.meta, true))))
                 }
@@ -4811,6 +5433,10 @@ impl Core {
             let br = Branch::new(born, data.clone(), data.clone(), info);
             // (the rows `from` has written so far, which `rebase_tx` counts the world's writes since from)
             br.synced_rows.store(src.changed.load(Ordering::Relaxed), Ordering::Relaxed);
+            if name.starts_with("_tx_") {
+                // a transaction expires with its world (see `set_expiry`)
+                br.life.expires.store(src.life.expires.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
             *br.reads.write().unwrap() = reads;
             // read with `data` held, as a merge publishes and moves the clock on with it held
             br.start.store(self.lock_clock.load(Ordering::SeqCst), Ordering::SeqCst);
@@ -4974,6 +5600,84 @@ impl Core {
         changes.map(|c| self.show_change(&base, &now, c)).collect()
     }
 
+    /// The privilege rows world `b` changed since it was forked (grants, owners, roles, row security, merge
+    /// policies and checks, agents, rules, masking), by key: what ASSIGN WORLD's check 4 refuses.
+    pub(crate) fn privilege_changes(&self, b: &str, since: &str) -> Result<Vec<String>> {
+        const PRIVILEGES: [&str; 11] = [
+            "_sonos_acl",
+            "_sonos_made",
+            "_sonos_roles",
+            "_sonos_rls",
+            "_sonos_policy",
+            "_sonos_policies",
+            "_sonos_agents",
+            "_sonos_checks",
+            "_sonos_defs/rule/",
+            "_sonos_masking",
+            "_sonos_canary",
+        ];
+        let (base, now) = (self.branch(since)?.base(), self.branch(b)?.snapshot());
+        Ok(self
+            .state_diff(&base, &now)?
+            .into_iter()
+            .filter(|c| PRIVILEGES.iter().any(|p| c.key.starts_with(p)))
+            .map(|c| c.key)
+            .collect())
+    }
+
+    /// What world `b` changed since it was forked that is outside `declared` (a scope: see `scope::outside`), in
+    /// words; none: all within it. Every row counts as applied. Rows of tables held to the scope's tenant through a
+    /// foreign key are judged by the tenant their key leads to, before (where the world forked) and after.
+    /// `since`: the world whose fork point the changes are counted from, `b` itself or an ancestor of it (what an
+    /// ancestor changed before `b` forked is then counted too).
+    pub(crate) fn strays(
+        &self,
+        b: &str,
+        since: &str,
+        declared: &serde_json::Value,
+        skip_shared: bool,
+    ) -> Result<Vec<String>> {
+        let (base, now) = (self.branch(since)?.base(), self.branch(b)?.snapshot());
+        let rows: Vec<Change> = self
+            .state_diff(&base, &now)?
+            .into_iter()
+            .filter(|c| shown(&c.key))
+            .map(|c| self.show_change(&base, &now, c))
+            .collect::<Result<_>>()?;
+        let mut described = sql::describe(&rows);
+        let mut reached = HashMap::new();
+        if let Some(col) = declared["tenant"]["column"].as_str() {
+            let view = self.view(b)?;
+            // rows of tables shared by every tenant (no column, no foreign key to it), when told to leave them out
+            if skip_shared {
+                let mut kept = vec![];
+                for d in described {
+                    let shared = d.id.is_some()
+                        && sql::tenant_reach(&view, &d.table, col)
+                            .map_err(|e| Error::Constraint { code: e.code, message: e.message })?
+                            == Some(sql::TenantReach::Shared);
+                    if !shared {
+                        kept.push(d);
+                    }
+                }
+                described = kept;
+            }
+            let (forked, world) = (View { s: base.clone(), ..view.clone() }, View { s: now.clone(), ..view.clone() });
+            let lacks = |r: &Option<serde_json::Value>| r.as_ref().is_some_and(|r| r.get(col).is_none());
+            for d in described.iter().filter(|d| d.id.is_some() && (lacks(&d.before) || lacks(&d.after))) {
+                let id = d.key.strip_prefix(&format!("{}/", d.table)).unwrap_or(&d.key);
+                let tenant = |v: &View| -> Result<Option<serde_json::Value>> {
+                    let Some(raw) = v.get(&d.key)? else { return Ok(None) };
+                    sql::reached_tenant(v, &d.table, id, &raw, col)
+                        .map_err(|e| Error::Constraint { code: e.code, message: e.message })
+                };
+                reached.insert(d.key.clone(), (tenant(&forked)?, tenant(&world)?));
+            }
+        }
+        let applied: std::collections::HashSet<&str> = described.iter().map(|d| d.key.as_str()).collect();
+        Ok(scope::outside(declared, &described, &applied, &reached))
+    }
+
     /// Three-way merge into the parent, then drop the branch. Returns rows applied.
     /// With `Resolve::Fail`, conflicts come back as data and nothing changes.
     /// The new parent version is built off to the side and swapped in, so readers never wait.
@@ -5038,6 +5742,7 @@ impl Core {
     /// (`attach::after_failed`), so a row whose two sides changed different columns combines, and only
     /// a column both changed is still a conflict.
     pub fn merge_kept(&self, b: &str, o: &MergeOptions) -> Result<(usize, Option<u64>)> {
+        self.part_of_parent(b, o)?;
         self.canary(b, o)?; // a big merge lands a few rows first (see `MergePolicy::canary`)
         match self.merge_once(b, o) {
             Err(e) if o.columns && self.attached.is_some() && attach::is_conflict(&e) => self.merge_once(b, o),
@@ -5049,6 +5754,16 @@ impl Core {
     fn merge_once(&self, b: &str, o: &MergeOptions) -> Result<(usize, Option<u64>)> {
         let _t = self.metrics.time(if b.starts_with("_tx_") { metrics::Op::Commit } else { metrics::Op::Merge });
         self.guard_shipping()?;
+        if !b.starts_with("_tx_") {
+            self.upgrade_log(); // (a transaction's commit is logged as it was: see `publish`)
+        }
+        // a merge into main by an operation id done before (its world merged and gone, maybe): what it did then
+        if let Some(id) = &o.operation {
+            let stored = self.val(&self.branch(MAIN)?.snapshot(), &ledger::op_key(id))?;
+            if let Some(n) = ledger::repeated(stored.as_deref(), id, &ledger::request(b, o))? {
+                return Ok((n, None));
+            }
+        }
         // the rows a merge brings count toward the parent's changes, and its agent's quota there
         let parent = {
             let m = self.branches.read().unwrap();
@@ -5069,6 +5784,7 @@ impl Core {
         let picks = settles(o);
         // a write done in batches to either side finishes first (see `batch_long`)
         let target = into.map(String::from).or_else(|| parent.as_ref().map(|(p, _)| p.clone()));
+        self.merge_alive(b, target.as_deref())?; // nothing from or into a world whose time is up
         // into main of a folder attached to Postgres: one write-back at a time, through main taking what it sent back
         let _attached = attach::before_merge(self, target.as_deref() == Some(MAIN) && !b.starts_with("_tx_"))?;
         let mut sides: Vec<Arc<Branch>> =
@@ -5112,8 +5828,9 @@ impl Core {
         };
         // like `write`, only a merge into main waits for the disk: worlds and transactions
         // inside one become durable when they reach main
-        let durable = into.map_or(parent.as_ref().is_some_and(|(p, _)| p == MAIN), |y| y == MAIN);
         let went = into.or(parent.as_ref().map(|(p, _)| p.as_str())).unwrap_or(MAIN);
+        // (and a merge into a durable world, as its own writes do: see `durable`)
+        let durable = went == MAIN || self.branch(went).is_ok_and(|w| durable::is_durable(&w));
         self.touch(went); // where the rows went
         if !whole {
             sql::world_types_moved(self, went); // (a whole merge's are read in as the world goes: see `retire`)
@@ -5212,6 +5929,8 @@ impl Core {
     /// under it, and settle conflicts as they come rather than all at its merge.
     pub fn rebase(&self, b: &str, o: &MergeOptions) -> Result<usize> {
         not_tx(b)?;
+        let br = self.branch(b)?;
+        self.check_alive(b, &br)?; // it changes the world: not once its time is up
         if o.into.is_some() || !o.only_tables.is_empty() || !o.only_keys.is_empty() {
             return Err(Error::Constraint {
                 code: "22023",
@@ -5224,6 +5943,7 @@ impl Core {
             let e = m.get(b).ok_or_else(|| Error::NoBranch(b.into()))?;
             e.parent.clone().ok_or(Error::IsMain)?
         };
+        self.upgrade_log();
         // a write done in batches to either side finishes first (see `batch_long`), as for a merge
         let mut sides: Vec<Arc<Branch>> = [b, parent.as_str()].iter().filter_map(|x| self.branch(x).ok()).collect();
         sides.sort_by_key(|x| std::cmp::Reverse(x.born));
@@ -5236,7 +5956,7 @@ impl Core {
         let Merged::Done(n, pos, ..) = done else { unreachable!("a rebase is done or refused") };
         self.touch(b);
         sql::world_types_moved(self, b); // (its parent's composite types may be others by now)
-        self.after(pos, false);
+        self.after(pos, self.branch(b).is_ok_and(|w| durable::is_durable(&w)));
         Ok(n)
     }
 
@@ -5306,129 +6026,31 @@ impl Core {
         Ok(Some((what, v, overwrites)))
     }
 
-    /// The merge itself (see `merge_with`), or with `dry` its plan. `o.picks` is ignored: rows
-    /// settled one by one come in `picks` (replay gives them as they were stored).
-    fn merge_locked(&self, b: &str, o: &MergeOptions, picks: &HashMap<String, Settle>, mode: Mode) -> Result<Merged> {
-        let (how, expected, columns) = (o.how, o.expected, o.columns);
-        let (dry, rebase) = (mode == Mode::Dry, mode == Mode::Rebase);
-        SETTLED.set(Settled::NONE);
-        // `parent` is the world merged into: the branch's parent, or `into`
-        let (child, parent, name, into) = {
-            let m = self.branches.read().unwrap();
-            let e = m.get(b).ok_or_else(|| Error::NoBranch(b.into()))?;
-            let p = e.parent.as_ref().ok_or(Error::IsMain)?;
-            match o.into.as_deref().filter(|y| y != p) {
-                // a parent can't go away while it has children
-                None => (e.br.clone(), m[p].br.clone(), p.clone(), None),
-                Some(y) if y == b => {
-                    return Err(Error::Constraint { code: "22023", message: format!("can't merge {b} into itself") });
-                }
-                Some(y) => {
-                    let t = m.get(y).ok_or_else(|| Error::NoBranch(y.into()))?;
-                    (e.br.clone(), t.br.clone(), y.to_string(), Some(y))
-                }
-            }
-        };
-        // the branch stays open: only some of its rows merge, or they go to another world
-        let stays = into.is_some() || !o.only_tables.is_empty() || !o.only_keys.is_empty();
-        let (mut gone, parent_gone) = if parent.born > child.born {
-            let p = lock(&parent.writer);
-            (lock(&child.writer), p)
-        } else {
-            let c = lock(&child.writer);
-            (c, lock(&parent.writer))
-        };
-        if *gone {
-            return Err(Error::NoBranch(b.into()));
-        }
-        if *parent_gone {
-            return Err(Error::NoBranch(name)); // `into` merged or discarded meanwhile
-        }
-        let actual = child.version.load(Ordering::Relaxed);
-        if !dry
-            && (expected.is_some_and(|e| e != actual) || (expected.is_none() && child.flagged.load(Ordering::Relaxed)))
-        {
-            return Err(Error::Stale { branch: b.into(), expected, actual });
-        }
-        // and the world merged into, when the caller settled rows against it as a preview saw it
-        let target_now = parent.stamp.load(Ordering::Relaxed);
-        if o.target.is_some_and(|t| !dry && t != target_now) {
-            return Err(Error::Constraint {
-                code: "55000",
-                message: format!(
-                    "{name} changed since the preview this merge settles rows by (its target): preview again; nothing was merged"
-                ),
-            });
-        }
-        let (base_state, ours_state) = (child.base(), child.snapshot());
-        // a transaction (or savepoint) too big to merge row by row in memory: its own state is the result, when the
-        // world it goes into has nothing it hasn't seen (see `merge_published`); a transaction's world it was brought up
-        // to at last (see `merge_with`), a savepoint's transaction changes only so
-        if !dry
-            && !stays
-            && b.starts_with("_tx_")
-            && picks.is_empty()
-            && !(name == MAIN && self.attached.is_some() && !RECOVERING.get()) // (main's guard below refuses it)
-            && big_tx(&base_state, &ours_state)
-            && lock(&child.locked).is_empty()
-        {
-            let theirs_state = parent.snapshot();
-            // (a checkpoint since may have put the same rows under another tree)
-            let seen = name.starts_with("_tx_") || base_state.same(&theirs_state) || {
-                let synced = lock(&child.synced).clone();
-                synced.same(&theirs_state) || self.state_diff_iter(&synced, &theirs_state, None)?.next().is_none()
-            };
-            let rebased = child.rebased.load(Ordering::Relaxed);
-            if seen
-                && let Some(next) =
-                    self.merge_published(&base_state, &ours_state, &theirs_state, parent.born, rebased)?
-            {
-                let notes = if name == MAIN { self.landed(&theirs_state, &next)? } else { vec![] };
-                let rec = self.record(|| Op::Merge(b.to_string(), how, expected));
-                self.flush_batch(&child); // replay merges them
-                self.flush_batch(&parent);
-                let pos = self.retire(b, rec, &parent, next, || {})?;
-                *gone = true;
-                return Ok(Merged::Done(child.changed.load(Ordering::Relaxed) as usize, pos, notes, None));
-            }
-        }
-        let mut diff = only(self.state_diff(&base_state, &ours_state)?, o)?;
-        // a transaction's row picked as its own that it left as it forked, while the parent
-        // changed it (an ALTER SEQUENCE setting back what another commit changed): its own stands
-        if b.starts_with("_tx_") {
-            for (k, _) in picks.iter().filter(|(_, s)| matches!(s, Settle::Ours)) {
-                if let Err(at) = diff.binary_search_by(|c| c.key.as_str().cmp(k)) {
-                    let v = self.val(&ours_state, k)?;
-                    diff.insert(at, Change { key: k.clone(), before: v.clone(), after: v });
-                }
-            }
-        }
-        // a world that checks its reads: what it read must be as it was when it forked (see `stale`)
-        // (replaying the log: a merge that happened passed then, and earlier reads aren't known now)
-        let read_set = if b.starts_with("_tx_") || self.me.get().is_none() { None } else { child.recorder() };
-        // a world that keeps what it reads only to tell whether it read text outsiders write (see `stale::WATCH_READS`)
-        // isn't held for its reads changing: only one that checks them is
-        let checks_reads = b.starts_with("_tx_") || child.info.read().unwrap().meta.contains_key(stale::CHECK_READS);
-        let stale_set = read_set.as_ref().filter(|_| checks_reads);
-        let wrote: std::collections::HashSet<String> = match &read_set {
-            Some(_) => diff.iter().map(|c| c.key.clone()).collect(),
-            None => Default::default(),
-        };
-        // rows merged into the parent on their own are settled for this branch: its fork point
-        // moves on to them, so a later merge takes only what changed since
-        let settled: Vec<(String, Option<Val>)> = match stays && into.is_none() && !dry {
-            true => diff.iter().map(|c| (c.key.clone(), c.after.clone())).collect(),
-            false => vec![],
-        };
-        let mut next = parent.snapshot();
-        let theirs_state = next.clone();
+    /// Resolve, the first step of a merge (see `merge_locked`): the three-way result of `diff` (the world's changes,
+    /// base to ours) against `sides` (base, ours, theirs: the world merged into, as it is now), settled row by row as
+    /// `picks` say, by columns (`columns`, a table's own setting, or `rules`' delta columns), then by `how`. Pure: it
+    /// reads the three states and tables' definitions only, and judges nothing (no rights, scope, policy, constraint
+    /// or check): what can refuse or hold the merge is the validation that follows it.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve(
+        &self,
+        mut diff: Vec<Change>,
+        sides: [&State; 3],
+        born: u64,
+        picks: &HashMap<String, Settle>,
+        how: Resolve,
+        columns: bool,
+        rules: &writeback::Rules,
+    ) -> Result<Resolved> {
+        assert!(!(RESOLVE_PANICS.get() && self.replaying()), "a merge was resolved while replaying the log");
+        let [base_state, ours_state, theirs_state] = sides;
         // both sides changed a table's definition: where they changed different columns, one
         // definition holds both (see `sql::merge_table_def`), applied as the world's change. The
         // world's rows of it are packed with its own layouts, which the merged definition keeps
         // after the parent's: they move there as they're written into the result (see `relayout`)
         let mut relayouts: Vec<Relayout> = vec![];
         for ch in diff.iter_mut().filter(|c| c.key.starts_with("_sonos_tables/")) {
-            let theirs = self.val(&theirs_state, &ch.key)?;
+            let theirs = self.val(theirs_state, &ch.key)?;
             if theirs == ch.before || theirs == ch.after {
                 continue;
             }
@@ -5440,62 +6062,32 @@ impl Core {
                 ch.after = Some(Val::from(m.def));
             }
         }
-        let parent_view =
-            View { core: self, born: parent.born, s: theirs_state.clone(), branch: String::new(), reads: None };
+        let parent_view = View { core: self, born, s: theirs_state.clone(), branch: String::new(), reads: None };
         // the world merged into with the definitions this merge brings it (a column the world added): a row settled
         // here as JSON (picked, or combined by columns) is stored as the merged table reads it
         let packing_view = {
             let mut s = theirs_state.clone();
             for ch in diff.iter().filter(|c| c.key.starts_with("_sonos_")) {
-                if self.val(&theirs_state, &ch.key)? == ch.before {
+                if self.val(theirs_state, &ch.key)? == ch.before {
                     s.set(&ch.key, ch.after.clone());
                 }
             }
             View { s, ..parent_view.clone() }
         };
-
         let (mut apply, mut conflicts) = (vec![], vec![]);
         let mut schema_clash = vec![];
         let mut outcomes: HashMap<String, (&'static str, Option<Val>)> = HashMap::new(); // for the plan
         let mut logged: Vec<(String, u8, Option<String>)> = vec![]; // rows settled here, for the log
-        // the acting agent's merge policy, checked below on the rows about to merge, under the
-        // locks: what's checked is what merges; merge checks likewise, on the merged result (a
-        // session's transaction commits into its own world: a write, not a merge)
-        let tx = b.starts_with("_tx_");
-        let policy = match tx || rebase {
-            true => None, // a rebase changes only the world: its merge is judged when it merges
-            false => self.acting_policy()?,
-        };
-        // a folder attached to Postgres: an agent's merge into main, which writes there, goes to a person unless the
-        // agent has a merge policy of its own to judge it
-        let attached_review = !tx
-            && !rebase
-            && name == MAIN
-            && policy.is_none()
-            && self.attached.is_some()
-            && !disk::actor().is_empty()
-            && !RECOVERING.get();
         let mut overwrote = 0; // rows the parent changed since the fork that this merge overwrites
         let mut by_table: HashMap<String, bool> = HashMap::new(); // tables' merge_by_columns
-        // an attached folder's delta columns (see `writeback`), into main: rows both sides changed combine by
-        // columns, a delta column both changed as theirs + ours - base (rules that don't load refuse the write-back)
-        let rules = match self.attached.as_deref().filter(|_| attach::writes_back(self, &name, tx)) {
-            Some(att) => att.rules().unwrap_or_default(),
-            None => writeback::Rules::default(),
-        };
-        // what the world was forked to change (see `scope`); not replaying the log: it was held then
-        let declared = match tx || rebase || self.me.get().is_none() {
-            true => None,
-            false => child.info.read().unwrap().meta.get(scope::SCOPE).cloned(),
-        };
-        let columns_reviewed = policy.as_ref().is_some_and(|p| !p.review_columns.is_empty() || p.max_nulled.is_some());
+        let mut deltas: HashMap<String, Vec<sql::DeltaColumn>> = HashMap::new(); // tables' SET MERGE AS DELTA columns
         let mut counts = Settled::NONE;
         // tables' definitions first: a table both sides changed is known before its rows come (a row of it can't be
         // combined by columns, the merged table's columns being undecided)
         let (defs, rows): (Vec<Change>, Vec<Change>) =
             diff.into_iter().partition(|c| c.key.starts_with("_sonos_tables/"));
         for ch in defs.into_iter().chain(rows) {
-            let theirs = self.val(&next, &ch.key)?;
+            let theirs = self.val(theirs_state, &ch.key)?;
             // Apply only where the parent still holds the value this branch forked from. If the
             // parent changed the row too, that's a conflict even when both sides wrote the same
             // value: the branch computed its write from a value that is gone (first merge wins).
@@ -5555,10 +6147,33 @@ impl Core {
                     Some(Settle::Ours) => Some(("picked ours", Settle::Ours)),
                     Some(Settle::Theirs) => Some(("picked theirs", Settle::Theirs)),
                     Some(Settle::Stored(v)) => Some(("picked row", Settle::Stored(v.clone()))),
+                    // a column both changed that merges as a delta (SET MERGE AS DELTA): both changes, applied
+                    None if !clashed
+                        && !deltas
+                            .entry(t.to_string())
+                            .or_insert_with(|| sql::merge_deltas(&parent_view, t))
+                            .is_empty() =>
+                    {
+                        let states = [base_state, ours_state, theirs_state];
+                        let vals = [&ch.before, &ch.after, &theirs];
+                        match self.delta_settle(&ch.key, states, vals, combine, &deltas[t], &packing_view)? {
+                            Some(v) => {
+                                by_cols_overwrites = Some(false); // it adds to the parent's change, not over it
+                                Some(("combined delta", Settle::Stored(Some(v))))
+                            }
+                            None if combine => self.by_columns(&ch.key, states, vals, how, &packing_view, delta)?.map(
+                                |(what, v, over)| {
+                                    by_cols_overwrites = Some(over);
+                                    (what, Settle::Stored(Some(v)))
+                                },
+                            ),
+                            None => None,
+                        }
+                    }
                     None if combine => self
                         .by_columns(
                             &ch.key,
-                            [&base_state, &ours_state, &theirs_state],
+                            [base_state, ours_state, theirs_state],
                             [&ch.before, &ch.after, &theirs],
                             how,
                             &packing_view,
@@ -5596,7 +6211,7 @@ impl Core {
                     };
                     if shown(&ch.key) && !sql::internal(&ch.key) {
                         match what {
-                            "by columns" => counts.combined += 1,
+                            "by columns" | "combined delta" => counts.combined += 1,
                             "kept ours" | "picked ours" | "by columns ours" => counts.ours += 1,
                             "kept theirs" | "picked theirs" | "by columns theirs" => counts.theirs += 1,
                             _ => counts.given += 1,
@@ -5612,6 +6227,222 @@ impl Core {
                 None => conflicts.push(Conflict { key: ch.key, base: ch.before, ours: ch.after, theirs }),
             }
         }
+        Ok(Resolved {
+            apply,
+            conflicts,
+            schema_clash,
+            outcomes,
+            logged,
+            relayouts,
+            overwrote,
+            counts,
+            packing: packing_view.s,
+        })
+    }
+
+    /// The merge itself (see `merge_with`), or with `dry` its plan. `o.picks` is ignored: rows
+    /// settled one by one come in `picks` (replay gives them as they were stored).
+    ///
+    /// Three steps: `resolve` (the three-way result, pure), validation (everything that can refuse the merge or
+    /// hold it for review: the body between the two, and the only place a new check goes; none of it runs while
+    /// `replaying`), and `publish` (the record, the worlds' new states, the append). Replaying the log, only the
+    /// logical records of transactions and of logs from before `Op::Applied` come here; an `Op::Applied` never does
+    /// (see `replay_applied`).
+    fn merge_locked(&self, b: &str, o: &MergeOptions, picks: &HashMap<String, Settle>, mode: Mode) -> Result<Merged> {
+        let (how, expected, columns) = (o.how, o.expected, o.columns);
+        let (dry, rebase) = (mode == Mode::Dry, mode == Mode::Rebase);
+        SETTLED.set(Settled::NONE);
+        // `parent` is the world merged into: the branch's parent, or `into`
+        let (child, parent, name, into) = {
+            let m = self.branches.read().unwrap();
+            let e = m.get(b).ok_or_else(|| Error::NoBranch(b.into()))?;
+            let p = e.parent.as_ref().ok_or(Error::IsMain)?;
+            match o.into.as_deref().filter(|y| y != p) {
+                // a parent can't go away while it has children
+                None => (e.br.clone(), m[p].br.clone(), p.clone(), None),
+                Some(y) if y == b => {
+                    return Err(Error::Constraint { code: "22023", message: format!("can't merge {b} into itself") });
+                }
+                Some(y) => {
+                    let t = m.get(y).ok_or_else(|| Error::NoBranch(y.into()))?;
+                    (e.br.clone(), t.br.clone(), y.to_string(), Some(y))
+                }
+            }
+        };
+        // the branch stays open: only some of its rows merge, or they go to another world
+        let stays = into.is_some() || !o.only_tables.is_empty() || !o.only_keys.is_empty();
+        let (mut gone, parent_gone) = if parent.born > child.born {
+            let p = lock(&parent.writer);
+            (lock(&child.writer), p)
+        } else {
+            let c = lock(&child.writer);
+            (c, lock(&parent.writer))
+        };
+        if *gone {
+            return Err(Error::NoBranch(b.into()));
+        }
+        if *parent_gone {
+            return Err(Error::NoBranch(name)); // `into` merged or discarded meanwhile
+        }
+        // either side merged by a consolidation of its parent (see `consolidate::Hold`)
+        self.check_held(b, &child)?;
+        self.check_held(&name, &parent)?;
+        if !dry {
+            self.check_consolidated(b, &child)?; // its rows went into its parent already (see `consolidate`)
+        }
+        let actual = child.version.load(Ordering::Relaxed);
+        // (a replayed merge happened: the version it was made at was checked then. A log from before merges into a
+        // world moved its version holds versions that didn't count them)
+        if !dry
+            && ((expected.is_some_and(|e| e != actual) && !self.replaying())
+                || (expected.is_none() && child.flagged.load(Ordering::Relaxed)))
+        {
+            return Err(Error::Stale { branch: b.into(), expected, actual });
+        }
+        // and the world merged into, when the caller settled rows against it as a preview saw it
+        let target_now = parent.stamp.load(Ordering::Relaxed);
+        if o.target.is_some_and(|t| !dry && t != target_now) {
+            return Err(Error::Constraint {
+                code: "55000",
+                message: format!(
+                    "{name} changed since the preview this merge settles rows by (its target): preview again; nothing was merged"
+                ),
+            });
+        }
+        let (base_state, ours_state) = (child.base(), child.snapshot());
+        // a transaction (or savepoint) too big to merge row by row in memory: its own state is the result, when the
+        // world it goes into has nothing it hasn't seen (see `merge_published`); a transaction's world it was brought up
+        // to at last (see `merge_with`), a savepoint's transaction changes only so
+        if !dry
+            && !stays
+            && b.starts_with("_tx_")
+            && picks.is_empty()
+            && !(name == MAIN && self.attached.is_some() && !RECOVERING.get()) // (main's guard below refuses it)
+            && big_tx(&base_state, &ours_state)
+            && lock(&child.locked).is_empty()
+        {
+            let theirs_state = parent.snapshot();
+            // (a checkpoint since may have put the same rows under another tree)
+            let seen = name.starts_with("_tx_") || base_state.same(&theirs_state) || {
+                let synced = lock(&child.synced).clone();
+                synced.same(&theirs_state) || self.state_diff_iter(&synced, &theirs_state, None)?.next().is_none()
+            };
+            let rebased = child.rebased.load(Ordering::Relaxed);
+            if seen
+                && let Some(next) =
+                    self.merge_published(&base_state, &ours_state, &theirs_state, parent.born, rebased)?
+            {
+                let notes = if name == MAIN { self.landed(&theirs_state, &next)? } else { vec![] };
+                let rec = self.record(|| Op::Merge(b.to_string(), how, expected));
+                self.flush_batch(&child); // replay merges them
+                self.flush_batch(&parent);
+                let pos = self.retire(b, rec, &parent, next, || {})?;
+                *gone = true;
+                return Ok(Merged::Done(child.changed.load(Ordering::Relaxed) as usize, pos, notes, None));
+            }
+        }
+        let mut diff = only(self.state_diff(&base_state, &ours_state)?, o)?;
+        diff.retain(|c| !ledger::reserved(&c.key)); // main's own, never merged (see `ledger`)
+        if let Some(target) = into {
+            self.carried(b, target, &diff)?;
+        }
+        // a proposal's merge (see `proposals`): only the rows it was approved for, read here under the merge's locks
+        let approval = match dry || rebase {
+            true => None,
+            false => proposals::approval_for(b),
+        };
+        if let Some(a) = &approval
+            && proposals::diff_digest(&diff) != a.digest
+        {
+            return Err(Error::Constraint {
+                code: "40001",
+                message: format!(
+                    "{b} changed since its proposal was approved: what would merge isn't what was approved; nothing was merged"
+                ),
+            });
+        }
+        // the rules an approval lifts: a person's, any but those never lifted; a reviewer's, those not person_only
+        let lifted = |p: &agents::MergePolicy, rule: &str| {
+            approval.as_ref().is_some_and(|a| !proposals::never_lifted(rule) && (a.person || !p.person_needs(rule)))
+        };
+        // a transaction's row picked as its own that it left as it forked, while the parent
+        // changed it (an ALTER SEQUENCE setting back what another commit changed): its own stands
+        if b.starts_with("_tx_") {
+            for (k, _) in picks.iter().filter(|(_, s)| matches!(s, Settle::Ours)) {
+                if let Err(at) = diff.binary_search_by(|c| c.key.as_str().cmp(k)) {
+                    let v = self.val(&ours_state, k)?;
+                    diff.insert(at, Change { key: k.clone(), before: v.clone(), after: v });
+                }
+            }
+        }
+        // a world that checks its reads: what it read must be as it was when it forked (see `stale`)
+        // (replaying the log: a merge that happened passed then, and earlier reads aren't known now)
+        let read_set = if b.starts_with("_tx_") || self.replaying() { None } else { child.recorder() };
+        // a world that keeps what it reads only to tell whether it read text outsiders write (see `stale::WATCH_READS`)
+        // isn't held for its reads changing: only one that checks them is
+        let checks_reads = b.starts_with("_tx_") || child.info.read().unwrap().meta.contains_key(stale::CHECK_READS);
+        let stale_set = read_set.as_ref().filter(|_| checks_reads);
+        let wrote: std::collections::HashSet<String> = match &read_set {
+            Some(_) => diff.iter().map(|c| c.key.clone()).collect(),
+            None => Default::default(),
+        };
+        // rows merged into the parent on their own are settled for this branch: its fork point
+        // moves on to them, so a later merge takes only what changed since
+        let settled: Vec<(String, Option<Val>)> = match stays && into.is_none() && !dry {
+            true => diff.iter().map(|c| (c.key.clone(), c.after.clone())).collect(),
+            false => vec![],
+        };
+        let mut next = parent.snapshot();
+        let theirs_state = next.clone();
+        let parent_view =
+            View { core: self, born: parent.born, s: theirs_state.clone(), branch: String::new(), reads: None };
+        // the acting agent's merge policy, checked below on the rows about to merge, under the
+        // locks: what's checked is what merges; merge checks likewise, on the merged result (a
+        // session's transaction commits into its own world: a write, not a merge)
+        let tx = b.starts_with("_tx_");
+        // (replaying the log: judged when it happened)
+        let policy = match tx || rebase || self.replaying() {
+            true => None, // a rebase changes only the world: its merge is judged when it merges
+            false => self.acting_policy()?,
+        };
+        // a folder attached to Postgres: an agent's merge into main, which writes there, goes to a person unless the
+        // agent has a merge policy of its own to judge it
+        let attached_review = !tx
+            && !rebase
+            && name == MAIN
+            && policy.is_none()
+            && self.attached.is_some()
+            && !disk::actor().is_empty()
+            && !RECOVERING.get()
+            && !self.replaying();
+        // an attached folder's delta columns (see `writeback`), into main: rows both sides changed combine by
+        // columns, a delta column both changed as theirs + ours - base (rules that don't load refuse the write-back)
+        let rules = match self.attached.as_deref().filter(|_| attach::writes_back(self, &name, tx)) {
+            Some(att) => att.rules().unwrap_or_default(),
+            None => writeback::Rules::default(),
+        };
+        // what the world was forked to change (see `scope`); not replaying the log: it was held then
+        let declared = match tx || rebase || self.replaying() {
+            true => None,
+            false => child.info.read().unwrap().meta.get(scope::SCOPE).cloned(),
+        };
+        let columns_reviewed = policy.as_ref().is_some_and(|p| !p.review_columns.is_empty() || p.max_nulled.is_some());
+        // resolve: the three-way result, which nothing here has judged yet
+        let Resolved {
+            mut apply,
+            mut conflicts,
+            schema_clash,
+            outcomes,
+            logged,
+            relayouts,
+            overwrote,
+            counts,
+            packing,
+        } = self.resolve(diff, [&base_state, &ours_state, &theirs_state], parent.born, picks, how, columns, &rules)?;
+        // the world merged into with the definitions this merge brings it (see `Resolved::packing`)
+        let packing_view = View { s: packing, ..parent_view.clone() };
+        // validate: everything from here to `publish` can refuse the merge or hold it for review, and nothing else
+        // does (replaying the log, none of it runs: see `replaying`)
         if !dry {
             SETTLED.set(counts); // (read only once the merge went through: see `Settled::last`)
         }
@@ -5626,7 +6457,10 @@ impl Core {
                 // a row picked as JSON, or combined by columns, is stored as the merged table reads it
                 // (see `packing_view`); the rest are the world's own
                 let made = outcomes.get(&c.key).is_some_and(|o| {
-                    matches!(o.0, "picked row" | "by columns" | "by columns ours" | "by columns theirs")
+                    matches!(
+                        o.0,
+                        "picked row" | "by columns" | "by columns ours" | "by columns theirs" | "combined delta"
+                    )
                 });
                 let after_state = if made { &packing_view.s } else { &ours_state };
                 let c = Change { key: c.key.clone(), before: now, after: c.after.clone() };
@@ -5687,6 +6521,19 @@ impl Core {
         if let Some(rules) = declared.as_ref().map(scope::row_rules).filter(|r| !r.is_empty()) {
             strayed.extend(rule_rows(&rules)?);
         }
+        // rows outside the world's tenant are refused whoever merges, one keeping to a merge policy too, where the
+        // rest of what strays from a scope is a reason for review (rule T6): no reviewer may approve a tenant's world
+        // changing another tenant's rows
+        if let (Some(s), Some(_), false) = (&declared, &policy, dry)
+            && s.get("tenant").is_some_and(|t| !t.is_null())
+        {
+            let only = serde_json::json!({ "tenant": s["tenant"].clone() });
+            let applied: std::collections::HashSet<&str> = apply.iter().map(|c| c.key.as_str()).collect();
+            let out = scope::outside(&only, &merge_rows, &applied, &reached);
+            if !out.is_empty() {
+                return Err(scope::refused(b, s, &out));
+            }
+        }
         // outside its scope, merged by anyone keeping to no merge policy: refused as it is
         if let (Some(s), None, false) = (&declared, &policy, strayed.is_empty() || dry) {
             return Err(scope::refused(b, s, &strayed));
@@ -5704,6 +6551,33 @@ impl Core {
                 judged.extend(rule_rows(&p.row_rules)?.into_iter().map(|r| ("row_rules", r)));
             }
             judged.extend(p.nulled_broken(&merge_rows).map(|r| ("max_nulled", r)));
+            // evidence the policy asks its agents' merges to carry (see `proposals`)
+            if !p.require_evidence.is_empty() && !tx {
+                let have: Vec<String> = child
+                    .info
+                    .read()
+                    .unwrap()
+                    .meta
+                    .get(proposals::EVIDENCE)
+                    .and_then(|e| e.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e["kind"].as_str().map(String::from))
+                    .collect();
+                let missing: Vec<&String> = p.require_evidence.iter().filter(|k| !have.contains(k)).collect();
+                if !missing.is_empty() {
+                    let missing: Vec<&str> = missing.iter().map(|k| k.as_str()).collect();
+                    judged.push((
+                        "require_evidence",
+                        format!(
+                            "carries no evidence of kind {} (merge policy {} requires it: ATTACH EVIDENCE TO WORLD {b} (kind = '{}', ...))",
+                            missing.join(", "),
+                            p.name,
+                            missing[0]
+                        ),
+                    ));
+                }
+            }
             // far more rows than the policy's merges usually change: drift (see `tally::usual_rows`)
             if name == MAIN
                 && !tx
@@ -5759,6 +6633,8 @@ impl Core {
                     .map_err(|e| Error::Constraint { code: e.code, message: e.message })?;
                 judged.extend(why.into_iter().map(|r| ("critical", r)));
             }
+            // an approved proposal's merge: what the approval covers is lifted (see `proposals`)
+            judged.retain(|(rule, _)| !lifted(p, rule));
             person = p.for_a_person(&judged);
             broken = judged.into_iter().map(|(_, why)| why).collect();
         }
@@ -5812,6 +6688,7 @@ impl Core {
             )?;
             p.version = actual;
             p.target = target_now;
+            p.policy = policy.as_ref().map(|p| p.name.clone());
             if !tx && !rebase {
                 p.confirm_deletes = self.deletes_to_confirm(b, &apply)?;
             }
@@ -5835,6 +6712,7 @@ impl Core {
                 (None, _) if attached_review => Some(agents::needs_review(b, ATTACHED_REVIEW, &broken)),
                 (None, _) => Some(checks::broken(b, &broken)),
             };
+            p.reasons = broken.clone();
             p.blocked = p.blocked.or(refused.map(|e| e.to_string()));
             // into main of a folder attached to Postgres: the rows it would write there, to check against Postgres
             // once the locks are let go (see `merge_preview`)
@@ -5889,7 +6767,7 @@ impl Core {
         if !tx
             && !rebase
             && disk::actor().is_empty()
-            && self.me.get().is_some()
+            && !self.replaying()
             && !RECOVERING.get()
             && let Some(c) = self.deletes_to_confirm(b, &apply)?
             && o.confirm_deletes != Some(c.deletes)
@@ -5901,7 +6779,7 @@ impl Core {
         // policy is judged by its own rules above, and a world's own agent whose policy an admin took away by its
         // rights alone
         let actor = disk::actor();
-        if !tx && !rebase && policy.is_none() && !actor.is_empty() && !RECOVERING.get() {
+        if !tx && !rebase && policy.is_none() && !actor.is_empty() && !RECOVERING.get() && !self.replaying() {
             let info = child.info.read().unwrap();
             let meta = &info.meta;
             let own = meta.get(agents::OWNER).and_then(|o| o.as_str()) == Some(actor.as_str());
@@ -6008,9 +6886,12 @@ impl Core {
                 _ => (vec![], deleted),
             }
         });
+        // every row the result sets in the world merged into, in order: what `publish` logs (see `Op::Applied`)
+        let mut set: Vec<(String, Option<Val>)> = Vec::with_capacity(apply.len());
         for ch in apply {
             let v = relayout(&relayouts, &ch.key, ch.after);
-            next.set(&ch.key, v);
+            next.set(&ch.key, v.clone());
+            set.push((ch.key, v));
         }
         let before = View { core: self, born: parent.born, s: parent.snapshot(), branch: String::new(), reads: None };
         let after = View { core: self, born: parent.born, s: next.clone(), branch: String::new(), reads: None };
@@ -6024,13 +6905,30 @@ impl Core {
             }
         };
         for (k, v) in entries {
-            next.set(&k, v);
+            next.set(&k, v.clone());
+            set.push((k, v));
         }
         // both sides may be valid alone yet break a SQL constraint together; a parent left as the
         // branch forked from it, all of whose rows merge, has no side of its own: the result is the
         // branch's, which its statements checked (a RELEASE SAVEPOINT, whose foreign keys put off
         // until COMMIT may not hold yet, as in Postgres)
         let unchanged = !stays && base_state.same(&theirs_state) && !child.rebased.load(Ordering::Relaxed);
+        // and what merges check since 0.5.5: whole tables a constraint comes to, references to UNIQUE values
+        // (the index rows a new constraint brings main's rows are logged with the merge's own: see `Op::Applied`)
+        if !unchanged {
+            match self.recheck(&mut next, &before, &keys) {
+                Ok(rows) => set.extend(rows),
+                Err(e) => {
+                    if let Some(r) = review(broken, person) {
+                        return Ok(r);
+                    }
+                    return Err(Error::Constraint {
+                        code: e.code,
+                        message: format!("{}; nothing was merged", e.message),
+                    });
+                }
+            }
+        }
         let merged = View { core: self, born: parent.born, s: next.clone(), branch: String::new(), reads: None };
         if let Err(e) = if unchanged { Ok(()) } else { sql::check_merge(&merged, &before, &keys) } {
             if let Some(r) = review(broken, person) {
@@ -6054,7 +6952,7 @@ impl Core {
                 person.extend(stale.iter().cloned());
             }
             // what the merge leaves, by the totals the policy watches (see `watch_totals`)
-            if name == MAIN && !tx && !rebase && !p.watch_totals.is_empty() {
+            if name == MAIN && !tx && !rebase && !p.watch_totals.is_empty() && !lifted(p, "max_shift") {
                 let shifted = self.shifted_totals(p, &name, &theirs_state, &next);
                 if p.person_needs("max_shift") {
                     person.extend(shifted.iter().cloned());
@@ -6063,7 +6961,7 @@ impl Core {
             }
             // a merge that keeps every rule: a spot check picks one in so many for a person; else, with
             // review_every, its reviewer decides it (a person, without one)
-            if broken.is_empty() && !tx && !rebase {
+            if broken.is_empty() && !tx && !rebase && approval.is_none() {
                 if let Some(why) = p.spot_picked() {
                     if p.person_needs("spot_check") {
                         person.push(why.clone());
@@ -6090,6 +6988,7 @@ impl Core {
             // keeping its own rows over the parent's changes would make them look unchanged since at
             // its merge: an agent whose policy has a person look at overwrites can't rebase past one
             if overwrote > 0
+                && !self.replaying()
                 && let Some(p) = self.acting_policy()?.filter(|p| !p.overwrite)
             {
                 return Err(Error::Constraint {
@@ -6100,35 +6999,24 @@ impl Core {
                     ),
                 });
             }
-            // the world as if forked now: its fork point the parent as it is, its own changes on
-            // top as the merge would leave them. What it read stays as it was (unchanged, as just
-            // checked), so a later merge checks those reads from the new fork point
             let taken = self
                 .state_diff_iter(&base_state, &theirs_state, None)?
                 .filter(|c| c.as_ref().map_or(true, |c| shown(&c.key)))
                 .count();
-            // both sides' writes before this, in the log before it: replay takes in what it took in
-            self.flush_batch(&child);
-            self.flush_batch(&parent);
-            let rec = self.record(|| {
-                Op::Rebase(
-                    b,
-                    how,
-                    expected,
-                    logged.iter().map(|(k, kind, v)| (k.as_str(), *kind, v.as_deref())).collect(),
-                )
-            });
-            let mut snap = child.snap.write().unwrap(); // held through the append, as `write` does
-            *snap = next;
-            child.stamp.store(stamp(), Ordering::Relaxed);
-            *child.base.write().unwrap() = theirs_state;
-            child.version.fetch_add(1, Ordering::Relaxed);
-            child.active.store(self.now(), Ordering::Relaxed);
-            // its fork point moved: going back past now would put back rows as they sat on the old
-            // one (see `restore`). Set with the rebase, under its locks, and again by its replay
-            child.info.write().unwrap().meta.insert(REBASED.into(), serde_json::json!(self.now()));
-            let pos = self.append(rec);
-            return Ok(Merged::Done(taken, pos, vec![], None));
+            let to = Publish {
+                b,
+                name: &name,
+                o,
+                child: &child,
+                parent: &parent,
+                logged,
+                next,
+                set,
+                n,
+                version: actual,
+                audit: None,
+            };
+            return self.publish(to, Disposition::Rebased { theirs: theirs_state, taken });
         }
         // rows it locked: refused if changed, or locked FOR UPDATE by a merge, since it forked
         let locked = match stays || rebase {
@@ -6229,61 +7117,31 @@ impl Core {
                 }
             }
         }
-        if stays {
-            self.flush_batch(&child); // the merge reads them
-            self.flush_batch(&parent);
-            let rec = self.record(|| Op::MergeSome {
-                branch: b,
-                into: into.unwrap_or(""),
-                how,
-                expected,
-                tables: o.only_tables.iter().map(String::as_str).collect(),
-                keys: o.only_keys.iter().map(String::as_str).collect(),
-                rows: logged.iter().map(|(k, kind, v)| (k.as_str(), *kind, v.as_deref())).collect(),
-            });
-            let mut snap = parent.snap.write().unwrap(); // held through the append, as `write` does
-            *snap = next;
-            parent.stamp.store(stamp(), Ordering::Relaxed);
-            let mut base = child.base.write().unwrap();
-            if !settled.is_empty() {
-                // what's left to merge changed: a merge at the version a person reviewed is refused
-                child.version.fetch_add(1, Ordering::Relaxed);
-            }
-            for (k, v) in settled {
-                base.set(&k, v);
-            }
-            let kept = child.version.load(Ordering::Relaxed); // under its writer lock: no write since
-            parent.changed.fetch_add(n as u64, Ordering::Relaxed);
-            let pos = self.append(rec);
-            for (key, rows, deletes, effects) in counted.iter().chain(&shared) {
-                self.count_merge(key, *rows, *deletes, *effects);
-            }
-            if let Some((wrote, cleared)) = &tainting {
-                self.taint_rows(wrote, cleared);
-            }
-            if let Some((p, rows)) = &sized {
-                self.note_size(p, *rows);
-            }
-            return Ok(Merged::Done(n, pos, notes, Some(kept)));
-        }
-        // rows settled here are logged as the values they got, so replay settles them the same
-        let rec = self.record(|| match logged.is_empty() {
-            true => Op::Merge(b.to_string(), how, expected),
-            false => Op::MergeWith(b.to_string(), how, expected, logged),
-        });
-        self.flush_batch(&child); // the merge reads them
-        self.flush_batch(&parent);
-        let mut at = 0;
-        // the parent's state is published, and the lock clock moved on with it, under its state
-        // lock, which `retire` takes before the log and the map (a fork reads both at once)
-        let pos = self.retire(b, rec, &parent, next, || {
+        // publish: the result, logged, and the worlds' new states
+        // into main: who merged it and under what, for its ledger row; and its operation id, unless a merge with the
+        // same id got in first (see `ledger`)
+        let audit = match name == MAIN && !tx {
+            true => Some(self.ledger_context(b, &child, policy.as_ref(), o, &theirs_state)?),
+            false => None,
+        };
+        if let Some((id, request)) = audit.as_ref().and_then(|a| a.operation.as_ref())
+            && let Some(done) = ledger::repeated(self.val(&theirs_state, &ledger::op_key(id))?.as_deref(), id, request)?
+        {
             if !locked.is_empty() {
-                at = self.lock_clock.fetch_add(1, Ordering::SeqCst) + 1;
+                *lock(&child.locked) = locked; // unchanged
             }
-        })?;
-        *gone = true;
-        if !locked.is_empty() {
-            self.keep_locks(&name, &parent, locked, at);
+            return Ok(Merged::Done(done, 0, vec![], None));
+        }
+        let whole = !stays;
+        let disposition = match stays {
+            true => Disposition::Advanced { into, settled },
+            false => Disposition::Retired { locked },
+        };
+        let to =
+            Publish { b, name: &name, o, child: &child, parent: &parent, logged, next, set, n, version: actual, audit };
+        let Merged::Done(n, pos, _, kept) = self.publish(to, disposition)? else { unreachable!("published") };
+        if whole {
+            *gone = true;
         }
         for (key, rows, deletes, effects) in counted.iter().chain(&shared) {
             self.count_merge(key, *rows, *deletes, *effects);
@@ -6294,7 +7152,172 @@ impl Core {
         if let Some((p, rows)) = &sized {
             self.note_size(p, *rows);
         }
-        Ok(Merged::Done(n, pos, notes, None))
+        Ok(Merged::Done(n, pos, notes, kept))
+    }
+
+    /// Publish, the last step of a merge (see `merge_locked`), once validation let it through: logs it and makes the
+    /// worlds' new states, under the locks the merge holds. `to.next` is the state of the world merged into as the merge
+    /// leaves it (for a rebase, the world's own new state); `d` says what becomes of the world merged. Nothing here
+    /// can refuse the merge, but a whole merge of a world that has worlds of its own (see `retire`).
+    fn publish(&self, to: Publish<'_>, d: Disposition<'_>) -> Result<Merged> {
+        let Publish { b, name, o, child, parent, logged, mut next, set, n, version, audit } = to;
+        let (how, expected) = (o.how, o.expected);
+        // logged as the rows it set (`Op::Applied`), but a transaction's commit, which is logged as what it did (as are
+        // all merges until the folder's manifest says its log may hold the new record: see `upgrade_log`)
+        let physical = !b.starts_with("_tx_")
+            && !LOG_LOGICAL.get()
+            && self.log.as_ref().is_some_and(|l| l.applied_ok.load(Ordering::Relaxed));
+        let (source_id, target_id) = (child.info.read().unwrap().id.clone(), parent.info.read().unwrap().id.clone());
+        let at = self.now(); // when it happened, as recovery will have it
+        let digest = disk::rows_digest(&set.iter().map(|(k, v)| (k.as_str(), v.as_deref())).collect::<Vec<_>>());
+        // into main, logged physically: its ledger row (and operation row), rows of the merge's own record
+        let (book, head) = match (&audit, physical && !matches!(d, Disposition::Rebased { .. })) {
+            (Some(ctx), true) => {
+                let counted = || {
+                    set.iter().filter(|(k, _)| {
+                        shown(k) && !k.starts_with("_sonos_") && !sql::internal(k) && !sql::btree_entry(k)
+                    })
+                };
+                let (rows, deletes) = (counted().count(), counted().filter(|(_, v)| v.is_none()).count());
+                let theirs = parent.snapshot();
+                let root = theirs.tree.as_ref().filter(|_| theirs.over.is_empty());
+                let root = root.map(|t| blake3::Hash::from(*t.0).to_hex().to_string());
+                let (book, head) = ledger::rows(
+                    self.ledger_head(&theirs)?,
+                    ctx,
+                    (b, source_id.as_str()),
+                    &target_id,
+                    (rows, deletes, n),
+                    &digest,
+                    root,
+                    at,
+                );
+                // an approved proposal's merge: the proposal's `merged` row too (see `proposals::merged_row`)
+                let mut book = book;
+                book.extend(proposals::merged_row(b, n, at));
+                (book, Some(head))
+            }
+            _ => (vec![], None),
+        };
+        for (k, v) in &book {
+            next.set(k, v.as_deref().map(Val::from));
+        }
+        let applied = |kind: disk::AppliedKind, settled: &[(String, Option<Val>)]| {
+            self.record(|| {
+                let rows: Vec<(&str, Option<&str>)> = set.iter().map(|(k, v)| (k.as_str(), v.as_deref())).collect();
+                Op::Applied(Box::new(disk::Applied {
+                    kind,
+                    source: b,
+                    source_id: source_id.as_str(),
+                    target: name,
+                    target_id: target_id.as_str(),
+                    version,
+                    applied: n as u64,
+                    part: !o.only_tables.is_empty() || !o.only_keys.is_empty(),
+                    at,
+                    digest,
+                    rows,
+                    ledger: book.iter().map(|(k, v)| (k.as_str(), v.as_deref())).collect(),
+                    settled: settled.iter().map(|(k, v)| (k.as_str(), v.as_deref())).collect(),
+                }))
+            })
+        };
+        match d {
+            Disposition::Rebased { theirs, taken } => {
+                // the world as if forked now: its fork point the parent as it is, its own changes on
+                // top as the merge would leave them. What it read stays as it was (unchanged, as
+                // checked), so a later merge checks those reads from the new fork point
+                // both sides' writes before this, in the log before it: replay takes in what it took in
+                self.flush_batch(child);
+                self.flush_batch(parent);
+                let rec = match physical {
+                    true => applied(disk::AppliedKind::Rebase, &[]),
+                    false => self.record(|| {
+                        Op::Rebase(
+                            b,
+                            how,
+                            expected,
+                            logged.iter().map(|(k, kind, v)| (k.as_str(), *kind, v.as_deref())).collect(),
+                        )
+                    }),
+                };
+                let mut snap = child.snap.write().unwrap(); // held through the append, as `write` does
+                *snap = next;
+                child.stamp.store(stamp(), Ordering::Relaxed);
+                *child.base.write().unwrap() = theirs;
+                child.version.fetch_add(1, Ordering::Relaxed);
+                child.active.store(at, Ordering::Relaxed);
+                // its fork point moved: going back past now would put back rows as they sat on the old
+                // one (see `restore`). Set with the rebase, under its locks, and again by its replay
+                child.info.write().unwrap().meta.insert(REBASED.into(), serde_json::json!(at));
+                let pos = self.append(rec);
+                Ok(Merged::Done(taken, pos, vec![], None))
+            }
+            Disposition::Advanced { into, settled } => {
+                self.flush_batch(child); // the merge reads them
+                self.flush_batch(parent);
+                let rec = match physical {
+                    true => applied(disk::AppliedKind::Partial, &settled),
+                    false => self.record(|| Op::MergeSome {
+                        branch: b,
+                        into: into.unwrap_or(""),
+                        how,
+                        expected,
+                        tables: o.only_tables.iter().map(String::as_str).collect(),
+                        keys: o.only_keys.iter().map(String::as_str).collect(),
+                        rows: logged.iter().map(|(k, kind, v)| (k.as_str(), *kind, v.as_deref())).collect(),
+                    }),
+                };
+                let mut snap = parent.snap.write().unwrap(); // held through the append, as `write` does
+                *snap = next;
+                parent.stamp.store(stamp(), Ordering::Relaxed);
+                if n > 0 {
+                    parent.version.fetch_add(1, Ordering::Relaxed); // rows came in: a new version (see `retire`)
+                }
+                let mut base = child.base.write().unwrap();
+                if !settled.is_empty() {
+                    // what's left to merge changed: a merge at the version a person reviewed is refused
+                    child.version.fetch_add(1, Ordering::Relaxed);
+                }
+                for (k, v) in settled {
+                    base.set(&k, v);
+                }
+                let kept = child.version.load(Ordering::Relaxed); // under its writer lock: no write since
+                parent.changed.fetch_add(n as u64, Ordering::Relaxed);
+                let pos = self.append(rec);
+                if head.is_some() {
+                    *self.ledger_head.lock().unwrap() = head;
+                }
+                Ok(Merged::Done(n, pos, vec![], Some(kept)))
+            }
+            Disposition::Retired { locked } => {
+                // rows settled here are logged as the values they got, so replay settles them the same
+                let rec = match physical {
+                    true => applied(disk::AppliedKind::Whole, &[]),
+                    false => self.record(|| match logged.is_empty() {
+                        true => Op::Merge(b.to_string(), how, expected),
+                        false => Op::MergeWith(b.to_string(), how, expected, logged),
+                    }),
+                };
+                self.flush_batch(child); // the merge reads them
+                self.flush_batch(parent);
+                let mut at = 0;
+                // the parent's state is published, and the lock clock moved on with it, under its state
+                // lock, which `retire` takes before the log and the map (a fork reads both at once)
+                let pos = self.retire(b, rec, parent, next, || {
+                    if !locked.is_empty() {
+                        at = self.lock_clock.fetch_add(1, Ordering::SeqCst) + 1;
+                    }
+                })?;
+                if !locked.is_empty() {
+                    self.keep_locks(name, parent, locked, at);
+                }
+                if head.is_some() {
+                    *self.ledger_head.lock().unwrap() = head; // (main's writer lock is still held)
+                }
+                Ok(Merged::Done(n, pos, vec![], None))
+            }
+        }
     }
 
     /// The merge of a transaction too big to merge row by row in memory (see `big_tx`), into `theirs`, its world as it
@@ -6471,6 +7494,8 @@ impl Core {
                 target: 0,
                 live: None,
                 confirm_deletes: None,
+                policy: None,
+                reasons: vec![],
             },
             next,
         ))
@@ -6502,6 +7527,18 @@ impl Core {
             });
         }
         todo.sort_by_key(|(_, br)| std::cmp::Reverse(br.born)); // the lock order: the later fork first
+        // agents' worlds leave a tombstone on main (see `proposals`): made now, while they're there to read, and
+        // written once they're gone, for those that went
+        let mut buried: Vec<(usize, (String, Option<String>))> = vec![];
+        if !self.replaying() && !RECOVERING.get() {
+            for (i, _) in &todo {
+                if let Ok(w) = self.world(names[*i].as_ref())
+                    && let Some(t) = self.tombstone_row(&w, "discarded", &[])
+                {
+                    buried.push((*i, t));
+                }
+            }
+        }
         let mut recs: Vec<_> = todo.iter().map(|(i, _)| self.record(|| Op::Discard(names[*i].as_ref()))).collect();
         let (mut borns, mut worlds, mut discarded) = (vec![], vec![], vec![]); // (`discarded`: transactions' too)
         let mut effects = vec![]; // what each world held to send, recorded once it's gone (see `discarding`)
@@ -6537,7 +7574,7 @@ impl Core {
                 borns.push(br.born);
                 discarded.push(b);
                 if !b.starts_with("_tx_") {
-                    if self.me.get().is_some() && !RECOVERING.get() {
+                    if !self.replaying() && !RECOVERING.get() {
                         let held = self.effects_of(br).unwrap_or_default();
                         if !held.is_empty() {
                             let info = br.info.read().unwrap();
@@ -6554,6 +7591,7 @@ impl Core {
         for (b, id, meta, held) in effects {
             self.discarding(b, &id, &meta, held);
         }
+        self.bury(buried.into_iter().filter(|(i, _)| out[*i].is_ok()).map(|(_, t)| t).collect());
         self.forget(&borns);
         sql::forget_world_stats(self.uid, &worlds); // a world made again by that name starts with none
         sql::forget_world_types(self.uid, Some(&discarded));
@@ -7218,6 +8256,12 @@ impl Core {
             }
             *snap = next;
             parent.stamp.store(stamp(), Ordering::Relaxed);
+            // a world (or a transaction) that changed anything, merged in: the world merged into is at a new version,
+            // as a write would leave it (a resume token, a reviewed version, a ranking: each sees it moved). By the
+            // merged world's own version, which replay has as the merge had it: so replay moves it the same
+            if m.get(b).is_some_and(|e| e.br.version.load(Ordering::Relaxed) > 0) {
+                parent.version.fetch_add(1, Ordering::Relaxed);
+            }
             published(); // moved on with the state published: a fork reads both at once (see `fork_info`)
             let (born, up) = m.take(b).map(|e| (e.br.born, e.parent)).unzip();
             self.row_locks.lock().unwrap().remove(b); // what was locked in it goes with it
@@ -7445,6 +8489,44 @@ thread_local! {
     /// This thread is putting rows back (RESTORE, UNDO MERGE, UNDO AGENT): main's protection
     /// lets it through (see `Core::guard_main`).
     static RECOVERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// Tests only: this thread's merges are logged as they were before `Op::Applied` (see `test_log_logical`).
+    static LOG_LOGICAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests only: resolving a merge while replaying the log panics (see `test_resolve_panics`).
+    static RESOLVE_PANICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// For tests: this thread's merges, partial merges and rebases are logged as the logical records 0.5.5 wrote
+/// (`Merge`, `MergeWith`, `MergeSome`, `Rebase`) instead of `Op::Applied`, to prove those still replay.
+#[doc(hidden)]
+pub fn test_log_logical(on: bool) {
+    LOG_LOGICAL.set(on);
+}
+
+/// For tests: a merge resolved on this thread while replaying the log (at recovery: a logical record) panics, to
+/// prove recovery of `Op::Applied` resolves nothing.
+#[doc(hidden)]
+pub fn test_resolve_panics(on: bool) {
+    RESOLVE_PANICS.set(on);
+}
+
+thread_local! {
+    /// Merges on this thread skip the checks merges gained after 0.5.5 (see `merge_rechecks_off`).
+    static RECHECKS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with the merge checks added after 0.5.5 off on this thread: those that recheck a whole table when a merge
+/// brings it a UNIQUE, FOREIGN KEY or NOT NULL constraint, that follow foreign keys to UNIQUE columns, and that refuse
+/// rows a world's parent never merged. Only for tests: a merge an older Chronos let through and logged, to show the
+/// log still replays (recovery never runs these checks: see `Core::rechecks`).
+#[doc(hidden)]
+pub fn merge_rechecks_off<T>(f: impl FnOnce() -> T) -> T {
+    let before = RECHECKS_OFF.replace(true);
+    let out = f();
+    RECHECKS_OFF.set(before);
+    out
 }
 
 /// Marks this thread as putting rows back until dropped (see `RECOVERING`).
@@ -7702,6 +8784,63 @@ fn max_worlds(most: u64) -> Error {
 /// one panic doesn't make every later caller panic too.
 fn lock<T>(m: &Mutex<T>) -> sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What a merge publishes (see `Core::publish`).
+struct Publish<'a> {
+    b: &'a str,
+    /// the world merged into
+    name: &'a str,
+    o: &'a MergeOptions,
+    child: &'a Arc<Branch>,
+    parent: &'a Arc<Branch>,
+    /// rows settled here, as the logical records log them
+    logged: Vec<(String, u8, Option<String>)>,
+    /// the world merged into as the merge leaves it; for a rebase, the world's own new state
+    next: State,
+    /// every row the merge set in `next`, in order (data rows after relayout, then index entries)
+    set: Vec<(String, Option<Val>)>,
+    /// rows applied
+    n: usize,
+    /// the world's version before the merge
+    version: u64,
+    /// into main: what its ledger row says beyond its rows (see `ledger`)
+    audit: Option<ledger::Context>,
+}
+
+/// What becomes of the world merged (see `Core::publish`).
+enum Disposition<'a> {
+    /// A whole merge: the world goes, and the rows it locked are kept in the world merged into.
+    Retired { locked: std::collections::BTreeMap<String, u8> },
+    /// A partial merge (`ONLY`), or one `into` another world: the world stays, its fork point moved on for the rows
+    /// that merged into its parent (`settled`; none for `into`).
+    Advanced { into: Option<&'a str>, settled: Vec<(String, Option<Val>)> },
+    /// A rebase: the world's fork point is the parent as it is (`theirs`), its own changes on top; `taken`: rows of
+    /// the parent's it took in.
+    Rebased { theirs: State, taken: usize },
+}
+
+/// A merge's three-way result (see `Core::resolve`), before anything has judged it.
+struct Resolved {
+    /// rows that change the world merged into, as the world (or the settling) has them, before relayout
+    apply: Vec<Change>,
+    /// rows both sides changed that nothing settled
+    conflicts: Vec<Conflict>,
+    /// tables both sides changed the definition of, differently: a conflict no setting settles
+    schema_clash: Vec<String>,
+    /// how each settled row was settled, and its result (for the plan)
+    outcomes: HashMap<String, (&'static str, Option<Val>)>,
+    /// rows settled here, as the logical records log them (see `Op::MergeWith`)
+    logged: Vec<(String, u8, Option<String>)>,
+    /// tables whose definitions were combined: the world's rows of them move to the merged layout
+    relayouts: Vec<Relayout>,
+    /// rows the parent changed since the fork that this merge overwrites
+    overwrote: usize,
+    /// how the settled rows were settled, by kind (see `Settled`)
+    counts: Settled,
+    /// the world merged into with the definitions this merge brings it (a column the world added): a row settled
+    /// here as JSON (picked, or combined by columns) is stored as the merged table reads it
+    packing: State,
 }
 
 /// A table whose definition a merge combined (see `sql::MergedTable`): the world's rows of it

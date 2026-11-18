@@ -2,9 +2,136 @@
 
 ## Unreleased
 
+## 0.6.0 (beta), 2026-11-18
+
+**Merges are logged as what they did, agents are kept to their tenant, and worlds gain what long-running agents
+need.** A merge now writes the rows it set as one log record, chained into a ledger `VERIFY LEDGER` checks, so
+recovery replays what happened instead of judging the merge again. Merges check constraints they bring against rows
+they never saw. Agents held to a tenant are kept to its worlds and rows everywhere, and new agents read only their
+own worlds and main. Worlds gain durable checkpoints, grants, transfer and budgets; coordinators gain delta columns,
+`CONSOLIDATE` and arbitration; reviewers gain certified proposals; and world sets fork, rank and merge the best of
+many tries. Built and signed on the maintainer's Mac as 0.5.5 was.
+
+**Upgrading.** The first checkpoint or merge after 0.6.0 opens a folder writes data format 8, which 0.5.5 and older
+refuse ("is from a newer Chronos"): back up first if you may need to go back, and upgrade replicas before the primary. `VERIFY DATABASE`
+returns two more columns. Agents made from now on without rights read only their own worlds and main (`ALTER
+SYSTEM SET agent_default_read = 'read'` keeps the old default); existing agents keep theirs.
+
+**Not yet.** Tested on macOS only: the full suite on Linux, the S3 store and the performance budgets were not run
+for this release. Not yet covered by a test: replaying logs that mix 0.5.5 and 0.6.0 records in one
+segment, a crash at every step of a merge, and crash recovery beside an attached database.
+
 - The public repository moved to the 2090 Labs organization: `github.com/2090-labs/Chronos-DB`. The Studio's README
   and issue links and the TypeScript client's package links name it. The old addresses still redirect, so the
   install command of earlier releases keeps working.
+- Merges are logged as what they did. A world merge, partial merge or rebase now writes one physical log record
+  holding every row it set (data after relayout, index entries, outbox rows as delayed), the merged world's fate and
+  a blake3 digest; opening the database writes those rows again and judges nothing, so recovery no longer depends on
+  merge rules that may since have changed. Transaction commits keep their old record, and logs written by 0.5.5
+  still replay as before. A checkpoint writes manifest format 8 (the first merge on a folder writes one first): from then on
+  0.5.5 refuses the folder ("is from a newer Chronos"), so back up before upgrading if you may need to go back.
+- Every merge into main writes a ledger row (`_sonos_ledger/<seq>`: who merged what, under which policy and the hash
+  of its row, the rows and deletes, the digest) in the same log record as its data, chained by hash. `VERIFY LEDGER`
+  recomputes the chain and returns a row per entry (`seq`, `ok`, `detail`). A merge given an operation id
+  (`MergeOptions::operation`) records it: asked again with the same id and request it returns the first result, and
+  the same id with another request is refused. A database kept in memory has no log, and so no ledger.
+- **Merges check the constraints they bring to rows they never saw.** A world that adds a UNIQUE or FOREIGN KEY
+  constraint, or sets NOT NULL, has the whole table checked when it merges, so a duplicate, an orphan or a null main
+  added meanwhile refuses the merge (it went through before); merged, the new constraint's index rows cover main's
+  rows too. A world that deletes a row, or changes a value, that a foreign key to a UNIQUE column references refuses
+  to merge while main has added a row referencing it. `UNDO MERGE` is checked as a merge is: it refuses to delete a
+  parent a row added since references, and `SKIP CHANGED` leaves that parent. Recovery never runs these checks: a
+  log that holds a merge they would refuse opens to the same state.
+- **`VERIFY DATABASE` lists rows that break a constraint.** Two more columns, `world` and `problem`: one row per
+  NOT NULL, UNIQUE, FOREIGN KEY or CHECK violation in any world (none: the counts alone, as before). The `verify`
+  command and HTTP call list them too.
+- **Merges into another world keep to the world's line.** `MERGE WORLD g INTO w` past g's parent refuses rows the
+  parent changed and never merged there (g's rows carried the parent's change along). An agent may merge a world
+  only into its parent or a world forked from it, and may not merge part of a world (`ONLY TABLES`, `ONLY KEYS`,
+  `INTO`) while worlds are forked from it; a person may. A diff and `MERGE ... DRY RUN` list grants, owners, rules and
+  casts, which merged without being shown.
+- A world's life is held to at every use. An expired world is read-only at once (writes, merges from and into it, forks,
+  and a `COMMIT` of a transaction that wrote in it get 55000), not only when the 30 s sweeper discards it; it reads until
+  then, and the sweeper discards it with its forks, deepest first. A fork's expiry is capped at its parent's, and
+  shortening a parent's TTL shortens its forks'. New: `max_depth` and `max_children` (ALTER SYSTEM, and per agent;
+  54000); `GRANT {READ | WRITE | MERGE | FORK} ON WORLD w TO agent [UNTIL ...]` and `REVOKE ... ON WORLD`, rights in one
+  world and its forks, never main; `TRANSFER WORLD w TO agent`, which moves the world's lease epoch on and fences the old
+  owner (55P03); and world budgets, `budget_rows` and `budget_statements` (53400), a fork's at most its parent's left.
+  See [SQL](docs/sql.md#a-worlds-life-expiry-nesting-grants-transfer-budgets).
+- Durable worlds: `CREATE WORLD w WITH (durable)` (or `ALTER WORLD w SET (durable = true)`) makes every write the
+  world acknowledges wait for the disk, as `main`'s do, so a crash loses none and doesn't flag the world. A durable
+  world that checks its reads keeps its read set in the log, so its merge is checked as usual after a crash instead
+  of held. `CHECKPOINT WORLD w AS label PIN '1 day'` keeps the world's state past `history_retention` until the pin
+  runs out, and `ROLLBACK WORLD w TO CHECKPOINT label` returns to it. `SHOW WORLD STATE w` and
+  `RESUME WORLD w TOKEN '<id>:<version>:<epoch>'` say where a world is for an agent coming back to it.
+- Negotiable merges for worlds that work under one coordinator. `ALTER TABLE t ALTER COLUMN c SET MERGE AS DELTA
+  [ESCROW (MIN n [, MAX m])]` makes a number column merge as parent + (ours - base) where two worlds both changed it,
+  refused (23514) past an escrow bound; `SET MERGE AS DEFAULT` takes it away. `FORECAST CONFLICTS [FOR WORLD w]`
+  lists rows sibling worlds (and a world and its parent) both changed, or one read and another changed.
+  `CONSOLIDATE PREVIEW p` says per row what merging all of p's children would do; `CONSOLIDATE p [ONLY CHILDREN
+  (...)] [USING ARBITRATION]` merges them into p as one, all or nothing. A new merge policy setting, `arbitrate`
+  (`priority`, `newest`, `oldest`, `fail`), settles rows two children both changed, and records the losing value in
+  the coordinator's metadata (`_sonos_arbitration`). See [SQL](docs/sql.md#combining-childrens-changes-delta-columns-forecasts-consolidate).
+- Certified merges: `ATTACH EVIDENCE TO WORLD`, `PROPOSE MERGE WORLD` (a proposal bound to a certificate hash of
+  every row the merge would write, its read set, evidence, scope and merge policy; the world is fixed for agents while
+  it's open), `APPROVE` / `REJECT` / `WITHDRAW PROPOSAL`, and `MERGE PROPOSAL`, which derives the certificate again
+  (refused with 40001 if anything changed) and merges as the proposing agent, its policy judged again with only what
+  the approval covers lifted. `EXPLAIN MERGE WORLD` (counts, conflicts, policy verdict, readers, effects, evidence and
+  the certificate in one answer), `SHOW DECISION PROVENANCE`, `SHOW PROPOSALS`, and `SHOW TOMBSTONES` (agents'
+  worlds discarded, refused or rejected). Merge policy setting `require_evidence`. MCP tools `propose`,
+  `attach_evidence` and `explain_merge`; HTTP ops `propose`, `attach_evidence`, `proposals`, `decide_proposal`,
+  `withdraw_proposal` and `merge_proposal`.
+- Cross-world reads: `FROM t AT WORLD w` reads a table as another world has it, joined with this world's tables
+  (read only; an agent needs the right to read that world, and row security applies there as here). `AT WORLDS OF
+  SET s` reads it in every world of a set with a `_world` column.
+- World sets: `CREATE WORLD SET s FROM WORLD b`, `FORK WORLD SET s COUNT n RUN $$...$$ SEED k` (deterministic, as
+  SIMULATE), `ADOPT WORLD w INTO SET s`, `COMPARE WORLDS a, b [SUMMARY]`, `RANK WORLD SET s BY (...) [WITH CHECKS]`,
+  `PRUNE WORLD SET s WHERE rank > k OR failed`, and `MERGE BEST OF SET s INTO b [DRY RUN]`, which merges the best
+  world into the set's base, never straight into main. Objectives: `CREATE OBJECTIVE o MINIMIZE $$...$$ SUBJECT TO
+  CHECKS (...)` and `OPTIMIZE o FROM WORLD b RUN $$...$$ COUNT n KEEP k SEED s`. See docs/sql.md.
+- A proposal merged into main is marked `merged` in the merge's own log record, beside its ledger row: a crash can no
+  longer leave it `approved` with its world gone (a merge into another world still marks it after). While
+  `CONSOLIDATE p` merges its last step into p and discards the children, each child is held: a write to it, a fork of
+  it, or a transaction's commit into it is refused (55000) instead of being lost with it. A durable world's read set is
+  logged only once the folder's manifest is format 8, so a 0.5.5 Chronos refuses the folder rather than misreading it.
+- A merge into a world that changes it (a child's merge, a partial merge, a transaction's commit) moves that world's
+  version on, as a write does: a `RESUME` token, a reviewed or proposed version, and a world set's ranking all see it
+  (40001). `MERGE PROPOSAL` of an agent's proposal checks the agent's rights as they are when it merges: rights taken away since
+  give 42501, a world transferred away from it 55P03. `CONSOLIDATE p` holds its children from before it copies them,
+  so a transaction committed into one meanwhile is refused (55000) rather than lost; a crash after its last merge no
+  longer lets the children merge twice (the next open discards them). `CHECKPOINT WORLD w AS label` without `PIN`
+  drops a pin the label had, so `ROLLBACK` goes to the newer moment. An operation id is bound to how its merge
+  settles rows too (another pick: 23505). `OPTIMIZE` with an objective that has no `SUBJECT TO CHECKS` judges no merge
+  checks.
+- Security: agents held to a tenant are kept to their tenant's worlds and rows everywhere.
+  - Every world has a tenant identity (a tenant, global, or unassigned for worlds made before this release), shown
+    as `tenant_status` in SHOW WORLDS. A world forked from a tenant's world is that tenant's; it can't be changed
+    later. `ASSIGN WORLD w TO TENANT '...' | TO GLOBAL REASON '...'` gives an older world one, once its changes pass
+    every check. Its changes are counted from where its line of unassigned worlds left main, so a world forked from
+    an unassigned one answers for what that one changed; the world and every world forked from it are assigned
+    together or not at all.
+  - A tenant agent may not change the definition of a table held to its tenant, nor anything that exists in main,
+    nor roles, grants, row security, types or functions (`ALTER COLUMN ... TYPE ... USING` could rewrite other
+    tenants' rows). Main is read-only to it: it changes main only by merging a world of its tenant.
+  - SIMULATE and REPLAY make their worlds as a fork does: their tenant, scope and read checks. A tenant agent may not
+    simulate from a past moment, restore or undo. A world forked from a scoped world keeps its scope and may only
+    narrow it.
+  - A tenant agent is refused materialized views without its tenant's column, the planner's statistics, the outbox
+    and the review channel.
+- New agents made without rights get `read_own` and `read_main` (their own worlds and main) instead of `read`
+  (every world). Agents that already exist keep their rights. `ALTER SYSTEM SET agent_default_read = 'read'` keeps
+  the old default. SHOW BRANCHES lists such an agent the worlds SHOW WORLDS does, and SHOW AGENT ... PRIVILEGES IN
+  WORLD says what it may read in that world.
+- A delta column (attach rules' `delta`, and `SET MERGE AS DELTA`) holding a number of more than 38 digits is no
+  longer read as 0 when two sides changed it: the merge is refused as a conflict, where it wrote the database's value
+  minus itself. The MCP `diff` tool with a `limit` near the largest number no longer panics (over stdio, that ended the
+  process). A tenant agent's statement given parameters (SIMULATE and FORK WORLD SET scripts, Parse and Describe) no
+  longer overflows the stack. An agent reads a world as it was (`name@when`, AS OF, USE WORLD) only when it is the
+  world that has the name now; a tenant agent diffs or compares two worlds only when both were forked from one state,
+  and no world as it was; COMPARE WORLDS masks masked columns and RANK ... WITH CHECKS gives an agent check reasons
+  without values; the name a merge check reads the merged state by can't be guessed; deciding, withdrawing and merging
+  a proposal no longer race; a canary leaves proposals, operation ids, AT VERSION and CONSOLIDATE whole; and turning a
+  world's durability off reaches the disk before the writes it no longer waits for.
 
 ## 0.5.5 (beta), 2026-11-17
 

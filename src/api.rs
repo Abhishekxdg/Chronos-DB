@@ -303,12 +303,10 @@ pub fn call_as(db: &Db, me: &chronos::Acting, op: &str, a: &Value) -> Result<Val
     match op {
         "get" | "find" | "world" | "branches" | "worlds" => me.may_read(branch)?,
         "history" | "check_reads" => me.may_see_changes(branch)?,
-        "diff" => {
-            me.may_see_changes(branch)?;
-            if let Some(to) = s("to") {
-                me.may_see_changes(to)?;
-            }
-        }
+        "diff" => match s("to") {
+            Some(to) => me.may_see_between(branch, to)?,
+            None => me.may_see_changes(branch)?,
+        },
         "put" | "delete" => me.may_write(branch, 1)?,
         "batch" => me.may_write(branch, a.get("rows").and_then(Value::as_array).map_or(0, Vec::len))?,
         "fork" => {
@@ -327,6 +325,15 @@ pub fn call_as(db: &Db, me: &chronos::Acting, op: &str, a: &Value) -> Result<Val
         "restore" => me.may_restore(branch)?,
         "undo_merge" => me.may_undo()?,
         "review" => {} // checked as it runs: the policy's reviewer, or an admin
+        // certified merges: evidence is a change to the world, a proposal a merge's first step; deciding, merging
+        // and withdrawing a proposal are checked as they run (never an agent's own approval)
+        "attach_evidence" => me.may_write(branch, 0)?,
+        "propose" => match s("into") {
+            Some(into) => me.may_merge_into(branch, into)?,
+            None => me.may_merge(branch)?,
+        },
+        "proposals" => me.may_list_all("proposals")?,
+        "decide_proposal" | "merge_proposal" | "withdraw_proposal" => {}
         "sql" => return run_sql(db, a, Some(&me.agent.name)),
         "simulate" | "replay" => return simulate(db, op, a, Some(&me.agent.name)), // checked as it runs
         // every agent's results: the database's own user only (the admin token, or the server's with --unsafe)
@@ -613,6 +620,8 @@ fn agent_spec(a: &Value) -> Result<chronos::AgentSpec, Fail> {
         max_idle_ms: num("max_idle_ms"),
         max_threads: num("max_threads"),
         priority,
+        max_depth: num("max_depth"),
+        max_children: num("max_children"),
         disabled: a.get("disabled").and_then(Value::as_bool),
         policy,
         tenant: a.get("tenant").cloned(),
@@ -654,6 +663,13 @@ pub(crate) fn private_worlds(db: &Db, a: &Value) -> Result<(), Fail> {
 }
 
 pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
+    let out = call_op(db, op, a);
+    // what a durable world read through this call is on disk before the answer goes out (see `Db::persist_reads`)
+    db.persist_reads(a.get("branch").and_then(Value::as_str).unwrap_or(chronos::MAIN));
+    out
+}
+
+fn call_op(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
     let s = |k: &str| a.get(k).and_then(Value::as_str);
     let need = |k: &str| s(k).filter(|v| !v.is_empty()).ok_or_else(|| bad(format!("'{k}' is required (a string)")));
     // a session's transaction world is its own, whoever asks (agents are refused by their checks too)
@@ -738,7 +754,7 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
             Ok(json!({ "ok": true, "world": world(&w) }))
         }
         "branches" | "worlds" => {
-            let b: Vec<Value> = db.worlds().iter().filter(|w| !w.name.starts_with("_tx_")).map(world).collect();
+            let b: Vec<Value> = db.visible_worlds().iter().filter(|w| !w.name.starts_with("_tx_")).map(world).collect();
             Ok(json!({ "branches": b }))
         }
         "world" => Ok(world(&db.world(need("branch")?)?)),
@@ -824,7 +840,9 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
         }
         "verify" => {
             let v = db.verify().map_err(Error::from)?;
-            Ok(json!({ "pages": v.pages, "bytes": v.bytes, "log_records": v.log_records }))
+            let found: Vec<_> =
+                db.constraint_violations()?.into_iter().map(|(w, p)| json!({ "world": w, "problem": p })).collect();
+            Ok(json!({ "pages": v.pages, "bytes": v.bytes, "log_records": v.log_records, "violations": found }))
         }
         "checkpoint" => {
             let at = db.checkpoint_world(need("branch")?, need("name")?)?;
@@ -876,6 +894,43 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                 })
             }
         }),
+        "attach_evidence" => {
+            // {branch, kind, uri, sha256, note}, or {branch, evidence: {kind, uri, sha256, note}}
+            let mut spec = match a.get("evidence") {
+                None | Some(Value::Null) => serde_json::Map::new(),
+                Some(Value::Object(m)) => m.clone(),
+                Some(_) => return Err(bad("'evidence' must be an object: {kind, uri, sha256, note}")),
+            };
+            for k in ["kind", "uri", "sha256", "note"] {
+                if let Some(v) = a.get(k).filter(|v| !v.is_null()) {
+                    spec.insert(k.into(), v.clone());
+                }
+            }
+            let item = db.attach_evidence(need("branch")?, &Value::Object(spec))?;
+            Ok(json!({ "ok": true, "evidence": item }))
+        }
+        "propose" => {
+            let mut p = db.propose_merge(need("branch")?, s("into"))?;
+            if let Some(m) = p.as_object_mut() {
+                m.remove("reads"); // what it read: kept for its certificate, shown as the certificate's part
+            }
+            Ok(json!({ "ok": true, "proposal": p }))
+        }
+        "proposals" => Ok(json!({ "proposals": db.proposals()? })),
+        "decide_proposal" => {
+            let approve = match need("verdict")? {
+                "approve" => true,
+                "reject" => false,
+                v => return Err(bad(format!("'verdict' must be approve or reject, not '{v}'"))),
+            };
+            db.decide_proposal(need("id")?, approve, s("reason").unwrap_or(""), None)?;
+            Ok(json!({ "ok": true }))
+        }
+        "withdraw_proposal" => {
+            db.withdraw_proposal(need("id")?)?;
+            Ok(json!({ "ok": true }))
+        }
+        "merge_proposal" => Ok(json!({ "ok": true, "merged": db.merge_proposal(need("id")?)? })),
         "review" => {
             let verdict = match need("verdict")? {
                 "approve" => chronos::Verdict::Approve,
@@ -1133,6 +1188,9 @@ pub fn call(db: &Db, op: &str, a: &Value) -> Result<Value, Fail> {
                 // "confirm_deletes": the rows it deletes, as the person approving read them (a policy's
                 // confirm_deletes_over asks for it; a wrong count is refused with the real one)
                 confirm_deletes: a.get("confirm_deletes").and_then(Value::as_u64),
+                // "operation": the caller's id for this merge into main; the same id and request again returns what
+                // the first did (see the merge ledger)
+                operation: a.get("operation").and_then(Value::as_str).map(String::from),
             };
             if a.get("dry_run").and_then(Value::as_bool) == Some(true) {
                 let plan = db.merge_preview(b, &o)?;

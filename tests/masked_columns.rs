@@ -135,6 +135,21 @@ fn what_would_read_values_as_they_are_is_refused() {
     assert!(chronos::sql::row_security_refuses(&db, "bot", "w", &["leads2"]).unwrap().is_none());
 }
 
+/// COMPARE WORLDS shows rows of both worlds as DIFF does: masked for an agent without `unmask`.
+#[test]
+fn compare_worlds_shows_no_values() {
+    let db = Db::new();
+    setup(&db);
+    let mut s = bot(&db);
+    s.run(&db, "create world w1; create world w2; use world w1; delete from customers", &[]).unwrap();
+    let c = s.run(&db, "compare worlds w1, w2", &[]).unwrap().pop().unwrap();
+    assert!(!c.rows.is_empty());
+    let text = format!("{:?}", c.rows);
+    assert!(!text.contains("@example.com") && !text.contains("555-01"), "{text}");
+    let p = run(&db, MAIN, "compare worlds w1, w2", &[]).unwrap().pop().unwrap();
+    assert!(format!("{:?}", p.rows).contains("@example.com"), "a person's compare shows them");
+}
+
 #[test]
 fn diffs_and_errors_show_no_values() {
     let db = Db::new();

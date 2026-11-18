@@ -165,3 +165,206 @@ fn a_column_grant_to_write_shows_on_the_column() {
     assert_eq!(row(&rows, "orders", "total")[3], "insert in its own worlds");
     assert_eq!(row(&rows, "orders", "id")[3], "insert in its own worlds");
 }
+
+// --- Gate S (CHRONOS-PLAN-2026-11-17-r3.md, batch S4; approved decision 3): a new agent reads its
+// own worlds and main (`read_own`, `read_main`), not other agents' worlds; agents made before keep
+// `read`; the setting `agent_default_read` gives new agents `read` as before. Added failing in S0. ---
+
+/// An agent's rights by name (text, so the test builds before S4 adds the new rights).
+fn rights(db: &Db, name: &str) -> Vec<&'static str> {
+    db.agent(name).unwrap().can.iter().map(|c| c.name()).collect()
+}
+
+/// Two agents made with the new defaults, `a` with a world holding a change.
+fn two_agents(db: &Db) -> (Session, Session) {
+    setup(db);
+    run(db, MAIN, "insert into orders values (1, 10, 'open')", &[]).unwrap();
+    db.create_agent("a", &AgentSpec::default()).unwrap();
+    db.create_agent("b", &AgentSpec::default()).unwrap();
+    let (mut a, mut b) = (Session::new(MAIN), Session::new(MAIN));
+    a.agent = Some("a".into());
+    b.agent = Some("b".into());
+    a.run(db, "create world aw; use world aw; update orders set status = 'secret plan' where id = 1", &[]).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    a.run(db, "update orders set total = 99 where id = 1; use world main", &[]).unwrap();
+    (a, b)
+}
+
+fn refused(db: &Db, s: &mut Session, sql: &str) {
+    match s.run(db, sql, &[]) {
+        Ok(out) => panic!("{sql}: allowed: {:?}", out.iter().map(|r| r.rows.len()).collect::<Vec<_>>()),
+        Err(e) => assert_eq!(e.code, "42501", "{sql}: {}", e.message),
+    }
+}
+
+#[test]
+fn new_agent_default_rights() {
+    let db = Db::new();
+    setup(&db);
+    db.create_agent("bot", &AgentSpec::default()).unwrap();
+    let can = rights(&db, "bot");
+    assert!(can.contains(&"read_own") && can.contains(&"read_main"), "{can:?}");
+    assert!(!can.contains(&"read"), "{can:?}");
+    run(&db, MAIN, "create agent sqlbot", &[]).unwrap();
+    let can = rights(&db, "sqlbot");
+    assert!(!can.contains(&"read"), "{can:?}");
+}
+
+#[test]
+fn read_own_cannot_read_other_world() {
+    let db = Db::new();
+    let (mut a, mut b) = two_agents(&db);
+    refused(&db, &mut b, "use world aw");
+    let mut inside = Session::new("aw");
+    inside.agent = Some("b".into());
+    refused(&db, &mut inside, "select * from orders");
+    refused(&db, &mut b, "fork world aw as bw");
+    // its own world and main it reads
+    assert!(b.run(&db, "select * from orders", &[]).is_ok());
+    b.run(&db, "create world bw; use world bw", &[]).unwrap();
+    assert!(b.run(&db, "select * from orders", &[]).is_ok());
+    assert!(a.run(&db, "use world aw; select * from orders", &[]).is_ok());
+}
+
+#[test]
+fn cannot_read_other_world_at_time() {
+    let db = Db::new();
+    let (_, mut b) = two_agents(&db);
+    refused(&db, &mut b, "use world 'aw@-1 second'");
+    refused(&db, &mut b, "fork world 'aw@-1 second' as bw");
+    refused(&db, &mut b, "diff world 'aw@-1 second' to aw");
+}
+
+#[test]
+fn cannot_diff_other_world() {
+    let db = Db::new();
+    let (_, mut b) = two_agents(&db);
+    for sql in [
+        "diff world aw",
+        "diff world aw as sql",
+        "diff world aw readers",
+        "diff world main to aw",
+        "merge world aw dry run",
+    ] {
+        refused(&db, &mut b, sql);
+    }
+}
+
+#[test]
+fn cannot_list_other_worlds_changes() {
+    let db = Db::new();
+    let (_, mut b) = two_agents(&db);
+    for sql in ["show history limit 50", "show storage for world aw", "show reviews", "show audit"] {
+        match b.run(&db, sql, &[]) {
+            Err(e) => assert_eq!(e.code, "42501", "{sql}: {}", e.message),
+            Ok(out) => {
+                let text: String = out.iter().flat_map(|r| r.rows.iter().flatten().map(|v| v.to_text())).collect();
+                assert!(!text.contains("secret plan") && !text.contains("aw"), "{sql}: {text}");
+            }
+        }
+    }
+}
+
+/// Agents in a folder made before the change keep `read`: tests/fixtures/legacy-assign was made by
+/// the 0.5.5 binary with agent run42 created `can = 'read,...'`.
+#[test]
+fn existing_agent_rights_unchanged_after_upgrade() {
+    let from = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/legacy-assign");
+    let dir = std::env::temp_dir().join(format!("chronos-agent-privileges-legacy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_dir(&from, &dir);
+    let db = Db::open(&dir).unwrap();
+    let can = rights(&db, "run42");
+    assert!(can.contains(&"read"), "{can:?}");
+    assert!(!can.contains(&"read_own"), "{can:?}");
+    // and a new agent made in the upgraded folder gets the new default
+    db.create_agent("fresh", &AgentSpec::default()).unwrap();
+    assert!(!rights(&db, "fresh").contains(&"read"));
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn legacy_default_setting() {
+    let db = Db::new();
+    setup(&db);
+    run(&db, MAIN, "alter system set agent_default_read = 'read'", &[]).unwrap();
+    db.create_agent("old_style", &AgentSpec::default()).unwrap();
+    assert!(rights(&db, "old_style").contains(&"read"));
+    run(&db, MAIN, "alter system set agent_default_read = 'read_own,read_main'", &[]).unwrap();
+    db.create_agent("new_style", &AgentSpec::default()).unwrap();
+    assert!(!rights(&db, "new_style").contains(&"read"));
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let p = e.unwrap().path();
+        let dst = to.join(p.file_name().unwrap());
+        if p.is_dir() {
+            copy_dir(&p, &dst);
+        } else {
+            std::fs::copy(&p, dst).unwrap();
+        }
+    }
+}
+
+/// PR #362 review: SHOW BRANCHES lists the worlds SHOW WORLDS does: without `read`, main and the agent's own.
+#[test]
+fn cannot_list_other_worlds_as_branches() {
+    let db = Db::new();
+    let (mut a, mut b) = two_agents(&db);
+    let names = |s: &mut Session| -> Vec<String> {
+        s.run(&db, "show branches", &[]).unwrap().pop().unwrap().rows.iter().map(|r| r[0].to_text()).collect()
+    };
+    let seen = names(&mut b);
+    assert!(seen.contains(&MAIN.to_string()) && !seen.contains(&"aw".to_string()), "{seen:?}");
+    assert!(names(&mut a).contains(&"aw".to_string()));
+    // nor through the catalog
+    let datnames = |s: &mut Session| -> Vec<String> {
+        s.run(&db, "select datname from pg_database", &[])
+            .unwrap()
+            .pop()
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r[0].to_text())
+            .collect()
+    };
+    let seen = datnames(&mut b);
+    assert!(seen.contains(&MAIN.to_string()) && !seen.contains(&"aw".to_string()), "{seen:?}");
+    assert!(datnames(&mut a).contains(&"aw".to_string()));
+    let all = run(&db, MAIN, "show branches", &[]).unwrap().pop().unwrap();
+    assert!(all.rows.iter().any(|r| r[0].to_text() == "aw"), "a person sees every world");
+}
+
+/// PR #362 review: SHOW AGENT ... PRIVILEGES IN WORLD w says what the agent may read in that world: `read_main` reads
+/// main only, `read_own` its own worlds only.
+#[test]
+fn privileges_read_by_world() {
+    let db = Db::new();
+    let _ = two_agents(&db);
+    let read_in = |agent: &str, world: &str| -> (String, String) {
+        let out =
+            run(&db, MAIN, &format!("show agent {agent} privileges in world {world}"), &[]).unwrap().pop().unwrap();
+        let r = out.rows.iter().find(|r| r[0].to_text() == "orders" && r[1].to_text().is_empty()).unwrap();
+        (r[2].to_text(), r[5].to_text())
+    };
+    assert_eq!(read_in("a", "aw").0, "yes", "its own world");
+    assert_eq!(read_in("b", MAIN).0, "yes", "main");
+    let (read, why) = read_in("b", "aw");
+    assert_eq!(read, "no", "another agent's world: {why}");
+    assert!(why.contains("neither main nor its own"), "{why}");
+    db.create_agent(
+        "mainonly",
+        &AgentSpec { can: Some(vec![Can::ReadMain, Can::Fork, Can::WriteOwn]), ..Default::default() },
+    )
+    .unwrap();
+    let mut m = Session::new(MAIN);
+    m.agent = Some("mainonly".into());
+    m.run(&db, "create world mw", &[]).unwrap();
+    assert_eq!(read_in("mainonly", MAIN).0, "yes");
+    assert_eq!(read_in("mainonly", "mw").0, "no", "no read_own: not even its own world");
+    // and the agent's statements agree
+    assert_eq!(m.run(&db, "use world mw; select * from orders", &[]).unwrap_err().code, "42501");
+}

@@ -22,7 +22,9 @@ fn tmp(name: &str) -> PathBuf {
 fn fingerprint(db: &Db) -> String {
     let mut out = String::new();
     for (b, parent) in db.branches() {
-        let rows = db.scan(&b, "", usize::MAX).unwrap();
+        // (main's merge ledger, which only a database on disk keeps, aside: see `merge_ledger.rs`)
+        let mut rows = db.scan(&b, "", usize::MAX).unwrap();
+        rows.retain(|(k, _)| !k.starts_with("_sonos_ledger/") && !k.starts_with("_sonos_ops/"));
         let diff = db.diff(&b).unwrap();
         out += &format!("{b} <- {parent:?}\n  {rows:?}\n  {diff:?}\n");
     }
@@ -150,7 +152,7 @@ fn in_log_order<'a>(steps: &'a [Step], recs: &[(u8, String, usize, usize)]) -> V
         let want = |s: &Step| match (tag, s) {
             (1 | 17, Step::Write(b, _)) => b == world,
             (1 | 17, _) | (_, Step::Write(..)) => false,
-            (3 | 8, Step::Fork(..)) | (4 | 11 | 13, Step::Merge(..)) | (5, Step::Discard(_)) => true,
+            (3 | 8, Step::Fork(..)) | (4 | 11 | 13 | 20, Step::Merge(..)) | (5, Step::Discard(_)) => true,
             _ => panic!("a record with tag {tag} where {s:?} is next"),
         };
         for (i, s) in steps.iter().enumerate() {
@@ -305,6 +307,9 @@ fn crash_suite() {
         let before_ckpt;
         {
             let db = Db::open(&dir).unwrap();
+            // the checkpoint a new folder gets before its first merge (see `Op::Applied`), up front: every op
+            // after it is in one segment
+            db.checkpoint().unwrap();
             random_ops(&db, &reference, &mut r, 40, &mut steps, &mut forked);
             let checkpointed = r.below(2) == 0;
             if checkpointed {
@@ -686,4 +691,370 @@ fn log_zeros_ahead_are_not_records() {
     assert_eq!(db.get("main", "b").unwrap().as_deref(), Some("2"), "writes after the zeros were cut survive");
     drop(db);
     let _ = fs::remove_dir_all(&dir);
+}
+
+// --- Gate S (CHRONOS-PLAN-2026-11-17-r3.md): the security release changes no log or manifest
+// format, and recovery replays merges already logged as they were (rule T8). The fixtures were
+// written by the 0.5.5 release binary on 2026-11-17 (tests/fixtures/legacy-sim-*). ---
+
+fn legacy_fixture(name: &str) -> PathBuf {
+    let dir = tmp(&format!("legacy-{name}"));
+    copy_dir(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name), &dir);
+    dir
+}
+
+fn leads(db: &Db, world: &str) -> Vec<String> {
+    chronos::sql::run(db, world, "select id, org_id, name from leads order by id", &[]).unwrap()[0]
+        .rows
+        .iter()
+        .map(|r| r.iter().map(|v| v.to_text()).collect::<Vec<_>>().join("|"))
+        .collect()
+}
+
+/// A 0.5.5 log holding the cross-tenant merge (finding B, already made) opens to the same state:
+/// main's tenant-7 row reads org_id 42, as 0.5.5 itself showed. The merge is not undone or refused
+/// at recovery; `SHOW HISTORY` keeps it for audit. The unmerged fixture opens as 0.5.5 showed too.
+#[test]
+fn legacy_exploit_merge_still_replays() {
+    let dir = legacy_fixture("legacy-sim-merged");
+    let db = Db::open(&dir).unwrap();
+    assert_eq!(leads(&db, chronos::MAIN), ["1|42|acme", "3|42|globex"]);
+    let h = chronos::sql::run(&db, chronos::MAIN, "show history limit 20", &[]).unwrap().pop().unwrap();
+    let text: String = h.rows.iter().flatten().map(|v| v.to_text()).collect::<Vec<_>>().join(" ");
+    assert!(text.contains("z_0"), "the merge is in the history: {text}");
+    drop(db);
+    // twice: the same again
+    let db = Db::open(&dir).unwrap();
+    assert_eq!(leads(&db, chronos::MAIN), ["1|42|acme", "3|42|globex"]);
+    drop(db);
+
+    let dir = legacy_fixture("legacy-sim-kept");
+    let db = Db::open(&dir).unwrap();
+    assert_eq!(leads(&db, chronos::MAIN), ["1|42|acme", "3|7|globex"]);
+    assert_eq!(leads(&db, "z_0"), ["1|42|acme", "3|42|globex"]);
+}
+
+/// The tags of the records in every log segment of `dir`, in order.
+fn all_tags(dir: &Path) -> Vec<u8> {
+    let mut segs: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with("wal-"))
+        .collect();
+    segs.sort();
+    segs.iter().flat_map(|s| frame_tags(s)).map(|(t, _)| t).filter(|t| *t != 0).collect()
+}
+
+/// Whole merges (one settling a row both sides changed), a partial merge, a merge INTO another world, and a
+/// rebase, as a test of recovery runs them: every world's rows, diff and version.
+fn merges_of_every_kind(db: &Db) -> String {
+    use chronos::MergeOptions;
+    for k in ["t/a", "t/b", "t/c", "t/d"] {
+        db.put("main", k, "0").unwrap();
+    }
+    // a whole merge that settles a row both changed (ours), and deletes one
+    db.fork("main", "w").unwrap();
+    db.put("w", "t/a", "w").unwrap();
+    db.del("w", "t/d").unwrap();
+    db.put("main", "t/a", "main").unwrap();
+    db.merge("w", Resolve::Ours).unwrap();
+    // a partial merge: only b goes, the world stays with c
+    db.fork("main", "p").unwrap();
+    db.put("p", "t/b", "p").unwrap();
+    db.put("p", "t/c", "p").unwrap();
+    db.merge_with("p", &MergeOptions { only_keys: vec!["t/b".into()], ..Default::default() }).unwrap();
+    // INTO another world: p's rows go to q, p stays as it was
+    db.fork("main", "q").unwrap();
+    db.merge_with("p", &MergeOptions { into: Some("q".into()), ..Default::default() }).unwrap();
+    // a rebase onto main as it is now, with a row both changed kept as the world's
+    db.fork("main", "r").unwrap();
+    db.put("r", "t/e", "r").unwrap();
+    db.put("r", "t/c", "r").unwrap();
+    db.put("main", "t/c", "main").unwrap();
+    db.put("main", "t/f", "main").unwrap();
+    db.rebase("r", &MergeOptions { how: Resolve::Ours, ..Default::default() }).unwrap();
+    worlds(db)
+}
+
+/// `fingerprint`, with each world's version and whether it was rebased.
+fn worlds(db: &Db) -> String {
+    let mut out = fingerprint(db);
+    for (b, _) in db.branches() {
+        let w = db.world(&b).unwrap();
+        out += &format!("{b}: version {} rebased {}\n", w.version, w.meta.get("_sonos_rebased").is_some());
+    }
+    out
+}
+
+#[test]
+fn applied_recovery_runs_no_resolution() {
+    let dir = tmp("applied-recovery");
+    let want = {
+        let db = Db::open(&dir).unwrap();
+        merges_of_every_kind(&db)
+    };
+    let tags = all_tags(&dir);
+    assert!(tags.contains(&20), "merges are logged as Op::Applied: {tags:?}");
+    for logical in [4, 11, 13, 18] {
+        assert!(!tags.contains(&logical), "no logical merge record (tag {logical}) once the folder is format 8");
+    }
+    // recovery writes the rows logged: resolving any merge again would panic
+    chronos::test_resolve_panics(true);
+    let got = Db::open(&dir).map(|db| worlds(&db));
+    chronos::test_resolve_panics(false);
+    assert_eq!(got.unwrap(), want);
+    // and once more after a crash (no Close record): the same
+    let db = Db::open(&dir).unwrap();
+    assert_eq!(worlds(&db), want);
+    drop(db);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn partial_merge_applied_disposition() {
+    use chronos::MergeOptions;
+    let dir = tmp("applied-partial");
+    {
+        let db = Db::open(&dir).unwrap();
+        db.fork("main", "p").unwrap();
+        db.put("p", "t/1", "1").unwrap();
+        db.put("p", "t/2", "2").unwrap();
+        let before = db.world("p").unwrap().version;
+        db.merge_with("p", &MergeOptions { only_keys: vec!["t/1".into()], ..Default::default() }).unwrap();
+        assert_eq!(db.world("p").unwrap().version, before + 1, "settled rows move its version on");
+    }
+    let db = Db::open(&dir).unwrap();
+    assert_eq!(db.get("main", "t/1").unwrap().as_deref(), Some("1"));
+    assert_eq!(db.get("main", "t/2").unwrap(), None);
+    // its fork point moved on for k1 only: what's left to merge is k2
+    let left: Vec<String> = db.diff("p").unwrap().into_iter().map(|c| c.key).collect();
+    assert_eq!(left, vec!["t/2".to_string()]);
+    let w = db.world("p").unwrap();
+    db.merge_at("p", Resolve::Fail, Some(w.version)).unwrap();
+    assert_eq!(db.get("main", "t/2").unwrap().as_deref(), Some("2"));
+    drop(db);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn rebase_applied_disposition() {
+    use chronos::MergeOptions;
+    let dir = tmp("applied-rebase");
+    let want = {
+        let db = Db::open(&dir).unwrap();
+        db.put("main", "t/x", "0").unwrap();
+        db.fork("main", "r").unwrap();
+        db.put("r", "t/y", "r").unwrap();
+        db.put("main", "t/x", "main").unwrap();
+        db.rebase("r", &MergeOptions::default()).unwrap();
+        worlds(&db)
+    };
+    let db = Db::open(&dir).unwrap();
+    assert_eq!(worlds(&db), want);
+    // the world's fork point is main as it was: it sees main's x, and has only y to merge
+    assert_eq!(db.get("r", "t/x").unwrap().as_deref(), Some("main"));
+    let left: Vec<String> = db.diff("r").unwrap().into_iter().map(|c| c.key).collect();
+    assert_eq!(left, vec!["t/y".to_string()]);
+    assert!(db.world("r").unwrap().meta.get("_sonos_rebased").is_some(), "the rebase's time survives");
+    db.merge("r", Resolve::Fail).unwrap();
+    assert_eq!(db.get("main", "t/y").unwrap().as_deref(), Some("r"));
+    drop(db);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A log of the logical merge records 0.5.5 wrote (made here with the old path, which a test switch keeps) replays
+/// to the same state, alone and followed by `Op::Applied` records in the same log.
+#[test]
+fn legacy_logical_records_replay_same_state() {
+    let dir = tmp("applied-legacy");
+    let want = {
+        let db = Db::open(&dir).unwrap();
+        chronos::test_log_logical(true);
+        let want = merges_of_every_kind(&db);
+        chronos::test_log_logical(false);
+        want
+    };
+    let tags = all_tags(&dir);
+    assert!(!tags.contains(&20), "the old path logs no Op::Applied: {tags:?}");
+    assert!(
+        (tags.contains(&4) || tags.contains(&11)) && tags.contains(&13) && tags.contains(&18),
+        "Merge (or MergeWith), MergeSome and Rebase are in the log: {tags:?}"
+    );
+    let db = Db::open(&dir).unwrap();
+    assert_eq!(worlds(&db), want);
+    // new merges on top: one log with both kinds replays in one pass
+    db.fork("main", "z").unwrap();
+    db.put("z", "t/g", "z").unwrap();
+    db.merge("z", Resolve::Fail).unwrap();
+    let want = worlds(&db);
+    drop(db);
+    assert!(all_tags(&dir).contains(&20));
+    let db = Db::open(&dir).unwrap();
+    assert_eq!(worlds(&db), want);
+    drop(db);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn applied_record_damaged_refuses_to_open() {
+    let dir = tmp("applied-damaged");
+    {
+        let db = Db::open(&dir).unwrap();
+        db.put("main", "a", "0").unwrap();
+        db.fork("main", "w").unwrap();
+        db.put("w", "a", "w").unwrap();
+        db.merge("w", Resolve::Fail).unwrap();
+    }
+    // a byte of the row inside the record changed, its frame's checksum made good again: only the digest can tell
+    let seg = last_segment(&dir);
+    let mut b = fs::read(&seg).unwrap();
+    let (mut off, mut at) = (0, None);
+    while off + 8 <= b.len() {
+        let len = u32::from_le_bytes(b[off..off + 4].try_into().unwrap()) as usize;
+        if len == 0 {
+            break;
+        }
+        if b[off + 8] == 20 {
+            at = Some((off, len));
+        }
+        off += 8 + len;
+    }
+    let (off, len) = at.expect("an Op::Applied in the log");
+    let payload = off + 8;
+    // a's value as a row of the record holds it: [1][u32 len 1]["w"] (the ledger row's JSON has no such bytes)
+    let pos = payload + b[payload..payload + len].windows(6).position(|w| w == b"\x01\x01\x00\x00\x00w").unwrap() + 5;
+    b[pos] = b'v';
+    let crc = crc32fast::hash(&b[payload..payload + len]);
+    b[off + 4..off + 8].copy_from_slice(&crc.to_le_bytes());
+    fs::write(&seg, b).unwrap();
+    let err = Db::open(&dir).err().expect("a damaged merge record must refuse to open").to_string();
+    assert!(err.contains("diverged") || err.contains("corrupt"), "{err}");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A Chronos from before `Op::Applied` must refuse a folder before it reads one: the first merge writes a manifest of
+/// format 8 (which 0.5.5 refuses as "from a newer Chronos") before its record, and every such record is in a
+/// segment that manifest or a later one starts at or after.
+#[test]
+fn manifest_upgraded_before_first_applied() {
+    let dir = tmp("applied-manifest");
+    let db = Db::open(&dir).unwrap();
+    db.put("main", "a", "0").unwrap();
+    assert!(!dir.join("manifest").exists(), "no checkpoint yet: nothing to upgrade before a merge");
+    db.fork("main", "w").unwrap();
+    db.put("w", "a", "1").unwrap();
+    db.merge("w", Resolve::Fail).unwrap();
+    let man = fs::read(dir.join("manifest")).unwrap();
+    assert_eq!(&man[..9], b"SONOSMAN8", "the manifest is format 8 once a merge is logged physically");
+    let first = u64::from_le_bytes(man[9..17].try_into().unwrap());
+    let mut segs: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with("wal-"))
+        .collect();
+    segs.sort();
+    let mut seen = false;
+    for s in &segs {
+        let n: u64 = s.file_name().unwrap().to_str().unwrap()["wal-".len()..].parse().unwrap();
+        if frame_tags(s).iter().any(|(t, _)| *t == 20) {
+            seen = true;
+            assert!(n >= first, "an Op::Applied in segment {n}, older than the format-8 manifest's first ({first})");
+        }
+    }
+    assert!(seen);
+    drop(db);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A merge the current checks refuse (a child left pointing at a UNIQUE value the world deleted, a duplicate under a
+/// UNIQUE constraint the world added), as an older Chronos let through and logged: the folder still opens, to the
+/// same state. Recovery replays what was accepted; it never re-judges it.
+#[test]
+fn merge_past_new_checks_still_replays() {
+    let dir = tmp("past-new-checks");
+    let run = |db: &Db, w: &str, q: &str| {
+        chronos::sql::run(db, w, q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"));
+    };
+    let before = {
+        let db = Db::open(&dir).unwrap();
+        run(&db, "main", "create table org (id int primary key, slug text unique)");
+        run(&db, "main", "create table member (id int primary key, org text references org (slug))");
+        run(&db, "main", "create table u (id int primary key, email text)");
+        run(&db, "main", "insert into org values (1, 'acme'), (2, 'old')");
+        run(&db, "main", "insert into u values (1, 'a@x')");
+        db.fork("main", "w").unwrap();
+        run(&db, "w", "delete from org where slug = 'old'");
+        run(&db, "w", "alter table u add constraint u_email unique (email)");
+        run(&db, "main", "insert into member values (11, 'old')");
+        run(&db, "main", "insert into u values (2, 'a@x')");
+        assert!(chronos::sql::run(&db, "main", "merge world w", &[]).is_err(), "refused as it runs");
+        chronos::merge_rechecks_off(|| run(&db, "main", "merge world w"));
+        let f = fingerprint(&db);
+        db.close().unwrap();
+        f
+    };
+    let db = Db::open(&dir).unwrap();
+    assert_eq!(fingerprint(&db), before, "replayed to the same state");
+    drop(db);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Merges that went through the checks and settlements added alongside `Op::Applied` (a delta column combined, a
+/// UNIQUE constraint a world adds checked on the whole table, a merge policy's require_evidence, an approved proposal)
+/// replay from their physical records alone: recovery resolves and judges none of them again (resolving panics
+/// here), so a policy made stricter since changes nothing that happened.
+#[test]
+fn applied_replay_runs_no_new_checks() {
+    use chronos::sql::Session;
+    use chronos::{AgentSpec, Can};
+    let dir = tmp("applied-new-checks");
+    let run = |db: &Db, w: &str, q: &str| {
+        chronos::sql::run(db, w, q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"));
+    };
+    let want = {
+        let db = Db::open(&dir).unwrap();
+        run(&db, "main", "create table inv (sku int primary key, qty int, email text)");
+        run(&db, "main", "insert into inv values (1, 100, 'a'), (2, 50, 'b')");
+        run(&db, "main", "alter table inv alter column qty set merge as delta escrow (min 0)");
+        db.fork("main", "w").unwrap();
+        run(&db, "w", "update inv set qty = qty - 3 where sku = 1");
+        run(&db, "w", "alter table inv add constraint inv_email unique (email)");
+        run(&db, "main", "update inv set qty = qty - 4 where sku = 1");
+        run(&db, "main", "merge world w");
+        run(&db, "main", "create merge policy evid with (require_evidence = 'ticket')");
+        let spec = AgentSpec {
+            can: Some(vec![Can::Read, Can::Fork, Can::WriteOwn, Can::WriteMain, Can::MergeOwn]),
+            policy: Some("evid".into()),
+            ..Default::default()
+        };
+        db.create_agent("bot", &spec).unwrap();
+        let mut bot = Session::new("main");
+        bot.agent = Some("bot".into());
+        let mut b = |q: &str| bot.run(&db, q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"));
+        b("create world b1; use world b1; insert into inv values (3, 7, 'c'); use world main");
+        b("attach evidence to world b1 (kind = 'ticket', uri = 'https://t.example/1')");
+        b("merge world b1");
+        b("create world b2; use world b2; insert into inv values (4, 8, 'd'); use world main");
+        b("attach evidence to world b2 (kind = 'ticket', uri = 'https://t.example/2')");
+        let out = b("propose merge world b2");
+        let o = out.last().unwrap();
+        let at = o.columns.as_ref().unwrap().iter().position(|(c, _)| c == "id").unwrap();
+        let id = o.rows[0][at].to_text();
+        run(&db, "main", &format!("approve proposal '{id}'"));
+        run(&db, "main", &format!("merge proposal '{id}'"));
+        // stricter since: neither agent merge would pass now
+        run(&db, "main", "alter merge policy evid set (require_evidence = 'ticket,order_snapshot')");
+        assert_eq!(
+            chronos::sql::run(&db, "main", "select qty from inv where sku = 1", &[]).unwrap()[0].rows[0][0].to_text(),
+            "93",
+            "the delta combined"
+        );
+        worlds(&db)
+    };
+    assert!(all_tags(&dir).contains(&20));
+    chronos::test_resolve_panics(true);
+    let got = Db::open(&dir).map(|db| worlds(&db));
+    chronos::test_resolve_panics(false);
+    assert_eq!(got.unwrap(), want);
+    fs::remove_dir_all(&dir).unwrap();
 }

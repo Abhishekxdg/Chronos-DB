@@ -16,6 +16,11 @@
 //! A checkpoint ships its cut segment, sealed, before it writes the manifest that starts after it,
 //! then deletes the chunks the manifest before it needed (one checkpoint of slack, for a reader
 //! tailing the chain).
+//!
+//! Shipping reads no record: chunks are bytes. A machine that opens the remote replays them with
+//! `disk::recover`, which reads every record this version writes (`Op::Applied` included); one
+//! running a Chronos from before manifest format 8 refuses the remote's manifest before it reads
+//! any of its log, so replicas are upgraded before the primary.
 
 use crate::disk::{self, Log};
 use crate::remote::Remote;

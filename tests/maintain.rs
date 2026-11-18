@@ -499,3 +499,37 @@ fn lock_table_holds_its_mode_on_what_it_locks_until_the_transaction_ends() {
     assert!(locked(&mut s).is_empty());
     messages();
 }
+
+/// VERIFY DATABASE reads every row against its table's constraints, and lists those that break one: a state merges
+/// made before they were checked could leave (here made by turning the checks off, as a 0.5.5 log replays them).
+#[test]
+fn verify_database_reports_existing_violations() {
+    let db = Db::new();
+    let mut s = Session::new(MAIN);
+    for q in [
+        "create table org (id int primary key, slug text unique)",
+        "create table member (id int primary key, org text references org (slug))",
+        "create table n (id int primary key, v text, w int check (w > 0))",
+        "insert into org values (1, 'acme'), (2, 'old')",
+        "insert into n values (1, 'a', 1)",
+    ] {
+        tag(&db, &mut s, q);
+    }
+    let clean = s.run(&db, "verify database", &[]).unwrap().pop().unwrap();
+    assert_eq!(clean.rows.len(), 1, "no violations: the one summary row");
+    assert!(clean.rows[0].iter().skip(3).all(|v| *v == chronos::sql::Value::Null), "{:?}", clean.rows);
+    tag(
+        &db,
+        &mut s,
+        "create world w; use world w; delete from org where slug = 'old'; alter table n alter column v set not null; use world main",
+    );
+    tag(&db, &mut s, "insert into member values (11, 'old')");
+    tag(&db, &mut s, "insert into n values (2, null, 1)");
+    chronos::merge_rechecks_off(|| s.run(&db, "merge world w", &[]).map(|_| ())).unwrap();
+    let out = s.run(&db, "verify database", &[]).unwrap().pop().unwrap();
+    let found: Vec<String> =
+        out.rows.iter().map(|r| r.iter().map(|v| v.to_text()).collect::<Vec<_>>().join("|")).collect();
+    assert!(found.iter().any(|r| r.contains("member") && r.contains("member_org_fkey")), "{found:?}");
+    assert!(found.iter().any(|r| r.contains("n/2") && r.contains("NOT NULL")), "{found:?}");
+    assert_eq!(found.len(), 2, "{found:?}");
+}

@@ -505,6 +505,30 @@ impl Tenants {
     }
 }
 
+/// For an agent held to a tenant, reads that hold every tenant's values and can't be filtered to its rows (r3 batch
+/// S5): the planner's statistics (most common values, histogram bounds), and a materialized view without the
+/// tenant's column (nor a foreign key to it), computed over every tenant's rows when it was refreshed. A
+/// materialized view with the column is filtered as a table is.
+fn tenant_may_read(v: &View, table: &str) -> Result<()> {
+    let Some(cond) = tenant() else { return Ok(()) };
+    let name = rel_part(table);
+    let refuse = |what: &str| {
+        err(
+            "42501",
+            format!("an agent held to tenant {cond} may not read {what} \"{name}\": it holds every tenant's values"),
+        )
+    };
+    if matches!(name, "pg_stats" | "pg_statistic" | "pg_stats_ext" | "pg_stats_ext_exprs" | "pg_statistic_ext_data") {
+        return refuse("the statistics");
+    }
+    if relation_kind(v, table)? == Some("materialized view")
+        && !matches!(tenant_reach(v, table)?, Some(Reach::Column | Reach::Through { .. }))
+    {
+        return refuse("materialized view");
+    }
+    Ok(())
+}
+
 /// How `table` stands to the running statement's agent's tenant (see `reach`); None: no tenant, or no such table.
 fn tenant_reach(v: &View, table: &str) -> Result<Option<Reach>> {
     let Some(cond) = tenant() else { return Ok(None) };
@@ -623,7 +647,11 @@ pub(super) fn touched(v: &View, st: &Stmt) -> Result<bool> {
     }
     let views = v.core.has_views();
     for n in names {
-        if flags(v, &n)?.0 || (views && view_def(v, &n)?.is_some()) || tenant_policy(v, &n)?.is_some() {
+        if flags(v, &n)?.0
+            || (views && view_def(v, &n)?.is_some())
+            || tenant_policy(v, &n)?.is_some()
+            || tenant_may_read(v, &n).is_err()
+        {
             return Ok(true);
         }
     }
@@ -916,6 +944,7 @@ fn quals(perm: &[&Policy], restr: &[&Policy]) -> Result<Vec<Expr>> {
 /// The conditions `who` reads `table` by (SELECT's policies, and before them UPDATE's for FOR UPDATE
 /// and FOR SHARE), or None when row security doesn't limit it.
 pub(super) fn read(v: &View, table: &str, who: Option<&Who>, locking: bool) -> Result<Option<Vec<Expr>>> {
+    tenant_may_read(v, table)?;
     if !applies(v, table, who)? {
         return Ok(None);
     }

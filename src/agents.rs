@@ -26,7 +26,7 @@ use serde_json::{Value as Json, json};
 use std::collections::HashMap;
 
 const AGENTS: &str = "_sonos_agents";
-const POLICIES: &str = "_sonos_policies";
+pub(crate) const POLICIES: &str = "_sonos_policies";
 /// The secret masked columns' hashes are keyed by (see `Core::mask_key`).
 const MASK_KEY: &str = "_sonos_masking/key";
 /// The longest `world_ttl`: 100 years, in ms (an expiry is now plus it, and shows as an interval).
@@ -70,6 +70,10 @@ pub const SYSTEM: &str = "system";
 pub enum Can {
     /// read any world
     Read,
+    /// read the worlds it owns (and their past)
+    ReadOwn,
+    /// read main (through its tenant's rows, if held to one)
+    ReadMain,
     /// fork worlds (its own from then on)
     Fork,
     /// change the worlds it owns
@@ -93,8 +97,10 @@ pub enum Can {
 }
 
 impl Can {
-    pub const ALL: [Can; 11] = [
+    pub const ALL: [Can; 13] = [
         Can::Read,
+        Can::ReadOwn,
+        Can::ReadMain,
         Can::Fork,
         Can::WriteOwn,
         Can::Write,
@@ -106,13 +112,18 @@ impl Can {
         Can::Unmask,
         Can::Admin,
     ];
-    /// What a new agent may do unless told otherwise: read, fork, and change its own worlds. A
-    /// person reviews its diffs and merges.
-    pub const DEFAULT: [Can; 3] = [Can::Read, Can::Fork, Can::WriteOwn];
+    /// What a new agent may do unless told otherwise: read its own worlds and main, fork, and change its own worlds.
+    /// A person reviews its diffs and merges. (`agent_default_read = 'read'`: `LEGACY_DEFAULT`, as before the
+    /// security release.)
+    pub const DEFAULT: [Can; 4] = [Can::ReadOwn, Can::ReadMain, Can::Fork, Can::WriteOwn];
+    /// The default before the security release: read any world.
+    pub const LEGACY_DEFAULT: [Can; 3] = [Can::Read, Can::Fork, Can::WriteOwn];
 
     pub fn name(self) -> &'static str {
         match self {
             Can::Read => "read",
+            Can::ReadOwn => "read_own",
+            Can::ReadMain => "read_main",
             Can::Fork => "fork",
             Can::WriteOwn => "write_own",
             Can::Write => "write",
@@ -189,6 +200,10 @@ pub struct Agent {
     pub max_threads: u64,
     /// how its statements share the CPU with the database's own users (see `Priority`)
     pub priority: Priority,
+    /// how deep a world it forks may be: forks between it and main (0: no limit; see `lifecycle`)
+    pub max_depth: u64,
+    /// live forks a world may have when it forks one more, besides transactions' own; main's: `max_worlds` (0: no limit)
+    pub max_children: u64,
     pub created: u64,
     pub disabled: bool,
     /// the merge policy its merges keep to (see `MergePolicy`); None: its rights alone decide
@@ -226,6 +241,8 @@ pub struct AgentSpec {
     pub max_idle_ms: Option<u64>,
     pub max_threads: Option<u64>,
     pub priority: Option<Priority>,
+    pub max_depth: Option<u64>,
+    pub max_children: Option<u64>,
     pub disabled: Option<bool>,
     /// a merge policy's name; "" takes the agent's away
     pub policy: Option<String>,
@@ -265,6 +282,7 @@ impl Agent {
             "max_changes": self.max_changes, "world_ttl": self.world_ttl, "max_query_ms": self.max_query_ms,
             "max_concurrent": self.max_concurrent, "max_memory_mb": self.max_memory_mb, "max_idle_ms": self.max_idle_ms, "max_threads": self.max_threads,
             "priority": self.priority.name(),
+            "max_depth": self.max_depth, "max_children": self.max_children,
             "created": self.created,
             "disabled": self.disabled, "policy": self.policy, "token_hash": self.token_hash, "scram": self.scram,
             "tenant": self.tenant, "expires": self.expires, "rotated": self.rotated, "act_as": self.act_as,
@@ -290,6 +308,8 @@ impl Agent {
             max_threads: n("max_threads"),
             // (kept by an older version: none, normal)
             priority: j["priority"].as_str().and_then(Priority::parse).unwrap_or_default(),
+            max_depth: n("max_depth"),
+            max_children: n("max_children"),
             created: n("created"),
             disabled: j["disabled"].as_bool().unwrap_or(false),
             policy: j["policy"].as_str().map(String::from),
@@ -307,7 +327,7 @@ impl Agent {
         Agent {
             name: GUEST.into(),
             id: GUEST.into(),
-            can: Can::DEFAULT.to_vec(),
+            can: Can::LEGACY_DEFAULT.to_vec(),
             max_worlds: 0,
             writes_per_minute: 0,
             max_changes: 0,
@@ -318,6 +338,8 @@ impl Agent {
             max_idle_ms: 0,
             max_threads: 0,
             priority: Priority::Normal,
+            max_depth: 0,
+            max_children: 0,
             created: 0,
             disabled: false,
             policy: None,
@@ -355,6 +377,8 @@ impl Agent {
         self.max_idle_ms = spec.max_idle_ms.unwrap_or(self.max_idle_ms);
         self.max_threads = spec.max_threads.unwrap_or(self.max_threads);
         self.priority = spec.priority.unwrap_or(self.priority);
+        self.max_depth = spec.max_depth.unwrap_or(self.max_depth);
+        self.max_children = spec.max_children.unwrap_or(self.max_children);
         self.disabled = spec.disabled.unwrap_or(self.disabled);
         if let Some(p) = &spec.policy {
             self.policy = (!p.is_empty()).then(|| p.clone());
@@ -765,7 +789,10 @@ impl Core {
         let mut a = Agent {
             name: name.into(),
             id: format!("a{}", &crate::pages::hex(blake3::hash(token.as_bytes()).as_bytes())[..16]),
-            can: Can::DEFAULT.to_vec(),
+            can: match self.setting(crate::Setting::AgentDefaultRead) {
+                0 => Can::DEFAULT.to_vec(),
+                _ => Can::LEGACY_DEFAULT.to_vec(),
+            },
             max_worlds: 0,
             writes_per_minute: 0,
             max_changes: 0,
@@ -776,6 +803,8 @@ impl Core {
             max_idle_ms: 0,
             max_threads: 0,
             priority: Priority::Normal,
+            max_depth: 0,
+            max_children: 0,
             created: disk::now_ms(),
             disabled: false,
             policy: None,
@@ -837,6 +866,24 @@ impl Core {
     /// Changes what agent `name` may do; returns it.
     pub fn alter_agent(&self, name: &str, spec: &AgentSpec) -> Result<Agent> {
         let mut a = self.agent(name)?;
+        // its tenant is fixed while it owns worlds (rule T7): they are that tenant's, and a world whose owner's
+        // tenant changed would be held by one and owned by another
+        if let Some(t) = &spec.tenant {
+            let now = a.tenant.clone();
+            let to = if t.is_null() { None } else { Some(crate::scope::tenant(t)?) };
+            let same = match (&now, &to) {
+                (None, None) => true,
+                (Some(x), Some(y)) => crate::tenancy::same_tenant(x, y),
+                _ => false,
+            };
+            let owns = self.worlds().iter().filter(|w| w.owner.as_deref() == Some(name)).count();
+            if !same && owns > 0 {
+                return Err(refused(format!(
+                    "agent {name} owns {owns} world{}: its tenant can't change while it does; merge or discard them first",
+                    if owns == 1 { "" } else { "s" }
+                )));
+            }
+        }
         a.apply(spec)?;
         if spec.tenant.as_ref().is_some_and(|t| !t.is_null()) {
             self.tenant_held(&a)?;
@@ -1005,11 +1052,23 @@ impl Core {
         self.guard_disk(crate::WORLD_BYTES)?; // a mark, kept with the history it names
         let at = disk::now_ms();
         std::thread::sleep(std::time::Duration::from_millis(1)); // later writes get a later time
-        let mut marks = self.world(w)?.checkpoints;
+        let world = self.world(w)?;
+        let mut marks = world.checkpoints;
         marks.retain(|(n, _)| n != name);
         marks.push((name.into(), at));
         let marks: serde_json::Map<String, Json> = marks.into_iter().map(|(n, t)| (n, json!(t))).collect();
-        self.set_reserved(w, CHECKPOINTS, Some(Json::Object(marks)))?;
+        // the label names this moment now: a pin it had kept the one before, and goes with it (a pinned checkpoint
+        // pins again after this: see `pin_checkpoint`)
+        self.put_meta(&world.name, |meta| {
+            meta.insert(CHECKPOINTS.into(), Json::Object(marks));
+            if let Some(Json::Object(pins)) = meta.get_mut(crate::durable::PINS) {
+                pins.remove(name);
+                if pins.is_empty() {
+                    meta.remove(crate::durable::PINS);
+                }
+            }
+            Ok(())
+        })?;
         Ok(at)
     }
 
@@ -1023,25 +1082,26 @@ impl Core {
             .ok_or_else(|| bad(format!("world {} has no checkpoint '{name}'", w.name)))
     }
 
-    /// Discards worlds whose time is up (an agent's `world_ttl`, or `expire`), and worlds unused
-    /// for longer than `world_idle_ttl` unless pinned; never main, or a world with forks of its
-    /// own then. Forks first, so an idle parent can follow its idle forks. Runs in the
-    /// background, logged as `SYSTEM`; returns how many went.
+    /// Discards worlds whose time is up (an agent's `world_ttl`, or `expire`) with every world
+    /// forked from them (transactions open in them too: see `lifecycle`), and worlds unused for
+    /// longer than `world_idle_ttl` unless pinned; never main, or an idle world with forks of its
+    /// own then. Forks first, so a parent can follow its forks. Runs in the background, logged as
+    /// `SYSTEM`; returns how many worlds went (transactions' own not counted).
     pub fn expire_worlds(&self) -> Result<usize> {
         let _system = disk::acting_as(SYSTEM);
         let (now, idle) = (disk::now_ms(), self.setting(crate::Setting::WorldIdleTtl));
-        let due: Vec<String> = self
-            .worlds()
-            .into_iter()
-            .filter(|w| w.name != MAIN && !w.name.starts_with("_tx_"))
-            .filter(|w| {
-                w.expires.is_some_and(|e| e <= now)
-                    || (idle > 0 && !w.pinned && w.parent.is_some() && w.active.saturating_add(idle) <= now)
-            })
-            .map(|w| w.name)
-            .collect();
+        let mut due = self.expired_trees(now);
+        let expired: std::collections::HashSet<String> = due.iter().cloned().collect();
+        due.extend(
+            self.worlds()
+                .into_iter()
+                .filter(|w| w.name != MAIN && !w.name.starts_with("_tx_") && !expired.contains(&w.name))
+                .filter(|w| idle > 0 && !w.pinned && w.parent.is_some() && w.active.saturating_add(idle) <= now)
+                .map(|w| w.name),
+        );
         // a world with forks is refused, atomically against a fork racing this
-        Ok(self.discard_many(&due).iter().filter(|r| r.is_ok()).count())
+        let out = self.discard_many(&due);
+        Ok(due.iter().zip(out).filter(|(n, r)| r.is_ok() && !n.starts_with("_tx_")).count())
     }
 
     /// Where the history window starts, or None with no log or no history yet.
@@ -1117,6 +1177,19 @@ impl Core {
                     // the world stays open, on a new fork point
                     let onto = parents.get(&w).cloned().flatten().unwrap_or_default();
                     Some(Step::Rebase { world: w, onto })
+                }
+                // (never a transaction's: see `Core::publish`)
+                Op::Applied(a) => {
+                    let a = *a;
+                    let (world, into) = (a.source, a.target);
+                    Some(match a.kind {
+                        disk::AppliedKind::Whole => {
+                            parents.remove(&world);
+                            Step::Merge { world, into }
+                        }
+                        disk::AppliedKind::Partial => Step::MergeSome { world, into, part: a.part },
+                        disk::AppliedKind::Rebase => Step::Rebase { world, onto: into },
+                    })
                 }
                 Op::Discard(w) => {
                     parents.remove(&w);
@@ -1345,12 +1418,18 @@ impl Core {
     /// so; merged again before `canary_wait` has passed, refused; after, it merges as any merge (judged by its
     /// policy). Ok: merge as usual.
     pub(crate) fn canary(&self, b: &str, o: &crate::MergeOptions) -> Result<()> {
+        // (a proposal's approved merge, one with an operation id or AT VERSION, and CONSOLIDATE's are each the whole of
+        // one change: a part first would match neither the approval's certificate, the id's request nor the version)
         if b.starts_with("_tx_")
+            || b.starts_with("_consolidate_")
             || o.into.is_some()
+            || o.operation.is_some()
+            || o.expected.is_some()
             || !o.only_tables.is_empty()
             || !o.only_keys.is_empty()
             || disk::actor().is_empty()
-            || self.me.get().is_none()
+            || self.replaying()
+            || crate::proposals::approval_for(b).is_some()
         {
             return Ok(());
         }
@@ -1443,6 +1522,12 @@ impl Core {
             Error::Constraint { code: "23514", .. } => "checks",
             _ => return,
         };
+        // remembered on main, for an agent's world (see `proposals`)
+        if let Ok(w) = self.world(b)
+            && let Some(t) = self.tombstone_row(&w, "refused", &[for_people(&e.to_string())])
+        {
+            self.bury(vec![t]);
+        }
         let _ = self.put_meta(b, |meta| {
             let r = meta.entry(REFUSALS).or_insert_with(|| json!({}));
             r[kind] = json!(r[kind].as_u64().unwrap_or(0) + 1);
@@ -1500,6 +1585,10 @@ pub struct MergePolicy {
     /// an agent (a reviewer model's) that looks at its held merges before a person: it approves (the merge goes
     /// through), rejects, or passes one on, with a reason (see `Core::decide_review`)
     pub reviewer: Option<String>,
+    /// how CONSOLIDATE ... USING ARBITRATION settles a row two children both changed (see `consolidate`): `priority`
+    /// (the world owners' agent priority, admin-set; a tie, the older world), `newest`, `oldest` or `fail` (refused,
+    /// as without arbitration). None: `priority`
+    pub arbitrate: Option<String>,
     /// conditions every row a merge changes in a table must keep, each `(table, condition)`: SQL over the row as it
     /// was (`old.col`) and as the merge leaves it (`new.col`), as a CHECK reads its row (a NULL keeps it); a row that
     /// makes one false waits for a person (see `rowrules`)
@@ -1551,6 +1640,9 @@ pub struct MergePolicy {
     /// a merge changing more than this many times the rows the policy's merges usually change (the median of its last
     /// 50) waits for a review: drift, an agent doing something it never did (see `Core::usual_rows`)
     pub max_unusual: Option<u64>,
+    /// kinds of evidence (see `proposals`: ATTACH EVIDENCE) a merge must carry, every one: a merge without one of
+    /// them waits for a person, and no approval lifts it
+    pub require_evidence: Vec<String>,
     pub created: u64,
 }
 
@@ -1571,7 +1663,7 @@ pub const PERSON_ONLY: [&str; 9] = [
 
 /// Every rule a merge can break, by the name `person_only` takes (the settings', and `scope`, `checks` and
 /// `stale_reads` for a declared scope, merge checks and changed reads).
-pub const RULE_NAMES: [&str; 28] = [
+pub const RULE_NAMES: [&str; 29] = [
     "max_rows",
     "max_deletes",
     "confirm_deletes_over",
@@ -1600,6 +1692,7 @@ pub const RULE_NAMES: [&str; 28] = [
     "spot_check",
     "max_shift",
     "max_unusual",
+    "require_evidence",
 ];
 
 /// A rule a merge broke: which (by its name in `RULE_NAMES`, or `review_every`), and why, in words.
@@ -1773,6 +1866,20 @@ impl MergePolicy {
                 "check_reads" => self.check_reads = flag()?,
                 "rerun_reads" => self.rerun_reads = flag()?,
                 "require_scope" => self.require_scope = flag()?,
+                "arbitrate" => {
+                    self.arbitrate = match v {
+                        Json::Null => None,
+                        Json::String(s) if crate::consolidate::RULES.contains(&s.to_ascii_lowercase().as_str()) => {
+                            Some(s.to_ascii_lowercase())
+                        }
+                        _ => {
+                            return Err(bad(
+                                "arbitrate must be priority, newest, oldest or fail, or null for priority".into(),
+                            ));
+                        }
+                    }
+                }
+                "require_evidence" => self.require_evidence = evidence_kinds(v)?,
                 "reviewer" => {
                     self.reviewer = match v {
                         Json::Null => None,
@@ -1782,7 +1889,7 @@ impl MergePolicy {
                 }
                 k => {
                     return Err(bad(format!(
-                        "merge policies have no setting {k} (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, all_rows_per_hour, all_deletes_per_hour, all_effects_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, row_rules, max_nulled, untrusted_columns, trusted_columns, untrusted_guards, spot_check, schema, overwrite, critical, check_reads, rerun_reads, require_scope, reviewer, review_every, person_only, watch_totals, max_shift, canary, canary_wait, effects_delay, max_unusual)"
+                        "merge policies have no setting {k} (max_rows, max_deletes, confirm_deletes_over, rows_per_hour, deletes_per_hour, all_rows_per_hour, all_deletes_per_hour, all_effects_per_hour, max_age, max_effects, effects_per_hour, review_channels, tables, review_tables, review_columns, row_rules, max_nulled, untrusted_columns, trusted_columns, untrusted_guards, spot_check, schema, overwrite, critical, check_reads, rerun_reads, require_scope, reviewer, review_every, person_only, watch_totals, max_shift, canary, canary_wait, effects_delay, max_unusual, arbitrate, require_evidence)"
                     )));
                 }
             }
@@ -1800,13 +1907,14 @@ impl MergePolicy {
             "review_tables": self.review_tables, "review_columns": self.review_columns, "schema": self.schema, "overwrite": self.overwrite,
             "critical": self.critical, "check_reads": self.check_reads, "rerun_reads": self.rerun_reads,
             "require_scope": self.require_scope, "reviewer": self.reviewer, "created": self.created,
+            "arbitrate": self.arbitrate,
             "row_rules": self.row_rules, "all_rows_per_hour": self.all_rows_per_hour,
             "all_deletes_per_hour": self.all_deletes_per_hour, "all_effects_per_hour": self.all_effects_per_hour,
             "spot_check": self.spot_check, "max_nulled": self.max_nulled,
             "untrusted_columns": self.untrusted_columns, "untrusted_guards": self.untrusted_guards,
             "trusted_columns": self.trusted_columns, "watch_totals": self.watch_totals, "max_shift": self.max_shift,
             "canary": self.canary, "canary_wait": self.canary_wait, "effects_delay": self.effects_delay,
-            "max_unusual": self.max_unusual,
+            "max_unusual": self.max_unusual, "require_evidence": self.require_evidence,
             "review_every": self.review_every, "person_only": self.person_only,
         })
         .to_string()
@@ -1850,6 +1958,7 @@ impl MergePolicy {
             rerun_reads: j["rerun_reads"].as_bool().unwrap_or(false),
             require_scope: j["require_scope"].as_bool().unwrap_or(false),
             reviewer: j["reviewer"].as_str().map(String::from),
+            arbitrate: j["arbitrate"].as_str().map(String::from),
             row_rules: pairs("row_rules"),
             all_rows_per_hour: j["all_rows_per_hour"].as_u64(),
             all_deletes_per_hour: j["all_deletes_per_hour"].as_u64(),
@@ -1864,6 +1973,7 @@ impl MergePolicy {
             canary_wait: j["canary_wait"].as_u64(),
             effects_delay: j["effects_delay"].as_u64(),
             max_unusual: j["max_unusual"].as_u64().filter(|n| *n > 0),
+            require_evidence: list("require_evidence"),
             untrusted_guards: list("untrusted_guards"),
             review_every: j["review_every"].as_bool().unwrap_or(false),
             person_only: j["person_only"]
@@ -2228,6 +2338,24 @@ impl MergePolicy {
         }
         out
     }
+}
+
+/// `require_evidence`'s kinds: `'ticket,order_snapshot'` or an array of names; null for none.
+fn evidence_kinds(v: &Json) -> Result<Vec<String>> {
+    let wrong =
+        || bad("require_evidence must be a list of evidence kinds like 'ticket,order_snapshot', or null".into());
+    let items: Vec<String> = match v {
+        Json::Null => return Ok(vec![]),
+        Json::String(s) => s.split(',').map(|k| k.trim().to_string()).collect(),
+        Json::Array(a) => {
+            a.iter().map(|k| k.as_str().map(|k| k.trim().to_string()).ok_or_else(wrong)).collect::<Result<_>>()?
+        }
+        _ => return Err(wrong()),
+    };
+    if items.iter().any(|k| k.is_empty()) {
+        return Err(wrong());
+    }
+    Ok(items)
 }
 
 /// A comma-separated list of table names as SQL reads them: unquoted names fold to lowercase;
@@ -2639,6 +2767,10 @@ impl Core {
                     w.name
                 )));
             }
+            // rule T4: a reviewer held to a tenant decides only its tenant's worlds
+            if let Ok(a) = self.agent(&actor) {
+                Acting { core: self, _as: disk::acting_as(&actor), agent: a }.held(&w.name, "decide the review of")?;
+            }
         }
         // rules only a person approves a merge past (see `MergePolicy::person_only`): not an agent, a reviewer or an
         // admin agent, however sure it is; it may still reject or pass it on, with its reason
@@ -2781,10 +2913,108 @@ impl Acting<'_> {
         w.owner.as_deref() == Some(self.agent.name.as_str())
     }
 
-    /// Whether the agent may read world `w` (a name, ID, or `name@when`).
+    /// Whether the agent holds `right` on world `w` by a grant on it or a world it was forked from (see `lifecycle`).
+    fn granted(&self, w: &World, right: &str) -> bool {
+        self.core.granted(w, &self.agent.name, right).is_some()
+    }
+
+    /// Refuses a change or merge of world `w` by an agent it was transferred away from (55P03, lease lost); an admin
+    /// may still.
+    fn fenced(&self, w: &World) -> Result<()> {
+        if crate::lifecycle::fenced(w, &self.agent.name) && !self.agent.may(Can::Admin) {
+            return Err(crate::lifecycle::lease_lost(w, &self.agent.name));
+        }
+        Ok(())
+    }
+
+    /// Whether the agent holds `right` (see `lifecycle::RIGHTS`) on world `w`: what it may grant there. MERGE is the
+    /// right to merge `w` itself, whatever it may change of the world it goes into.
+    pub(crate) fn holds(&self, w: &World, right: &str) -> Result<()> {
+        match right {
+            "read" => self.may_read(&w.name),
+            "write" => self.may_change(&w.name),
+            "fork" => self.may_fork(&w.name),
+            _ => {
+                self.fenced(w)?;
+                if self.agent.may(Can::Merge)
+                    || (self.owns(w) && self.agent.may(Can::MergeOwn))
+                    || self.granted(w, "merge")
+                {
+                    return Ok(());
+                }
+                Err(refused(format!("agent {} may not merge {}", self.agent.name, w.name)))
+            }
+        }
+    }
+
+    /// Whether the agent may read world `w` (a name, ID, or `name@when`): 'read', or READ granted on it.
     pub fn may_read(&self, w: &str) -> Result<()> {
         crate::not_tx(w)?; // a session's transaction is its own
-        self.need(Can::Read, "read")
+        self.may_read_world(w)?;
+        self.held(w, "read")
+    }
+
+    /// `read` reads any world; `read_main` main (as it is or was), `read_own` the worlds the agent owns (decision 3).
+    fn may_read_world(&self, w: &str) -> Result<()> {
+        if self.agent.may(Can::Read) {
+            return Ok(());
+        }
+        let name = w.split_once('@').map_or(w, |(n, _)| n);
+        if name.starts_with("_tx_") {
+            return Ok(()); // its own session's transaction (`not_tx` refused anyone else's)
+        }
+        let world = self.core.world(name).map(|x| x.name);
+        if name == MAIN || world.as_ref().is_ok_and(|x| x == MAIN) {
+            return self.need(Can::ReadMain, "read main");
+        }
+        let owned = match &world {
+            Ok(x) => self.core.world(x).is_ok_and(|x| self.owns(&x)),
+            Err(_) => false,
+        };
+        if owned && self.agent.may(Can::ReadOwn) {
+            return Ok(());
+        }
+        // a world it was granted READ on (`GRANT READ ON WORLD`), never main
+        if let Ok(x) = self.core.world(name)
+            && self.granted(&x, "read")
+        {
+            return Ok(());
+        }
+        Err(refused(format!(
+            "agent {} may read {}, not world {name}: it has no 'read' right",
+            self.agent.name,
+            match (self.agent.may(Can::ReadOwn), self.agent.may(Can::ReadMain)) {
+                (true, true) => "its own worlds and main",
+                (true, false) => "its own worlds",
+                (false, true) => "main",
+                (false, false) => "no world",
+            }
+        )))
+    }
+
+    /// For an agent held to a tenant (rule T4, r3.1): it acts only on worlds of its tenant, and on main, which it
+    /// reads through its tenant's rows (and changes only by merging). A world of another tenant, of none (`global`),
+    /// or with no tenant recorded (`unassigned`, `quarantined`) is refused, its own included. Others: allowed.
+    pub(crate) fn held(&self, w: &str, doing: &str) -> Result<()> {
+        let Some(t) = &self.agent.tenant else { return Ok(()) };
+        let name = w.split_once('@').map_or(w, |(n, _)| n);
+        let world = match self.core.world(name) {
+            Ok(x) => x.name,
+            Err(_) if name.starts_with("_tx_") => name.to_string(), // its own transaction: the world it began on
+            Err(e) => return Err(e),
+        };
+        if world == MAIN {
+            return Ok(());
+        }
+        match self.core.identity(&world)? {
+            crate::Identity::Tenant(x) if crate::tenancy::same_tenant(&x, t) => Ok(()),
+            id => Err(refused(format!(
+                "agent {} works for tenant {} only: it may not {doing} world {world}, which is {}",
+                self.agent.name,
+                self.agent.tenant_sql().unwrap_or_default(),
+                id.words()
+            ))),
+        }
     }
 
     /// Whether the agent may see world `w`'s changes as rows (a diff, its history, a dry run of its merge, what it
@@ -2796,20 +3026,50 @@ impl Acting<'_> {
             return Ok(());
         }
         let name = w.split_once('@').map_or(w, |(n, _)| n);
-        if self.core.world(name)?.owner.as_deref() == Some(self.agent.name.as_str()) {
+        // (a world as it was holds what merged into its base by then, other tenants' rows too)
+        if name == w && self.core.world(name)?.owner.as_deref() == Some(self.agent.name.as_str()) {
             return Ok(());
         }
         Err(refused(format!(
-            "agent {} works for one tenant ({}): it sees the changes of the worlds it forked, not {name}'s; read rows \
-             with SQL, which shows its tenant's",
+            "agent {} works for one tenant ({}): it sees the changes of the worlds it forked as they are now, not {w}'s; \
+             read rows with SQL, which shows its tenant's",
             self.agent.name,
             self.agent.tenant_sql().unwrap_or_default()
         )))
     }
 
-    /// For an agent held to a tenant, what lists every world's or agent's doings (SHOW REVIEWS, SHOW AUDIT, SHOW
-    /// HISTORY, merge outcomes): row keys and reasons of other tenants' worlds, refused. Others: allowed.
+    /// Whether the agent may see the rows that differ between worlds `a` and `b` (a two-world DIFF, READERS or
+    /// COMPARE): each world's changes, and for an agent held to a tenant, two worlds forked from one state: else the
+    /// difference holds what merged into one's base and not the other's, other tenants' rows with it.
+    pub fn may_see_between(&self, a: &str, b: &str) -> Result<()> {
+        self.may_see_changes(a)?;
+        self.may_see_changes(b)?;
+        if self.agent.tenant.is_none() {
+            return Ok(());
+        }
+        let base = |w: &str| self.core.branch(&self.core.world(w)?.name).map(|x| x.base());
+        if base(a)?.same(&base(b)?) {
+            return Ok(());
+        }
+        Err(refused(format!(
+            "agent {} works for one tenant: it compares {a} and {b} only when both were forked from one state (a \
+             world against its own base: DIFF WORLD {a})",
+            self.agent.name
+        )))
+    }
+
+    /// For an agent held to a tenant, or without the `read` right, what lists every world's or agent's doings (SHOW
+    /// REVIEWS, SHOW AUDIT, SHOW HISTORY, the outbox, the review channel): row keys and reasons of other worlds,
+    /// refused. Others: allowed.
     pub fn may_list_all(&self, what: &str) -> Result<()> {
+        if self.agent.tenant.is_none() && !self.agent.may(Can::Read) {
+            // no 'read' right (decision 3): it reads its own worlds and main, not lists of every world's changes
+            return Err(refused(format!(
+                "agent {} may read its own worlds and main, not {what}: that lists every world's changes (it has no \
+                 'read' right)",
+                self.agent.name
+            )));
+        }
         match &self.agent.tenant {
             None => Ok(()),
             Some(_) => Err(refused(format!(
@@ -2824,6 +3084,15 @@ impl Acting<'_> {
     /// rate, and the world's change quota. An agent keeping to a merge policy changes main only
     /// by merging, where the policy is checked: else `write_main` would get around it.
     pub fn may_write(&self, w: &str, rows: usize) -> Result<()> {
+        // main is every tenant's: an agent held to one changes it only by merging a world of its tenant (r3.1, T4)
+        if self.agent.tenant.is_some() && self.core.world(w)?.name == MAIN {
+            return Err(refused(format!(
+                "agent {} works for tenant {} only, so it changes main only by merging a world of its tenant: fork one, \
+                 change it, merge it",
+                self.agent.name,
+                self.agent.tenant_sql().unwrap_or_default()
+            )));
+        }
         if let Some(p) = &self.agent.policy
             && self.core.world(w)?.name == MAIN
         {
@@ -2838,7 +3107,9 @@ impl Acting<'_> {
     /// `may_write` without the merge policy's rule: for merges, which check the policy themselves.
     fn may_write_rows(&self, w: &str, rows: usize) -> Result<()> {
         let world = self.core.world(w)?;
+        self.held(&world.name, "change")?;
         self.may_change(&world.name)?;
+        self.core.frozen(&world.name)?; // a world whose merge is proposed stays as proposed (see `proposals`)
         let a = &self.agent;
         if a.max_changes > 0 && world.name != MAIN && self.core.changed(&world.name)? + rows as u64 > a.max_changes {
             return Err(refused(format!(
@@ -2859,10 +3130,13 @@ impl Acting<'_> {
     /// 'merge_own', its own, into a parent it may change (main needs 'write_main').
     pub fn may_merge(&self, w: &str) -> Result<()> {
         let world = self.core.world(w)?;
+        self.held(&world.name, "merge")?;
+        self.fenced(&world)?;
+        self.core.frozen(&world.name)?; // merged by its proposal (see `proposals`)
         if self.agent.may(Can::Merge) {
             return Ok(());
         }
-        if !(self.owns(&world) && self.agent.may(Can::MergeOwn)) {
+        if !((self.owns(&world) && self.agent.may(Can::MergeOwn)) || self.granted(&world, "merge")) {
             return Err(refused(format!(
                 "agent {} may not merge {}: it needs 'merge', or 'merge_own' and to own it",
                 self.agent.name, world.name
@@ -2877,10 +3151,12 @@ impl Acting<'_> {
     /// Whether the agent may change world `w` (its right to, not its rate or quota).
     fn may_change(&self, w: &str) -> Result<()> {
         let world = self.core.world(w)?;
+        self.fenced(&world)?;
         let doing = format!("change {}", world.name);
         match () {
             _ if world.name == MAIN => self.need(Can::WriteMain, &doing),
             _ if self.owns(&world) && self.agent.may(Can::WriteOwn) => Ok(()),
+            _ if self.granted(&world, "write") => Ok(()), // GRANT WRITE ON WORLD (see `lifecycle`)
             _ => self.need(Can::Write, &doing),
         }
     }
@@ -2889,9 +3165,22 @@ impl Acting<'_> {
     /// forks, so forking any world but main needs the right to change it: else anyone who may
     /// read a world could pin it.
     pub fn may_fork(&self, w: &str) -> Result<()> {
+        // FORK granted on a world (see `lifecycle`): forks of it, without 'fork' or the right to change it
+        if !self.agent.may(Can::Fork)
+            && let Ok(world) = self.core.world(w)
+            && world.name != MAIN
+            && self.granted(&world, "fork")
+        {
+            self.core.frozen(&world.name)?; // merged by its proposal (see `proposals`)
+            return Ok(());
+        }
         self.need(Can::Fork, "fork")?;
         let world = self.core.world(w)?;
+        self.held(&world.name, "fork")?;
         if world.name != MAIN {
+            self.core.frozen(&world.name)?; // merged by its proposal (see `proposals`)
+        }
+        if world.name != MAIN && !self.granted(&world, "fork") {
             self.may_change(&world.name).map_err(|_| {
                 refused(format!(
                     "agent {} may not fork {}: forking a world needs the right to change it",
@@ -2903,10 +3192,21 @@ impl Acting<'_> {
     }
 
     /// Whether the agent may merge world `w` into world `into`: the right to merge `w`, and,
-    /// unless `into` is its parent, to change `into`.
+    /// unless `into` is its parent, to change `into`, which must be a world forked from its parent (or from those,
+    /// and so on): past its parent, `w`'s rows carry what the parent changed and never merged (see `Core::carried`).
     pub fn may_merge_into(&self, w: &str, into: &str) -> Result<()> {
         self.may_merge(w)?;
-        if self.core.world(w)?.parent.as_deref() != Some(self.core.world(into)?.name.as_str()) {
+        let (world, target) = (self.core.world(w)?, self.core.world(into)?);
+        if world.parent.as_deref() != Some(target.name.as_str()) {
+            if let Some(p) = &world.parent
+                && !self.core.within(&target.name, p)
+            {
+                return Err(refused(format!(
+                    "agent {} may not merge {} into {}: an agent merges a world into its parent ({p}) or a world \
+                     forked from it",
+                    self.agent.name, world.name, target.name
+                )));
+            }
             self.may_write_rows(into, 0)?;
         }
         Ok(())
@@ -2915,6 +3215,7 @@ impl Acting<'_> {
     /// Whether the agent may discard world `w` or change its metadata: its own, or with 'write'.
     pub fn may_manage(&self, w: &str) -> Result<()> {
         let world = self.core.world(w)?;
+        self.held(&world.name, "manage")?;
         if world.name == MAIN || !(self.owns(&world) || self.agent.may(Can::Write)) {
             return Err(refused(format!(
                 "agent {} may not manage world {}: it's not its own",
@@ -2937,6 +3238,7 @@ impl Acting<'_> {
     /// `Core::may_undo_into`) the right to write that world. Never an agent keeping to a merge
     /// policy: an undo writes its rows straight into the world, main included, past the rules.
     pub fn may_undo(&self) -> Result<()> {
+        self.untenanted("undo merges or agents' changes")?;
         if let Some(p) = &self.agent.policy {
             return Err(refused(format!(
                 "agent {} keeps to merge policy {p}, so it may not undo merges or agents' changes: they write past the rules",
@@ -2949,8 +3251,34 @@ impl Acting<'_> {
         self.may_admin()
     }
 
+    /// Refused for an agent held to a tenant (r3 section 3, T4): putting rows back as they were (a restore, an undo, a
+    /// world from a past moment) puts back every tenant's rows, not its own.
+    pub(crate) fn untenanted(&self, doing: &str) -> Result<()> {
+        match &self.agent.tenant {
+            None => Ok(()),
+            Some(_) => Err(refused(format!(
+                "agent {} works for tenant {} only: it may not {doing}, which puts every tenant's rows back as they were",
+                self.agent.name,
+                self.agent.tenant_sql().unwrap_or_default()
+            ))),
+        }
+    }
+
+    /// Refused for an agent held to a tenant: `doing` touches every tenant's rows or payloads.
+    pub(crate) fn not_tenant(&self, doing: &str) -> Result<()> {
+        match &self.agent.tenant {
+            None => Ok(()),
+            Some(_) => Err(refused(format!(
+                "agent {} works for tenant {} only: it may not {doing}",
+                self.agent.name,
+                self.agent.tenant_sql().unwrap_or_default()
+            ))),
+        }
+    }
+
     /// Whether the agent may put world `w` back as it was.
     pub fn may_restore(&self, w: &str) -> Result<()> {
+        self.untenanted("restore a world")?;
         self.need(Can::Restore, "restore")?;
         self.may_write(w, 0)
     }
@@ -2964,6 +3292,20 @@ impl Acting<'_> {
     pub fn fork(&self, from: &str, name: &str, meta: Json) -> Result<World> {
         self.may_fork(from)?;
         let owner = self.forks(1)?;
+        let meta = self.fork_meta(from, meta, owner)?;
+        self.core.tenant_first(from, &meta)?;
+        self.core.fork_owned(from, name, meta)
+    }
+
+    /// A new world's metadata, for a world this agent makes from `from` (a fork, a simulation's or a replay's
+    /// worlds: all made the one way): `meta` as declared, checked, with its tenant (rule T1), its scope (within its
+    /// parent's and its policy's), what its policy checks of its reads, and `owner` (from `forks`).
+    pub(crate) fn fork_meta(
+        &self,
+        from: &str,
+        meta: Json,
+        owner: serde_json::Map<String, Json>,
+    ) -> Result<serde_json::Map<String, Json>> {
         let mut meta = match meta {
             Json::Object(m) => m,
             Json::Null => Default::default(),
@@ -2971,6 +3313,7 @@ impl Acting<'_> {
         };
         crate::reserved_keys(&meta)?; // only the database sets its own keys (owner, expiry, last use, ...)
         crate::stale::from_meta(&mut meta)?;
+        crate::durable::from_meta(&mut meta)?;
         // an agent held to a tenant forks only that tenant's worlds: declared so, whatever it says
         if let Some(t) = &self.agent.tenant {
             let mine = json!({ t["column"].as_str().unwrap_or_default(): t["value"].clone() });
@@ -2985,7 +3328,12 @@ impl Acting<'_> {
             }
             meta.insert("tenant".into(), mine);
         }
+        // its tenant identity: its parent's, if that has one (rule T1, see `tenancy`)
+        let parent = self.core.inherit(from, &mut meta, self.agent.tenant.as_ref())?;
         crate::scope::from_meta(self.core, from, &mut meta)?;
+        crate::tenancy::mark(&parent, &mut meta);
+        self.core.budget_from_meta(from, &mut meta)?; // budget_rows, budget_statements: at most what `from` has left
+        self.core.agent_fork_room(&self.agent, from)?; // its max_depth, max_children
         let policy = self.core.policy_of(&self.agent)?;
         if policy.as_ref().is_some_and(|p| p.check_reads || p.rerun_reads) {
             meta.insert(crate::stale::CHECK_READS.into(), Json::Bool(true)); // its policy checks what it reads
@@ -3023,14 +3371,13 @@ impl Acting<'_> {
             )));
         }
         meta.extend(owner);
-        self.core.tenant_first(from, &meta)?;
-        self.core.fork_owned(from, name, meta)
+        Ok(meta)
     }
 
     /// The metadata that makes `n` new worlds this agent's (its owner, its TTL), once it's checked
-    /// the agent may fork and has room for `n` more worlds.
+    /// it has room for `n` more worlds. Callers check it may fork the world first (`may_fork`: 'fork', or FORK
+    /// granted on that world).
     pub(crate) fn forks(&self, n: usize) -> Result<serde_json::Map<String, Json>> {
-        self.need(Can::Fork, "fork")?;
         let a = &self.agent;
         if a.max_worlds > 0 {
             let owned = self.owned();

@@ -210,7 +210,7 @@ fn qualified(table: &str, k: &str, s: &str) -> Result<String, String> {
 // ---------------------------------------------------------------- numbers, for delta columns
 
 /// A decimal number's digits as an integer and its scale (digits after the point): `-12.50` is (-1250, 2).
-fn decimal(v: &Json) -> Option<(i128, u32)> {
+pub(crate) fn decimal(v: &Json) -> Option<(i128, u32)> {
     let s = match v {
         Json::Number(n) => n.to_string(),
         Json::String(s) => s.clone(),
@@ -228,7 +228,11 @@ fn decimal(v: &Json) -> Option<(i128, u32)> {
     if int.is_empty() && frac.is_empty() || !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let digits: i128 = format!("{int}{frac}").trim_start_matches('0').parse().unwrap_or(0);
+    let all = format!("{int}{frac}");
+    let digits: i128 = match all.trim_start_matches('0') {
+        "" => 0,
+        d => d.parse().ok()?, // more digits than an i128 holds: not a number a delta can be taken of
+    };
     let scale = u32::try_from(frac.len()).ok().filter(|s| *s <= 30)?;
     Some((if neg { -digits } else { digits }, scale))
 }
@@ -237,19 +241,27 @@ fn scaled(v: (i128, u32), to: u32) -> Option<i128> {
     v.0.checked_mul(10i128.checked_pow(to - v.1)?)
 }
 
+/// A decimal (see `decimal`) as text: (-1250, 2) is `-12.50`.
+pub(crate) fn show_decimal((n, scale): (i128, u32)) -> String {
+    let digits = format!("{:0>width$}", n.unsigned_abs(), width = scale as usize + 1);
+    let (i, f) = digits.split_at(digits.len() - scale as usize);
+    let body = if scale == 0 { i.to_string() } else { format!("{i}.{f}") };
+    if n < 0 { format!("-{body}") } else { body }
+}
+
+/// How two decimals (see `decimal`) compare; None past what 128 bits hold at the larger scale.
+pub(crate) fn cmp_decimal(a: (i128, u32), b: (i128, u32)) -> Option<std::cmp::Ordering> {
+    let scale = a.1.max(b.1);
+    Some(scaled(a, scale)?.cmp(&scaled(b, scale)?))
+}
+
 /// `theirs + ours - base` for a delta column (see `TableRules::delta`), in the form `theirs` has it (a JSON number,
 /// or text): what both sides' increments leave. None: not numbers delta can add.
 pub fn add_deltas(base: &Json, ours: &Json, theirs: &Json) -> Option<Json> {
     let (b, o, t) = (decimal(base)?, decimal(ours)?, decimal(theirs)?);
     let scale = b.1.max(o.1).max(t.1);
     let sum = scaled(t, scale)?.checked_add(scaled(o, scale)?)?.checked_sub(scaled(b, scale)?)?;
-    let text = {
-        let neg = sum < 0;
-        let digits = format!("{:0>width$}", sum.unsigned_abs(), width = scale as usize + 1);
-        let (i, f) = digits.split_at(digits.len() - scale as usize);
-        let body = if scale == 0 { i.to_string() } else { format!("{i}.{f}") };
-        if neg { format!("-{body}") } else { body }
-    };
+    let text = show_decimal((sum, scale));
     match theirs {
         Json::String(_) => Some(Json::String(text)),
         _ => serde_json::from_str(&text).ok(),
@@ -260,6 +272,14 @@ pub fn add_deltas(base: &Json, ours: &Json, theirs: &Json) -> Option<Json> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_decimal_too_long_is_none_not_zero() {
+        assert_eq!(decimal(&json!("-12.50")), Some((-1250, 2)));
+        assert_eq!(decimal(&json!("000.0")), Some((0, 1)));
+        // 42 digits: past an i128, so no delta is taken of it (it once read as 0, and merged to 0)
+        assert_eq!(decimal(&json!("1234567890123456789012.12345678901234567890")), None);
+    }
 
     #[test]
     fn rules_parse_and_refuse() {

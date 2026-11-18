@@ -248,7 +248,7 @@ pub(super) fn reach(s: &Stmt) -> Reach {
     access(s)
 }
 
-fn access(s: &Stmt) -> Reach {
+pub(super) fn access(s: &Stmt) -> Reach {
     match s {
         Stmt::Select(_) if side_effects(s) => Reach::Write,
         // EXPLAIN without ANALYZE runs nothing that changes anything (see `effects`), but EXPLAIN EXECUTE works out its
@@ -302,7 +302,14 @@ fn access(s: &Stmt) -> Reach {
         | Stmt::ShowPolicies
         | Stmt::ShowChecks
         | Stmt::ShowReviews
+        | Stmt::ShowProposals
+        | Stmt::ExplainMerge(_)
+        | Stmt::ShowProvenance { .. }
+        | Stmt::ShowTombstones(_)
         | Stmt::CheckReads(_)
+        | Stmt::WorldState { .. }
+        | Stmt::Forecast(_)
+        | Stmt::Consolidate { preview: true, .. }
         | Stmt::ShowMergeOutcomes { .. }
         | Stmt::ShowSecurityAudit { .. }
         | Stmt::ShowOutbox
@@ -327,6 +334,8 @@ fn access(s: &Stmt) -> Reach {
         // a cursor's rows are its query's: what FETCH reads was checked when it was declared
         Stmt::Declare { query, .. } => access(query),
         Stmt::Fetch { .. } | Stmt::CloseCursor(_) => Reach::Read,
+        // it reads the two worlds only
+        Stmt::WorldSet(op) if matches!(**op, crate::SetStmt::Compare { .. }) => Reach::Read,
         // TO STDOUT reads, unless its query is an INSERT, UPDATE or DELETE ... RETURNING; TO a file writes (the
         // server's file system, as Postgres's read-only rules count it)
         Stmt::Copy(c) if !c.from && c.file.is_none() => c.dml.as_deref().map_or(Reach::Read, access),

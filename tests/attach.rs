@@ -9,6 +9,9 @@ use chronos::{Db, MAIN};
 use std::process::Command;
 use std::sync::Mutex;
 
+#[path = "common/write_matrix.rs"]
+mod write_matrix;
+
 /// The source a folder's merges write to is the process's CHRONOS_SOURCE_URL: tests here take turns.
 static SOURCE: Mutex<()> = Mutex::new(());
 
@@ -2782,4 +2785,112 @@ fn a_merge_by_columns_meeting_postgres_changes_to_other_columns_goes_through() {
     std::fs::remove_dir_all(&dir).unwrap();
     drop(pg);
     drop_db(&name);
+}
+
+/// Gate S (CHRONOS-PLAN-2026-11-17-r3.md section 5, "No cross-tenant production writes"): the cases of
+/// `tenant_isolation::cross_tenant_write_matrix`, against an attached Postgres. Every way a tenant-42 agent can send a
+/// change ends with tenant 7's rows unchanged in Postgres itself, and in Chronos's main.
+#[test]
+fn cross_tenant_write_matrix_postgres() {
+    if std::env::var("CHRONOS_TEST_PG").is_err() {
+        eprintln!("skipped: set CHRONOS_TEST_PG to a Postgres URL");
+        return;
+    }
+    let shown = |db: &Db, s: &mut Session, sql: &str| match s.run(db, sql, &[]) {
+        Ok(out) => out
+            .iter()
+            .flat_map(|r| r.rows.iter().map(|row| row.iter().map(|v| v.to_text()).collect::<Vec<_>>().join("|")))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(e) => format!("ERROR {}: {}", e.code, e.message),
+    };
+    let pg_rows = |pg: &mut postgres::Client, sql: &str| -> String {
+        pg.simple_query(sql)
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m {
+                postgres::SimpleQueryMessage::Row(r) => {
+                    Some((0..r.len()).map(|i| r.get(i).unwrap_or("NULL")).collect::<Vec<_>>().join("|"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    const T7_LEADS: &str = "select id, org_id, name, owner from leads where org_id = 7 or id in (3, 4) order by id";
+    const T7_NOTES: &str = "select id, org_id, lead_id, body from notes where org_id = 7 order by id";
+    for (i, (what, steps)) in write_matrix::CASES.iter().enumerate() {
+        let (mut pg, name, _url, turn) = throwaway(&format!("xtw{i}")).unwrap();
+        pg.batch_execute(
+            "create table leads (id int primary key, org_id int not null, name text, owner text);
+             create table notes (id int primary key, org_id int not null, lead_id int, body text);
+             create table plans (id int primary key, title text);
+             insert into leads values (1, 42, 'acme', 'bo'), (2, 42, 'initech', 'bo'), (3, 7, 'globex', 'eve'),
+                                      (4, 7, 'umbrella', 'eve');
+             insert into notes values (1, 42, 1, 'call'), (2, 7, 3, 'globex renewal');
+             insert into plans values (1, 'free'), (2, 'pro');",
+        )
+        .unwrap();
+        let dir = folder(&format!("xtw{i}"));
+        let (ok, out) = attach(&dir, &["--tables", "leads,notes,plans", "--yes"]);
+        assert!(ok, "{what}: {out}");
+        let db = Db::open(&dir).unwrap();
+        // every right a tenant agent can hold short of admin, and a merge policy of its own that lets its merges write
+        // to Postgres without a person (without one, each would only be queued, and the tenant checks never reached)
+        run(
+            &db,
+            MAIN,
+            "create merge policy open with (max_rows = 100000, max_deletes = 100000);
+             create agent all42 with (can = 'read,fork,write_own,write,write_main,merge_own,merge,restore,outbox', \
+             tenant = 'org_id = 42', policy = 'open')",
+            &[],
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let pg_leads = pg_rows(&mut pg, T7_LEADS);
+        let pg_notes = pg_rows(&mut pg, T7_NOTES);
+        assert_eq!(pg_leads, "3|7|globex|eve\n4|7|umbrella|eve");
+        let main_leads = shown(&db, &mut Session::new(MAIN), T7_LEADS);
+        let mut s = Session::new(MAIN);
+        s.agent = Some("all42".into());
+        for step in steps.iter() {
+            let said = shown(&db, &mut s, step);
+            for secret in ["globex", "umbrella", "eve"] {
+                let l = said.to_lowercase();
+                assert!(
+                    !l.split(|c: char| !c.is_alphanumeric()).any(|w| w == secret),
+                    "{what}: {step} shows tenant 7's {secret:?}:\n{said}"
+                );
+            }
+        }
+        // a person then merges every world the agent left, as one approving its runs would: what the agent could
+        // put in a world is its tenant's rows alone
+        for (w, _) in db.branches().into_iter().filter(|(w, _)| w != MAIN) {
+            let _ = run(&db, MAIN, &format!("merge world {w}"), &[]);
+        }
+        assert_eq!(pg_rows(&mut pg, T7_LEADS), pg_leads, "{what}: tenant 7's leads in Postgres");
+        assert_eq!(pg_rows(&mut pg, T7_NOTES), pg_notes, "{what}: tenant 7's notes in Postgres");
+        assert_eq!(shown(&db, &mut Session::new(MAIN), T7_LEADS), main_leads, "{what}: tenant 7's leads in main");
+        // and the control: the same agent's change to its own tenant's row does reach Postgres
+        let ctl = format!("ctl{i}");
+        let said = shown(
+            &db,
+            &mut s,
+            &format!(
+                "use world main; create world ctl; use world ctl; insert into leads values (100, 42, 'own', '{ctl}'); \
+                      use world main; merge world ctl"
+            ),
+        );
+        assert!(!said.starts_with("ERROR"), "{what}: control merge: {said}");
+        assert_eq!(
+            pg_cell(&mut pg, "select owner from leads where id = 100"),
+            ctl,
+            "{what}: control merge in Postgres"
+        );
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
+        drop(pg);
+        drop_db(&name);
+        drop(turn);
+    }
 }

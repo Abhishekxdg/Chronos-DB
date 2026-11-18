@@ -2001,8 +2001,19 @@ fn worlds() {
         assert_eq!(
             cols,
             [
-                "name", "id", "parent", "depth", "created", "version", "meta", "owner", "expires", "active", "pinned",
-                "scope"
+                "name",
+                "id",
+                "parent",
+                "depth",
+                "created",
+                "version",
+                "meta",
+                "owner",
+                "expires",
+                "active",
+                "pinned",
+                "scope",
+                "tenant_status"
             ]
         );
         let by_name = |n: &str| shown.rows.iter().find(|r| r[0] == Value::Text(n.into())).unwrap().clone();

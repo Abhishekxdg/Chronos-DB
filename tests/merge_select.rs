@@ -303,3 +303,32 @@ fn agents_need_the_right_to_change_the_target() {
     q(&db, "mine", "insert into t values (6, 'six'), (7, 'seven')");
     assert_eq!(run(&mut s, "merge world mine into scratch").unwrap_err().code, "42501");
 }
+
+/// An agent may not merge part of a world (ONLY TABLES, ONLY KEYS, INTO) while worlds are forked from it: what they
+/// forked from would change under them. A person may.
+#[test]
+fn partial_merge_of_parent_with_children_refused_for_agent() {
+    let db = Db::new();
+    q(&db, MAIN, "create table pt (id int primary key, v text)");
+    let can = vec![Can::Read, Can::Fork, Can::WriteOwn, Can::WriteMain, Can::MergeOwn];
+    db.create_agent("bot", &AgentSpec { can: Some(can), ..Default::default() }).unwrap();
+    let me = db.as_agent("bot").unwrap();
+    me.fork(MAIN, "par", serde_json::Value::Null).unwrap();
+    me.fork("par", "kid", serde_json::Value::Null).unwrap();
+    me.fork(MAIN, "other", serde_json::Value::Null).unwrap();
+    drop(me);
+    q(&db, "par", "insert into pt values (5, 'five'), (6, 'six')");
+    let mut s = Session::new(MAIN);
+    s.agent = Some("bot".into());
+    for sql in ["merge world par only tables (pt)", "merge world par only keys ('pt/5')", "merge world par into other"]
+    {
+        let e = s.run(&db, sql, &[]).unwrap_err();
+        assert_eq!(e.code, "42501", "{sql}: {e}");
+    }
+    assert!(rows(&q(&db, MAIN, "select id from pt")).is_empty(), "nothing merged");
+    // a person may
+    assert_eq!(q(&db, MAIN, "merge world par only keys ('pt/5')").tag, "MERGE 1");
+    // and with its child gone, the agent may
+    q(&db, MAIN, "drop world kid");
+    assert_eq!(s.run(&db, "merge world par only keys ('pt/6')", &[]).unwrap().pop().unwrap().tag, "MERGE 1");
+}

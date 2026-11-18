@@ -572,7 +572,7 @@ impl Core {
     /// Whether this process records what happens to effects now: a database in use, not one replaying its log
     /// (whose merges and drops were recorded when they happened).
     fn records_effects(&self) -> bool {
-        self.me.get().is_some() && !crate::RECOVERING.get()
+        !self.replaying() && !crate::RECOVERING.get()
     }
 
     /// The effects a merge of world `b` (forked from `base`, now `ours`) into main lands, as `apply` (the rows it

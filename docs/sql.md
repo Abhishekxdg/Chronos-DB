@@ -601,7 +601,7 @@ create world agent_7 with (owner = 'claude', task = 42);   -- from the current w
 fork world agent_7 as agent_7b meta '{"tags": ["retry"]}'; -- from a named world
 switch world agent_7b;                                     -- or: use world '<its id>'
 alter world agent_7 set (task = null, reviewer = 'ada');   -- null removes a key
-alter world agent_7 set ttl '2 hours';  -- discarded 2 hours from now (unless it has forks then)
+alter world agent_7 set ttl '2 hours';  -- read-only 2 hours from now, then discarded with its forks
 alter world agent_7 reset ttl;          -- never expires (agents need admin for either)
 alter world agent_7 set pinned;         -- never discarded for being idle (see world_idle_ttl); reset pinned undoes it
 show worlds;                  -- name, id, parent, depth, created, version, meta (jsonb), owner, expires, active, pinned
@@ -635,6 +635,115 @@ create merge check lists_keep_leads on tables (leads, lists) with (timeout = '2s
 show merge checks;            -- name, tables, timeout_ms, query, created
 drop merge check lists_keep_leads;
 ```
+
+### A world's life: expiry, nesting, grants, transfer, budgets
+
+```sql
+alter world agent_7 set ttl '1 hour';                    -- capped at its parent's; its forks' shortened to it
+alter system set max_depth = 4;                          -- forks between a world and main, at most (0: no limit)
+alter system set max_children = 50;                      -- live forks of one world (not main's: max_worlds), at most
+create agent bot with (can = 'read,fork,write_own', max_depth = 2, max_children = 10);  -- per agent too
+grant write, merge on world agent_7 to helper until '2026-12-01 09:00+00';  -- READ, WRITE, MERGE, FORK
+revoke write on world agent_7 from helper;
+transfer world agent_7 to reviewer_bot;                  -- world, owner, epoch
+create world trial with (budget_rows = 10000, budget_statements = 500);
+alter world trial set (budget_rows = 20000);             -- the database's own users and admins only
+```
+
+- **Expiry, at use.** Once a world's time is up it is read-only at once, not only when the background sweeper (every 30 s)
+  discards it: a write, `MERGE WORLD` from it or into it, `MERGE ... INTO`, a fork of it, and a `COMMIT` of a
+  transaction that wrote in it are refused with SQLSTATE 55000. Reads, read-only transactions included, keep working
+  until it's swept; the sweeper then discards it with every world forked from it (and transactions open in them), the
+  deepest first. A fork never outlives its parent: its expiry is capped at the parent's when it's forked (an agent's
+  `world_ttl` too) and when its TTL is set or reset, and shortening a parent's TTL shortens its forks' that would
+  outlive it (lengthening it leaves theirs).
+- **Nesting.** `max_depth` (a world forked from main is 1 deep) and `max_children` (live forks of one world; main's are
+  counted by `max_worlds`), as database settings and as agent settings; a fork past either is refused with SQLSTATE
+  54000. Transactions' own worlds count toward neither.
+- **Grants on a world.** `GRANT {READ | WRITE | MERGE | FORK}[, ...] ON WORLD w TO agent [UNTIL '<timestamp>']` lets
+  the agent do that in `w` and every world forked from it, besides its own rights; never in main (a grant on main is
+  refused, and merging into main still needs `write_main`). `MERGE` is the right to merge the world: merging a fork of
+  `w` into `w` takes `MERGE` and `WRITE` on `w`. A grantor grants only rights it holds on `w`, and what it holds only by
+  a grant it hands on no longer than its own lasts; the database's own users and admins grant any. A grant past its
+  `UNTIL` counts for nothing. `REVOKE ... ON WORLD w FROM agent` is for `w`'s owner, the grantor, or an admin; revoking
+  doesn't take back what the grantee granted on. Grants are kept in the world's metadata (`_sonos_grants`) and both
+  statements are in `SHOW SECURITY AUDIT`.
+- **Transfer.** `TRANSFER WORLD w TO agent`, by `w`'s owner or an admin, makes the agent its owner and moves its lease
+  epoch (`_sonos_epoch`, 0 for a world never transferred) on by one. The agent must be able to change the worlds it
+  owns (`write_own`), be of the world's tenant if it's held to one, and have room under its `max_worlds`. The old owner
+  is fenced: its writes and merges of `w` get SQLSTATE 55P03 (lease lost), whatever rights it has, until the world is
+  transferred back to it. The world is written back to Postgres as its new owner's role (`pg_role`). Audited.
+- **Budgets.** `budget_rows` (table rows written: not index entries) and `budget_statements` (writes: each statement
+  that changes rows, each HTTP `put` or `batch`) count as they happen, in the world and every world forked from it,
+  transactions included whether they commit or not; over, the statement is refused with SQLSTATE 53400 and writes
+  nothing. A fork's own budget is at most what its parent (and each world above it) has left (53400 if more). Only the
+  database's own users and admins change a budget with `ALTER WORLD`. The counts are kept in memory: after a restart,
+  they start again from zero.
+
+### Durable worlds, pinned checkpoints and RESUME
+
+A world an agent works in for hours, across restarts and crashes:
+
+```sql
+create world task_9 with (durable, check_reads = true);  -- or: alter world task_9 set (durable = true)
+checkpoint world task_9 as step3 pin '1 day';   -- kept for a day, past history_retention
+rollback world task_9 to checkpoint step3;      -- back to it (RESTORE WORLD ... TO CHECKPOINT does the same)
+show world state task_9;                        -- world, version, epoch, durable, flagged, check_reads, stale_reads, parent_changes, token
+resume world task_9 token 'w1a2b...:12:0';      -- the same, once the token still holds
+```
+
+- **Durable:** each write the world acknowledges is on disk first, as on `main` (the same group fsync); merges into it, its rebases and its metadata too. A crash loses none of them, so the world is not flagged at the next open (other worlds open in a crash are, and their merges need a version). Turning it on puts the writes it held in memory on disk first. With `synchronous_commit = off` nothing waits for the disk, `main` included.
+- **Its read set too:** a durable world that checks its reads logs what it read at the end of each statement that read something new, before the answer goes out, so after a crash its merge is checked as usual instead of held for reads the database lost.
+- **Pinned checkpoints:** `PIN '<interval>'` keeps the world as it is now (its tree's pages) until the pin runs out, whatever `history_retention` drops; a label taken again replaces it, with `PIN` or without (without, the pin goes too: the label names the newer moment). Without `PIN`, a checkpoint is a moment in history, gone with it. Needs a database on disk (0A000 in memory).
+- **RESUME:** the token is `<world id>:<version>:<epoch>`. A change since gives 40001: a write, or a merge into the world that changed it (a child's, a partial merge, a transaction's commit), each of which moves its version on; another epoch (the world was handed to another holder) gives 55P03; another world or a malformed token, 22023. Without `TOKEN` it is `SHOW WORLD STATE`. `stale_reads` says what the world read that changed in its parent since (for a world that checks its reads), `parent_changes` how many rows its parent changed since its fork point.
+
+### Combining children's changes: delta columns, forecasts, CONSOLIDATE
+
+Several worlds forked from one coordinator often change the same rows in ways that combine (two agents each take 5
+from a stock count). Declare those columns, see clashes before anyone merges, and merge the children as one:
+
+```sql
+alter table inventory alter column qty set merge as delta;                     -- parent + (ours - base)
+alter table inventory alter column qty set merge as delta escrow (min 0);      -- refused past a bound
+alter table inventory alter column qty set merge as delta escrow (min 0, max 500);
+alter table inventory alter column qty set merge as default;                   -- whole rows again
+forecast conflicts;                    -- world_a, world_b, kind, table, key, combinable
+forecast conflicts for world agent_7;  -- agent_7's siblings, and its parent's changes since its fork
+consolidate preview plan;              -- world, table, key, outcome, detail: nothing changes
+consolidate plan;                      -- every live child of plan, merged into it as one; then discarded
+consolidate plan only children (agent_7, agent_9);   -- those; the others stay
+consolidate plan using arbitration;    -- rows two children both changed: settled by the merge policy's arbitrate rule
+```
+
+- **Delta columns:** a number column only (`smallint`, `int`, `bigint`, `numeric`, `float`; any other is 0A000). Where
+  both sides of a merge changed a delta column of one row, and no other column both changed (nor, without `BY
+  COLUMNS`, other columns on both sides), the merge keeps the parent's value plus the world's change. An insert or a
+  delete of the row still conflicts. With `ESCROW`, a combined value past `MIN` or `MAX` refuses the merge (23514),
+  naming the row and the column; nothing merges. The setting is part of the table's definition: it forks, and merges
+  with the definition. The merge plan (`DRY RUN`) shows such rows as `combined delta`.
+- **`FORECAST CONFLICTS`:** for each pair of live worlds with one parent, and each world against what its parent
+  changed since its fork: `write-write` for a row both changed (`combinable` when only delta columns overlap), and
+  `read-write` for a row a world that checks its reads (`check_reads = true`) read and the other changed. Nothing
+  changes. Without `FOR WORLD`, agents need the rights to list every world.
+- **`CONSOLIDATE PREVIEW p`:** p's children in the order they were forked, each merged in memory onto p as it is and
+  the children before it: per row `applied`, `combined-delta`, `conflict` or `escrow-violation`.
+- **`CONSOLIDATE p`:** each child is merged, in fork order, into a scratch fork of p (`_consolidate_p`); when all of them
+  went through, the scratch merges into p as one merge and the children are discarded. Any refusal (a conflict 40001,
+  an escrow bound 23514, a merge policy, a child written to meanwhile) discards the scratch: p and every child stay
+  as they were. A child with forks of its own is refused (2BP01); a world in `ONLY CHILDREN` that isn't p's child is
+  22023. Returns `CONSOLIDATE n`, the children merged. Merge policies judge each child's merge and the final one.
+  From before they're copied into the scratch world until they're discarded, the children are held: a write to one, a
+  fork of one, or a merge of one or into one (a transaction's commit) is refused with 55000, so nothing written then is
+  lost with them; so is a second `CONSOLIDATE p` while one runs. Just before the final merge each child is marked with
+  the scratch world: after a crash between that merge and the discards, the next open (or `CONSOLIDATE p`) discards
+  the children whose rows are in p already, and a merge of one is refused (55000), so nothing merges twice.
+  An expired child refuses the consolidation (55000), and the scratch world is forked as any fork of p (its expiry
+  capped at p's; none once p's time is up).
+- **`USING ARBITRATION`:** a row two children both changed (not one the parent changed since) goes to one of them by
+  the acting agent's merge policy's `arbitrate` setting: `priority` (the world owners' agent priority, which only an
+  admin sets; a tie, the older world; the default), `newest`, `oldest`, or `fail` (refused, as without it). Each
+  settled row is recorded in p's metadata, `_sonos_arbitration`: `key`, `winner_world`, `loser_world`,
+  `loser_value_hash` (BLAKE3 of the losing row as stored), `rule`, `at`. The last 200 are kept.
 
 ### Databases
 
@@ -715,6 +824,48 @@ select setseed(0.42); select random();     -- a repeatable random() for this ses
 - **Agents:** the worlds are the agent's own and count toward its `max_worlds`. They run in batches that fit, keeping the best so far; a `KEEP` that can't fit is refused before anything runs (42501). Each world's statements are checked as the agent's, and its row quota applies in each world.
 - **Size:** worlds are forked 1,024 at a time, and the losers go after each batch, so about `KEEP` + 1,024 worlds are alive at once. 10,000 worlds that each insert a row take 0.4 s; 10,000 that each update 1,000 rows take about 30 s (8-core laptop busy with other work, release build).
 - **`setseed(x)`** (x from -1 to 1) seeds the session's `random()` and `gen_random_uuid()`, as in Postgres, until the session ends or it's called again.
+
+## Cross-world reads and world sets
+
+```sql
+-- another world's table, in the same query as this world's (read only)
+select a.sku, a.price as before, b.price as after
+from prices a join prices at world pricing_17 b using (sku)
+where a.price <> b.price;
+select * from prices at world 'pricing_17@-1 hour';    -- a world as it was
+
+-- a set of worlds forked from one base world, run, compared, ranked; the best merged into the base
+create world set pricing from world plan with (max_live = 100);
+fork world set pricing count 50 run $$update prices set p = p * (0.9 + random() * 0.2) where sku % 50 = $1$$ seed 42;
+adopt world my_try into set pricing;                   -- a fork of the base, made some other way
+select _world, sum(p * sold) from prices at worlds of set pricing group by 1;
+compare worlds pricing_3, pricing_7;                   -- table, key, a_value, b_value
+compare worlds pricing_3, pricing_7 summary;           -- table, a_changed, b_changed, differing
+rank world set pricing by ($$select sum(p * sold) from prices$$ desc, $$select count(*) from stockouts$$ asc)
+  with checks;                                         -- world, rank, score, scores, failed, reason, kept
+prune world set pricing where rank > 5 or failed;      -- the worlds discarded
+merge best of set pricing into plan dry run;           -- world, action, rows
+merge best of set pricing into plan;
+
+-- an objective: what OPTIMIZE ranks by, and the merge checks a world must pass
+create objective holding_cost minimize $$select sum(qty * unit_cost) from stock$$ subject to checks (no_stockout);
+optimize holding_cost from world plan as set hc run $$update stock set qty = qty - $1 % 7$$ count 200 keep 5 seed 42;
+drop objective holding_cost;
+```
+
+- **`AT WORLD w`** after a table in FROM (before or after its alias) reads that table as world `w` has it now: its rows and its definition there. `'name@when'` reads it as it was. Several worlds can be joined in one query.
+  - Read only: `UPDATE`, `DELETE` and `INSERT` refuse a target `AT WORLD` (0A000). A write may read another world in its `FROM` or `USING`.
+  - An agent needs the right to read each world it names (42501); a session's transaction is no one else's. Row security, an agent's tenant and masked columns apply to the other world's table as to its own.
+  - What's read there goes in no world's read set.
+- **`AT WORLDS OF SET s`** reads the table in every world of set `s`, one after another, each row with a last column `_world` naming its world. The worlds must give the table the same columns (42804 names the world that doesn't: read it with `AT WORLD`); a set with no worlds yet gives the base's columns and no rows.
+- **A world set** is a base world and worlds forked from it. Its base can't be main: the best world merges into the base, and the base merges into main as any world does.
+  - `FORK WORLD SET s COUNT n RUN $$script$$ [SEED k] [THREADS t]` forks n worlds `s_<index>` and runs the script in each as `SIMULATE` does (`$1` the index, `$2` the seed; seeded `random()`; `now()` at the fork), keeping all of them, failed ones too. The same seed gives the same worlds on any number of threads, and `REPLAY WORLD` makes one again. `max_live` limits the set's worlds (53400).
+  - Forked for an agent, each world is forked as the agent forks any world: its own, with its tenant and its merge policy's settings. A world with no scope of its own gets the base's.
+  - `COMPARE WORLDS a, b`: the rows the two hold differently. Two worlds of a set are compared by what each changed since the fork, not row by row.
+  - `RANK WORLD SET`: each metric is one SELECT giving a number, run read only in each world (as the caller). The first metric orders them, the next break ties, then the index. A world whose script failed, whose metric failed, or (`WITH CHECKS`, or `WITH CHECKS (c, ...)` for some) that breaks a merge check as a merge into the base would run it, ranks last. The ranking is kept in each world's metadata (`_sonos_set_scores`).
+  - `PRUNE` and `MERGE BEST` go by the kept ranking, refused when a world changed since (40001): rank again. `MERGE BEST` merges rank 1 with an ordinary `MERGE WORLD` as the caller (rights, merge policy, merge checks), then discards the rest.
+- **Objectives** are kept on main; only the database's own users and admins make them. `OPTIMIZE` makes a world set (named `AS SET`, else after the objective), forks and runs `COUNT` worlds, ranks them by the objective with its checks (an objective without `SUBJECT TO CHECKS` judges none), and with `KEEP k` discards all but the best k that passed.
+- Not in a transaction (25001).
 
 ## Metrics
 
@@ -808,6 +959,76 @@ retrying a refused merge in a loop grows the log by that much each time. A merge
 MERGE` still counts as merged (the undo is logged as an ordinary write). After a crash, refusals since the last sync to
 disk may be missing; merges never are. An in-memory database keeps no log: no rows, and a notice says so. Only the
 database's own users may run it: an agent's session gets 42501.
+
+### Certified merges: evidence, proposals, approvals
+
+```sql
+attach evidence to world w (kind = 'ticket', uri = 'https://tickets.example/42', sha256 = 'ab12...', note = 'asked');
+explain merge world w;                     -- section, item, detail: everything its merge would do, and why
+propose merge world w;                     -- id, world, target, proposer, status, verdict, reasons, certificate, ...
+propose merge world w into staging;
+show proposals;
+approve proposal 'p1a2b3c4d5e6f7a8b' reason 'refunds checked against the tickets';
+reject proposal 'p1a2b3c4d5e6f7a8b' reason 'needs the order snapshot';
+withdraw proposal 'p1a2b3c4d5e6f7a8b';
+merge proposal 'p1a2b3c4d5e6f7a8b';        -- MERGE PROPOSAL n: rows merged
+show decision provenance for merge 'p1a2b3c4d5e6f7a8b';   -- step, at, by, detail
+show decision provenance for world w;
+show tombstones;                           -- agents' worlds that didn't make it
+show tombstones for agent bot;
+```
+
+`ATTACH EVIDENCE` keeps what a change rests on with its world (metadata key `_sonos_evidence`, which only the database
+writes): a `kind` (required: policies ask for kinds), and optionally a `uri`, the content's `sha256` (hex) and a `note`,
+with an id, when, and who attached it (the agent, or `person`). The content stays where the URI points; store hashes
+and links, not personal data. It needs the right to change the world, and is refused (`55000`) once its merge is
+proposed, until the proposal is rejected or withdrawn, and after the proposal merged.
+
+`PROPOSE MERGE WORLD w` writes a proposal on main (`_sonos_proposals/<id>`) with a certificate: blake3 over the
+canonical JSON of the digest of every row the world changed (sorted key, before and after, the database's own rows
+too: grants, outbox entries, index entries), its read set (a world that keeps one), its fork point, the evidence, its
+declared scope, and the merge policy of the agent it would merge as, by name and the blake3 of the policy's row. It
+also holds a dry run's verdict, judged as the proposing agent's merge: `passes`, `held` (the policy would send it to a
+review, with the reasons), `conflicts` or `refused`. While a proposal is open or approved, an agent's writes to the
+world, forks of it and merges of it outside the proposal are refused (`55000`, `proposal open`). Proposing needs the
+right to merge the world. A person may propose an agent's world: it merges as its owner.
+
+`APPROVE PROPOSAL` and `REJECT PROPOSAL` are a person's (the session's user is kept with the approval), the proposing
+agent's merge policy's `reviewer`, or an admin agent's; never the agent that proposed it or owns the world (`42501`).
+An approval names the certificate: the certificate is derived again first, and one that differs (the world written to,
+evidence, scope or the policy changed) is refused (`40001`). A rejection frees the world and leaves a tombstone.
+
+`MERGE PROPOSAL` derives the certificate again (`40001`, `changed since proposal`, if it differs) and merges as the
+proposing agent, at the version proposed. An agent's own proposal merges with its rights as they are then: rights
+taken away since are refused (`42501`), and a world transferred away from it (`TRANSFER WORLD`) has lost its lease
+(`55P03`); only the proposal's own hold on the world is lifted. Its merge policy judges the merge again, with the rules the approval covers
+lifted, for exactly the rows proposed (checked again under the merge's locks). A person's approval covers every rule
+but merge checks, reads that changed since the fork, and `require_evidence`; a reviewer's covers the rules not in its
+policy's `person_only`. So, unlike `REVIEW WORLD ... APPROVE` (which merges as a person), a reviewer's approval of a
+merge that deletes rows doesn't merge it: it waits for a person. The merge shows in the audit as the agent's.
+
+`EXPLAIN MERGE WORLD w` puts in one answer: the certificate a proposal made now would carry, rows per table, each
+conflict, what would block it, the merge policy's verdict (as its owner's merge) and each reason, what reads the
+columns it changes (as `DIFF ... READERS`), the effects it would queue (`NOTIFY ON MERGE`), its evidence and scope.
+
+`SHOW DECISION PROVENANCE FOR MERGE 'id'` (a proposal's id) or `FOR WORLD w` (its latest proposal, or the world as
+it is when none was made) gives the chain: the proposal, certificate, verdict, evidence, scope, run keys (`run_id`,
+...), policy and its hash, each approval and rejection, the merge, what agents did in the world (`SHOW AUDIT`'s
+steps), and a last `retention` row: steps older than the history window may be missing.
+
+When an agent's world is discarded, a merge of it is refused (conflicts, changed reads, merge checks), or its proposal
+is rejected, a tombstone stays on main (`_sonos_tombstones/...`): the world, owner, kind, run, parent, when it was
+made, depth, a digest and counts of what it changed (not the rows) and why. `SHOW TOMBSTONES FOR AGENT a` lists one
+agent's; an agent may list its own, and every agent's needs `admin`.
+
+The merge policy setting `require_evidence = 'ticket,order_snapshot'` holds an agent's merge that carries no evidence
+of one of those kinds (`carries no evidence of kind ticket`); no approval lifts it: attach it, and merge again.
+
+Limits: proposal, approval and tombstone rows are written to main as rows of their own, not in the merge's log record:
+a crash between a merge and its proposal's `merged` leaves the proposal approved with its world gone. An agent's
+reads in a world after it's proposed don't change the certificate (the read set is kept as proposed); a merge of a
+world that checks its reads is still held for reads changed since its fork. Approvers are as authenticated as the
+session: "person" is any session acting for no agent.
 
 ## Roles and privileges
 
@@ -931,12 +1152,14 @@ alter system set max_worlds = 10000;          -- live worlds besides main (0: no
 alter system set world_idle_ttl = '7 days';   -- unused worlds are discarded (0: never, the default)
 alter system set protect_main = on;           -- main's rows change only by merging a world (on in a folder serve makes)
 alter system set outbox_keep_payloads = on;   -- discarded effects keep their payloads, not only a hash (off by default)
+alter system set max_depth = 4;               -- worlds nested at most this deep (0: no limit, the default)
+alter system set max_children = 50;           -- live forks of one world, main's aside (0: no limit, the default)
 show max_worlds;
 show world_idle_ttl;
 show protect_main;
 ```
 
-They're kept in the folder across restarts, as `synchronous_commit` is. Past `max_worlds`, a fork is refused with SQLSTATE 53400. See [operations](operations.md#limits-and-cleanup).
+They're kept in the folder across restarts, as `synchronous_commit` is. Past `max_worlds`, a fork is refused with SQLSTATE 53400; past `max_depth` or `max_children`, with 54000. See [operations](operations.md#limits-and-cleanup).
 
 **`protect_main`:** with it on, nobody changes `main`'s rows directly, the database's own user and admins included: an `INSERT`, `UPDATE`, `DELETE`, `COPY`, `TRUNCATE` or HTTP `put` there, or a transaction's `COMMIT` that changes rows of `main`, is refused with 42501, naming a row. Rows reach `main` by merging a world, so a mistaken `DELETE` is a diff someone sees (and a merge policy can hold) before it lands. Still direct: definitions that change no rows (`CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE ... ADD COLUMN` without a default to fill), the database's own rows (agents, merge policies and checks, the outbox), and the ways back (`RESTORE WORLD`, `UNDO MERGE`, `UNDO AGENT`). Turning it off is `ALTER SYSTEM SET protect_main = off`, which needs the database's own user or `admin`.
 

@@ -332,3 +332,73 @@ fn an_agent_declares_less_than_its_policy_never_more() {
     assert!(e.message.contains("changes 2 rows (it declared at most 1), outside its declared scope"), "{}", e.message);
     assert_eq!(db.reviews().len(), 1);
 }
+
+// --- Gate S (CHRONOS-PLAN-2026-11-17-r3.md, batch S3): a world forked from a scoped world is held
+// to at least its parent's scope. Added failing in batch S0. ---
+
+/// A scoped world `w` (status of org 1's leads, at most 10 rows) and an agent `bot` that owns it.
+fn scoped_parent(db: &Db) -> Session {
+    crm(db);
+    run(db, MAIN, "create agent bot with (can = 'read,fork,write_own,merge_own')", &[]).unwrap();
+    let mut bot = Session::new(MAIN);
+    bot.agent = Some("bot".into());
+    bot.run(db, "create world w with (may_change = 'leads.status', tenant = 'org = 1', max_rows = 10)", &[]).unwrap();
+    bot
+}
+
+#[test]
+fn child_inherits_parent_scope() {
+    let db = Db::new();
+    let mut bot = scoped_parent(&db);
+    bot.run(&db, "fork world w as c", &[]).unwrap();
+    run(&db, MAIN, "fork world w as pc", &[]).unwrap(); // a person's child too
+    let parent = db.world("w").unwrap().scope.unwrap();
+    for c in ["c", "pc"] {
+        let child = db.world(c).unwrap().scope.unwrap_or_default();
+        for key in ["may_change", "tenant", "max_rows"] {
+            assert_eq!(child[key], parent[key], "{c}.{key}: child {child} parent {parent}");
+        }
+    }
+    // and the child's merge is held to it: a change outside it is refused
+    Session::new("c").run(&db, "update leads set owner = 'x' where id = 1", &[]).unwrap();
+    let e = run(&db, "w", "merge world c", &[]).unwrap_err();
+    assert_eq!(e.code, "42501", "{}", e.message);
+}
+
+#[test]
+fn child_cannot_widen_may_change() {
+    let db = Db::new();
+    let mut bot = scoped_parent(&db);
+    for with in ["may_change = 'leads'", "may_change = 'leads.status, leads.owner'", "may_change = 'lists'"] {
+        let e = bot.run(&db, &format!("fork world w as c with ({with})"), &[]).unwrap_err();
+        assert_eq!(e.code, "42501", "{with}: {}", e.message);
+        assert!(db.world("c").is_err());
+    }
+    // narrower is fine (it names a part of the parent's)
+    bot.run(&db, "fork world w as c with (may_change = 'leads.status')", &[]).unwrap();
+}
+
+#[test]
+fn child_cannot_raise_row_limits() {
+    let db = Db::new();
+    let mut bot = scoped_parent(&db);
+    for with in ["max_rows = 11", "max_rows = 1000"] {
+        let e = bot.run(&db, &format!("fork world w as c with ({with})"), &[]).unwrap_err();
+        assert_eq!(e.code, "42501", "{with}: {}", e.message);
+    }
+    bot.run(&db, "fork world w as c with (max_rows = 5)", &[]).unwrap();
+    assert_eq!(db.world("c").unwrap().scope.unwrap()["max_rows"], 5);
+}
+
+#[test]
+fn child_cannot_change_tenant() {
+    let db = Db::new();
+    let mut bot = scoped_parent(&db);
+    for (who, s) in [("agent", &mut bot), ("person", &mut Session::new(MAIN))] {
+        for with in ["tenant = 'org = 2'", "tenant = null"] {
+            let e = s.run(&db, &format!("fork world w as c with ({with})"), &[]).unwrap_err();
+            assert_eq!(e.code, "42501", "{who} {with}: {}", e.message);
+            assert!(db.world("c").is_err());
+        }
+    }
+}

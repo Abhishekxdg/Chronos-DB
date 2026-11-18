@@ -1193,7 +1193,7 @@ pub fn masks(db: &crate::Db, t: &Table) -> Vec<(String, &'static str)> {
 
 /// Whether merges into `name` in this database write back to Postgres now.
 pub(crate) fn writes_back(core: &Core, name: &str, tx: bool) -> bool {
-    name == MAIN && !tx && core.attached.is_some() && core.me.get().is_some() && !crate::RECOVERING.get() && !SKIP.get()
+    name == MAIN && !tx && core.attached.is_some() && !core.replaying() && !crate::RECOVERING.get() && !SKIP.get()
 }
 
 /// The rows of attached tables a merge into main changes (`apply`, from the parent's state `theirs`; the world's
@@ -3414,7 +3414,7 @@ fn shape_ok(t: &Table, shape: Shape) -> Result<()> {
 /// (see `resolve`): taken by `merge_kept` before the merge's own locks, held until `after_merge` is done.
 pub(crate) fn before_merge(core: &Core, into_main: bool) -> Result<Option<Hold<'_>>> {
     let Some(att) = core.attached.as_deref() else { return Ok(None) };
-    if !into_main || SKIP.get() || crate::RECOVERING.get() || core.me.get().is_none() {
+    if !into_main || SKIP.get() || crate::RECOVERING.get() || core.replaying() {
         return Ok(None);
     }
     let held = att.hold();

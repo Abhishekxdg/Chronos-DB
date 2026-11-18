@@ -722,3 +722,30 @@ fn a_tenants_reads_are_held_only_by_its_tenants_rows() {
 fn cell(db: &Db, sql: &str) -> String {
     run(db, MAIN, sql, &[]).unwrap().pop().unwrap().rows[0][0].to_text()
 }
+
+/// Finding C (CHRONOS-PLAN-2026-11-17-r2.md): a simulation's kept world of an agent whose policy
+/// checks reads checks them too. Today a kept world is forked without the policy's read flags, so
+/// its merge never looks at what its script read. The script reads account 5, main changes it, and
+/// the merge must be held as a fork's would be.
+#[test]
+fn simulated_world_checks_reads() {
+    let db = Db::new();
+    bank(&db);
+    run(&db, MAIN, "create merge policy careful with (check_reads = true)", &[]).unwrap();
+    let can = "read,fork,write_own,write_main,merge_own";
+    run(&db, MAIN, &format!("create agent bot with (can = '{can}', policy = 'careful')"), &[]).unwrap();
+    let mut bot = Session::new(MAIN);
+    bot.agent = Some("bot".into());
+    bot.run(
+        &db,
+        "simulate 1 worlds as pay run $$select balance from accounts where id = 5; insert into payouts values (5, 5, 100)$$ \
+         score $$select 1$$ keep 1",
+        &[],
+    )
+    .unwrap();
+    run(&db, MAIN, "update accounts set balance = 0 where id = 5", &[]).unwrap();
+    let e = bot.run(&db, "merge world pay_0", &[]).unwrap_err();
+    assert_eq!(e.code, "42501", "{}", e.message);
+    assert!(e.message.contains("accounts/5"), "{}", e.message);
+    assert_eq!(db.reviews().len(), 1);
+}

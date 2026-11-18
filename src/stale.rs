@@ -119,6 +119,8 @@ pub(crate) struct ReadSet {
     loose: bool,
     /// whom its reads were made for (see `Whose`)
     whose: Whose,
+    /// a hash of what was last logged of it, for a durable world (see `durable`): None, never
+    logged: Option<u64>,
 }
 
 /// Whom a world's reads were made for: what the reading agent's tenant was (see `sql::tenant_now`) as each was made.
@@ -148,6 +150,24 @@ fn group(key: &str) -> Option<String> {
 }
 
 impl ReadSet {
+    /// Whether key `k` is among what it read, or may be (a range or whole table over it, a filtered scan of its
+    /// table, reads before a restart that weren't kept): for a forecast of conflicts (see `consolidate`).
+    pub(crate) fn may_have_read_key(&self, k: &str) -> bool {
+        if !self.complete || self.keys.contains(k) {
+            return true;
+        }
+        if let Some(g) = group(k)
+            && (self.groups.contains(&g) || self.filters.iter().any(|(f, _)| *f == g))
+        {
+            return true;
+        }
+        self.ranges.iter().any(|(prefix, after, upto)| {
+            k.starts_with(prefix.as_str())
+                && after.as_deref().is_none_or(|a| k > a)
+                && upto.as_deref().is_none_or(|u| k <= u)
+        })
+    }
+
     pub(crate) fn complete() -> ReadSet {
         ReadSet { complete: true, ..Default::default() }
     }
@@ -460,7 +480,38 @@ impl ReadSet {
                 Json::Bool(false) => Whose::None,
                 _ => Whose::Any,
             },
+            logged: None,
         })
+    }
+
+    /// What a durable world's log keeps of it (see `durable`), when that changed since it was last kept: whether it
+    /// is complete, and what `readsets` would keep. None when nothing changed since.
+    pub(crate) fn snapshot(&mut self) -> Option<String> {
+        use std::hash::{Hash, Hasher};
+        let text = json!({ "complete": self.complete, "set": self.to_json() }).to_string();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        let h = h.finish();
+        if self.logged == Some(h) {
+            return None;
+        }
+        self.logged = Some(h);
+        Some(text)
+    }
+
+    /// Logged no more: the next `snapshot` gives it whole again (the log it was in may be dropped).
+    pub(crate) fn forget_logged(&mut self) {
+        self.logged = None;
+    }
+
+    /// Back from `snapshot`, for a world whose metadata is `meta`: incomplete (its reads unknown, as after a crash)
+    /// if it was, or doesn't read back whole.
+    pub(crate) fn from_snapshot(text: &str, meta: &Map<String, Json>) -> ReadSet {
+        let j: Json = serde_json::from_str(text).unwrap_or_default();
+        match (j["complete"].as_bool(), ReadSet::from_json(&j["set"])) {
+            (Some(true), Some(set)) => set,
+            _ => ReadSet::of(meta, false),
+        }
     }
 }
 

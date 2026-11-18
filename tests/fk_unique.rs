@@ -75,3 +75,36 @@ fn worlds_merges_and_reopening_keep_a_reference_to_a_unique_column() {
     db.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// H1: a world deletes (or rekeys) a parent row that main's new child references through a UNIQUE column, not the
+/// primary key: each side is fine alone, the merge would leave the child pointing at nothing, so it is refused.
+#[test]
+fn delete_parent_referenced_unique_refused() {
+    let db = Db::new();
+    let s = &mut Session::new(chronos::MAIN);
+    for q in [
+        "create table org (id int primary key, slug text unique)",
+        "create table member (id int primary key, org text references org (slug))",
+        "insert into org values (1, 'acme'), (2, 'old')",
+    ] {
+        s.run(&db, q, &[]).unwrap_or_else(|e| panic!("{q}: {e}"));
+    }
+    s.run(&db, "create world w; use world w; delete from org where slug = 'old'; use world main", &[]).unwrap();
+    s.run(&db, "insert into member values (11, 'old')", &[]).unwrap();
+    let e = fails(&db, s, "merge world w");
+    assert_eq!(e.code, "23503", "{e:?}");
+    assert_eq!(rows(&db, s, "select slug from org order by id"), ["acme", "old"], "a refused merge changes nothing");
+    // the referenced value changed rather than deleted: the same
+    s.run(&db, "create world w2; use world w2; update org set slug = 'ACME' where id = 1; use world main", &[])
+        .unwrap();
+    s.run(&db, "insert into member values (12, 'acme')", &[]).unwrap();
+    let e = fails(&db, s, "merge world w2");
+    assert_eq!(e.code, "23503", "{e:?}");
+    assert_eq!(rows(&db, s, "select slug from org order by id"), ["acme", "old"]);
+    // a value nobody references still goes
+    s.run(&db, "insert into org values (3, 'spare')", &[]).unwrap();
+    s.run(&db, "create world w3; use world w3; delete from org where slug = 'spare'; use world main", &[]).unwrap();
+    s.run(&db, "insert into member values (13, 'acme')", &[]).unwrap();
+    s.run(&db, "merge world w3", &[]).unwrap();
+    assert_eq!(rows(&db, s, "select slug from org order by id"), ["acme", "old"]);
+}

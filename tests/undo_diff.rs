@@ -68,3 +68,47 @@ fn into_another_world() {
     assert_eq!(rows(&q(&db, MAIN, "select count(*) from t")), ["3"], "main as it was: 1, 2, 4");
     assert_eq!(rows(&q(&db, "w", "diff world w to after")).len(), 3, "w differs from after in those three rows");
 }
+
+fn tmp(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("chronos-undo-merge-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    d
+}
+
+/// A parent row a merge brought, and a child main added after that references it.
+fn merged_parent(db: &Db) {
+    q(db, MAIN, "create table p (id int primary key)");
+    q(db, MAIN, "create table c (id int primary key, pid int references p (id))");
+    db.fork(MAIN, "w").unwrap();
+    q(db, "w", "insert into p values (1), (2)");
+    q(db, MAIN, "merge world w");
+    q(db, MAIN, "insert into c values (10, 1)");
+}
+
+/// H4: UNDO MERGE is checked as a merge is: undoing it would delete a parent a later child references, so it is
+/// refused and nothing changes.
+#[test]
+fn undo_merge_breaking_reference_refused() {
+    let dir = tmp("refused");
+    let db = Db::open(&dir).unwrap();
+    merged_parent(&db);
+    let e = chronos::sql::run(&db, MAIN, "undo merge of world w", &[]).unwrap_err();
+    assert_eq!(e.code, "23503", "{e}");
+    assert_eq!(rows(&q(&db, MAIN, "select id from p order by id")), ["1", "2"], "nothing undone");
+    assert_eq!(rows(&q(&db, MAIN, "select id, pid from c")), ["10|1"]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With SKIP CHANGED, the referenced parent is left as one changed since, and the rest is undone.
+#[test]
+fn undo_merge_skip_changed_keeps_parent() {
+    let dir = tmp("skip");
+    let db = Db::open(&dir).unwrap();
+    merged_parent(&db);
+    q(&db, MAIN, "undo merge of world w skip changed");
+    assert_eq!(rows(&q(&db, MAIN, "select id from p order by id")), ["1"], "the parent stays, 2 goes");
+    assert_eq!(rows(&q(&db, MAIN, "select id, pid from c")), ["10|1"]);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}

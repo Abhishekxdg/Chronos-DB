@@ -494,3 +494,55 @@ fn a_driver_binds_parameters() {
     let got: Vec<(String, i32)> = r.iter().map(|r| (r.get(0), r.get(1))).collect();
     assert_eq!(got, [("errors".to_string(), 2), ("hits".to_string(), 5)]);
 }
+
+/// MERGE WORLD ... INTO: an agent may merge a world into its parent or into a world of its parent's, not past its
+/// parent (a grandchild straight into main would take the parent's rows along with its own).
+#[test]
+fn grandchild_into_main_refused_for_agent() {
+    let db = Db::new();
+    let mut s = Session::new(MAIN);
+    run_all(&db, &mut s, &["create table t (id int primary key, v text)", "insert into t values (1, 'a')"]);
+    let can = vec![Can::Read, Can::Fork, Can::WriteOwn, Can::WriteMain, Can::MergeOwn];
+    db.create_agent("bot", &AgentSpec { can: Some(can), ..Default::default() }).unwrap();
+    let me = db.as_agent("bot").unwrap();
+    me.fork(MAIN, "p", serde_json::Value::Null).unwrap();
+    me.fork("p", "g", serde_json::Value::Null).unwrap();
+    me.fork("p", "sib", serde_json::Value::Null).unwrap();
+    drop(me);
+    run_all(&db, &mut Session::new("g"), &["insert into t values (2, 'g')"]);
+    let mut a = Session::new(MAIN);
+    a.agent = Some("bot".into());
+    let e = fails(&db, &mut a, "merge world g into main");
+    assert_eq!(e.code, "42501", "{e}");
+    assert_eq!(rows(&db, &mut s, "select id from t order by id"), ["1"], "nothing merged");
+    // into a world of its parent's, and into its parent: its own to merge
+    assert_eq!(a.run(&db, "merge world g into sib", &[]).unwrap().pop().unwrap().tag, "MERGE 1");
+    run_all(&db, &mut Session::new("g"), &["insert into t values (3, 'g')"]);
+    let e = fails(&db, &mut a, "merge world g into main");
+    assert_eq!(e.code, "42501", "{e}");
+    // a person may
+    run_all(&db, &mut s, &["merge world g into main"]);
+    assert_eq!(rows(&db, &mut s, "select id from t order by id"), ["1", "2", "3"]);
+}
+
+/// MERGE WORLD g INTO an ancestor past g's parent never carries rows the parent changed and hasn't merged there: a
+/// row g changed on top of its parent's change is refused, even when taken as g's own (USING OURS).
+#[test]
+fn ancestor_merge_refuses_parent_unmerged_rows() {
+    let db = Db::new();
+    let mut s = Session::new(MAIN);
+    run_all(&db, &mut s, &["create table t (id int primary key, v text)", "insert into t values (1, 'a')"]);
+    db.fork(MAIN, "p").unwrap();
+    run_all(&db, &mut Session::new("p"), &["update t set v = 'p' where id = 1", "insert into t values (2, 'p')"]);
+    db.fork("p", "g").unwrap();
+    run_all(&db, &mut Session::new("g"), &["update t set v = 'g' where id = 2", "insert into t values (3, 'g')"]);
+    let e = fails(&db, &mut s, "merge world g into main using ours");
+    assert!(e.message.contains("t/2"), "{e}");
+    assert_eq!(rows(&db, &mut s, "select id, v from t order by id"), ["1|a"], "nothing merged");
+    // its own rows alone go: those the parent never changed
+    run_all(&db, &mut s, &["merge world g into main only keys ('t/3')"]);
+    assert_eq!(rows(&db, &mut s, "select id, v from t order by id"), ["1|a", "3|g"]);
+    // once the parent's rows are merged, g's change to them goes too
+    run_all(&db, &mut s, &["merge world p only tables (t)", "merge world g into main using ours"]);
+    assert_eq!(rows(&db, &mut s, "select id, v from t order by id"), ["1|p", "2|g", "3|g"]);
+}

@@ -70,7 +70,7 @@ If a merge keeps to every rule (no deletes, at most 500 rows, nothing in `paymen
 
 ## Contents
 
-- [What's new in 0.5](#whats-new-in-05)
+- [What's new in 0.6](#whats-new-in-06)
 - [Install](#install)
 - [Quickstart: five minutes](#quickstart-five-minutes)
 - [Chronos Studio](#chronos-studio)
@@ -83,6 +83,16 @@ If a merge keeps to every rule (no deletes, at most 500 rows, nothing in `paymen
 - [Feedback and contributing](#feedback-and-contributing)
 - [What's in this repository](#whats-in-this-repository)
 - [License](#license)
+
+## What's new in 0.6
+
+- **Merges are logged as what they did, in a hash-chained ledger.** Recovery replays the rows a merge wrote instead of judging it again, and `VERIFY LEDGER` checks every merge into main. The first checkpoint or merge writes data format 8, which 0.5 cannot open: upgrade replicas before the primary, and back up first.
+- **Merges check the constraints they bring.** A world that adds a UNIQUE, FOREIGN KEY or NOT NULL constraint has the whole table checked when it merges; `VERIFY DATABASE` lists rows that break one.
+- **Worlds for long-running agents.** Expiry held at every use, `max_depth` and `max_children`, `GRANT ... ON WORLD`, `TRANSFER WORLD`, budgets, durable worlds with pinned checkpoints, `ROLLBACK WORLD ... TO CHECKPOINT` and `RESUME WORLD`.
+- **Many agents, one result.** Delta columns with escrow bounds, `FORECAST CONFLICTS`, `CONSOLIDATE` (all of a coordinator's children as one merge), and arbitration of rows two children both changed.
+- **Certified merges.** An agent proposes a merge bound to a hash of every row it would write; a person approves, and `MERGE PROPOSAL` merges exactly that or refuses. `EXPLAIN MERGE`, `SHOW DECISION PROVENANCE` and evidence attached to a world.
+- **World sets.** Fork many worlds from one, compare and rank them, prune and merge the best; read across worlds with `AT WORLD`.
+- **Tenant isolation.** An agent held to a tenant is kept to its tenant's worlds and rows everywhere, and new agents read only their own worlds and main by default. If you run agents for more than one tenant, upgrade.
 
 ## What's new in 0.5
 
@@ -114,7 +124,7 @@ Options, set as environment variables for the script:
 | Variable | What it does |
 |---|---|
 | `CHRONOS_INSTALL_DIR=<folder>` | installs into another folder you can write (default `~/.local/bin`) |
-| `CHRONOS_VERSION=v0.5.5` | installs a given release tag instead of the latest |
+| `CHRONOS_VERSION=v0.6.0` | installs a given release tag instead of the latest |
 | `CHRONOS_VERIFY=1` | also checks the build's signature with [cosign](https://docs.sigstore.dev/cosign/system_config/installation/) (keyless, Sigstore) |
 
 If `~/.local/bin` isn't on your `PATH`, the script says so; add it with `export PATH="$HOME/.local/bin:$PATH"`. The examples below use `psql`: `brew install libpq` on macOS, `sudo apt-get install postgresql-client` on Debian or Ubuntu.
@@ -378,7 +388,7 @@ The same pages, with search, are on the [docs site](https://chronosdb-docs.verce
 - **Security issues:** report them privately, as [SECURITY.md](SECURITY.md) describes.
 - **Contributing:** see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-What changed in each release: [CHANGELOG.md](CHANGELOG.md). The newest build is always at [releases/latest](https://github.com/2090-labs/Chronos-DB/releases/latest); as this page was written that was [v0.5.5](https://github.com/2090-labs/Chronos-DB/releases/tag/v0.5.5), 2026-11-17.
+What changed in each release: [CHANGELOG.md](CHANGELOG.md). The newest build is always at [releases/latest](https://github.com/2090-labs/Chronos-DB/releases/latest); as this page was written that was [v0.6.0](https://github.com/2090-labs/Chronos-DB/releases/tag/v0.6.0), 2026-11-18.
 
 ## What's in this repository
 

@@ -276,3 +276,244 @@ fn concurrent_forks_and_discards_lose_no_children() {
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Gate S, batch S3 (CHRONOS-PLAN-2026-11-17-r2.md D4): with an agent acting, the core makes no
+/// world without an owner. Every agent path goes through the agents' constructor, which stamps the
+/// owner, tenant, scope and read flags; a core call that skips it (a path missed by the audit) is
+/// refused rather than making an unstamped world. With no agent acting it works as before.
+#[test]
+fn core_refuses_ownerless_agent_world() {
+    let db = Db::new();
+    chronos::sql::run(
+        &db,
+        MAIN,
+        "create table t (id int primary key, org_id int);
+         create agent run42 with (can = 'read,fork,write_own', tenant = 'org_id = 42')",
+        &[],
+    )
+    .unwrap();
+    {
+        let _acting = chronos::acting_as("run42");
+        assert!(db.fork(MAIN, "a").is_err(), "fork");
+        assert!(db.fork_with(MAIN, "b", serde_json::json!({})).is_err(), "fork_with");
+        assert!(db.world("a").is_err() && db.world("b").is_err());
+        // through the agent's own constructor it works, stamped
+        let w = db.as_agent("run42").unwrap().fork(MAIN, "c", serde_json::Value::Null).unwrap();
+        assert_eq!(w.owner.as_deref(), Some("run42"));
+    }
+    db.fork(MAIN, "d").unwrap();
+    db.fork_with(MAIN, "e", serde_json::json!({})).unwrap();
+}
+
+/// Runs `q` on world `w` as the database's own user.
+fn on(db: &Db, w: &str, q: &str) -> Result<Vec<chronos::sql::Output>, chronos::sql::SqlError> {
+    chronos::sql::run(db, w, q, &[])
+}
+
+/// The SQLSTATE `q` on world `w` fails with.
+fn refused(db: &Db, w: &str, q: &str) -> &'static str {
+    match on(db, w, q) {
+        Ok(_) => panic!("{q} on {w}: went through"),
+        Err(e) => e.code,
+    }
+}
+
+/// Expires world `w` now and lets the clock pass it.
+fn expire_now(db: &Db, w: &str) {
+    db.expire(w, Some(chronos_now())).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(3));
+}
+
+fn crm(db: &Db) {
+    on(db, MAIN, "create table t (id int primary key, v text); insert into t values (1, 'a'), (2, 'b')").unwrap();
+}
+
+fn count(db: &Db, w: &str) -> String {
+    on(db, w, "select count(*) from t").unwrap()[0].rows[0][0].to_text()
+}
+
+/// A world whose time is up is read-only at once: no write (SQL or the API), merge, fork or MERGE INTO from it,
+/// rather than everything until the sweeper's next round. It still reads until the sweeper discards it.
+#[test]
+fn expired_world_refuses_write_merge_fork_at_once() {
+    let db = Db::new();
+    crm(&db);
+    on(&db, MAIN, "create world w; create world other").unwrap();
+    on(&db, "w", "insert into t values (3, 'c')").unwrap();
+    expire_now(&db, "w");
+
+    assert_eq!(refused(&db, "w", "insert into t values (4, 'd')"), "55000");
+    assert_eq!(refused(&db, "w", "update t set v = 'z'"), "55000");
+    assert_eq!(refused(&db, "w", "begin; insert into t values (5, 'e'); commit"), "55000");
+    match db.put("w", "kv/1", "{}") {
+        Err(Error::Constraint { code, .. }) => assert_eq!(code, "55000"),
+        r => panic!("an API write to an expired world: {r:?}"),
+    }
+    assert_eq!(refused(&db, MAIN, "create world child from w"), "55000");
+    assert_eq!(refused(&db, MAIN, "merge world w"), "55000");
+    assert_eq!(refused(&db, MAIN, "merge world w into other"), "55000");
+    // nor does anything merge into it
+    on(&db, MAIN, "create world feeder; alter world feeder set (note = 1)").unwrap();
+    on(&db, "feeder", "insert into t values (6, 'f')").unwrap();
+    assert_eq!(refused(&db, MAIN, "merge world feeder into w"), "55000");
+
+    // reads still work, a read-only transaction too, until it's swept
+    assert_eq!(count(&db, "w"), "3");
+    on(&db, "w", "begin; select count(*) from t; commit").unwrap();
+    assert_eq!(count(&db, MAIN), "2", "nothing reached main");
+    assert_eq!(db.expire_worlds().unwrap(), 1);
+    assert!(db.world("w").is_err());
+}
+
+/// A child never outlives its parent: its expiry is capped by the parent's when forked, when its TTL is set or reset,
+/// and for an agent's world_ttl.
+#[test]
+fn child_ttl_capped_by_parent() {
+    let db = Db::new();
+    crm(&db);
+    on(&db, MAIN, "create world p; alter world p set ttl '1 hour'; create world c from p").unwrap();
+    let p = db.world("p").unwrap().expires.unwrap();
+    assert_eq!(db.world("c").unwrap().expires, Some(p), "a child with no TTL gets its parent's");
+    on(&db, MAIN, "alter world c set ttl '10 days'").unwrap();
+    assert_eq!(db.world("c").unwrap().expires, Some(p), "a longer TTL is capped");
+    on(&db, MAIN, "alter world c reset ttl").unwrap();
+    assert_eq!(db.world("c").unwrap().expires, Some(p), "no TTL is capped too");
+    on(&db, MAIN, "alter world c set ttl '1 minute'").unwrap();
+    let c = db.world("c").unwrap().expires.unwrap();
+    assert!(c < p, "a shorter one stands");
+    on(&db, MAIN, "create world g from c").unwrap();
+    assert_eq!(db.world("g").unwrap().expires, Some(c));
+
+    // an agent's world_ttl too
+    on(&db, MAIN, "create agent bot with (can = 'read,fork,write_own,write', world_ttl = '1 day')").unwrap();
+    let mut s = chronos::sql::Session::new(MAIN);
+    s.agent = Some("bot".into());
+    s.run(&db, "create world mine from p", &[]).unwrap();
+    assert_eq!(db.world("mine").unwrap().expires, Some(p));
+}
+
+/// When a world's time is up, the worlds forked from it go with it, the deepest first, even ones that were given no
+/// TTL of their own before it had one.
+#[test]
+fn parent_expiry_expires_subtree_deepest_first() {
+    let db = Db::new();
+    crm(&db);
+    on(&db, MAIN, "create world p; create world c from p; create world g from c; create world c2 from p").unwrap();
+    on(&db, "g", "insert into t values (9, 'g')").unwrap();
+    on(&db, MAIN, "create world bystander").unwrap();
+    expire_now(&db, "p");
+    for w in ["p", "c", "g", "c2"] {
+        assert!(db.world(w).unwrap().expires.is_some(), "{w} expires with its parent");
+    }
+    assert_eq!(refused(&db, "g", "insert into t values (10, 'h')"), "55000", "a grandchild is expired at once too");
+    assert_eq!(db.expire_worlds().unwrap(), 4);
+    let names: Vec<String> = db.worlds().into_iter().map(|w| w.name).collect();
+    assert_eq!(names, ["bystander", "main"]);
+}
+
+/// Shortening a world's TTL shortens its forks' that would outlive it; lengthening it leaves theirs.
+#[test]
+fn shortening_parent_ttl_shortens_children() {
+    let db = Db::new();
+    crm(&db);
+    on(&db, MAIN, "create world p; alter world p set ttl '10 days'; create world c from p; create world g from c")
+        .unwrap();
+    on(&db, MAIN, "create world quick from p; alter world quick set ttl '1 minute'").unwrap();
+    let quick = db.world("quick").unwrap().expires.unwrap();
+    on(&db, MAIN, "alter world p set ttl '1 hour'").unwrap();
+    let p = db.world("p").unwrap().expires.unwrap();
+    assert_eq!(db.world("c").unwrap().expires, Some(p));
+    assert_eq!(db.world("g").unwrap().expires, Some(p));
+    assert_eq!(db.world("quick").unwrap().expires, Some(quick), "a shorter one stands");
+    on(&db, MAIN, "alter world p set ttl '20 days'").unwrap();
+    assert_eq!(db.world("c").unwrap().expires, Some(p), "lengthening the parent's lengthens no child's");
+}
+
+/// A transaction open in a world whose time runs out (its own, or its parent's) can't commit: what it wrote never
+/// lands. A read-only one commits.
+#[test]
+fn open_transaction_on_expiring_child_commit_refused() {
+    let db = Db::new();
+    crm(&db);
+    on(&db, MAIN, "create world p; create world c from p").unwrap();
+    let mut s = chronos::sql::Session::new("c");
+    s.run(&db, "begin; insert into t values (7, 'tx')", &[]).unwrap();
+    let mut r = chronos::sql::Session::new("c");
+    r.run(&db, "begin; select count(*) from t", &[]).unwrap();
+    expire_now(&db, "p");
+    assert_eq!(s.run(&db, "commit", &[]).unwrap_err().code, "55000");
+    r.run(&db, "commit", &[]).unwrap();
+    assert_eq!(count(&db, "c"), "2", "the transaction's row never landed");
+    // and one begun after can't write
+    let mut late = chronos::sql::Session::new("c");
+    late.run(&db, "begin", &[]).unwrap();
+    assert_eq!(late.run(&db, "insert into t values (8, 'late')", &[]).unwrap_err().code, "55000");
+}
+
+/// How deep worlds nest and how many forks one world has, for the database (ALTER SYSTEM) and per agent; over either,
+/// a fork is refused with 54000. Transactions' own worlds count toward neither.
+#[test]
+fn max_depth_and_max_children_refuse() {
+    let db = Db::new();
+    crm(&db);
+    on(&db, MAIN, "alter system set max_depth = 2").unwrap();
+    assert_eq!(on(&db, MAIN, "show max_depth").unwrap()[0].rows[0][0].to_text(), "2");
+    on(&db, MAIN, "create world a; create world b from a").unwrap();
+    assert_eq!(refused(&db, MAIN, "create world c from b"), "54000");
+    on(&db, "b", "begin; insert into t values (5, 'x'); commit").unwrap(); // a transaction is no deeper world
+
+    on(&db, MAIN, "alter system set max_children = 2").unwrap();
+    on(&db, MAIN, "create world k1 from a").unwrap(); // a has b and k1
+    assert_eq!(refused(&db, MAIN, "create world k2 from a"), "54000");
+    on(&db, MAIN, "create world top1; create world top2; create world top3").unwrap(); // main's are max_worlds'
+    on(&db, MAIN, "alter system set max_depth = 0; alter system set max_children = 0").unwrap();
+    on(&db, MAIN, "create world k2 from a; create world c from b").unwrap();
+
+    // per agent
+    on(&db, MAIN, "create agent deep with (can = 'read,fork,write_own', max_depth = 1)").unwrap();
+    let mut s = chronos::sql::Session::new(MAIN);
+    s.agent = Some("deep".into());
+    s.run(&db, "create world d1", &[]).unwrap();
+    assert_eq!(s.run(&db, "create world d2 from d1", &[]).unwrap_err().code, "54000");
+    on(&db, MAIN, "create agent wide with (can = 'read,fork,write_own', max_children = 1)").unwrap();
+    let mut s = chronos::sql::Session::new(MAIN);
+    s.agent = Some("wide".into());
+    s.run(&db, "create world n1; create world n2 from n1", &[]).unwrap();
+    assert_eq!(s.run(&db, "create world n3 from n1", &[]).unwrap_err().code, "54000");
+    assert_eq!(db.agent("wide").unwrap().max_children, 1);
+    assert_eq!(db.agent("deep").unwrap().max_depth, 1);
+}
+
+/// A world's budget of rows written and statements run, counted as they happen; a fork's own budget is at most what
+/// its parent has left, and what a fork writes counts toward its parent's budget too. Over, 53400.
+#[test]
+fn budget_rows_refuses_and_child_capped() {
+    let db = Db::new();
+    crm(&db);
+    on(&db, MAIN, "create world b with (budget_rows = 10, budget_statements = 4)").unwrap();
+    on(&db, "b", "insert into t select g, 'x' from generate_series(10, 13) g").unwrap(); // 4 rows, 1 statement
+    assert_eq!(refused(&db, MAIN, "create world big from b with (budget_rows = 7)"), "53400");
+    on(&db, MAIN, "create world c from b with (budget_rows = 3)").unwrap();
+    on(&db, "c", "insert into t values (20, 'c'), (21, 'c'), (22, 'c')").unwrap(); // c: 3, b: 7
+    assert_eq!(refused(&db, "c", "insert into t values (23, 'c')"), "53400", "c's own budget");
+    assert_eq!(refused(&db, "b", "insert into t select g, 'x' from generate_series(30, 33) g"), "53400", "b's");
+    on(&db, "b", "insert into t values (30, 'x'), (31, 'x'), (32, 'x')").unwrap(); // b: 10 rows, 3 statements
+    assert_eq!(refused(&db, "b", "insert into t values (40, 'x')"), "53400");
+    assert_eq!(count(&db, "b"), "9", "refused statements wrote nothing");
+    let budget = &db.world("c").unwrap().meta["_sonos_budget"];
+    assert_eq!(budget["rows"], 3);
+    assert_eq!(refused(&db, MAIN, "alter world b set (_sonos_budget = 1)"), "22023");
+
+    // statements
+    on(&db, MAIN, "create world s with (budget_statements = 2)").unwrap();
+    on(&db, "s", "insert into t values (50, 's'); update t set v = 'y' where id = 50").unwrap();
+    assert_eq!(refused(&db, "s", "delete from t where id = 50"), "53400");
+    on(&db, MAIN, "alter world s set (budget_statements = 5)").unwrap();
+    on(&db, "s", "delete from t where id = 50").unwrap();
+    // an agent can't raise its own
+    on(&db, MAIN, "create agent bot with (can = 'read,fork,write_own')").unwrap();
+    let mut a = chronos::sql::Session::new(MAIN);
+    a.agent = Some("bot".into());
+    a.run(&db, "create world mine with (budget_rows = 1)", &[]).unwrap();
+    assert_eq!(a.run(&db, "alter world mine set (budget_rows = 100)", &[]).unwrap_err().code, "42501");
+}

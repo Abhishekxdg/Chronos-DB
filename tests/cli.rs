@@ -155,7 +155,7 @@ fn mcp_session() {
 
     assert_eq!(replies.len(), 10, "one reply per request, none for the notification:\n{out}");
     assert_eq!(replies[0]["result"]["serverInfo"]["name"], "chronos");
-    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 31);
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 34);
     let text = |i: usize| replies[i]["result"]["content"][0]["text"].as_str().unwrap().to_string();
     let is_err = |i: usize| replies[i]["result"]["isError"].as_bool().unwrap();
     assert_eq!(text(5), "merged 1 change from task-1 into main");
@@ -212,7 +212,12 @@ fn mcp_safe_mode() {
     assert_eq!(r.len(), 26, "{r:#?}");
     let names: Vec<&str> =
         r[0]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names.len(), 28, "{names:?}"); // rebase too: on its own branches only; check_reads only reads
+    assert_eq!(names.len(), 31, "{names:?}"); // rebase too: on its own branches only; check_reads only reads
+    // a proposal's tools for an agent: evidence, propose, explain; deciding one is never an agent's tool
+    for t in ["attach_evidence", "propose", "explain_merge"] {
+        assert!(names.contains(&t), "{t}: {names:?}");
+    }
+    assert!(!names.iter().any(|n| n.contains("approve") || n.contains("decide")), "{names:?}");
     assert!(!names.contains(&"merge") && !names.contains(&"restore") && !names.contains(&"undo_merge"), "{names:?}");
     let text = |id: usize| r[id - 1]["result"]["content"][0]["text"].as_str().unwrap().to_string();
     let refused = |id: usize, why: &str| {
@@ -1073,11 +1078,7 @@ fn mcp_merge_checks() {
     let tools: Vec<&str> =
         bot[0]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert!(tools.contains(&"merge_checks") && !tools.contains(&"set_merge_check"), "{tools:?}");
-    assert!(
-        is_err(&bot[3]) && text(&bot[3]).contains("breaks merge check keep, which finds …"),
-        "{}",
-        text(&bot[3])
-    );
+    assert!(is_err(&bot[3]) && text(&bot[3]).contains("breaks merge check keep, which finds …"), "{}", text(&bot[3]));
     assert!(text(&bot[4]).contains("keep"), "{}", text(&bot[4]));
     // what reads the columns the branch changed, and what that couldn't see
     let readers = text(&bot[5]);

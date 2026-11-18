@@ -42,6 +42,18 @@ pub(super) fn show(db: &Db, name: &str, world: &str) -> Result<Vec<Vec<Value>>> 
         .and_then(|t| t["column"].as_str())
         .map(|c| (c.to_string(), a.tenant_sql().unwrap_or_default()));
     let can = |c: crate::Can| a.may(c);
+    // whether it may read this world at all, as `Acting::may_read` decides: `read` any world, `read_main` main,
+    // `read_own` the worlds it owns
+    let here = db.world(world.split_once('@').map_or(world, |(n, _)| n)).ok();
+    let (reads, no_read) = if can(crate::Can::Read) {
+        (true, "")
+    } else if here.as_ref().is_some_and(|w| w.name == crate::MAIN) {
+        (can(crate::Can::ReadMain), "no 'read' or 'read_main' capability")
+    } else if here.as_ref().is_some_and(|w| w.owner.as_deref() == Some(a.name.as_str())) {
+        (can(crate::Can::ReadOwn), "no 'read' or 'read_own' capability")
+    } else {
+        (false, "no 'read' capability, and the world is neither main nor its own")
+    };
     // where it may change rows: an agent keeping to a merge policy changes main only by merging
     let mut places: Vec<&str> = vec![];
     if can(crate::Can::Write) {
@@ -82,8 +94,8 @@ pub(super) fn show(db: &Db, name: &str, world: &str) -> Result<Vec<Vec<Value>>> 
             Some(w) => rls::limits(&v, &t.name, Some(w)).unwrap_or(true),
             None => false,
         };
-        let read = if !can(crate::Can::Read) {
-            why.push("no 'read' capability".into());
+        let read = if !reads {
+            why.push(no_read.into());
             "no".to_string()
         } else if !has(acl::SELECT) {
             why.push(format!("role {role} has no SELECT on it (columns it was granted are listed)"));
@@ -142,7 +154,7 @@ pub(super) fn show(db: &Db, name: &str, world: &str) -> Result<Vec<Vec<Value>>> 
             let mut differs = false;
             if let (Some(w), Some(o)) = (&who, &obj)
                 && read == "no"
-                && can(crate::Can::Read)
+                && reads
                 && acl::column_has(&v, &t.name, &c.name, w, o.owner, acl::SELECT)?
             {
                 cread = "yes".into();

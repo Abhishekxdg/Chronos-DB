@@ -194,8 +194,16 @@ impl Core {
         let Some(db) = self.db() else {
             return Ok(sql::Output { typmods: vec![], columns: None, rows: vec![], tag: String::new() });
         };
-        // a name only this run reads the state by; `@` makes it read only
-        let at = format!("{world}@merge-{}", RUNS.fetch_add(1, Ordering::Relaxed));
+        // a name only this run reads the state by; `@` makes it read only. A secret of this process in it: a counter
+        // alone, any session could name it and read a merge's state while its checks run (`view_tx` answers it)
+        static SALT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let salt = SALT.get_or_init(|| {
+            let mut b = [0u8; 16];
+            ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut b)
+                .expect("the system's random numbers");
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        });
+        let at = format!("{world}@merge-{salt}-{}", RUNS.fetch_add(1, Ordering::Relaxed));
         self.merging.lock().unwrap().insert(at.clone(), state.clone());
         let out = {
             let _nobody = disk::acting_as("");
@@ -216,7 +224,7 @@ impl Core {
         after: &State,
     ) -> Vec<String> {
         use crate::agents::value;
-        if self.me.get().is_none() {
+        if self.replaying() {
             return vec![]; // replaying the log: the merge was judged when it happened
         }
         let most = p.max_shift.unwrap_or(DEFAULT_SHIFT);
@@ -258,12 +266,26 @@ impl Core {
     /// the merge may go through). `keys`: the rows the merge changes, whose tables say which
     /// checks run. A check that fails to run, or to finish in its timeout, counts as broken.
     pub(crate) fn failed_checks(&self, world: &str, state: &State, keys: &[String]) -> Result<Vec<String>> {
-        if self.me.get().is_none() {
+        self.failed_checks_of(world, state, keys, None)
+    }
+
+    /// `failed_checks`, of only the checks named in `only` (when given; see `worldsets`).
+    pub(crate) fn failed_checks_of(
+        &self,
+        world: &str,
+        state: &State,
+        keys: &[String],
+        only: Option<&[String]>,
+    ) -> Result<Vec<String>> {
+        if self.replaying() {
             return Ok(vec![]); // replaying the log: the merge was checked when it happened
         }
         let changed: std::collections::HashSet<&str> = keys.iter().filter_map(|k| table_of(k)).collect();
         let mut out = vec![];
         for c in self.checks()? {
+            if only.is_some_and(|o| !o.contains(&c.name)) {
+                continue;
+            }
             if !c.tables.is_empty() && !c.tables.iter().any(|t| changed.contains(t.as_str())) {
                 continue;
             }

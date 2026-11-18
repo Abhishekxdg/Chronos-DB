@@ -39,7 +39,75 @@ pub(crate) const BATCH_BYTES: usize = 64 << 10;
 /// A record's first byte for a `Batch`; an `Op`'s is its variant's.
 const BATCH: u8 = 17;
 const MAN_MAGIC: &[u8] = b"SONOSMAN"; // then the format's version, one digit
-const MAN_VERSION: u8 = b'7'; // 6: logs without Op::Bulk; 5: without counters; 4: without deltas; 3: without world IDs and metadata. All still read.
+// 7: logs without Op::Applied (a checkpoint writes '8' before the first one is logged: see `Core::upgrade_log`);
+// 6: without Op::Bulk; 5: without counters; 4: without deltas; 3: without world IDs and metadata. All still read.
+const MAN_VERSION: u8 = b'8';
+/// The first manifest version whose log may hold `Op::Applied`: a Chronos that reads only older ones refuses it
+/// ("is from a newer Chronos") before it reads a record it doesn't know.
+pub(crate) const MAN_APPLIED: u8 = b'8';
+/// The layout of an `Op::Applied` record. A physical record's layout changes only by adding a new number here,
+/// read alongside the old ones.
+pub(crate) const APPLIED_LAYOUT: u8 = 1;
+const APPLIED: u8 = 20;
+/// `Op::ReadSet`'s tag.
+const READ_SET: u8 = 21;
+
+/// What a merge logged as `Op::Applied` did to the world merged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AppliedKind {
+    /// A whole merge: the world is gone.
+    Whole = 0,
+    /// A merge of some of its rows, or into a world other than its parent: the world stays, its fork point moved on
+    /// for the rows that went to its parent (`Applied::settled`).
+    Partial = 1,
+    /// A rebase: the world's fork point is now its parent as it is here, `rows` the world's own on top.
+    Rebase = 2,
+}
+
+/// A world merge, partial merge or rebase as it was committed: every row it set, so recovery writes them again and
+/// decides nothing (no diff, three-way, index rebuild, rights or checks: see `Core::replay_applied`). The record of
+/// a merge into main also holds its ledger rows (`ledger`), in the same frame and the same fsync as the data.
+pub(crate) struct Applied<S> {
+    pub(crate) kind: AppliedKind,
+    /// the world merged, by name and id (an id survives renames and a name reused)
+    pub(crate) source: S,
+    pub(crate) source_id: S,
+    /// the world merged into (for a rebase, its parent, which doesn't change), by name and id
+    pub(crate) target: S,
+    pub(crate) target_id: S,
+    /// the merged world's version just before: recovery finding another means a log damaged or out of order
+    pub(crate) version: u64,
+    /// rows the merge applied, as `merge` returned it
+    pub(crate) applied: u64,
+    /// a partial merge of only some of the world's rows (not one `into` another world)
+    pub(crate) part: bool,
+    /// when it was committed (ms since 1970): a rebase's time (see `REBASED`)
+    pub(crate) at: u64,
+    /// every row the merge set in the target, in order (for a rebase, in the world's new state over its parent's):
+    /// data rows after relayout, outbox rows as delayed, then index entries; none deletes
+    pub(crate) rows: Vec<(S, Option<S>)>,
+    /// rows of the database's own written with the merge: its ledger row, and its operation row (see `ledger`)
+    pub(crate) ledger: Vec<(S, Option<S>)>,
+    /// a partial merge: the world's fork point for these rows, now
+    pub(crate) settled: Vec<(S, Option<S>)>,
+    /// blake3 of `rows` (see `rows_digest`), checked at recovery; the ledger row keeps it too
+    pub(crate) digest: [u8; 32],
+}
+
+/// The digest an `Op::Applied` keeps of its rows: blake3 over them as the record encodes them.
+pub(crate) fn rows_digest<S: AsRef<str>>(rows: &[(S, Option<S>)]) -> [u8; 32] {
+    let mut b = vec![];
+    put_rows(&mut b, rows);
+    *blake3::hash(&b).as_bytes()
+}
+
+fn put_rows<S: AsRef<str>>(b: &mut Vec<u8>, rows: &[(S, Option<S>)]) {
+    b.extend((rows.len() as u32).to_le_bytes());
+    for (k, v) in rows {
+        put_str(b, k.as_ref());
+        put_opt(b, v.as_ref().map(|v| v.as_ref()));
+    }
+}
 
 pub(crate) enum Op<S> {
     /// Rows written to one branch atomically; `None` deletes.
@@ -92,6 +160,13 @@ pub(crate) enum Op<S> {
     /// A READ COMMITTED transaction (and the savepoints above it) brought up to what its world has committed
     /// since it last was (see `Core::rebase_tx`): replay does the same on the same states.
     RebaseTx(S),
+    /// A world merge, partial merge or rebase, physically (see `Applied`): written in place of `Merge`, `MergeWith`,
+    /// `MergeSome` and `Rebase` for every world but a transaction's, once the manifest is `MAN_APPLIED`.
+    Applied(Box<Applied<S>>),
+    /// A durable world's read set, whole, as `stale::ReadSet::snapshot` writes it: (branch, snapshot). Logged when it
+    /// changed by the end of a statement, and again first in each segment (see `durable`), so the stale-read check
+    /// survives a crash. (Tag 21, `READ_SET`: the next free one after `Op::Applied`'s.)
+    ReadSet(S, S),
 }
 
 impl<S: AsRef<str>> Op<S> {
@@ -218,6 +293,34 @@ impl<S: AsRef<str>> Op<S> {
             Op::RebaseTx(br) => {
                 b.push(19);
                 put_str(&mut b, br.as_ref());
+            }
+            Op::Applied(a) => {
+                b.reserve(
+                    96 + [&a.rows, &a.ledger, &a.settled]
+                        .iter()
+                        .flat_map(|r| r.iter())
+                        .map(|(k, v)| 9 + k.as_ref().len() + v.as_ref().map_or(0, |v| v.as_ref().len()))
+                        .sum::<usize>(),
+                );
+                b.push(APPLIED);
+                b.push(APPLIED_LAYOUT);
+                b.push(a.kind as u8);
+                for s in [&a.source, &a.source_id, &a.target, &a.target_id] {
+                    put_str(&mut b, s.as_ref());
+                }
+                b.extend(a.version.to_le_bytes());
+                b.extend(a.applied.to_le_bytes());
+                b.push(u8::from(a.part));
+                b.extend(a.at.to_le_bytes());
+                for rows in [&a.rows, &a.ledger, &a.settled] {
+                    put_rows(&mut b, rows);
+                }
+                b.extend(a.digest);
+            }
+            Op::ReadSet(br, set) => {
+                b.push(READ_SET);
+                put_str(&mut b, br.as_ref());
+                put_str(&mut b, set.as_ref());
             }
             Op::Bulk(br, rows, root, version) => {
                 b.push(15);
@@ -354,6 +457,44 @@ fn decode(p: &[u8]) -> Option<Op<String>> {
         15 => Op::Bulk(r.str()?, r.u64()?, r.take(32)?.try_into().ok()?, r.u64()?),
         16 => Op::Synced(r.u64()?),
         19 => Op::RebaseTx(r.str()?),
+        APPLIED => {
+            if r.u8()? != APPLIED_LAYOUT {
+                return None; // a layout this Chronos doesn't know
+            }
+            let kind = match r.u8()? {
+                0 => AppliedKind::Whole,
+                1 => AppliedKind::Partial,
+                2 => AppliedKind::Rebase,
+                _ => return None,
+            };
+            let (source, source_id, target, target_id) = (r.str()?, r.str()?, r.str()?, r.str()?);
+            let (version, applied) = (r.u64()?, r.u64()?);
+            let part = match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            };
+            let at = r.u64()?;
+            let mut rows = || (0..r.u32()?).map(|_| Some((r.str()?, r.opt()?))).collect::<Option<Vec<_>>>();
+            let (rows, ledger, settled) = (rows()?, rows()?, rows()?);
+            let digest = r.take(32)?.try_into().ok()?;
+            Op::Applied(Box::new(Applied {
+                kind,
+                source,
+                source_id,
+                target,
+                target_id,
+                version,
+                applied,
+                part,
+                at,
+                rows,
+                ledger,
+                settled,
+                digest,
+            }))
+        }
+        READ_SET => Op::ReadSet(r.str()?, r.str()?),
         _ => return None,
     };
     r.0.is_empty().then_some(op)
@@ -381,6 +522,8 @@ pub(crate) struct Log {
     appended: AtomicU64,
     /// Shipping to the remote, when there is one (see `wal_ship`).
     pub(crate) ship: Option<Arc<crate::wal_ship::Ship>>,
+    /// The folder's manifest is `MAN_APPLIED` or later, so `Op::Applied` may be logged (see `Core::upgrade_log`).
+    pub(crate) applied_ok: std::sync::atomic::AtomicBool,
     lock: File,
 }
 
@@ -537,6 +680,7 @@ pub(crate) fn fatal(e: io::Error) -> ! {
 impl Log {
     fn open(dir: &Path, seg: u64, lock: File, crypt: Option<Arc<Crypt>>) -> io::Result<Log> {
         let (file, len) = open_seg(dir, seg)?;
+        let applied_ok = manifest_version(dir, crypt.as_deref())?.is_some_and(|v| v >= MAN_APPLIED);
         sync_dir(dir)?;
         Ok(Log {
             dir: dir.into(),
@@ -561,6 +705,7 @@ impl Log {
             live: Default::default(),
             appended: AtomicU64::new(0),
             ship: None,
+            applied_ok: std::sync::atomic::AtomicBool::new(applied_ok),
             lock,
         })
     }
@@ -1315,6 +1460,17 @@ pub(crate) fn manifest_first(dir: &Path, c: Option<&Crypt>) -> io::Result<u64> {
     Ok(read_manifest(&dir.join("manifest"), c)?.map_or(1, |m| m.0))
 }
 
+/// The version of the folder's manifest (b'3' to `MAN_VERSION`), None without one.
+pub(crate) fn manifest_version(dir: &Path, c: Option<&Crypt>) -> io::Result<Option<u8>> {
+    let path = dir.join("manifest");
+    let buf = match fs::read(&path) {
+        Ok(b) => crate::crypt::open_file(c, b, &path.display().to_string())?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(buf.strip_prefix(MAN_MAGIC).and_then(|b| b.first().copied()))
+}
+
 pub(crate) fn read_manifest_at(path: &Path, c: Option<&Crypt>) -> io::Result<Option<(u64, bool, Vec<ManBranch>)>> {
     Ok(read_manifest(path, c)?.map(|(first, closed, branches, _)| (first, closed, branches)))
 }
@@ -1562,5 +1718,52 @@ mod lock_tests {
         assert!(super::lock(&dir).is_ok(), "free although a copy is still open");
         unsafe { libc::close(copy) };
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod applied_tests {
+    use super::*;
+
+    #[test]
+    fn applied_record_roundtrip() {
+        let rows = vec![("t/1", Some("{\"a\":1}")), ("t/2", None), ("_sonos_outbox/9", Some("x"))];
+        for (kind, part) in [(AppliedKind::Whole, false), (AppliedKind::Partial, true), (AppliedKind::Rebase, false)] {
+            let a = Applied {
+                kind,
+                source: "w",
+                source_id: "id-w",
+                target: "main",
+                target_id: "main",
+                version: 7,
+                applied: 2,
+                part,
+                at: 1_700_000_000_123,
+                digest: rows_digest(&rows),
+                rows: rows.clone(),
+                ledger: vec![("_sonos_ledger/00000000000000000001", Some("{}"))],
+                settled: vec![("t/1", Some("{\"a\":1}")), ("t/2", None)],
+            };
+            let rec = Op::Applied(Box::new(a)).encode();
+            let ops = decode_all(&rec).expect("decodes");
+            let [Op::Applied(b)] = &ops[..] else { panic!("one Applied") };
+            assert_eq!(b.kind, kind);
+            assert_eq!((b.source.as_str(), b.source_id.as_str()), ("w", "id-w"));
+            assert_eq!((b.target.as_str(), b.target_id.as_str()), ("main", "main"));
+            assert_eq!((b.version, b.applied, b.part, b.at), (7, 2, part, 1_700_000_000_123));
+            let own = |r: &[(String, Option<String>)]| -> Vec<(String, Option<String>)> { r.to_vec() };
+            let want = |r: &[(&str, Option<&str>)]| -> Vec<(String, Option<String>)> {
+                r.iter().map(|(k, v)| (k.to_string(), v.map(String::from))).collect()
+            };
+            assert_eq!(own(&b.rows), want(&rows));
+            assert_eq!(b.ledger.len(), 1);
+            assert_eq!(b.settled.len(), 2);
+            assert_eq!(b.digest, rows_digest(&b.rows), "the digest is of the rows as decoded too");
+            // a layout this Chronos doesn't know, or a byte short, is no record
+            let mut other = rec.clone();
+            other[1] = APPLIED_LAYOUT + 1;
+            assert!(decode_all(&other).is_none());
+            assert!(decode_all(&rec[..rec.len() - 1]).is_none());
+        }
     }
 }

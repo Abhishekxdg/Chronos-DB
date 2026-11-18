@@ -335,6 +335,38 @@ fn agents_see_the_same_past() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A world's past is read by the world that has its name now: a world dropped since, of the same name, was another
+/// agent's, and an agent reading `name@then` (or AS OF) gets no rows of it.
+#[test]
+fn a_reused_world_name_reads_no_older_worlds_past() {
+    use chronos::sql::{Session, run};
+    let dir = std::env::temp_dir().join(format!("chronos-agent-reused-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = Db::open(&dir).unwrap();
+    run(&db, MAIN, "create table t (id int primary key, v text)", &[]).unwrap();
+    for a in ["b", "a"] {
+        db.create_agent(a, &AgentSpec::default()).unwrap();
+    }
+    let mut b = Session::new(MAIN);
+    b.agent = Some("b".into());
+    b.run(&db, "create world task; use world task; insert into t values (1, 'b secret')", &[]).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    let then = chronos::sql::moment("now").unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    b.run(&db, "use world main; drop world task", &[]).unwrap();
+    b.close(&db);
+    let mut a = Session::new(MAIN);
+    a.agent = Some("a".into());
+    a.run(&db, "create world task", &[]).unwrap();
+    let _as = chronos::acting_as("a");
+    assert!(db.view_at("task", then).is_err(), "task then was b's world");
+    drop(_as);
+    assert!(db.view_at("task", then).is_ok(), "a person reads it, by name");
+    a.close(&db);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Everything an agent changed in a world since a moment can be undone, row by row, whether it
 /// wrote there directly, committed transactions or merged its own worlds in. Everyone else's
 /// An undo writes the world it undoes into, main included: besides `restore` and `merge`, the

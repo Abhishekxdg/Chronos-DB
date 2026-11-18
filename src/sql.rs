@@ -110,7 +110,8 @@ pub use impact::{Impact, Reader, impact};
 pub(crate) use opt::stats::KEY as RELSTATS;
 pub(crate) use opt::stats::merged as relstats_merged;
 pub(crate) use rls::{
-    MOST_HOPS as MOST_TENANT_HOPS, Reach as TenantReach, Tenants, reached_tenant, tenant as tenant_now,
+    MOST_HOPS as MOST_TENANT_HOPS, Reach as TenantReach, Tenants, reach as tenant_reach, reached_tenant,
+    tenant as tenant_now,
 };
 pub(crate) use rowrules::{row_rule_parses, row_rule_reasons, text_columns};
 pub use safe::Reach;
@@ -7083,7 +7084,7 @@ impl ColDef {
     fn opts(&self, ty: Type) -> Result<ColOpts> {
         let storage = self.storage.as_deref().map(|w| column_storage(w, ty)).transpose()?.flatten();
         let compression = self.compression.as_deref().map(|w| column_compression(w, ty)).transpose()?.flatten();
-        Ok(ColOpts { storage, stats: None, compression, mask: None })
+        Ok(ColOpts { storage, stats: None, compression, mask: None, merge: None })
     }
 }
 
@@ -7778,6 +7779,9 @@ enum ColOpt {
     Stats(i64),
     /// SET MASKED [WITH HASH | NULL | PARTIAL] (its mode), DROP MASKED (None): see `mask`
     Mask(Option<char>),
+    /// SET MERGE AS DELTA [ESCROW (MIN n [, MAX m])] (its bounds, as written), SET MERGE AS DEFAULT (None): see
+    /// `MergeDelta`
+    Merge(Option<MergeDelta>),
 }
 
 /// Whether `e` is column `c`, or a cast of it (to `varchar(n)` a `left()` around it, to
@@ -8527,6 +8531,8 @@ enum Stmt {
         world: String,
         name: Option<String>,
     },
+    /// World sets, objectives and COMPARE WORLDS (see `crate::worldsets`)
+    WorldSet(Box<crate::SetStmt>),
     ShowTimeout,
     /// ALTER SYSTEM SET statement_timeout | max_worlds | world_idle_ttl (ms, or a count)
     SetSystem(crate::Setting, u64),
@@ -8564,16 +8570,25 @@ enum Stmt {
     UseBranch(String, &'static str),
     ShowBranches,
     ShowWorlds,
+    /// ASSIGN WORLD name TO TENANT 'col = v' | TO GLOBAL [INCLUDING UNTENANTED TABLES] REASON 'why' (see
+    /// `Core::assign_world`): `tenant` None for GLOBAL
+    AssignWorld {
+        name: String,
+        tenant: Option<String>,
+        including_untenanted: bool,
+        reason: String,
+    },
     /// SHOW HISTORY [FOR WORLD name] [LIMIT n]
     ShowHistory {
         world: Option<String>,
         limit: Option<usize>,
     },
-    /// RESTORE WORLD name TO <when> | TO CHECKPOINT 'label'
+    /// RESTORE WORLD name TO <when> | TO CHECKPOINT 'label'; ROLLBACK WORLD name TO CHECKPOINT 'label' (`rollback`)
     Restore {
         world: String,
         at: Expr,
         checkpoint: Option<String>,
+        rollback: bool,
     },
     /// CREATE AGENT name [WITH (can = 'read,fork', max_worlds = 10, world_ttl = '1 day', ...)]
     CreateAgent {
@@ -8622,6 +8637,23 @@ enum Stmt {
     /// CHECK READS [OF WORLD w]: what a world that checks its reads read that changed since its fork (see
     /// `Core::check_reads`); None: the session's world
     CheckReads(Option<String>),
+    /// SHOW WORLD STATE w, RESUME WORLD w [TOKEN '<world id>:<version>:<epoch>']: where a world is, for an agent
+    /// coming back to it (see `durable`); a token given is checked first
+    WorldState {
+        world: String,
+        token: Option<String>,
+    },
+    /// FORECAST CONFLICTS [FOR WORLD w]: rows live worlds of one parent both change, or one reads and another changes
+    /// (see `Core::forecast_conflicts`); None: every world's
+    Forecast(Option<String>),
+    /// CONSOLIDATE [PREVIEW] p [ONLY CHILDREN (c1, ...)] [USING ARBITRATION]: p's children merged into it as one
+    /// (see `consolidate`)
+    Consolidate {
+        name: String,
+        preview: bool,
+        only: Vec<String>,
+        arbitrate: bool,
+    },
     /// SHOW MERGE OUTCOMES [BY AGENT | BY POLICY]: how worlds ended within the history window
     ShowMergeOutcomes {
         by_policy: bool,
@@ -8640,11 +8672,13 @@ enum Stmt {
     ShowSecurityAudit {
         limit: Option<usize>,
     },
-    /// CHECKPOINT WORLD name AS 'label'; with no world (an empty name), Postgres's CHECKPOINT: the database's log
-    /// folded into its trees
+    /// CHECKPOINT WORLD name AS 'label' [PIN 'interval']; with no world (an empty name), Postgres's CHECKPOINT: the
+    /// database's log folded into its trees. PIN keeps the world as it is for that long, past history's retention
+    /// (see `durable`), in ms
     Checkpoint {
         world: String,
         label: String,
+        pin: Option<u64>,
     },
     /// UNDO MERGE [OF] [WORLD] name [SKIP CHANGED]
     UndoMerge {
@@ -8665,6 +8699,37 @@ enum Stmt {
         verdict: crate::agents::Verdict,
         reason: String,
     },
+    /// ATTACH EVIDENCE TO WORLD w (kind = '...', uri = '...', sha256 = '...', note = '...') (see `proposals`)
+    AttachEvidence {
+        world: String,
+        spec: Json,
+    },
+    /// PROPOSE MERGE WORLD w [INTO target]: a proposal bound to a certificate of what the merge would do
+    ProposeMerge {
+        world: String,
+        into: Option<String>,
+    },
+    /// WITHDRAW PROPOSAL 'id'
+    WithdrawProposal(String),
+    /// APPROVE PROPOSAL 'id' [REASON '...'] (`approve`) or REJECT PROPOSAL 'id' [REASON '...']
+    DecideProposal {
+        id: String,
+        approve: bool,
+        reason: String,
+    },
+    /// MERGE PROPOSAL 'id': merged as the proposing agent, if its certificate still holds
+    MergeProposal(String),
+    /// SHOW PROPOSALS
+    ShowProposals,
+    /// EXPLAIN MERGE WORLD [w]: what its merge would do and why, in one answer
+    ExplainMerge(Option<String>),
+    /// SHOW DECISION PROVENANCE FOR MERGE 'id' | FOR WORLD w
+    ShowProvenance {
+        id: Option<String>,
+        world: Option<String>,
+    },
+    /// SHOW TOMBSTONES [FOR AGENT a]: agents' worlds that didn't make it
+    ShowTombstones(Option<String>),
     /// UNDO DIFF [WORLD] a TO b [EXCEPT TABLES (t, ...)] [SKIP CHANGED]: in the session's world, what turned a into b
     UndoDiff {
         from: String,
@@ -8697,6 +8762,8 @@ enum Stmt {
     Backup(String),
     /// VERIFY DATABASE: reads every page still needed and every log record, checking each
     Verify,
+    /// VERIFY LEDGER: the merge ledger's hash chain recomputed, a row per ledger row (see `ledger`)
+    VerifyLedger,
     /// ALTER WORLD name SET (key = value, ...): null removes a key; or SET TTL 'interval' /
     /// RESET TTL: discarded that long from now, or never (`ttl`: Some(None)); or SET PINNED /
     /// RESET PINNED: kept however long it's idle, or not
@@ -8705,6 +8772,20 @@ enum Stmt {
         meta: Json,
         ttl: Option<Option<u64>>,
         pin: Option<bool>,
+    },
+    /// GRANT {READ | WRITE | MERGE | FORK}[, ...] ON WORLD w TO agent [UNTIL '<timestamp>'] (`until`: ms since 1970),
+    /// or (`grant` false) REVOKE ... ON WORLD w FROM agent: rights in one world and its forks (see `lifecycle`)
+    GrantWorld {
+        grant: bool,
+        rights: Vec<String>,
+        world: String,
+        agent: String,
+        until: Option<u64>,
+    },
+    /// TRANSFER WORLD w TO agent: a new owner, its lease epoch moved on, the old owner fenced (see `lifecycle`)
+    TransferWorld {
+        world: String,
+        to: String,
     },
     /// DIFF [WORLD a [TO b]] [AS SQL | SUMMARY]: a since its fork, or from a to b (either may be
     /// `name@when`); as rows, as the SQL statements that make the change, or (the last field) as
@@ -11770,6 +11851,7 @@ impl Parser {
             "insert" => {
                 self.expect_kw("into")?;
                 let table = self.table_name()?;
+                self.no_at_world(&table)?;
                 let alias = if self.kw("as") { Some(self.name()?) } else { own_alias(&table) };
                 // INSERT INTO t (SELECT ...): the parentheses hold the query, not column names
                 let paren_query = matches!(self.peek(), Some(Tok::Sym("(")))
@@ -11907,6 +11989,7 @@ impl Parser {
                 let only = self.kw("only");
                 let table = self.table_name()?;
                 self.sym("*");
+                self.no_at_world(&table)?;
                 let explicit = self.target_alias()?;
                 self.shadowed = explicit.clone().map(|a| (rel_part(&table).to_string(), a));
                 let alias = explicit.or_else(|| own_alias(&table));
@@ -12009,6 +12092,7 @@ impl Parser {
                 let only = self.kw("only");
                 let table = self.table_name()?;
                 self.sym("*");
+                self.no_at_world(&table)?;
                 let explicit = self.target_alias()?;
                 self.shadowed = explicit.clone().map(|a| (rel_part(&table).to_string(), a));
                 let alias = explicit.or_else(|| own_alias(&table));
@@ -12077,6 +12161,17 @@ impl Parser {
             }
             "create" | "drop" | "alter" if self.foreign_object() => self.foreign_stmt(&w),
             "create" => self.create(),
+            "explain"
+                if self.is_kw("merge")
+                    && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "world" || w == "branch") =>
+            {
+                self.i += 2;
+                let name = match self.peek() {
+                    Some(Tok::Word(_) | Tok::Ident(_) | Tok::Str(_)) => Some(self.branch_name()?),
+                    _ => None,
+                };
+                Ok(Stmt::ExplainMerge(name))
+            }
             "explain" => {
                 let opts = self.explain_options()?;
                 // DECLARE c [SCROLL ...] CURSOR [WITH HOLD] FOR query: its query's plan, as Postgres shows it
@@ -12185,6 +12280,11 @@ impl Parser {
             }
             "show" if self.kw("branches") => Ok(Stmt::ShowBranches),
             "show" if self.kw("worlds") => Ok(Stmt::ShowWorlds),
+            "assign" if self.kw("world") => self.assign_world(),
+            "fork" if self.is_world_set(0) && matches!(self.t.get(self.i + 3), Some(Tok::Word(w)) if w == "count") => {
+                self.i += 2;
+                self.fork_world_set()
+            }
             "fork" => {
                 // FORK WORLD source [AS] name [WITH (...)]
                 self.expect_kw("world")?;
@@ -12286,6 +12386,9 @@ impl Parser {
             "show" if self.kw("world_idle_ttl") => Ok(Stmt::ShowSystem(crate::Setting::WorldIdleTtl)),
             "show" if self.kw("protect_main") => Ok(Stmt::ShowSystem(crate::Setting::ProtectMain)),
             "show" if self.kw("outbox_keep_payloads") => Ok(Stmt::ShowSystem(crate::Setting::OutboxKeepPayloads)),
+            "show" if self.kw("agent_default_read") => Ok(Stmt::ShowSystem(crate::Setting::AgentDefaultRead)),
+            "show" if self.kw("max_depth") => Ok(Stmt::ShowSystem(crate::Setting::MaxDepth)),
+            "show" if self.kw("max_children") => Ok(Stmt::ShowSystem(crate::Setting::MaxChildren)),
             "show" if self.kw("disk") => Ok(Stmt::ShowDisk),
             "show" if self.kw("synchronous_commit") => Ok(Stmt::ShowSync),
             "show" if self.kw("wal_shipping_delay") => Ok(Stmt::ShowShippingDelay),
@@ -12312,10 +12415,34 @@ impl Parser {
                 }
             }
             "verify" => {
+                if self.kw("ledger") {
+                    return Ok(Stmt::VerifyLedger);
+                }
                 self.expect_kw("database")?;
                 Ok(Stmt::Verify)
             }
             "simulate" => self.simulate(),
+            "adopt" => {
+                // ADOPT WORLD w INTO SET s
+                self.expect_kw("world")?;
+                let world = self.branch_name()?;
+                self.expect_kw("into")?;
+                self.expect_kw("set")?;
+                let set = self.branch_name()?;
+                Ok(Stmt::WorldSet(Box::new(crate::SetStmt::Adopt { world, set })))
+            }
+            "compare" => {
+                // COMPARE WORLDS a, b [SUMMARY]
+                self.expect_kw("worlds")?;
+                let a = self.branch_name()?;
+                self.expect_sym(",")?;
+                let b = self.branch_name()?;
+                let summary = self.kw("summary");
+                Ok(Stmt::WorldSet(Box::new(crate::SetStmt::Compare { a, b, summary })))
+            }
+            "rank" => self.rank_world_set(),
+            "prune" => self.prune_world_set(),
+            "optimize" => self.optimize(),
             "register" => {
                 self.expect_kw("reader")?;
                 let name = self.branch_name()?;
@@ -12351,12 +12478,23 @@ impl Parser {
             "checkpoint" => {
                 // Postgres's CHECKPOINT, alone: the whole database's (see `Stmt::Checkpoint`)
                 if matches!(self.peek(), None | Some(Tok::Sym(";"))) {
-                    return Ok(Stmt::Checkpoint { world: String::new(), label: String::new() });
+                    return Ok(Stmt::Checkpoint { world: String::new(), label: String::new(), pin: None });
                 }
                 self.expect_kw("world")?;
                 let world = self.branch_name()?;
                 self.expect_kw("as")?;
-                Ok(Stmt::Checkpoint { world, label: self.branch_name()? })
+                let label = self.branch_name()?;
+                let pin = match self.kw("pin") {
+                    true => match self.next() {
+                        Some(Tok::Str(s)) => match time::parse_interval(&s).map(interval_ms) {
+                            Some(ms) => Some(ms),
+                            None => return self.fail("expected an interval after PIN, like '1 day'"),
+                        },
+                        _ => return self.fail("expected an interval after PIN, like '1 day'"),
+                    },
+                    false => None,
+                };
+                Ok(Stmt::Checkpoint { world, label, pin })
             }
             "show" if self.kw("agents") => Ok(Stmt::ShowAgents),
             "show" if self.kw("agent") => {
@@ -12477,6 +12615,42 @@ impl Parser {
                 Ok(Stmt::ClaimOutbox { channels, limit, lease, idempotent })
             }
             "show" if self.kw("reviews") => Ok(Stmt::ShowReviews),
+            "forecast" if self.kw("conflicts") => {
+                let name = match self.kw("for") {
+                    true => {
+                        let _ = self.kw("world") || self.kw("branch");
+                        Some(self.branch_name()?)
+                    }
+                    false => None,
+                };
+                Ok(Stmt::Forecast(name))
+            }
+            "consolidate" => {
+                let preview = self.kw("preview");
+                let _ = self.kw("world") || self.kw("branch");
+                let name = self.branch_name()?;
+                let mut only = vec![];
+                if self.kw("only") {
+                    self.expect_kw("children")?;
+                    self.expect_sym("(")?;
+                    loop {
+                        only.push(self.branch_name()?);
+                        if !self.sym(",") {
+                            break;
+                        }
+                    }
+                    self.expect_sym(")")?;
+                }
+                let arbitrate = self.kw("using") && {
+                    self.expect_kw("arbitration")?;
+                    true
+                };
+                if preview && arbitrate {
+                    return self
+                        .fail("CONSOLIDATE PREVIEW shows rows two children change as conflicts: no USING ARBITRATION");
+                }
+                Ok(Stmt::Consolidate { name, preview, only, arbitrate })
+            }
             "check" if self.kw("reads") => {
                 let name = match self.kw("of") {
                     true => {
@@ -12567,6 +12741,9 @@ impl Parser {
                 Ok(Stmt::ShowAudit { agent, limit })
             }
             "drop" if self.kw("agent") => Ok(Stmt::DropAgent(self.branch_name()?)),
+            "drop" if self.kw("objective") => {
+                Ok(Stmt::WorldSet(Box::new(crate::SetStmt::DropObjective(self.branch_name()?))))
+            }
             "drop" if self.kw("policy") => self.drop_policy(),
             "drop" if self.kw("role") || self.kw("user") || self.kw("group") => self.drop_role(),
             "drop" if self.kw("owned") => {
@@ -12587,8 +12764,14 @@ impl Parser {
                 self.expect_kw("to")?;
                 Ok(Stmt::Reassign(roles, self.role_spec(false)?))
             }
+            "grant" | "revoke" if self.at_world_grant() => self.world_grant(w == "grant"),
             "grant" => self.grant(true),
             "revoke" => self.grant(false),
+            "transfer" if self.kw("world") => {
+                let world = self.branch_name()?;
+                self.expect_kw("to")?;
+                Ok(Stmt::TransferWorld { world, to: self.branch_name()? })
+            }
             "alter" if self.kw("role") || self.kw("user") => self.alter_role(false),
             "alter" if self.kw("group") => self.alter_role(true),
             "reset" if self.kw("role") => self.set_role(false, true),
@@ -12605,6 +12788,59 @@ impl Parser {
                 }
                 self.expect_kw("set")?;
                 Ok(Stmt::AlterAgent { name, spec: self.meta_pairs()? })
+            }
+            "attach" if self.kw("evidence") => {
+                self.expect_kw("to")?;
+                let _ = self.kw("world") || self.kw("branch");
+                let world = self.branch_name()?;
+                Ok(Stmt::AttachEvidence { world, spec: self.meta_pairs()? })
+            }
+            "propose" if self.kw("merge") => {
+                let _ = self.kw("world") || self.kw("branch");
+                let world = self.branch_name()?;
+                let into = match self.kw("into") {
+                    true => Some(self.branch_name()?),
+                    false => None,
+                };
+                Ok(Stmt::ProposeMerge { world, into })
+            }
+            "withdraw" if self.kw("proposal") => Ok(Stmt::WithdrawProposal(self.proposal_id()?)),
+            "approve" | "reject" if self.is_kw("proposal") => {
+                self.i += 1;
+                let approve = w == "approve";
+                let id = self.proposal_id()?;
+                let reason = match self.kw("reason") {
+                    true => match self.next() {
+                        Some(Tok::Str(s)) => s,
+                        t => {
+                            self.put_back(t);
+                            return self.fail("expected the reason as a string (REASON 'why')");
+                        }
+                    },
+                    false => String::new(),
+                };
+                Ok(Stmt::DecideProposal { id, approve, reason })
+            }
+            "merge" if self.kw("proposal") => Ok(Stmt::MergeProposal(self.proposal_id()?)),
+            "show" if self.kw("proposals") => Ok(Stmt::ShowProposals),
+            "show" if self.kw("tombstones") => {
+                let agent = match self.kw("for") {
+                    true => {
+                        self.expect_kw("agent")?;
+                        Some(self.branch_name()?)
+                    }
+                    false => None,
+                };
+                Ok(Stmt::ShowTombstones(agent))
+            }
+            "show" if self.kw("decision") => {
+                self.expect_kw("provenance")?;
+                self.expect_kw("for")?;
+                if self.kw("merge") || self.kw("proposal") {
+                    return Ok(Stmt::ShowProvenance { id: Some(self.proposal_id()?), world: None });
+                }
+                let _ = self.kw("world") || self.kw("branch");
+                Ok(Stmt::ShowProvenance { id: None, world: Some(self.branch_name()?) })
             }
             "review" if self.kw("world") => {
                 let world = self.branch_name()?;
@@ -12737,9 +12973,40 @@ impl Parser {
                 self.expect_kw("to")?;
                 if self.kw("checkpoint") {
                     let label = self.branch_name()?;
-                    return Ok(Stmt::Restore { world, at: Expr::Lit(Value::Null), checkpoint: Some(label) });
+                    return Ok(Stmt::Restore {
+                        world,
+                        at: Expr::Lit(Value::Null),
+                        checkpoint: Some(label),
+                        rollback: false,
+                    });
                 }
-                Ok(Stmt::Restore { world, at: self.expr()?, checkpoint: None })
+                Ok(Stmt::Restore { world, at: self.expr()?, checkpoint: None, rollback: false })
+            }
+            "rollback" if self.is_kw("world") => {
+                // ROLLBACK WORLD w TO CHECKPOINT label (not a transaction's ROLLBACK: see `durable`)
+                self.expect_kw("world")?;
+                let world = self.branch_name()?;
+                self.expect_kw("to")?;
+                self.expect_kw("checkpoint")?;
+                let label = self.branch_name()?;
+                Ok(Stmt::Restore { world, at: Expr::Lit(Value::Null), checkpoint: Some(label), rollback: true })
+            }
+            "resume" => {
+                // RESUME WORLD w [TOKEN '...']
+                self.expect_kw("world")?;
+                let world = self.branch_name()?;
+                let token = match self.kw("token") {
+                    true => match self.next() {
+                        Some(Tok::Str(s)) => Some(s),
+                        _ => return self.fail("expected TOKEN '<world id>:<version>:<epoch>'"),
+                    },
+                    false => None,
+                };
+                Ok(Stmt::WorldState { world, token })
+            }
+            "show" if self.is_kw("world") && matches!(self.t.get(self.i + 1), Some(Tok::Word(w)) if w == "state") => {
+                self.i += 2;
+                Ok(Stmt::WorldState { world: self.branch_name()?, token: None })
             }
             "alter" if self.is_kw("system") => {
                 self.expect_kw("system")?;
@@ -12787,24 +13054,34 @@ impl Parser {
                         None => self.fail("expected wal_shipping = off, async or sync"),
                     };
                 }
-                let system =
-                    ["statement_timeout", "max_worlds", "world_idle_ttl", "protect_main", "outbox_keep_payloads"]
-                        .into_iter()
-                        .find(|k| self.kw(k));
+                let system = [
+                    "statement_timeout",
+                    "max_worlds",
+                    "world_idle_ttl",
+                    "protect_main",
+                    "outbox_keep_payloads",
+                    "agent_default_read",
+                    "max_depth",
+                    "max_children",
+                ]
+                .into_iter()
+                .find(|k| self.kw(k));
                 if let Some(k) = system.and_then(crate::Setting::parse) {
                     if !self.sym("=") {
                         self.expect_kw("to")?;
                     }
                     let v = match k {
                         crate::Setting::StatementTimeout => self.timeout()?.unwrap_or(0),
-                        crate::Setting::MaxWorlds => match self.next() {
-                            Some(Tok::Num(n)) => n.parse().map_err(|_| SqlError {
-                                code: BAD_INPUT,
-                                message: format!("max_worlds must be a whole number, not {n}"),
-                                info: None,
-                            })?,
-                            _ => return self.fail("expected max_worlds = <a number>, 0 for no limit"),
-                        },
+                        crate::Setting::MaxWorlds | crate::Setting::MaxDepth | crate::Setting::MaxChildren => {
+                            match self.next() {
+                                Some(Tok::Num(n)) => n.parse().map_err(|_| SqlError {
+                                    code: BAD_INPUT,
+                                    message: format!("{} must be a whole number, not {n}", k.name()),
+                                    info: None,
+                                })?,
+                                _ => return self.fail(&format!("expected {} = <a number>, 0 for no limit", k.name())),
+                            }
+                        }
                         crate::Setting::WorldIdleTtl => match self.next() {
                             Some(Tok::Num(n)) if n == "0" => 0,
                             Some(Tok::Str(v)) if v.trim() == "0" => 0,
@@ -12828,6 +13105,14 @@ impl Parser {
                             Some(Tok::Num(n)) if n == "0" || n == "1" => n.parse().unwrap_or(0),
                             _ => return self.fail(&format!("expected {} = on or off", k.name())),
                         },
+                        crate::Setting::AgentDefaultRead => match self.next() {
+                            Some(Tok::Word(w) | Tok::Str(w)) => match w.replace(' ', "").to_lowercase().as_str() {
+                                "read" | "all" => 1,
+                                "read_own,read_main" | "read_main,read_own" | "own" => 0,
+                                _ => return self.fail("expected agent_default_read = 'read_own,read_main' or 'read'"),
+                            },
+                            _ => return self.fail("expected agent_default_read = 'read_own,read_main' or 'read'"),
+                        },
                     };
                     return Ok(Stmt::SetSystem(k, v));
                 }
@@ -12844,6 +13129,19 @@ impl Parser {
                 }
             }
             "merge" if self.kw("into") => self.merge_into(),
+            "merge" if self.kw("best") => {
+                // MERGE BEST OF SET s INTO b [DRY RUN]
+                self.expect_kw("of")?;
+                self.expect_kw("set")?;
+                let set = self.branch_name()?;
+                self.expect_kw("into")?;
+                let into = self.branch_name()?;
+                let dry = self.kw("dry");
+                if dry {
+                    self.expect_kw("run")?;
+                }
+                Ok(Stmt::WorldSet(Box::new(crate::SetStmt::MergeBest { set, into, dry })))
+            }
             "merge" if self.kw("branch") || self.kw("world") => {
                 let name = match self.peek() {
                     Some(Tok::Word(w)) if crate::MERGE_WORDS.contains(&w.as_str()) => None,
@@ -14439,8 +14737,11 @@ impl Parser {
         }
         self.sym("*"); // t *: with the tables that inherit from it, which is what a read does anyway
         let mut at = self.as_of()?;
+        if at.is_none() {
+            at = self.at_world()?;
+        }
         let mut aliased = false;
-        let alias = if !self.is_as_of() && self.kw("as") {
+        let alias = if !self.is_as_of() && !self.is_at_world() && self.kw("as") {
             aliased = true;
             self.name()?
         } else {
@@ -14449,7 +14750,8 @@ impl Parser {
                     if !RESERVED.contains(&w.as_str())
                         && !LATER.contains(&w.as_str())
                         && w != "for"
-                        && w != "tablesample" =>
+                        && w != "tablesample"
+                        && !self.is_at_world() =>
                 {
                     aliased = true;
                     self.name()?
@@ -14465,6 +14767,9 @@ impl Parser {
         let names = if aliased && self.sym("(") { self.names()? } else { vec![] };
         if at.is_none() {
             at = self.as_of()?; // t alias AS OF ...
+        }
+        if at.is_none() {
+            at = self.at_world()?; // t alias AT WORLD w
         }
         let plain = Source {
             table,
@@ -14545,6 +14850,44 @@ impl Parser {
     fn is_as_of(&self) -> bool {
         let word = |i: usize, w: &str| matches!(self.t.get(self.i + i), Some(Tok::Word(x)) if x == w);
         (word(0, "as") && word(1, "of")) || (word(0, "for") && word(1, "system_time"))
+    }
+
+    /// AT WORLD w, or AT WORLDS OF SET s, next?
+    fn is_at_world(&self) -> bool {
+        let word = |i: usize, w: &str| matches!(self.t.get(self.i + i), Some(Tok::Word(x)) if x == w);
+        word(0, "at") && (word(1, "world") || word(1, "worlds"))
+    }
+
+    /// Reads AT WORLD w (the table as world `w` has it now: a name, an ID, or `'name@when'`) or AT WORLDS OF SET s
+    /// (the table in each world of set `s`, with a `_world` column naming it) if it's next, as `Source::at` holds it
+    /// (see `at_world_of`).
+    fn at_world(&mut self) -> Result<Option<Expr>> {
+        if !self.is_at_world() {
+            return Ok(None);
+        }
+        self.expect_kw("at")?;
+        if self.kw("worlds") {
+            self.expect_kw("of")?;
+            self.expect_kw("set")?;
+            return Ok(Some(at_marker(AT_SET, self.branch_name()?)));
+        }
+        self.expect_kw("world")?;
+        Ok(Some(at_marker(AT_WORLD, self.branch_name()?)))
+    }
+
+    /// The table a statement changes can't be another world's: AT WORLD reads only.
+    fn no_at_world(&self, table: &str) -> Result<()> {
+        if self.is_at_world() {
+            return err(
+                UNSUPPORTED,
+                format!(
+                    "AT WORLD only reads: {} can't be changed in another world from here; switch to that world, or \
+                     merge",
+                    rel_part(table)
+                ),
+            );
+        }
+        Ok(())
     }
 
     /// Reads AS OF <when> (or FOR SYSTEM_TIME AS OF <when>) if it's next.
@@ -16719,6 +17062,40 @@ impl Parser {
                         },
                     };
                     Alter::ColOpt(c, ColOpt::Mask(Some(m)))
+                } else if set && self.kw("merge") {
+                    self.expect_kw("as")?;
+                    if self.kw("default") {
+                        Alter::ColOpt(c, ColOpt::Merge(None))
+                    } else {
+                        self.expect_kw("delta")?;
+                        let mut d = MergeDelta::default();
+                        if self.kw("escrow") {
+                            self.expect_sym("(")?;
+                            loop {
+                                let min = match () {
+                                    _ if self.kw("min") => true,
+                                    _ if self.kw("max") => false,
+                                    _ => return self.fail("expected MIN or MAX in ESCROW (MIN n, MAX m)"),
+                                };
+                                let neg = self.sym("-");
+                                let n = match self.next() {
+                                    Some(Tok::Num(n)) => {
+                                        crate::writeback::decimal(&Json::String(if neg { format!("-{n}") } else { n }))
+                                    }
+                                    _ => None,
+                                };
+                                let Some(n) = n else {
+                                    return self.fail("expected a plain number after ESCROW's MIN or MAX");
+                                };
+                                *(if min { &mut d.min } else { &mut d.max }) = Some(n);
+                                if !self.sym(",") {
+                                    break;
+                                }
+                            }
+                            self.expect_sym(")")?;
+                        }
+                        Alter::ColOpt(c, ColOpt::Merge(Some(d)))
+                    }
                 } else if set && self.kw("storage") {
                     Alter::ColOpt(c, ColOpt::Storage(self.storage_word()?))
                 } else if set && self.kw("compression") {
@@ -17300,6 +17677,54 @@ impl Parser {
     }
 
     /// A branch name: a name, or a quoted one for names like "agent-7".
+    /// After GRANT or REVOKE: whether rights on a world follow (`READ | WRITE | MERGE | FORK [, ...] ON WORLD`), not
+    /// Postgres's privileges.
+    fn at_world_grant(&self) -> bool {
+        let word = |t: Option<&Tok>, f: &dyn Fn(&str) -> bool| matches!(t, Some(Tok::Word(w)) if f(w));
+        let mut j = self.i;
+        loop {
+            if !word(self.t.get(j), &|w| crate::RIGHTS.contains(&w)) {
+                return false;
+            }
+            j += 1;
+            if !matches!(self.t.get(j), Some(Tok::Sym(","))) {
+                break;
+            }
+            j += 1;
+        }
+        word(self.t.get(j), &|w| w == "on") && word(self.t.get(j + 1), &|w| w == "world")
+    }
+
+    /// After GRANT or REVOKE (see `at_world_grant`): `rights ON WORLD w TO | FROM agent`, and a grant's
+    /// `UNTIL '<timestamp>'`.
+    fn world_grant(&mut self, grant: bool) -> Result<Stmt> {
+        let mut rights = vec![];
+        loop {
+            if let Some(Tok::Word(r)) = self.next() {
+                rights.push(r);
+            }
+            if !self.sym(",") {
+                break;
+            }
+        }
+        self.expect_kw("on")?;
+        self.expect_kw("world")?;
+        let world = self.branch_name()?;
+        self.expect_kw(if grant { "to" } else { "from" })?;
+        let agent = self.branch_name()?;
+        let until = match grant && self.kw("until") {
+            false => None,
+            true => match self.next() {
+                Some(Tok::Str(t)) => match time::parse_timestamptz(&t) {
+                    Ok(us) => Some((us / 1000).max(0) as u64),
+                    Err(_) => return self.fail("expected UNTIL '<timestamp>', like '2026-12-01 09:00+00'"),
+                },
+                _ => return self.fail("expected UNTIL '<timestamp>', like '2026-12-01 09:00+00'"),
+            },
+        };
+        Ok(Stmt::GrantWorld { grant, rights, world, agent, until })
+    }
+
     /// A world's metadata, if given: WITH (key = value, ...) or META '<json object>'.
     fn world_meta(&mut self) -> Result<Json> {
         if self.kw("with") {
@@ -17328,6 +17753,14 @@ impl Parser {
         let mut m = Map::new();
         loop {
             let key = self.branch_name()?;
+            // a key alone is a flag: WITH (durable) is WITH (durable = true)
+            if matches!(self.peek(), Some(Tok::Sym(",") | Tok::Sym(")"))) {
+                m.insert(key, Json::Bool(true));
+                if !self.sym(",") {
+                    break;
+                }
+                continue;
+            }
             self.expect_sym("=")?;
             let neg = self.sym("-");
             let v = match self.peek().cloned() {
@@ -17352,6 +17785,19 @@ impl Parser {
         }
         self.expect_sym(")")?;
         Ok(Json::Object(m))
+    }
+
+    /// A proposal's id: a string, as PROPOSE MERGE answered it (or a bare word).
+    fn proposal_id(&mut self) -> Result<String> {
+        match self.peek() {
+            Some(Tok::Str(s)) => {
+                let s = s.clone();
+                self.i += 1;
+                Ok(s)
+            }
+            Some(Tok::Word(_) | Tok::Ident(_)) => self.name(),
+            _ => self.fail("expected a proposal's id, as a string ('p...')"),
+        }
     }
 
     fn branch_name(&mut self) -> Result<String> {
@@ -17381,6 +17827,35 @@ impl Parser {
 
     /// After SIMULATE: n WORLDS [FROM world] AS prefix RUN 'sql' SCORE 'select ...' [ASC | DESC]
     /// [KEEP k | KEEP ALL] [SEED s] [THREADS t], in any order after SCORE.
+    /// ASSIGN WORLD name TO TENANT 'col = v' | TO GLOBAL [INCLUDING UNTENANTED TABLES] REASON 'why' (after ASSIGN
+    /// WORLD). Its own function: the statement parser's frame is on the stack of every nested expression.
+    #[inline(never)]
+    fn assign_world(&mut self) -> Result<Stmt> {
+        let name = self.branch_name()?;
+        self.expect_kw("to")?;
+        let tenant = match self.kw("global") {
+            true => None,
+            false => {
+                self.expect_kw("tenant")?;
+                match self.next() {
+                    Some(Tok::Str(t)) => Some(t),
+                    _ => return self.fail("expected the tenant as text, like 'org_id = 42', after TO TENANT"),
+                }
+            }
+        };
+        let including_untenanted = self.kw("including");
+        if including_untenanted {
+            self.expect_kw("untenanted")?;
+            self.expect_kw("tables")?;
+        }
+        self.expect_kw("reason")?;
+        let reason = match self.next() {
+            Some(Tok::Str(r)) => r,
+            _ => return self.fail("expected why, as text, after REASON"),
+        };
+        Ok(Stmt::AssignWorld { name, tenant, including_untenanted, reason })
+    }
+
     fn simulate(&mut self) -> Result<Stmt> {
         let worlds = self.int("the number of worlds")?;
         self.expect_kw("worlds")?;
@@ -17408,6 +17883,147 @@ impl Parser {
                 spec.threads = usize::try_from(self.int("a number of threads")?).unwrap_or(0).max(1);
             } else {
                 return Ok(Stmt::Simulate(Box::new(spec)));
+            }
+        }
+    }
+
+    /// WORLD SET, `at` tokens ahead?
+    fn is_world_set(&self, at: usize) -> bool {
+        let word = |i: usize, w: &str| matches!(self.t.get(self.i + i), Some(Tok::Word(x)) if x == w);
+        word(at, "world") && word(at + 1, "set")
+    }
+
+    /// After FORK WORLD SET: s COUNT n RUN $$script$$ [SEED k] [THREADS t], in any order after RUN.
+    fn fork_world_set(&mut self) -> Result<Stmt> {
+        let set = self.branch_name()?;
+        self.expect_kw("count")?;
+        let count = usize::try_from(self.int("how many worlds")?).unwrap_or(0);
+        self.expect_kw("run")?;
+        let script = self.text("the script to run, like $$update ...$$")?;
+        let mut spec = crate::ForkSet { set, count, script, seed: 0, threads: 0, agent: None };
+        loop {
+            if self.kw("seed") {
+                spec.seed = self.int("a seed")?;
+            } else if self.kw("threads") {
+                spec.threads = usize::try_from(self.int("a number of threads")?).unwrap_or(0).max(1);
+            } else {
+                return Ok(Stmt::WorldSet(Box::new(crate::SetStmt::Fork(spec))));
+            }
+        }
+    }
+
+    /// After RANK: WORLD SET s BY ($$metric$$ [ASC | DESC], ...) [WITH CHECKS [(c, ...)]].
+    fn rank_world_set(&mut self) -> Result<Stmt> {
+        self.expect_kw("world")?;
+        self.expect_kw("set")?;
+        let set = self.branch_name()?;
+        self.expect_kw("by")?;
+        self.expect_sym("(")?;
+        let mut metrics = vec![];
+        loop {
+            let query = self.text("a metric query, like $$select sum(total) from orders$$")?;
+            let ascending = if self.kw("asc") {
+                true
+            } else {
+                self.kw("desc");
+                false
+            };
+            metrics.push(crate::Metric { query, ascending });
+            if !self.sym(",") {
+                break;
+            }
+        }
+        self.expect_sym(")")?;
+        let checks = if self.kw("with") {
+            self.expect_kw("checks")?;
+            Some(if self.sym("(") { self.names_closed()? } else { vec![] })
+        } else {
+            None
+        };
+        Ok(Stmt::WorldSet(Box::new(crate::SetStmt::Rank { set, metrics, checks })))
+    }
+
+    /// Names, then `)` (the `(` read already).
+    fn names_closed(&mut self) -> Result<Vec<String>> {
+        let mut v = vec![self.branch_name()?];
+        while self.sym(",") {
+            v.push(self.branch_name()?);
+        }
+        self.expect_sym(")")?;
+        Ok(v)
+    }
+
+    /// After PRUNE: WORLD SET s WHERE rank > k | failed, or both joined by OR.
+    fn prune_world_set(&mut self) -> Result<Stmt> {
+        self.expect_kw("world")?;
+        self.expect_kw("set")?;
+        let set = self.branch_name()?;
+        self.expect_kw("where")?;
+        let mut rule = crate::Prune { rank_gt: None, failed: false };
+        loop {
+            if self.kw("failed") {
+                rule.failed = true;
+            } else if self.kw("rank") {
+                self.expect_sym(">")?;
+                rule.rank_gt = Some(usize::try_from(self.int("a rank")?).unwrap_or(0));
+            } else {
+                return self.fail("PRUNE WORLD SET s WHERE takes rank > k, failed, or both joined by OR");
+            }
+            if !self.kw("or") {
+                return Ok(Stmt::WorldSet(Box::new(crate::SetStmt::Prune { set, rule })));
+            }
+        }
+    }
+
+    /// After CREATE [OR REPLACE] OBJECTIVE: o MINIMIZE | MAXIMIZE $$query$$ [SUBJECT TO CHECKS (c, ...)].
+    fn create_objective(&mut self, replace: bool) -> Result<Stmt> {
+        let name = self.branch_name()?;
+        let minimize = if self.kw("minimize") {
+            true
+        } else {
+            self.expect_kw("maximize")?;
+            false
+        };
+        let query = self.text("the query giving the number, like $$select sum(cost) from stock$$")?;
+        let checks = if self.kw("subject") {
+            self.expect_kw("to")?;
+            self.expect_kw("checks")?;
+            self.expect_sym("(")?;
+            self.names_closed()?
+        } else {
+            vec![]
+        };
+        Ok(Stmt::WorldSet(Box::new(crate::SetStmt::CreateObjective { name, query, minimize, checks, replace })))
+    }
+
+    /// After OPTIMIZE: o FROM WORLD b [AS SET s] RUN $$script$$ COUNT n [KEEP k] [SEED s] [THREADS t], in any order
+    /// after RUN.
+    fn optimize(&mut self) -> Result<Stmt> {
+        let objective = self.branch_name()?;
+        self.expect_kw("from")?;
+        self.expect_kw("world")?;
+        let base = self.branch_name()?;
+        let set = if self.kw("as") {
+            self.expect_kw("set")?;
+            Some(self.branch_name()?)
+        } else {
+            None
+        };
+        self.expect_kw("run")?;
+        let script = self.text("the script to run, like $$update ...$$")?;
+        let mut spec =
+            crate::Optimize { objective, base, set, script, count: 0, keep: None, seed: 0, threads: 0, agent: None };
+        loop {
+            if self.kw("count") {
+                spec.count = usize::try_from(self.int("how many worlds")?).unwrap_or(0);
+            } else if self.kw("keep") {
+                spec.keep = Some(usize::try_from(self.int("how many worlds to keep")?).unwrap_or(0));
+            } else if self.kw("seed") {
+                spec.seed = self.int("a seed")?;
+            } else if self.kw("threads") {
+                spec.threads = usize::try_from(self.int("a number of threads")?).unwrap_or(0).max(1);
+            } else {
+                return Ok(Stmt::WorldSet(Box::new(crate::SetStmt::Optimize(spec))));
             }
         }
     }
@@ -17858,6 +18474,28 @@ impl Parser {
         }
         if self.kw("database") {
             return self.create_database();
+        }
+        if self.kw("objective") {
+            return self.create_objective(replace);
+        }
+        if self.is_world_set(0) && !matches!(self.t.get(self.i + 2), Some(Tok::Word(w)) if w == "from") {
+            // CREATE WORLD SET s FROM WORLD b [WITH (max_live = n)]
+            self.i += 2;
+            let set = self.branch_name()?;
+            self.expect_kw("from")?;
+            self.expect_kw("world")?;
+            let base = self.branch_name()?;
+            let mut max_live = 0;
+            if self.kw("with") {
+                let Json::Object(m) = self.meta_pairs()? else { unreachable!("an object") };
+                for (k, v) in m {
+                    match (k.as_str(), v.as_u64()) {
+                        ("max_live", Some(n)) => max_live = n as usize,
+                        _ => return self.fail(&format!("a world set takes WITH (max_live = n), not {k} = {v}")),
+                    }
+                }
+            }
+            return Ok(Stmt::WorldSet(Box::new(crate::SetStmt::Create { set, base, max_live })));
         }
         if self.is_kw("branch") || self.is_kw("world") {
             let noun = if self.kw("world") {
@@ -23876,6 +24514,51 @@ struct ColOpts {
     compression: Option<char>,
     /// SET MASKED: how agents without `unmask` read the column (see `mask`); None: as it is
     mask: Option<char>,
+    /// SET MERGE AS DELTA: how merges combine the column (see `MergeDelta`); None: as the rest of its row
+    merge: Option<MergeDelta>,
+}
+
+/// A column merged as a delta (`ALTER TABLE t ALTER COLUMN c SET MERGE AS DELTA [ESCROW (MIN n [, MAX m])]`): where
+/// two sides of a merge both changed it in one row, and nothing else of the row conflicts, the merge keeps the
+/// parent's value plus the world's own change (parent + (ours - base)), so two agents each taking stock both land
+/// (see `Core::delta_settle`). The escrow bounds refuse a combined value past them (23514). Kept with the column in
+/// the table's definition, so it forks and merges with it. Numbers only.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct MergeDelta {
+    /// each bound as a decimal: (digits, scale), `-1.5` as (-15, 1) (see `writeback::decimal`)
+    pub(crate) min: Option<(i128, u32)>,
+    pub(crate) max: Option<(i128, u32)>,
+}
+
+/// A delta column of a table (see `merge_deltas`): its name and escrow bounds.
+pub(crate) type DeltaColumn = (String, MergeDelta);
+
+/// Whether column `c` of type `ty` may merge as a delta with bounds `d`: numbers only (0A000), a MIN no greater than
+/// its MAX (22023).
+fn merge_delta_allowed(c: &str, ty: Type, d: &MergeDelta) -> Result<()> {
+    if !matches!(ty, Type::SmallInt | Type::Int | Type::BigInt | Type::Numeric | Type::Float) {
+        return err(
+            "0A000",
+            format!(
+                "column \"{c}\" is {}: only number columns merge as a delta (parent + this world's change); \
+                 leave it to merge as rows do (SET MERGE AS DEFAULT)",
+                ty.name()
+            ),
+        );
+    }
+    if let (Some(lo), Some(hi)) = (d.min, d.max)
+        && crate::writeback::cmp_decimal(lo, hi) == Some(std::cmp::Ordering::Greater)
+    {
+        let show = crate::writeback::show_decimal;
+        return err("22023", format!("ESCROW's MIN ({}) is greater than its MAX ({})", show(lo), show(hi)));
+    }
+    Ok(())
+}
+
+/// Table `table`'s columns merged as a delta (see `MergeDelta`), in world `v`; none for a table that has none.
+pub(crate) fn merge_deltas(v: &View, table: &str) -> Vec<DeltaColumn> {
+    let Ok(Some(t)) = load(v, table) else { return vec![] };
+    t.cols.iter().filter_map(|c| Some((c.name.clone(), c.opts.merge?))).collect()
 }
 
 impl ColOpts {
@@ -23886,6 +24569,10 @@ impl ColOpts {
             stats: c["stats"].as_i64(),
             compression: letter("compression"),
             mask: letter("mask"),
+            merge: (c["merge"]["as"] == "delta").then(|| {
+                let bound = |k: &str| crate::writeback::decimal(&c["merge"][k]);
+                MergeDelta { min: bound("min"), max: bound("max") }
+            }),
         }
     }
 
@@ -23901,6 +24588,10 @@ impl ColOpts {
         }
         if let Some(m) = self.mask {
             j["mask"] = Json::String(m.to_string());
+        }
+        if let Some(d) = self.merge {
+            let bound = |b: Option<(i128, u32)>| b.map(crate::writeback::show_decimal);
+            j["merge"] = serde_json::json!({ "as": "delta", "min": bound(d.min), "max": bound(d.max) });
         }
     }
 }
@@ -24535,6 +25226,10 @@ pub fn describe(changes: &[crate::Change]) -> Vec<Described> {
             (comments::COMMENTS, ["comment on", "drop comment", "comment on"]),
             (collation::COLLATIONS, ["create collation", "drop collation", "alter collation"]),
             (pgcrypto::EXTENSIONS, ["create extension", "drop extension", "alter extension"]),
+            // (rows that merge though no statement of DIFF AS SQL makes them: see `merged_object`)
+            (acl::ACLS, ["grant", "revoke", "change privileges"]),
+            ("_sonos_defs/rule", ["create rule", "drop rule", "alter rule"]),
+            ("_sonos_defs/cast", ["create cast", "drop cast", "alter cast"]),
         ];
         if let Some((name, [create, drop, alter])) =
             object.iter().find_map(|(p, names)| Some((c.key.strip_prefix(p)?.strip_prefix('/')?, *names)))
@@ -24667,6 +25362,11 @@ pub fn diff_sql(after: &View, diff: &[Described]) -> Result<Vec<String>> {
         // (row security once the tables are made)
         if let Some(sql) = rls::diff_sql(after, d) {
             notes.push(sql);
+            continue;
+        }
+        // privileges, owners, rules and casts merge, and are listed; no statement here makes them
+        if merged_object(&d.key) {
+            notes.push(format!("-- {}: {} (not written as SQL here)", d.key, d.change));
             continue;
         }
         if let Some(sql) = object_sql(d) {
@@ -25143,6 +25843,8 @@ fn agent_spec(j: &Json) -> Result<crate::AgentSpec> {
                 spec.can = Some(can);
             }
             "max_worlds" => spec.max_worlds = Some(num()?),
+            "max_depth" => spec.max_depth = Some(num()?),
+            "max_children" => spec.max_children = Some(num()?),
             "writes_per_minute" => spec.writes_per_minute = Some(num()?),
             "max_changes" => spec.max_changes = Some(num()?),
             "max_concurrent" => spec.max_concurrent = Some(num()?),
@@ -26599,6 +27301,15 @@ fn ref_key(t: &Table, f: &Fk, vals: &[Value], id: &str) -> Option<String> {
 }
 
 /// Whether a key is a B-tree index entry (see `btree`).
+/// A row's key (`table/id`) as its table and its id, as people read them (see `show_key`).
+fn split_row_key(key: &str) -> (String, String) {
+    let shown = show_key(key);
+    match shown.split_once('/') {
+        Some((t, id)) => (t.to_string(), id.to_string()),
+        None => (String::new(), shown.into_owned()),
+    }
+}
+
 /// Whether merges combine table `table`'s rows by columns (ALTER TABLE ... SET
 /// (merge_by_columns = true)), in world `v`.
 pub(crate) fn merges_by_columns(v: &View, table: &str) -> bool {
@@ -28133,6 +28844,308 @@ fn check_merge_in(v: &View, before: &View, keys: &[String], fresh: &HashSet<Stri
         }
     }
     Ok(())
+}
+
+/// The checks merges gained after 0.5.5 (run only outside a replay: see `Core::rechecks`), in the merged state `v`
+/// (`before`: the world merged into, as it was) for the rows `keys` merged. A table whose definition the merge changes
+/// so that it gains a UNIQUE, FOREIGN KEY or NOT NULL constraint has every row checked against it, not only the rows
+/// the merge brings: the world checked its own rows when it added the constraint, never those the other side added
+/// meanwhile. Their index rows for it are returned, to merge along (the constraint's entries for rows the world never
+/// had). And a row the merge deletes, or whose values a foreign key to a UNIQUE constraint names it changes, leaves no
+/// row referencing what it had (the other side may have added one: `check_merge` follows only primary keys).
+pub(crate) fn recheck_merge(v: &View, before: &View, keys: &[String]) -> Result<Vec<(String, Option<crate::Val>)>> {
+    userdefs::in_world(v, || recheck_merge_in(v, before, keys))
+}
+
+fn recheck_merge_in(v: &View, before: &View, keys: &[String]) -> Result<Vec<(String, Option<crate::Val>)>> {
+    let tables = schemas(v)?;
+    let mut out: BTreeMap<String, Option<crate::Val>> = BTreeMap::new();
+    for t in &tables {
+        if !keys.iter().any(|k| *k == schema_key(&t.name)) {
+            continue;
+        }
+        // (a table the merge makes: each of its rows is among those merged, and checked as one)
+        let Some(old) = load(before, &t.name)? else { continue };
+        let uniques: Vec<&Unique> = (t.uniques.iter())
+            .filter(|u| !u.primary && uniq_index(t, u).is_none())
+            .filter(|u| !old.uniques.iter().any(|o| o.name == u.name && o.cols == u.cols && o.nnd == u.nnd))
+            .collect();
+        let fks: Vec<&Fk> = (t.fks.iter())
+            .filter(|f| f.valid && !t.ri_off.contains(&f.name))
+            .filter(|f| !old.fks.iter().any(|o| o.name == f.name && o.valid && o.cols == f.cols && o.table == f.table))
+            .collect();
+        // (a column the merge adds is filled by its default, which its definition checked)
+        let not_null: Vec<usize> = (t.cols.iter().enumerate())
+            .filter(|(_, c)| c.not_null && old.cols.iter().any(|o| o.id == c.id && !o.not_null))
+            .map(|(i, _)| i)
+            .collect();
+        if uniques.is_empty() && fks.is_empty() && not_null.is_empty() {
+            continue;
+        }
+        let parents: Vec<Option<Table>> = fks.iter().map(|f| load(v, &f.table)).collect::<Result<_>>()?;
+        let mut held: HashMap<String, String> = HashMap::new(); // unique entry -> the row holding it
+        let prefix = format!("{}/", t.name);
+        for r in v.prefix(&prefix)? {
+            let (k, raw) = r?;
+            let id = &k[prefix.len()..];
+            let vals = decode_raw(t, id, &raw, None)?;
+            for &i in &not_null {
+                if vals[i] == Value::Null {
+                    return Err(violation(
+                        NOT_NULL,
+                        format!(
+                            "{}/{} has a null in column \"{}\", which the merge makes NOT NULL",
+                            t.name,
+                            show_id(id),
+                            t.cols[i].name
+                        ),
+                        &t.name,
+                        None,
+                        Some(&t.cols[i].name),
+                        None,
+                    ));
+                }
+            }
+            for u in &uniques {
+                let Some(key) = uniq_key(t, u, &vals) else { continue };
+                if let Some(other) = held.insert(key.clone(), id.to_string()) {
+                    return Err(violation(
+                        UNIQUE,
+                        format!(
+                            "{}/{} and {}/{} both have the same values for unique constraint \"{}\", which the merge adds",
+                            t.name,
+                            show_id(&other),
+                            t.name,
+                            show_id(id),
+                            u.name
+                        ),
+                        &t.name,
+                        Some(&u.name),
+                        None,
+                        None,
+                    ));
+                }
+                if v.get(&key)?.as_deref() != Some(id) {
+                    out.insert(key, Some(crate::Val::from(id)));
+                }
+            }
+            for (f, parent) in fks.iter().zip(&parents) {
+                if mixes_nulls(t, f, &vals) {
+                    return Err(err_match_full(t, f, id));
+                }
+                let Some(x) = fk_vals(t, f, &vals) else { continue };
+                let get = |k: &str| -> Result<Option<String>> {
+                    match out.get(k) {
+                        Some(x) => Ok(x.as_deref().map(String::from)),
+                        None => Ok(v.get(k)?.map(|x| x.to_string())),
+                    }
+                };
+                if fk_parent_any(v, parent.as_ref(), f, &x, &get)?.is_none() {
+                    let shown: Vec<String> = x.iter().map(Value::to_text).collect();
+                    return Err(violation(
+                        "23503",
+                        format!(
+                            "{}/{} references {} ({}), which has no such row: the merge adds foreign key {}",
+                            t.name,
+                            show_id(id),
+                            f.table,
+                            shown.join(", "),
+                            f.name
+                        ),
+                        &t.name,
+                        Some(&f.name),
+                        None,
+                        None,
+                    ));
+                }
+                if let Some(rk) = ref_key(t, f, &vals, id)
+                    && v.get(&rk)?.is_none()
+                {
+                    out.insert(rk, Some(crate::Val::from("")));
+                }
+            }
+        }
+    }
+    // rows a foreign key to UNIQUE values may still reference by what they had
+    let mut cache = HashMap::new();
+    for k in keys {
+        let Some((tn, id)) = k.split_once('/') else { continue };
+        if crate::reserved_table(tn)
+            || !tables.iter().any(|c| c.fks.iter().any(|f| f.table == tn && !f.refs.is_empty()))
+        {
+            continue;
+        }
+        if let Some((child, fk, cid)) = left_referencing(v, before, &tables, tn, id, true, &mut cache)? {
+            return Err(violation(
+                "23503",
+                format!(
+                    "{tn}/{} no longer has the values {child}/{} (added on the other side) references by foreign key {fk}",
+                    show_id(id),
+                    show_id(&cid)
+                ),
+                tn,
+                Some(&fk),
+                None,
+                None,
+            ));
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
+/// The rows of `keys` gone or changed from `before` to `v` that a row of `v` still references by what they had
+/// (UNDO ... SKIP CHANGED leaves them as they are).
+pub(crate) fn left_referenced(v: &View, before: &View, keys: &[String]) -> Result<Vec<String>> {
+    userdefs::in_world(v, || {
+        let tables = schemas(v)?;
+        let mut cache = HashMap::new();
+        let mut out = vec![];
+        for k in keys {
+            let Some((tn, id)) = k.split_once('/') else { continue };
+            if crate::reserved_table(tn) || !tables.iter().any(|c| c.fks.iter().any(|f| f.table == tn)) {
+                continue;
+            }
+            if left_referencing(v, before, &tables, tn, id, false, &mut cache)?.is_some() {
+                out.push(k.clone());
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// A row of `v` that references row `id` of `tn` by values that row had in `before` and has no more in `v` (deleted,
+/// or a value a foreign key to a UNIQUE constraint names changed and no other row took it), as (its table, the
+/// foreign key, its id). With `unique_only`, only foreign keys to UNIQUE constraints are followed. `cache`: tables as
+/// `before` and `v` have them.
+fn left_referencing(
+    v: &View,
+    before: &View,
+    tables: &[Table],
+    tn: &str,
+    id: &str,
+    unique_only: bool,
+    cache: &mut HashMap<String, (Option<Table>, Option<Table>)>,
+) -> Result<Option<(String, String, String)>> {
+    let k = row_key(tn, id);
+    let Some(raw) = before.get(&k)? else { return Ok(None) };
+    if !cache.contains_key(tn) {
+        cache.insert(tn.to_string(), (load(before, tn)?, load(v, tn)?));
+    }
+    let (Some(old_t), new_t) = &cache[tn] else { return Ok(None) };
+    let old = decode_raw(old_t, id, &raw, None)?;
+    let now = match (v.get(&k)?, new_t) {
+        (Some(r), Some(t)) => Some((decode_raw(t, id, &r, None)?, t)),
+        _ => None,
+    };
+    for child in tables {
+        for f in child.fks.iter().filter(|f| f.table == tn && (!unique_only || !f.refs.is_empty())) {
+            let x: Vec<Value> = if f.refs.is_empty() {
+                if now.is_some() {
+                    continue; // the row is there, so is its key
+                }
+                match key_values(old_t, id)? {
+                    Some(x) => x,
+                    None => continue,
+                }
+            } else {
+                let x: Vec<Value> = ref_cols(old_t, f).into_iter().map(|i| old[i].clone()).collect();
+                if x.len() != f.refs.len() || x.contains(&Value::Null) {
+                    continue;
+                }
+                if let Some((vals, t)) = &now
+                    && ref_cols(t, f).into_iter().map(|i| vals[i].clone()).eq(x.iter().cloned())
+                {
+                    continue;
+                }
+                // (another row holds them now: a unique value changed hands, and references to it still hold)
+                let get = |k: &str| -> Result<Option<String>> { Ok(v.get(k)?.map(|x| x.to_string())) };
+                if fk_parent_any(v, new_t.as_ref(), f, &x, &get)?.is_some() {
+                    continue;
+                }
+                // (the reference entries hold the values as the referencing columns have them)
+                (x.into_iter().zip(&f.cols))
+                    .map(|(val, c)| match position(child, *c) {
+                        Some(i) => coerce(val, child.cols[i].ty),
+                        None => Ok(val),
+                    })
+                    .collect::<Result<_>>()?
+            };
+            if let Some(r) = v.prefix(&ref_prefix(child, f, &x))?.next() {
+                let (rk, _) = r?;
+                let cid = rk.rsplit('/').next().unwrap_or_default().to_string();
+                return Ok(Some((child.name.clone(), f.name.clone(), cid)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Every row of `v` that breaks a constraint of its table (NOT NULL, UNIQUE, FOREIGN KEY, CHECK), as a line naming the
+/// row, the constraint and how. A merge made before merges checked them all could have left one (see `recheck_merge`):
+/// VERIFY DATABASE lists them.
+pub(crate) fn violations(v: &View) -> Result<Vec<String>> {
+    userdefs::in_world(v, || {
+        let mut out = vec![];
+        for t in schemas(v)?.iter().filter(|t| t.schema && t.matview.is_none()) {
+            let checks: Vec<(&str, Expr)> = (bound_checks(t)?.into_iter())
+                .filter(|(n, _)| t.checks.iter().any(|c| c.name == *n && c.valid))
+                .collect();
+            let fks: Vec<&Fk> = t.fks.iter().filter(|f| f.valid && !t.ri_off.contains(&f.name)).collect();
+            let parents: Vec<Option<Table>> = fks.iter().map(|f| load(v, &f.table)).collect::<Result<_>>()?;
+            let uniques: Vec<&Unique> = t.uniques.iter().filter(|u| uniq_index(t, u).is_none()).collect();
+            let mut held: Vec<HashMap<String, String>> = vec![HashMap::new(); uniques.len()];
+            let prefix = format!("{}/", t.name);
+            for r in v.prefix(&prefix)? {
+                let (k, raw) = r?;
+                let id = &k[prefix.len()..];
+                let row = format!("{}/{}", t.name, show_id(id));
+                let vals = match decode_raw(t, id, &raw, None) {
+                    Ok(vals) => vals,
+                    Err(e) => {
+                        out.push(format!("{row}: can't be read: {}", e.message));
+                        continue;
+                    }
+                };
+                for (i, c) in t.cols.iter().enumerate() {
+                    if vals[i] == Value::Null && (c.not_null || t.in_key(i)) {
+                        out.push(format!("{row}: a null in column \"{}\", which is NOT NULL", c.name));
+                    }
+                }
+                for (u, held) in uniques.iter().zip(&mut held) {
+                    let Some(key) = uniq_key(t, u, &vals) else { continue };
+                    if let Some(other) = held.insert(key, id.to_string()) {
+                        out.push(format!(
+                            "{row}: the same values as {}/{} for unique constraint \"{}\"",
+                            t.name,
+                            show_id(&other),
+                            u.name
+                        ));
+                    }
+                }
+                for (f, parent) in fks.iter().zip(&parents) {
+                    if mixes_nulls(t, f, &vals) {
+                        out.push(format!("{row}: foreign key {} mixes null and non-null values (MATCH FULL)", f.name));
+                        continue;
+                    }
+                    let Some(x) = fk_vals(t, f, &vals) else { continue };
+                    let get = |k: &str| -> Result<Option<String>> { Ok(v.get(k)?.map(|x| x.to_string())) };
+                    if fk_parent_any(v, parent.as_ref(), f, &x, &get)?.is_none() {
+                        let shown: Vec<String> = x.iter().map(Value::to_text).collect();
+                        out.push(format!(
+                            "{row}: foreign key {} references {} ({}), which has no such row",
+                            f.name,
+                            f.table,
+                            shown.join(", ")
+                        ));
+                    }
+                }
+                if let Err(e) = check_row(t, &checks, id, &vals) {
+                    out.push(format!("{row}: {}", e.message));
+                }
+            }
+        }
+        Ok(out)
+    })
 }
 
 /// Postgres's makeObjectName: `name1_name2_label`, cut to fit in 63 bytes by cutting the longer of the two names
@@ -31213,7 +32226,7 @@ fn scan(
 
 /// Whether a dry run's plan shows row `p`: a table's row, or a table, view or sequence itself.
 fn shown_planned(p: &crate::Planned) -> bool {
-    !p.key.starts_with("_sonos_") || p.key.starts_with(SCHEMAS) || schema_object(&p.key)
+    !p.key.starts_with("_sonos_") || p.key.starts_with(SCHEMAS) || schema_object(&p.key) || merged_object(&p.key)
 }
 
 /// Whether the merge planned deletes row `p` from the world it merges into.
@@ -31282,6 +32295,95 @@ pub fn summary(counts: impl IntoIterator<Item = (String, Counts)>) -> String {
         .map(|(t, c)| format!("{}: {}", shown_name(t), counts_line(c)))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// EXPLAIN MERGE WORLD w: what its merge would do and why, a row each (section, item, detail): its counts, conflicts,
+/// what blocks it, the merge policy's verdict and reasons (judged as its owner's merge, or the acting agent's), what
+/// reads the columns it changes (DIFF ... READERS), the effects it would queue, its evidence and scope, and the
+/// certificate a proposal made now would carry.
+fn explain_merge(db: &Db, w: &str) -> Result<Vec<Vec<Value>>> {
+    let world = db.world(w)?;
+    let merge_as = db.merge_as(&world);
+    let plan = db.preview_as(&world.name, None, &merge_as)?;
+    let reads = db.reads_of(&world.name);
+    let (cert, parts) = db.certificate(&world.name, None, &merge_as, &reads)?;
+    let mut rows: Vec<Vec<Value>> = vec![];
+    let mut line = |section: &str, item: String, detail: String| {
+        let t = |s: String| if s.is_empty() { Value::Null } else { Value::Text(crate::agents::for_caller(&s)) };
+        rows.push(vec![Value::Text(section.into()), t(item), t(detail)]);
+    };
+    line(
+        "certificate",
+        cert,
+        "what a proposal made now is bound to: every row it changes (the database's own too), its read set, evidence, \
+         scope and merge policy"
+            .into(),
+    );
+    for (t, c) in plan_counts(&plan.rows) {
+        line("counts", shown_name(&t), counts_line(&c));
+    }
+    for p in plan.rows.iter().filter(|p| p.outcome == "conflict") {
+        line("conflict", show_key(&p.key).into_owned(), p.detail.clone());
+    }
+    let (verdict, _) = crate::Core::verdict(&plan);
+    line("policy", plan.policy.clone().unwrap_or_else(|| "none".into()), verdict.into());
+    for r in &plan.reasons {
+        line("reason", String::new(), r.clone());
+    }
+    if let Some(b) = &plan.blocked {
+        line("blocked", String::new(), b.clone());
+    }
+    let found = impact(db, &world.name, &db.diff(&world.name)?)?;
+    for r in found.readers {
+        let detail = format!(
+            "{} reads {}.{}{}{}",
+            r.kind,
+            shown_name(&r.table),
+            r.columns.join(", "),
+            if r.critical { " (critical)" } else { "" },
+            if r.detail.is_empty() { String::new() } else { format!(": {}", r.detail) }
+        );
+        line("reader", r.name, detail);
+    }
+    for e in db.world_effects(&world.name)? {
+        line("effect", e.channel, e.payload);
+    }
+    for e in parts["evidence"].as_array().into_iter().flatten() {
+        let s = |k: &str| e[k].as_str().unwrap_or_default().to_string();
+        let d = [s("uri"), s("sha256"), s("note"), format!("by {}", s("by"))]
+            .into_iter()
+            .filter(|x| !x.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        line("evidence", s("kind"), d);
+    }
+    if !parts["scope"].is_null() {
+        line("scope", String::new(), parts["scope"].to_string());
+    }
+    Ok(rows)
+}
+
+/// A proposal as PROPOSE MERGE and SHOW PROPOSALS give it (see `proposals`).
+fn proposal_row(p: &Json) -> Vec<Value> {
+    let s = |k: &str| p[k].as_str().map_or(Value::Null, |s| Value::Text(s.to_string()));
+    let reasons: Vec<String> = p["reasons"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.as_str().map(crate::agents::for_caller))
+        .collect();
+    vec![
+        s("id"),
+        s("world"),
+        s("target"),
+        s("proposer"),
+        s("status"),
+        s("verdict"),
+        if reasons.is_empty() { Value::Null } else { Value::Text(reasons.join("; ")) },
+        s("certificate"),
+        Value::Json(p["approvals"].clone()),
+        p["created"].as_u64().map_or(Value::Null, |t| Value::TimestampTz(t as i64 * 1000)),
+    ]
 }
 
 /// What a merge plan does per table (rows it would change in the world merged into; conflicts aren't changes yet).
@@ -38516,12 +39618,21 @@ impl Session {
                 me.fork(&from, name, meta.clone())?;
                 return Ok((Some(Output::tag(format!("CREATE {noun}"))), me.agent));
             }
-            Stmt::UseBranch(..) => me.may_read(&self.branch)?,
+            // the world it switches to (rule T4, decision 3): refused here, not at its first read
+            Stmt::UseBranch(b, _) => me.may_read(b)?,
             // the statement it runs is checked when it runs; its arguments, worked out first, here (nextval, lo_create)
             Stmt::Execute { .. } if safe::side_effects(&s.0) => me.may_write(&self.branch, 0)?,
             Stmt::Execute { .. } => {}
             Stmt::CreateDatabase(_) | Stmt::DropDatabase { .. } => me.may_admin()?, // worlds with no owner
+            Stmt::AssignWorld { .. } => me.may_admin()?, // a person's or an admin's call (rule T3)
             Stmt::Simulate(_) | Stmt::Replay { .. } => {} // checked as it runs: its worlds are the agent's
+            // objectives rank every agent's worlds, as merge checks judge them: for those who manage the database
+            Stmt::WorldSet(op)
+                if matches!(**op, crate::SetStmt::CreateObjective { .. } | crate::SetStmt::DropObjective(_)) =>
+            {
+                me.may_admin()?
+            }
+            Stmt::WorldSet(_) => {} // checked as it runs, world by world
             // (a rehearsal writes to Postgres, locking the rows, if only to roll back: as a merge's)
             // chunks split one merge into many, each under the policy's max_rows: for those who may do anything
             Stmt::MergeBranch { chunks: Some(_), .. } => me.may_admin()?,
@@ -38535,22 +39646,55 @@ impl Session {
             Stmt::DropBranch { name, .. } | Stmt::AlterWorld { name, .. } => me.may_manage(name)?,
             Stmt::Checkpoint { world, .. } if world.is_empty() => me.may_admin()?,
             Stmt::Checkpoint { world, .. } => me.may_manage(world)?,
+            // checked as they run: a grantor's rights on the world, a world's owner (see `lifecycle`)
+            Stmt::GrantWorld { .. } | Stmt::TransferWorld { .. } => {}
             Stmt::Restore { world, .. } => me.may_restore(world)?,
             Stmt::UndoMerge { .. } | Stmt::UndoMergeIds { .. } | Stmt::UndoAgent { .. } | Stmt::UndoDiff { .. } => {
                 me.may_undo()?
             }
             Stmt::ReviewWorld { .. } => {} // checked as it runs: the policy's reviewer, or an admin
+            // certified merges (see `proposals`): evidence is a change to the world; a proposal, a merge's first step
+            Stmt::AttachEvidence { world: w, .. } => me.may_write(w, 0)?,
+            Stmt::ProposeMerge { world: w, into: Some(into) } => me.may_merge_into(w, into)?,
+            Stmt::ProposeMerge { world: w, .. } => me.may_merge(w)?,
+            Stmt::ExplainMerge(name) => me.may_see_changes(&world(name))?,
+            // checked as they run: the proposer, the policy's reviewer, an admin; never an agent its own approval
+            Stmt::WithdrawProposal(_) | Stmt::DecideProposal { .. } | Stmt::MergeProposal(_) => {}
+            Stmt::ShowProposals => me.may_list_all("SHOW PROPOSALS")?,
+            Stmt::ShowProvenance { .. } => me.may_list_all("SHOW DECISION PROVENANCE")?,
+            // its own worlds' tombstones; every agent's are for those who manage agents
+            Stmt::ShowTombstones(Some(a)) if *a == me.agent.name => {}
+            Stmt::ShowTombstones(_) => me.may_admin()?,
             // checked as they run: 'outbox' or 'admin', policy or not
-            Stmt::AckOutbox(_) | Stmt::RetryOutbox(_) | Stmt::ClaimOutbox { .. } => {}
+            // main's outbox and the review channel carry every tenant's payloads: not for an agent held to one
+            // (an outbox worker without 'read' keeps working its queue: only the tenant is checked here)
+            Stmt::AckOutbox(_) | Stmt::RetryOutbox(_) | Stmt::ClaimOutbox { .. } | Stmt::ShowOutbox => {
+                me.not_tenant("work main's outbox, which holds every tenant's effects")?
+            }
+            Stmt::Listen(c) if c == crate::agents::REVIEW_CHANNEL => {
+                me.not_tenant("listen on the review channel, which names every tenant's held worlds")?
+            }
+            Stmt::ShowStorage(Some(w)) => me.may_read(w)?,
             Stmt::Rebase { name, .. } => me.may_write(&world(name), 0)?, // it changes the world only
             Stmt::CheckReads(name) => me.may_see_changes(&world(name))?, // it reads only
-            // changes shown as rows, whatever tenant they are (see `Acting::may_see_changes`)
-            Stmt::Diff(a, b, ..) | Stmt::Readers(a, b) => {
-                me.may_see_changes(&world(a))?;
-                if let Some(b) = b {
-                    me.may_see_changes(b)?;
+            Stmt::WorldState { world, .. } => me.may_see_changes(world)?, // it reads only
+            Stmt::Forecast(Some(name)) => me.may_see_changes(name)?,
+            Stmt::Forecast(None) => me.may_list_all("FORECAST CONFLICTS")?,
+            Stmt::Consolidate { name, preview: true, .. } => me.may_see_changes(name)?,
+            // the coordinator's, and a merge of each child it takes
+            Stmt::Consolidate { name, only, .. } => {
+                me.may_manage(name)?;
+                for w in db.worlds().into_iter().filter(|w| w.parent.as_deref() == Some(name.as_str())) {
+                    if only.is_empty() || only.contains(&w.name) {
+                        me.may_merge(&w.name)?;
+                    }
                 }
             }
+            // changes shown as rows, whatever tenant they are (see `Acting::may_see_changes`)
+            Stmt::Diff(a, b, ..) | Stmt::Readers(a, b) => match b {
+                Some(b) => me.may_see_between(&world(a), b)?,
+                None => me.may_see_changes(&world(a))?,
+            },
             Stmt::ShowHistory { world: w, .. } => match w {
                 Some(w) => me.may_see_changes(w)?,
                 None => me.may_list_all("SHOW HISTORY")?,
@@ -38577,6 +39721,26 @@ impl Session {
             // what the views it reads call counts too
             _ => match s.access_in(db, self.target()) {
                 Reach::Read => me.may_read(&self.branch)?,
+                // a read of main that calls functions, or a transaction's control, by an agent held to a tenant: a
+                // read (main is read-only to it, and any row written there is refused where main's rows are written,
+                // `Core::guard_main`)
+                Reach::Write
+                    if me.agent.tenant.is_some()
+                        && (safe::access(&s.0) == Reach::Read
+                            || matches!(
+                                s.0,
+                                Stmt::Begin
+                                    | Stmt::BeginRead(_)
+                                    | Stmt::Commit
+                                    | Stmt::Rollback
+                                    | Stmt::Savepoint(_)
+                                    | Stmt::Release(_)
+                                    | Stmt::RollbackTo(_)
+                            ))
+                        && db.world(&self.branch).is_ok_and(|w| w.name == crate::MAIN) =>
+                {
+                    me.may_read(&self.branch)?
+                }
                 Reach::Write => me.may_write(&self.branch, 0)?, // a transaction's hidden world is the session's
                 Reach::World => me.may_admin()?,
             },
@@ -39769,6 +40933,10 @@ impl Session {
         }
         let top = outer.0;
         drop(outer);
+        if top {
+            // a durable world's read set on disk before the answer goes out (see `durable`)
+            db.persist_reads(&self.branch);
+        }
         if !lent.is_empty() {
             let mut st = self.state.lock().unwrap();
             for n in lent {
@@ -41288,25 +42456,35 @@ impl Session {
             | Stmt::DropBranch { .. }
             | Stmt::MergeBranch { .. }
             | Stmt::Rebase { .. }
+            | Stmt::Consolidate { .. }
             | Stmt::CheckReads(_)
             | Stmt::AlterWorld { .. }
+            | Stmt::GrantWorld { .. }
+            | Stmt::TransferWorld { .. }
             | Stmt::Restore { .. }
             | Stmt::UndoMerge { .. }
             | Stmt::UndoMergeIds { .. }
             | Stmt::UndoAgent { .. }
             | Stmt::UndoDiff { .. }
             | Stmt::ReviewWorld { .. }
+            | Stmt::AttachEvidence { .. }
+            | Stmt::ProposeMerge { .. }
+            | Stmt::WithdrawProposal(_)
+            | Stmt::DecideProposal { .. }
+            | Stmt::MergeProposal(_)
             | Stmt::SetRetention(_)
             | Stmt::SetSync(_)
             | Stmt::SetShipping(..)
             | Stmt::Simulate(_)
             | Stmt::Replay { .. }
+            | Stmt::WorldSet(_)
             | Stmt::SetSystem(..)
                 if in_tx =>
             {
                 no_tx()
             }
             Stmt::Simulate(_) | Stmt::Replay { .. } => s.simulate(db, &self.branch, self.agent.as_deref()),
+            Stmt::WorldSet(_) => s.world_set(db, &self.branch, self.agent.as_deref()),
             Stmt::DropBranch { name, cascade: true, .. } => {
                 // the session's world may be in the tree: then it carries on from the tree's parent
                 let parent = db.world(name).ok().and_then(|w| w.parent);
@@ -42157,6 +43335,133 @@ impl Statement {
         }
     }
 
+    /// A world set statement (see `crate::worldsets`), from `branch`, as `agent` if any.
+    fn world_set(&self, db: &Db, _branch: &str, agent: Option<&str>) -> Result<Output> {
+        use crate::SetStmt as S;
+        use Value::*;
+        let Stmt::WorldSet(op) = &self.0 else { unreachable!("only world set statements") };
+        let columns = self.columns(db, _branch, &[])?;
+        let text = |t: Option<String>| t.map_or(Null, Text);
+        let out = |tag: String, rows: Vec<Vec<Value>>| -> Result<Output> {
+            Ok(Output { typmods: vec![], tag, columns: columns.clone(), rows })
+        };
+        let ranked = |r: Vec<crate::RankedWorld>| -> Vec<Vec<Value>> {
+            r.into_iter()
+                .map(|r| {
+                    let scores = serde_json::Value::from(r.values.clone()).to_string();
+                    let first = r.values.first().copied().flatten().map_or(Null, Float);
+                    let reason = (!r.reasons.is_empty()).then(|| r.reasons.join("; "));
+                    vec![
+                        Text(r.world),
+                        Int(r.rank as i64),
+                        first,
+                        Text(scores),
+                        Bool(r.failed),
+                        text(reason),
+                        Bool(r.kept),
+                    ]
+                })
+                .collect()
+        };
+        match &**op {
+            S::Create { set, base, max_live } => {
+                db.create_world_set(set, base, *max_live, agent)?;
+                Ok(Output::tag("CREATE WORLD SET"))
+            }
+            S::Fork(spec) => {
+                let mut spec = spec.clone();
+                spec.agent = agent.map(String::from);
+                let rows: Vec<Vec<Value>> = db
+                    .fork_world_set(&spec)?
+                    .into_iter()
+                    .map(|m| {
+                        let index = m.index.map_or(Null, |i| Int(i as i64));
+                        vec![Text(m.name), Text(m.id), index, m.seed.map_or(Null, Int), text(m.error)]
+                    })
+                    .collect();
+                out(format!("FORK WORLD SET {}", rows.len()), rows)
+            }
+            S::Adopt { world, set } => {
+                db.adopt_world(world, set, agent)?;
+                Ok(Output::tag("ADOPT WORLD"))
+            }
+            S::Compare { a, b, summary } => {
+                let c = db.compare_worlds(a, b, agent)?;
+                let split =
+                    |k: &str| k.split_once('/').map_or((k.to_string(), String::new()), |(t, r)| (t.into(), r.into()));
+                if !summary {
+                    let json =
+                        |v: Option<String>| v.map_or(Null, |s| Json(serde_json::from_str(&s).unwrap_or(s.into())));
+                    let rows: Vec<Vec<Value>> = c
+                        .rows
+                        .into_iter()
+                        .map(|d| {
+                            let (t, k) = split(&d.key);
+                            vec![Text(t), Text(k), json(d.a), json(d.b)]
+                        })
+                        .collect();
+                    let mut o = out(format!("COMPARE {}", rows.len()), rows)?;
+                    // rows as they are in either world: masked as DIFF's are
+                    if mask::on() {
+                        mask::output(&[&db.view_tx(a)?, &db.view_tx(b)?], &mut o)?;
+                    }
+                    return Ok(o);
+                }
+                let mut tables: std::collections::BTreeMap<String, [i64; 3]> = Default::default();
+                for d in &c.rows {
+                    tables.entry(split(&d.key).0).or_default()[2] += 1;
+                }
+                if let Some((ka, kb)) = &c.changed {
+                    for (i, keys) in [ka, kb].into_iter().enumerate() {
+                        for k in keys {
+                            tables.entry(split(k).0).or_default()[i] += 1;
+                        }
+                    }
+                }
+                let known = c.changed.is_some();
+                let rows: Vec<Vec<Value>> = tables
+                    .into_iter()
+                    .map(|(t, [x, y, d])| {
+                        let n = |v: i64| if known { Int(v) } else { Null };
+                        vec![Text(t), n(x), n(y), Int(d)]
+                    })
+                    .collect();
+                out(format!("COMPARE {}", rows.len()), rows)
+            }
+            S::Rank { set, metrics, checks } => {
+                let rows = ranked(db.rank_world_set(set, metrics, checks.as_deref(), agent)?);
+                out(format!("RANK {}", rows.len()), rows)
+            }
+            S::Prune { set, rule } => {
+                let rows: Vec<Vec<Value>> =
+                    db.prune_world_set(set, *rule, agent)?.into_iter().map(|w| vec![Text(w)]).collect();
+                out(format!("PRUNE {}", rows.len()), rows)
+            }
+            S::MergeBest { set, into, dry } => {
+                let rows: Vec<Vec<Value>> = db
+                    .merge_best(set, into, *dry, agent)?
+                    .into_iter()
+                    .map(|(w, what, n)| vec![Text(w), Text(what), Int(n as i64)])
+                    .collect();
+                out("MERGE BEST".into(), rows)
+            }
+            S::CreateObjective { name, query, minimize, checks, replace } => {
+                db.create_objective(name, query, *minimize, checks, *replace)?;
+                Ok(Output::tag("CREATE OBJECTIVE"))
+            }
+            S::DropObjective(name) => {
+                db.drop_objective(name)?;
+                Ok(Output::tag("DROP OBJECTIVE"))
+            }
+            S::Optimize(spec) => {
+                let mut spec = spec.clone();
+                spec.agent = agent.map(String::from);
+                let rows = ranked(db.optimize(&spec)?);
+                out(format!("OPTIMIZE {}", rows.len()), rows)
+            }
+        }
+    }
+
     /// What kind of work it is, for metrics.
     fn op(&self) -> crate::metrics::Op {
         use crate::metrics::Op;
@@ -42238,7 +43543,8 @@ impl Statement {
 
     fn params_here(&self, db: &Db, branch: &str, given: &[Option<Type>]) -> Result<Vec<Type>> {
         if let Some(s) = self.catalog(db, branch, None)? {
-            return s.params(db, branch, given);
+            // its row security is in: added again, a tenant's filter would be added without end (see `execute_here`)
+            return rls::skipping(true, || s.params(db, branch, given));
         }
         if let Stmt::Explain { stmt: query, .. } | Stmt::Declare { query, .. } = &self.0 {
             return Statement((**query).clone(), PlanCache::default(), self.2).params(db, branch, given);
@@ -42456,7 +43762,8 @@ impl Statement {
         types: &[Type],
     ) -> Result<Option<(Columns, Vec<Option<(u32, i32)>>)>> {
         if let Some(s) = self.catalog(db, branch, None)? {
-            return s.columns_typed(db, branch, types);
+            // its row security is in already (see `params_here`)
+            return rls::skipping(true, || s.columns_typed(db, branch, types));
         }
         if self.2 {
             // RETURNING f(x): its type is f's, where the call can be found already
@@ -42486,6 +43793,7 @@ impl Statement {
                     ("active", Type::TimestampTz),
                     ("pinned", Type::Bool),
                     ("scope", Type::Json),
+                    ("tenant_status", Type::Text),
                 ]);
             }
             Stmt::ShowHistory { .. } => {
@@ -42511,7 +43819,11 @@ impl Statement {
             Stmt::ShowShipping => return fixed(&[("wal_shipping", Type::Text)]),
             Stmt::ShowShippingDelay => return fixed(&[("wal_shipping_delay", Type::Text)]),
             Stmt::ShowSystem(crate::Setting::WorldIdleTtl) => return fixed(&[("world_idle_ttl", Type::Interval)]),
-            Stmt::ShowSystem(k @ (crate::Setting::ProtectMain | crate::Setting::OutboxKeepPayloads)) => {
+            Stmt::ShowSystem(
+                k @ (crate::Setting::ProtectMain
+                | crate::Setting::OutboxKeepPayloads
+                | crate::Setting::AgentDefaultRead),
+            ) => {
                 return fixed(&[(k.name(), Type::Text)]);
             }
             Stmt::ShowSystem(k) => return fixed(&[(k.name(), Type::BigInt)]),
@@ -42536,6 +43848,44 @@ impl Statement {
                     ("kept", Type::Bool),
                 ]);
             }
+            Stmt::WorldSet(op) => {
+                use crate::SetStmt as S;
+                return match &**op {
+                    S::Fork(_) => fixed(&[
+                        ("world", Type::Text),
+                        ("id", Type::Text),
+                        ("index", Type::BigInt),
+                        ("seed", Type::BigInt),
+                        ("error", Type::Text),
+                    ]),
+                    S::Compare { summary: false, .. } => fixed(&[
+                        ("table", Type::Text),
+                        ("key", Type::Text),
+                        ("a_value", Type::Json),
+                        ("b_value", Type::Json),
+                    ]),
+                    S::Compare { summary: true, .. } => fixed(&[
+                        ("table", Type::Text),
+                        ("a_changed", Type::BigInt),
+                        ("b_changed", Type::BigInt),
+                        ("differing", Type::BigInt),
+                    ]),
+                    S::Rank { .. } | S::Optimize(_) => fixed(&[
+                        ("world", Type::Text),
+                        ("rank", Type::BigInt),
+                        ("score", Type::Float),
+                        ("scores", Type::Text),
+                        ("failed", Type::Bool),
+                        ("reason", Type::Text),
+                        ("kept", Type::Bool),
+                    ]),
+                    S::Prune { .. } => fixed(&[("world", Type::Text)]),
+                    S::MergeBest { .. } => {
+                        fixed(&[("world", Type::Text), ("action", Type::Text), ("rows", Type::BigInt)])
+                    }
+                    S::Create { .. } | S::Adopt { .. } | S::CreateObjective { .. } | S::DropObjective(_) => Ok(None),
+                };
+            }
             Stmt::Replay { .. } => {
                 return fixed(&[
                     ("world", Type::Text),
@@ -42548,7 +43898,16 @@ impl Statement {
                 ]);
             }
             Stmt::Verify => {
-                return fixed(&[("pages", Type::BigInt), ("bytes", Type::BigInt), ("log_records", Type::BigInt)]);
+                return fixed(&[
+                    ("pages", Type::BigInt),
+                    ("bytes", Type::BigInt),
+                    ("log_records", Type::BigInt),
+                    ("world", Type::Text),
+                    ("problem", Type::Text),
+                ]);
+            }
+            Stmt::VerifyLedger => {
+                return fixed(&[("seq", Type::BigInt), ("ok", Type::Bool), ("detail", Type::Text)]);
             }
             Stmt::ShowMetrics => {
                 let ms = |n: &'static str| (n, Type::Float);
@@ -42564,6 +43923,9 @@ impl Statement {
             }
             Stmt::CreateAgent { .. } | Stmt::RotateAgentToken(_) => {
                 return fixed(&[("name", Type::Text), ("id", Type::Text), ("token", Type::Text)]);
+            }
+            Stmt::TransferWorld { .. } => {
+                return fixed(&[("world", Type::Text), ("owner", Type::Text), ("epoch", Type::BigInt)]);
             }
             Stmt::ShowAgentPrivileges { .. } => return fixed(&agentprivs::COLUMNS),
             Stmt::ShowAgents | Stmt::AlterAgent { .. } => {
@@ -42629,6 +43991,7 @@ impl Statement {
                     ("canary_wait", Type::Interval),
                     ("effects_delay", Type::Interval),
                     ("max_unusual", Type::BigInt),
+                    ("require_evidence", Type::Text),
                 ]);
             }
             Stmt::ShowChecks | Stmt::CreateCheck { .. } => {
@@ -42687,6 +44050,79 @@ impl Statement {
                 ]);
             }
             Stmt::CheckReads(_) => return fixed(&[("checked_against", Type::Text), ("changed", Type::Text)]),
+            Stmt::WorldState { .. } => {
+                return fixed(&[
+                    ("world", Type::Text),
+                    ("version", Type::BigInt),
+                    ("epoch", Type::BigInt),
+                    ("durable", Type::Bool),
+                    ("flagged", Type::Bool),
+                    ("check_reads", Type::Bool),
+                    ("stale_reads", Type::Text),
+                    ("parent_changes", Type::BigInt),
+                    ("token", Type::Text),
+                ]);
+            }
+            Stmt::Forecast(_) => {
+                return fixed(&[
+                    ("world_a", Type::Text),
+                    ("world_b", Type::Text),
+                    ("kind", Type::Text),
+                    ("table", Type::Text),
+                    ("key", Type::Text),
+                    ("combinable", Type::Bool),
+                ]);
+            }
+            Stmt::Consolidate { preview: true, .. } => {
+                return fixed(&[
+                    ("world", Type::Text),
+                    ("table", Type::Text),
+                    ("key", Type::Text),
+                    ("outcome", Type::Text),
+                    ("detail", Type::Text),
+                ]);
+            }
+            Stmt::ProposeMerge { .. } | Stmt::ShowProposals => {
+                return fixed(&[
+                    ("id", Type::Text),
+                    ("world", Type::Text),
+                    ("target", Type::Text),
+                    ("proposer", Type::Text),
+                    ("status", Type::Text),
+                    ("verdict", Type::Text),
+                    ("reasons", Type::Text),
+                    ("certificate", Type::Text),
+                    ("approvals", Type::Json),
+                    ("created", Type::TimestampTz),
+                ]);
+            }
+            Stmt::ExplainMerge(_) => {
+                return fixed(&[("section", Type::Text), ("item", Type::Text), ("detail", Type::Text)]);
+            }
+            Stmt::ShowProvenance { .. } => {
+                return fixed(&[
+                    ("step", Type::Text),
+                    ("at", Type::TimestampTz),
+                    ("by", Type::Text),
+                    ("detail", Type::Text),
+                ]);
+            }
+            Stmt::ShowTombstones(_) => {
+                return fixed(&[
+                    ("id", Type::Text),
+                    ("world", Type::Text),
+                    ("owner", Type::Text),
+                    ("kind", Type::Text),
+                    ("run_id", Type::Text),
+                    ("parent", Type::Text),
+                    ("born", Type::TimestampTz),
+                    ("depth", Type::BigInt),
+                    ("digest", Type::Text),
+                    ("counts", Type::Text),
+                    ("reasons", Type::Text),
+                    ("at", Type::TimestampTz),
+                ]);
+            }
             Stmt::ShowReviews => {
                 return fixed(&[
                     ("world", Type::Text),
@@ -43029,6 +44465,11 @@ impl Statement {
 
     fn run_here(&self, x: &Exec, branch: &str, params: &[Value]) -> Result<Output> {
         let db = x.db;
+        // (an agent held to a tenant changes no definition its tenant's rows are held by or that other tenants
+        // share: see `tenant_ddl_refused`)
+        if rls::tenant().is_some() {
+            tenant_ddl_refused(x, &self.0)?;
+        }
         match &self.0 {
             // (`execute` has looked its schemas up and runs what it holds)
             Stmt::InSchemas { stmt, .. } => {
@@ -43219,6 +44660,9 @@ impl Statement {
                     crate::Setting::ProtectMain | crate::Setting::OutboxKeepPayloads => {
                         Value::Text(if v == 0 { "off" } else { "on" }.into())
                     }
+                    crate::Setting::AgentDefaultRead => {
+                        Value::Text(if v == 0 { "read_own,read_main" } else { "read" }.into())
+                    }
                     _ => Value::Int(v as i64),
                 };
                 let columns = self.columns(db, branch, &[])?;
@@ -43378,6 +44822,14 @@ impl Statement {
                     r => r.map(|_| Output::tag(format!("DROP {noun}"))).map_err(Into::into),
                 }
             }
+            Stmt::AssignWorld { name, tenant, including_untenanted, reason } => {
+                let to = match tenant {
+                    Some(t) => crate::AssignTo::Tenant(crate::scope_tenant(&Json::String(t.clone()))?),
+                    None => crate::AssignTo::Global,
+                };
+                let done = db.assign_world(name, to, *including_untenanted, reason)?;
+                Ok(Output::tag(format!("ASSIGN WORLD {}", done.len())))
+            }
             Stmt::ShowWorlds | Stmt::AlterWorld { .. } => {
                 let worlds = match &self.0 {
                     Stmt::AlterWorld { name, ttl: Some(ttl), .. } => {
@@ -43385,13 +44837,14 @@ impl Statement {
                     }
                     Stmt::AlterWorld { name, pin: Some(pin), .. } => vec![db.pin(&db.world(name)?.name, *pin)?],
                     Stmt::AlterWorld { name, meta, .. } => vec![db.set_meta(&db.world(name)?.name, meta.clone())?],
-                    _ => db.worlds().into_iter().filter(|w| !w.name.starts_with(TX_PREFIX)).collect(),
+                    _ => db.visible_worlds().into_iter().filter(|w| !w.name.starts_with(TX_PREFIX)).collect(),
                 };
                 let rows: Vec<Vec<Value>> = worlds
                     .into_iter()
                     .map(|w| {
                         let active =
                             if w.parent.is_none() { Value::Null } else { Value::TimestampTz(w.active as i64 * 1000) };
+                        let status = db.identity(&w.name).map_or("", |i| i.status());
                         vec![
                             Value::Text(w.name),
                             Value::Text(w.id),
@@ -43405,6 +44858,7 @@ impl Statement {
                             active,
                             Value::Bool(w.pinned),
                             w.scope.map_or(Value::Null, Value::Json),
+                            Value::Text(status.into()),
                         ]
                     })
                     .collect();
@@ -43463,6 +44917,7 @@ impl Statement {
                     into: into.as_deref().map(|y| db.world(y).map(|w| w.name)).transpose()?,
                     target: *target,
                     confirm_deletes: *confirm_deletes,
+                    operation: None,
                 };
                 if let Some(n) = chunks {
                     if *dry
@@ -43596,10 +45051,12 @@ impl Statement {
                 Ok(out)
             }
             Stmt::ShowBranches => {
+                // the same worlds SHOW WORLDS lists: an agent without `read` sees main and its own
+                let seen: std::collections::HashSet<String> = db.visible_worlds().into_iter().map(|w| w.name).collect();
                 let rows = db
                     .branches()
                     .into_iter()
-                    .filter(|(n, _)| !n.starts_with(TX_PREFIX))
+                    .filter(|(n, _)| !n.starts_with(TX_PREFIX) && seen.contains(n))
                     .map(|(n, p)| {
                         let changes = if p.is_some() {
                             Value::Int(db.diff(&n)?.iter().filter(|c| !internal(&c.key)).count() as i64)
@@ -43630,6 +45087,99 @@ impl Statement {
                 Ok(Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows })
             }
             Stmt::Simulate(_) | Stmt::Replay { .. } => self.simulate(db, branch, None),
+            Stmt::AttachEvidence { world, spec } => {
+                db.attach_evidence(world, spec)?;
+                Ok(Output::tag("ATTACH EVIDENCE"))
+            }
+            Stmt::ProposeMerge { world, into } => {
+                let p = db.propose_merge(world, into.as_deref())?;
+                let rows = vec![proposal_row(&p)];
+                let columns = self.columns(db, branch, &[])?;
+                Ok(Output { typmods: vec![], tag: "PROPOSE MERGE".into(), columns, rows })
+            }
+            Stmt::ShowProposals => {
+                let rows: Vec<Vec<Value>> = db.proposals()?.iter().map(proposal_row).collect();
+                let columns = self.columns(db, branch, &[])?;
+                Ok(Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows })
+            }
+            Stmt::WithdrawProposal(id) => {
+                db.withdraw_proposal(id)?;
+                Ok(Output::tag("WITHDRAW PROPOSAL"))
+            }
+            Stmt::DecideProposal { id, approve, reason } => {
+                let role = roles::current().map(|w| w.name.clone());
+                db.decide_proposal(id, *approve, reason, role.as_deref())?;
+                Ok(Output::tag(if *approve { "APPROVE PROPOSAL" } else { "REJECT PROPOSAL" }))
+            }
+            Stmt::MergeProposal(id) => {
+                let n = db.merge_proposal(id)?;
+                Ok(Output::tag(format!("MERGE PROPOSAL {n}")))
+            }
+            Stmt::ExplainMerge(name) => {
+                let rows = explain_merge(db, name.as_deref().unwrap_or(branch))?;
+                let columns = self.columns(db, branch, &[])?;
+                Ok(Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows })
+            }
+            Stmt::ShowProvenance { id, world } => {
+                let text = |s: String| if s.is_empty() { Value::Null } else { Value::Text(s) };
+                let rows: Vec<Vec<Value>> = db
+                    .provenance(id.as_deref(), world.as_deref())?
+                    .into_iter()
+                    .map(|(step, at, by, detail)| {
+                        vec![
+                            Value::Text(step),
+                            at.map_or(Value::Null, |t| Value::TimestampTz(t as i64 * 1000)),
+                            text(crate::agents::for_caller(&by)),
+                            text(crate::agents::for_caller(&detail)),
+                        ]
+                    })
+                    .collect();
+                let columns = self.columns(db, branch, &[])?;
+                Ok(Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows })
+            }
+            Stmt::ShowTombstones(agent) => {
+                let s = |j: &Json| match j {
+                    Json::Null => Value::Null,
+                    Json::String(s) => Value::Text(s.clone()),
+                    j => Value::Text(j.to_string()),
+                };
+                let time = |j: &Json| j.as_u64().map_or(Value::Null, |t| Value::TimestampTz(t as i64 * 1000));
+                let rows: Vec<Vec<Value>> = db
+                    .tombstones(agent.as_deref())?
+                    .iter()
+                    .map(|t| {
+                        let c = &t["counts"];
+                        let reasons: Vec<String> = t["reasons"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|r| r.as_str().map(crate::agents::for_caller))
+                            .collect();
+                        vec![
+                            s(&t["id"]),
+                            s(&t["world"]),
+                            s(&t["owner"]),
+                            s(&t["kind"]),
+                            s(&t["run_id"]),
+                            s(&t["parent"]),
+                            time(&t["born"]),
+                            t["depth"].as_u64().map_or(Value::Null, |d| Value::Int(d as i64)),
+                            s(&t["digest"]),
+                            Value::Text(format!(
+                                "{}, {} deleted, {} effects",
+                                crate::agents::n_rows(c["rows"].as_u64().unwrap_or(0)),
+                                c["deletes"].as_u64().unwrap_or(0),
+                                c["effects"].as_u64().unwrap_or(0)
+                            )),
+                            if reasons.is_empty() { Value::Null } else { Value::Text(reasons.join("; ")) },
+                            time(&t["at"]),
+                        ]
+                    })
+                    .collect();
+                let columns = self.columns(db, branch, &[])?;
+                Ok(Output { typmods: vec![], tag: format!("SELECT {}", rows.len()), columns, rows })
+            }
+            Stmt::WorldSet(_) => self.world_set(db, branch, None),
             Stmt::ReviewWorld { world, verdict, reason } => {
                 let n = db.decide_review(world, *verdict, reason)?;
                 Ok(Output::tag(match verdict {
@@ -43706,13 +45256,16 @@ impl Statement {
                 undone_notices(&u);
                 Ok(Output::tag(format!("UNDO AGENT {}", u.rows)))
             }
-            Stmt::Restore { world, at, checkpoint } => {
+            Stmt::Restore { world, at, checkpoint, rollback } => {
                 let w = db.world(world)?.name;
-                let t = match checkpoint {
-                    Some(label) => db.checkpoint_time(&w, label)?,
-                    None => when(at, params)?,
+                let n = match checkpoint {
+                    Some(label) => db.restore_checkpoint(&w, label)?, // from its pinned tree, if pinned still
+                    None => db.restore(&w, when(at, params)?)?,
                 };
-                Ok(Output::tag(format!("RESTORE {}", db.restore(&w, t)?)))
+                Ok(Output::tag(match rollback {
+                    true => format!("ROLLBACK WORLD {n}"),
+                    false => format!("RESTORE {n}"),
+                }))
             }
             // Postgres 16's CHECKPOINT: a superuser's, or a member of pg_checkpoint's (counted in
             // pg_stat_bgwriter.checkpoints_req)
@@ -43729,9 +45282,35 @@ impl Statement {
                 pgstat::checkpointed(&db.core);
                 Ok(Output::tag("CHECKPOINT"))
             }
-            Stmt::Checkpoint { world, label } => {
-                db.checkpoint_world(world, label)?;
+            Stmt::Checkpoint { world, label, pin } => {
+                match pin {
+                    Some(ms) => db.pin_checkpoint(world, label, *ms)?,
+                    None => db.checkpoint_world(world, label)?,
+                };
                 Ok(Output::tag("CHECKPOINT"))
+            }
+            Stmt::GrantWorld { grant: true, rights, world, agent, until } => {
+                db.grant_world(world, agent, rights, *until)?;
+                Ok(Output::tag("GRANT"))
+            }
+            Stmt::GrantWorld { rights, world, agent, .. } => {
+                db.revoke_world(world, agent, rights)?;
+                Ok(Output::tag("REVOKE"))
+            }
+            Stmt::TransferWorld { world, to } => {
+                let w = db.transfer_world(world, to)?;
+                let epoch = db.world_epoch(&w.name)?;
+                let columns = self.columns(db, branch, &[])?;
+                Ok(Output {
+                    typmods: vec![],
+                    tag: "TRANSFER WORLD".into(),
+                    columns,
+                    rows: vec![vec![
+                        Value::Text(w.name),
+                        w.owner.map_or(Value::Null, Value::Text),
+                        Value::Int(epoch as i64),
+                    ]],
+                })
             }
             Stmt::CreateAgent { name, spec } => {
                 let (a, token) = db.create_agent_with(name, &agent_spec(spec)?, roles::scram_iterations())?;
@@ -43819,6 +45398,7 @@ impl Statement {
                             p.canary_wait.map_or(Value::Null, interval_of),
                             p.effects_delay.map_or(Value::Null, interval_of),
                             limit(p.max_unusual),
+                            Value::Text(p.require_evidence.join(",")),
                         ]
                     })
                     .collect();
@@ -43937,6 +45517,77 @@ impl Statement {
                     .claim_outbox(channels, *limit, *lease, *idempotent)?
                     .into_iter()
                     .map(|e| outbox_row(e, &landed))
+                    .collect();
+                Ok(Output {
+                    typmods: vec![],
+                    tag: format!("SELECT {}", rows.len()),
+                    columns: self.columns(db, branch, &[])?,
+                    rows,
+                })
+            }
+            Stmt::WorldState { world, token } => {
+                let s = db.world_state(world, token.as_deref())?;
+                Ok(Output {
+                    typmods: vec![],
+                    tag: "SELECT 1".into(),
+                    columns: self.columns(db, branch, &[])?,
+                    rows: vec![vec![
+                        Value::Text(s.world),
+                        Value::Int(s.version as i64),
+                        Value::Int(s.epoch as i64),
+                        Value::Bool(s.durable),
+                        Value::Bool(s.flagged),
+                        Value::Bool(s.check_reads),
+                        Value::Text(s.stale_reads.join("; ")),
+                        Value::Int(s.parent_changes as i64),
+                        Value::Text(s.token),
+                    ]],
+                })
+            }
+            Stmt::Forecast(name) => {
+                let w = name.as_deref().map(|n| db.world(n).map(|w| w.name)).transpose()?;
+                let rows: Vec<Vec<Value>> = db
+                    .forecast_conflicts(w.as_deref())?
+                    .into_iter()
+                    .map(|f| {
+                        let (table, key) = split_row_key(&f.key);
+                        vec![
+                            Value::Text(f.world_a),
+                            Value::Text(f.world_b),
+                            Value::Text(f.kind.into()),
+                            Value::Text(table),
+                            Value::Text(key),
+                            Value::Bool(f.combinable),
+                        ]
+                    })
+                    .collect();
+                Ok(Output {
+                    typmods: vec![],
+                    tag: format!("SELECT {}", rows.len()),
+                    columns: self.columns(db, branch, &[])?,
+                    rows,
+                })
+            }
+            Stmt::Consolidate { name, preview, only, arbitrate } => {
+                let p = db.world(name)?.name;
+                let only = only.iter().map(|c| db.world(c).map(|w| w.name)).collect::<crate::Result<Vec<_>>>()?;
+                if !*preview {
+                    let n = db.consolidate(&p, &only, *arbitrate)?;
+                    return Ok(Output::tag(format!("CONSOLIDATE {n}")));
+                }
+                let rows: Vec<Vec<Value>> = db
+                    .consolidate_preview(&p, &only)?
+                    .into_iter()
+                    .map(|c| {
+                        let (table, key) = split_row_key(&c.key);
+                        vec![
+                            Value::Text(c.world),
+                            Value::Text(table),
+                            Value::Text(key),
+                            Value::Text(c.outcome.into()),
+                            Value::Text(c.detail),
+                        ]
+                    })
                     .collect();
                 Ok(Output {
                     typmods: vec![],
@@ -44192,11 +45843,28 @@ impl Statement {
                     rows: vec![vec![Value::Int(b.files as i64), Value::Int(b.bytes as i64)]],
                 })
             }
+            Stmt::VerifyLedger => {
+                let rows = db
+                    .verify_ledger()?
+                    .into_iter()
+                    .map(|(seq, ok, detail)| vec![Value::Int(seq), Value::Bool(ok), Value::Text(detail)])
+                    .collect();
+                let columns = self.columns(db, branch, &[])?;
+                Ok(Output { typmods: vec![], tag: "VERIFY".into(), columns, rows })
+            }
             Stmt::Verify => {
                 let v = db.verify().map_err(crate::Error::from)?;
-                let row = [v.pages as i64, v.bytes as i64, v.log_records as i64].map(Value::Int).to_vec();
+                let counts = [v.pages as i64, v.bytes as i64, v.log_records as i64].map(Value::Int).to_vec();
+                // and a row for each row of a world that breaks a constraint of its table (none: the counts alone)
+                let found = db.constraint_violations()?;
+                let rows = match found.is_empty() {
+                    true => vec![[counts, vec![Value::Null, Value::Null]].concat()],
+                    false => (found.into_iter())
+                        .map(|(w, p)| [counts.clone(), vec![Value::Text(w), Value::Text(p)]].concat())
+                        .collect(),
+                };
                 let columns = self.columns(db, branch, &[])?;
-                Ok(Output { typmods: vec![], tag: "VERIFY".into(), columns, rows: vec![row] })
+                Ok(Output { typmods: vec![], tag: "VERIFY".into(), columns, rows })
             }
             Stmt::ShowMetrics => {
                 let m = db.metrics();
@@ -45183,6 +46851,13 @@ const VIEWS: &str = "_sonos_views";
 const SEQUENCES: &str = "_sonos_sequences";
 
 /// Whether `key` is a view's, a sequence's, a function's or a collation's definition (DIFF shows them).
+/// Rows of the database's own that merge with a world, and that SQL's DIFF turns into no statement of its own:
+/// privileges and owners (`_sonos_acl`), rules and casts. A diff and a dry run show them all the same: what merges is
+/// what they show.
+pub(crate) fn merged_object(key: &str) -> bool {
+    key.starts_with("_sonos_acl/") || key.starts_with("_sonos_defs/rule/") || key.starts_with("_sonos_defs/cast/")
+}
+
 pub(crate) fn schema_object(key: &str) -> bool {
     key.starts_with("_sonos_rls/")
         || key.starts_with("_sonos_policy/")
@@ -48595,21 +50270,30 @@ fn expand_select(
             continue;
         }
         if src.at.is_some() {
-            unkept(); // (when it reads depends on its parameters, or on the time now)
+            unkept(); // (when it reads depends on its parameters, or on the time now, or on another world)
         }
-        let at = match (&src.at, params) {
-            (Some(e), Some(p)) => Some(when(e, p)?),
-            (Some(e), None) => when(e, &[]).ok(),
+        // AT WORLDS OF SET s: the table in each of its worlds, read AT WORLD
+        if let Some(set) = src.at.as_ref().and_then(at_world_of).and_then(|(set, s)| set.then(|| s.to_string())) {
+            let mut body = world_set_union(v, src, &set)?;
+            expand_select(v, &mut body, params, any, deep, x)?;
+            src.sub = Some(Box::new(body));
+            src.at = None;
+            changed = true;
+            continue;
+        }
+        // (None: read now; Some(None): read then, or in another world, which `sources` says why it can't be)
+        let past = match (&src.at, params) {
+            (Some(e), _) if at_world_of(e).is_some() => Some(at_view(v, e, &[]).ok()),
+            (Some(e), Some(p)) => Some(v.core.view_at(&v.branch, when(e, p)?).ok()),
+            (Some(e), None) => when(e, &[]).ok().map(|t| v.core.view_at(&v.branch, t).ok()),
             (None, _) => None,
         };
-        let past = match at {
-            Some(t) => v.core.view_at(&v.branch, t).ok(), // (sources() says why it can't be)
-            None => None,
-        };
+        let at = past.is_some();
+        let past = past.flatten();
         let def = match (at, &past) {
-            (Some(_), Some(past)) => view_def(past, &src.table)?,
-            (Some(_), None) => None,
-            (None, _) => view_def(v, &src.table)?,
+            (true, Some(past)) => view_def(past, &src.table)?,
+            (true, None) => None,
+            (false, _) => view_def(v, &src.table)?,
         };
         let Some(def) = def else {
             // a table with masked columns, read where masks apply: a subquery of its rows with them masked, named
@@ -62654,12 +64338,16 @@ impl Exec<'_> {
                     };
                     let Some(i) = find(&t, c) else { return no_col(c) };
                     let ty = t.cols[i].ty;
+                    if let ColOpt::Merge(Some(d)) = opt {
+                        merge_delta_allowed(c, ty, d)?;
+                    }
                     let o = &mut t.cols[i].opts;
                     match opt {
                         ColOpt::Storage(w) => o.storage = column_storage(w, ty)?,
                         ColOpt::Compression(w) => o.compression = column_compression(w, ty)?,
                         ColOpt::Stats(_) => o.stats = stats.filter(|n| *n != -1),
                         ColOpt::Mask(m) => o.mask = *m,
+                        ColOpt::Merge(m) => o.merge = *m,
                     }
                 }
                 Alter::ReplicaIdentity(kind, index) => {
@@ -71967,10 +73655,12 @@ fn sources(v: &View, s: &Select, params: Option<&[Value]>) -> Result<Vec<Table>>
     for src in s.from.iter().chain(s.joins.iter().map(|j| &j.src)) {
         // planning (no parameter values yet): an AS OF that needs them reads the table as it is
         // now, or as nothing if it's gone since; running reads it as it was
-        let at = match (&src.at, params) {
-            (Some(e), Some(params)) => Some(when(e, params)?),
+        let past = match (&src.at, params) {
+            // another world (`t AT WORLD w`): as it is
+            (Some(e), _) if at_world_of(e).is_some() => Some(at_view(v, e, &[])?),
+            (Some(e), Some(params)) => Some(v.core.view_at(&v.branch, when(e, params)?)?),
             (Some(e), None) => match when(e, &[]) {
-                Ok(t) => Some(t),
+                Ok(t) => Some(v.core.view_at(&v.branch, t)?),
                 Err(_) if load_src(v, src)?.is_none() => {
                     let mut t = Table::default_named(&src.alias);
                     t.mem = Some(Default::default());
@@ -71981,8 +73671,7 @@ fn sources(v: &View, s: &Select, params: Option<&[Value]>) -> Result<Vec<Table>>
             },
             _ => None,
         };
-        if let Some(at) = at {
-            let past = v.core.view_at(&v.branch, at)?;
+        if let Some(past) = past {
             let mut t = need_src(&past, src)?;
             populated(&t)?;
             for c in &mut t.cols {
@@ -72228,6 +73917,114 @@ fn lateral_hint(e: SqlError, before: &[Table]) -> SqlError {
         );
     }
     e
+}
+
+/// `Source::at` of `t AT WORLD w`, and of `t AT WORLDS OF SET s`: a record of these field names, which no SQL can
+/// write, holding the world's (or the set's) name (see `at_world_of`).
+const AT_WORLD: &[&str] = &["\u{1}at world"];
+const AT_SET: &[&str] = &["\u{1}at worlds of set"];
+
+fn at_marker(kind: &'static [&'static str], name: String) -> Expr {
+    Expr::Func(Func::Record(kind), vec![Expr::Lit(Value::Text(name))])
+}
+
+/// What `Source::at` names when it's AT WORLD w (`(false, w)`) or AT WORLDS OF SET s (`(true, s)`); None for AS OF.
+fn at_world_of(e: &Expr) -> Option<(bool, &str)> {
+    match e {
+        Expr::Func(Func::Record(k), a) if *k == AT_WORLD || *k == AT_SET => match a.first() {
+            Some(Expr::Lit(Value::Text(n))) => Some((*k == AT_SET, n.as_str())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// World `w` as a statement running in `v`'s world reads it (`t AT WORLD w`): as it is now (or, for `'name@when'`,
+/// as it was then), read only. An agent needs the right to read it, as it does its own world; a session's
+/// transaction is no one else's. What's read of it goes in no world's read set: it's not this world's rows.
+fn world_view<'a>(v: &View<'a>, w: &str) -> Result<View<'a>> {
+    let me = crate::disk::actor();
+    if !me.is_empty() {
+        v.core.as_agent(&me)?.may_read(w)?;
+    }
+    Ok(v.core.view(w)?.unrecorded())
+}
+
+/// The view a table read AS OF a moment, or AT WORLD, is read through (`params`: as `when` takes them).
+fn at_view<'a>(v: &View<'a>, e: &Expr, params: &[Value]) -> Result<View<'a>> {
+    match at_world_of(e) {
+        Some((false, w)) => world_view(v, w),
+        // (expanded into its worlds' tables before it runs: see `world_set_union`)
+        Some((true, s)) => err(UNSUPPORTED, format!("AT WORLDS OF SET {s} can't be read here")),
+        None => Ok(v.core.view_at(&v.branch, when(e, params)?)?),
+    }
+}
+
+/// `t AT WORLDS OF SET s` as the query it reads: `t` in each world of set `s`, one after another (UNION ALL), each
+/// row with the name of its world as a last column, `_world`. The worlds must have the same columns (names and
+/// types) in `t`: else nothing can say which column is which.
+fn world_set_union(v: &View, src: &Source, set: &str) -> Result<Select> {
+    let (base, members) = v.core.world_set(set)?;
+    let read = |w: &str| -> Result<Select> {
+        let mut q = select_of(Expr::Lit(Value::Null));
+        q.items = vec![Item::Star, Item::Expr(Expr::Lit(Value::Text(w.into())), Some("_world".into()))];
+        q.from = Some(Source {
+            table: src.table.clone(),
+            alias: rel_part(&src.table).to_string(),
+            sub: None,
+            names: vec![],
+            rec: None,
+            working: false,
+            at: Some(at_marker(AT_WORLD, w.into())),
+            lateral: false,
+            srf: None,
+            cte: 0,
+            only: src.only,
+            hier: false,
+            policed: false,
+            bound: src.bound,
+        });
+        Ok(q)
+    };
+    if members.is_empty() {
+        // no worlds yet: the base's columns, and no rows
+        let mut q = read(&base)?;
+        q.filter = Some(Expr::Lit(Value::Bool(false)));
+        return Ok(q);
+    }
+    let mut first: Option<(String, Vec<(String, Type)>)> = None;
+    for w in &members {
+        let cols = match load_src(&world_view(v, w)?, src)? {
+            Some(t) => t.cols.iter().filter(|c| !c.hidden).map(|c| (c.name.clone(), c.ty)).collect::<Vec<_>>(),
+            None => {
+                return err(
+                    "42P01",
+                    format!("relation \"{}\" does not exist in world {w} of world set {set}", rel_part(&src.table)),
+                );
+            }
+        };
+        match &first {
+            None => first = Some((w.clone(), cols)),
+            Some((w0, c0)) if *c0 != cols => {
+                let show = |c: &[(String, Type)]| c.iter().map(|(n, t)| format!("{n} {t:?}")).collect::<Vec<_>>();
+                return err(
+                    "42804",
+                    format!(
+                        "table \"{}\" has other columns in world {w} ({}) than in world {w0} ({}) of world set {set}: \
+                         read each world with AT WORLD instead",
+                        rel_part(&src.table),
+                        show(&cols).join(", "),
+                        show(c0).join(", ")
+                    ),
+                );
+            }
+            Some(_) => {}
+        }
+    }
+    let mut parts = members.iter().map(|w| read(w)).collect::<Result<Vec<_>>>()?.into_iter();
+    let mut all = parts.next().expect("a world at least");
+    all.set = parts.map(|q| (SetOp::Union, true, Box::new(q))).collect();
+    Ok(all)
 }
 
 /// The moment an AS OF expression names, in ms since 1970: a time or a time ago as text, or a
@@ -74222,4 +76019,94 @@ mod tests {
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// Deny-by-default schema changes for an agent held to a tenant (approved decision 5 of the 2026-11-17 plan; finding
+/// A). A change to the definition of a table held to the tenant (it has the tenant's column, or a foreign key to one
+/// that has, see `rls::reach`) can let go of the hold or rewrite other tenants' rows in the agent's world: `ALTER
+/// COLUMN ... TYPE ... USING 42` set every row's tenant column to the agent's. A change to anything that exists in
+/// main is every tenant's once merged. So such an agent may change only objects it made itself in its world, and
+/// those not held to its tenant; privileges, roles, row security and shared definitions (types, domains, schemas,
+/// functions it didn't make) not at all. Everything else (reads, writes, CREATE of new objects) is as before.
+fn tenant_ddl_refused(x: &Exec, st: &Stmt) -> Result<()> {
+    let Some(cond) = rls::tenant() else { return Ok(()) };
+    // (the session's temporary tables live in a database of their own, the session's alone)
+    if session_temp().is_some_and(|d| std::ptr::eq(Arc::as_ptr(&d), x.db)) {
+        return Ok(());
+    }
+    let refuse = |what: &str| -> Result<()> {
+        err(
+            "42501",
+            format!(
+                "an agent held to tenant {cond} may not {what}: its tenant's rows are held by those definitions, \
+                 and other tenants share them (it may change only tables it made in its own world)"
+            ),
+        )
+    };
+    // statements no tenant agent may run
+    let never = match st {
+        Stmt::Role(_) | Stmt::Grant(_) | Stmt::AlterOwner(..) | Stmt::DropOwned(..) | Stmt::Reassign(..) => {
+            Some("change roles, grants or owners")
+        }
+        Stmt::Policy(_) => Some("change row security"),
+        Stmt::TableToView { .. } | Stmt::RenameRule { .. } => Some("change rules"),
+        Stmt::AlterType { .. } | Stmt::DropType { .. } | Stmt::AlterDomain { .. } => Some("change or drop a type"),
+        Stmt::DropSchema { .. } => Some("drop a schema"),
+        Stmt::AlterExtension { .. } | Stmt::DropExtension { .. } => Some("change or drop an extension"),
+        Stmt::AlterCollation { .. } | Stmt::DropCollation { .. } => Some("change or drop a collation"),
+        Stmt::DropFunction { .. } | Stmt::AlterRoutine { .. } => Some("change or drop a function"),
+        Stmt::CreateFunction(_, true, _) => Some("replace a function"),
+        Stmt::Foreign(_) => Some("change foreign tables or servers"),
+        _ => None,
+    };
+    if let Some(what) = never {
+        return refuse(what);
+    }
+    // the tables, views, sequences and indexes it would change
+    let v = x.view()?;
+    let mut rels: Vec<String> = vec![];
+    let mut indexes: Vec<String> = vec![];
+    match st {
+        Stmt::Alter { table, .. } | Stmt::CreateIndex { table, .. } | Stmt::VectorIndex { table, .. } => {
+            rels.push(table.clone())
+        }
+        Stmt::Drop { tables, .. } | Stmt::Truncate { tables, .. } => rels.extend(tables.iter().cloned()),
+        Stmt::DropObjects { names, .. } => rels.extend(names.iter().cloned()),
+        Stmt::Refresh { name, .. }
+        | Stmt::AlterSequence { name, .. }
+        | Stmt::RenameView { name, .. }
+        | Stmt::RenameViewColumn { name, .. }
+        | Stmt::ViewOptions { name, .. }
+        | Stmt::ViewDefault { name, .. } => rels.push(name.clone()),
+        Stmt::CreateView { name, replace: true, .. } => rels.push(name.clone()),
+        Stmt::CreateTrigger(_, table, _) | Stmt::DropTrigger { table, .. } | Stmt::RenameTrigger { table, .. } => {
+            rels.push(table.clone())
+        }
+        Stmt::DropIndex { name, more, .. } => {
+            indexes.push(name.clone());
+            indexes.extend(more.iter().cloned());
+        }
+        Stmt::RenameIndex { name, .. } | Stmt::IndexColumnAlter { name, .. } => indexes.push(name.clone()),
+        Stmt::AttachIndex { parent, child } => indexes.extend([parent.clone(), child.clone()]),
+        _ => return Ok(()),
+    }
+    for i in indexes {
+        if let Some(t) = index_owner(&v, &i)? {
+            rels.push(t);
+        }
+    }
+    let col = rls::tenant_column(&cond);
+    let main = x.db.core.view(crate::MAIN)?;
+    for r in rels {
+        let held = matches!(rls::reach(&v, &r, &col)?, Some(rls::Reach::Column | rls::Reach::Through { .. }));
+        let shared = relation_kind(&main, &r)?.is_some();
+        if held || shared {
+            return refuse(&format!(
+                "change the definition of \"{}\" ({})",
+                rel_part(&r),
+                if held { "held to its tenant" } else { "it is in main" }
+            ));
+        }
+    }
+    Ok(())
 }

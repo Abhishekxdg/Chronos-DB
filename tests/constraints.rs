@@ -118,3 +118,62 @@ fn checks_survive_a_reopen() {
     drop(db);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// H2: a world adds a UNIQUE constraint while main inserts a row duplicating a value: the merge brings the constraint
+/// to rows it never checked, so the whole table is checked and the merge refused. Without a duplicate it merges, and
+/// main's own rows are in the constraint's index from then on.
+#[test]
+fn world_adds_unique_main_duplicates_refused() {
+    let db = Db::new();
+    sql(&db, "create table u (id int primary key, email text)");
+    sql(&db, "insert into u values (1, 'a@x')");
+    db.fork(MAIN, "w").unwrap();
+    on(&db, "w", "alter table u add constraint u_email unique (email)");
+    sql(&db, "insert into u values (2, 'a@x')");
+    let (code, msg) = fails(&db, "merge world w");
+    assert_eq!(code, "23505", "{msg}");
+    assert_eq!(count(&db, "select count(*) from u"), 2, "nothing merged");
+    // no duplicate: merged, and main's row added meanwhile holds its value under the constraint
+    sql(&db, "delete from u where id = 2");
+    sql(&db, "insert into u values (3, 'b@x')");
+    sql(&db, "merge world w");
+    let (code, msg) = fails(&db, "insert into u values (4, 'b@x')");
+    assert_eq!(code, "23505", "{msg}");
+}
+
+/// H2b: a world adds a FOREIGN KEY while main inserts a row that references nothing: refused. Without one it merges,
+/// and main's referencing rows hold their parents from then on.
+#[test]
+fn world_adds_fk_main_orphan_refused() {
+    let db = Db::new();
+    sql(&db, "create table p (id int primary key)");
+    sql(&db, "create table c (id int primary key, pid int)");
+    sql(&db, "insert into p values (1), (2)");
+    sql(&db, "insert into c values (1, 1)");
+    db.fork(MAIN, "w").unwrap();
+    on(&db, "w", "alter table c add constraint c_p foreign key (pid) references p (id)");
+    sql(&db, "insert into c values (2, 99)");
+    let (code, msg) = fails(&db, "merge world w");
+    assert_eq!(code, "23503", "{msg}");
+    sql(&db, "delete from c where id = 2");
+    sql(&db, "insert into c values (3, 2)");
+    sql(&db, "merge world w");
+    let (code, msg) = fails(&db, "delete from p where id = 2");
+    assert_eq!(code, "23503", "{msg}");
+}
+
+/// H3: a world sets NOT NULL while main inserts a null: refused.
+#[test]
+fn world_sets_not_null_main_null_refused() {
+    let db = Db::new();
+    sql(&db, "create table n (id int primary key, v text)");
+    sql(&db, "insert into n values (1, 'a')");
+    db.fork(MAIN, "w").unwrap();
+    on(&db, "w", "alter table n alter column v set not null");
+    sql(&db, "insert into n values (2, null)");
+    let (code, msg) = fails(&db, "merge world w");
+    assert_eq!(code, "23502", "{msg}");
+    sql(&db, "update n set v = 'b' where id = 2");
+    sql(&db, "merge world w");
+    assert_eq!(fails(&db, "insert into n values (3, null)").0, "23502");
+}

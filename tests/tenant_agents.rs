@@ -399,6 +399,11 @@ fn a_shared_table_is_read_only_for_a_tenant_agent() {
         ] {
             let e = s.run(&db, q, &[]).unwrap_err();
             assert_eq!(e.code, "42501", "{q} ({at}): {}", e.message);
+            if at == "main" {
+                // main is read-only to a tenant agent (r3.1, T4): refused before the table is looked at
+                assert!(e.message.contains("changes main only by merging"), "{q} ({at}): {}", e.message);
+                continue;
+            }
             assert!(e.message.contains("may only read table \"countries\""), "{q} ({at}): {}", e.message);
             assert!(e.message.contains("no column org_id and no foreign key"), "{q} ({at}): {}", e.message);
         }
@@ -443,4 +448,98 @@ fn show_agent_privileges_says_how_each_table_is_held() {
     let (read, write, why) = row("countries");
     assert_eq!((read.as_str(), write.as_str()), ("yes", "no"), "{why}");
     assert!(why.contains("shared by every tenant: no column org_id and no foreign key"), "{why}");
+}
+
+/// Gate S, batch S3 (r2 creation audit, one case per row): every way a tenant agent can make a
+/// world either refuses (42501) or makes one owned by the agent and held to its tenant. Over SQL,
+/// the library calls the HTTP and MCP ops make, and MCP itself (HTTP over a server is in
+/// tests/tenant_isolation.rs `creation_path_matrix_http`).
+#[test]
+fn creation_path_matrix() {
+    let dir = std::env::temp_dir().join(format!("chronos-tenant-agents-creation-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = Db::open(&dir).unwrap();
+    setup(&db);
+    run(
+        &db,
+        MAIN,
+        "create agent res42 with (can = 'read,fork,write_own,merge_own,write_main,restore,merge', tenant = 'org_id = 42')",
+        &[],
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let stamped = |w: &str, how: &str| {
+        let world = db.world(w).unwrap_or_else(|_| panic!("{how}: {w} was not made"));
+        assert_eq!(world.owner.as_deref(), Some("res42"), "{how}: owner");
+        let scope = world.scope.unwrap_or_default();
+        assert_eq!(scope["tenant"]["column"], "org_id", "{how}: {scope}");
+        assert_eq!(scope["tenant"]["value"], 42, "{how}: {scope}");
+    };
+    let mut s = agent("res42");
+    // made, and stamped
+    for (sql, w) in [
+        ("create world c1", "c1"),
+        ("fork world main as c2", "c2"),
+        ("create world c3 from main", "c3"),
+        ("simulate 1 worlds as s run $$select 1$$ score $$select 1$$ keep 1", "s_0"),
+        ("replay world s_0 as r1", "r1"),
+        ("fork world c1 as c1_child", "c1_child"),
+    ] {
+        s.run(&db, sql, &[]).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
+        stamped(w, sql);
+    }
+    // the library calls the HTTP and MCP ops make
+    let me = db.as_agent("res42").unwrap();
+    me.fork(MAIN, "l1", serde_json::Value::Null).unwrap();
+    stamped("l1", "Acting::fork");
+    let mut spec = chronos::Simulate::new(MAIN, 1, "ls", "select 1", "select 1");
+    spec.keep = Some(1);
+    spec.agent = Some("res42".into());
+    db.simulate(&spec).unwrap();
+    stamped("ls_0", "Core::simulate");
+    db.replay("ls_0", Some("lr"), Some("res42")).unwrap();
+    stamped("lr", "replay");
+    // refused
+    for sql in [
+        "fork world 'main@-1 second' as h1",
+        "create world h2 from 'main@-1 second'",
+        "simulate 1 worlds from 'main@-1 second' as hs run $$select 1$$ score $$select 1$$ keep 1",
+        "restore world main to '-1 second'",
+        "create database cl template main",
+        "alter world c1 set (tenant = 'org_id = 7')",
+        "alter world c1 set (tenant = null)",
+        "create world c9 with (tenant = 'org_id = 7')",
+    ] {
+        let e = s.run(&db, sql, &[]).unwrap_err();
+        assert_eq!(e.code, "42501", "{sql}: {}", e.message);
+    }
+    // rebase keeps the world's stamp
+    s.run(&db, "rebase world c1", &[]).unwrap();
+    stamped("c1", "rebase");
+    drop(db);
+
+    // MCP, acting as the agent
+    use std::io::Write;
+    let calls = [
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fork","arguments":{"name":"m1"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"simulate","arguments":{"worlds":1,"prefix":"ms","script":"select 1","score":"select 1","keep":1}}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"replay","arguments":{"world":"ms_0","as":"mr"}}}"#,
+    ];
+    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_chronos"))
+        .args(["mcp", dir.to_str().unwrap(), "--agent", "res42"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    c.stdin.take().unwrap().write_all(calls.join("\n").as_bytes()).unwrap();
+    let out = c.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    let db = Db::open(&dir).unwrap();
+    for w in ["m1", "ms_0", "mr"] {
+        let world = db.world(w).unwrap_or_else(|_| panic!("MCP: {w} was not made"));
+        assert_eq!(world.owner.as_deref(), Some("res42"), "MCP {w}");
+        assert_eq!(world.scope.unwrap_or_default()["tenant"]["value"], 42, "MCP {w}");
+    }
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }
